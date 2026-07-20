@@ -92,7 +92,7 @@ Local derived schema
 
 文案事實來源必須是使用者 brief；模型只能回報影像證據，不能自行發明產品規格。
 
-即使第二個模型只讀 Clip Cards，也必須另設 claim validator：逐條比對輸出旁白中的型號、畫素、倍率與功能名稱是否能從 brief deterministic 對回。模型在 uncertainties 中指出素材型號衝突，不代表它不會同時寫出肯定旁白；Structured Output 通過也不代表數值換算正確。任何錯型號、可見浮水印或不一致標牌都應 fail closed，進入 `needs_human_review`，而不是由 narrative planner 自行決定採用。
+即使第二個模型只讀 Clip Cards，也必須另設 claim validator：逐條比對輸出旁白中的型號、畫素、倍率與功能名稱是否能從 brief deterministic 對回。模型在 uncertainties 中指出素材型號衝突，不代表衝突本身一定正確，也不代表它不會同時寫出肯定旁白；Structured Output 通過同樣不代表 OCR 或數值換算正確。任何疑似錯型號、可見浮水印或不一致標牌都應 fail closed，進入 `needs_human_review`，再由 orientation-corrected 原始影格確認。不得只憑 Clip Card OCR 自動淘汰素材，也不得由 narrative planner 自行決定採用。
 
 ### 5. Adaptive dense refinement
 
