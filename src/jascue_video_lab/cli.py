@@ -7,10 +7,12 @@ import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 
 from PIL import Image
 
 from .ab_review import render_grounding_ab_review
+from .billing import summarize_usage_and_list_price
 from .compare import compare_runs
 from .fixtures import generate_fixtures
 from .gemini import GeminiLabClient
@@ -64,6 +66,68 @@ def command_extract(args: argparse.Namespace) -> int:
     metadata = args.output.with_suffix(args.output.suffix + ".json")
     write_json(metadata, frame)
     print(frame.model_dump_json(indent=2))
+    return 0
+
+
+def command_upload(args: argparse.Namespace) -> int:
+    total_started = monotonic()
+    media = probe_video(args.video)
+    artifact_root = args.output
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    write_json(artifact_root / "media.json", media)
+    source_link = artifact_root / ("source" + args.video.suffix.lower())
+    if not source_link.exists():
+        source_link.symlink_to(args.video.resolve(strict=True))
+    upload_source = source_link
+    proxy_record: dict[str, object] | None = None
+    if args.analysis_proxy:
+        proxy_media = probe_video(args.analysis_proxy)
+        duration_delta_ms = abs(proxy_media.duration_ms - media.duration_ms)
+        if duration_delta_ms > args.max_proxy_duration_delta_ms:
+            raise ValueError(
+                f"proxy duration differs by {duration_delta_ms} ms; maximum is "
+                f"{args.max_proxy_duration_delta_ms} ms"
+            )
+        proxy_link = artifact_root / "analysis-proxy.mp4"
+        if not proxy_link.exists():
+            proxy_link.symlink_to(args.analysis_proxy.resolve(strict=True))
+        upload_source = proxy_link
+        proxy_record = {
+            "purpose": "Gemini semantic video analysis only; original source remains authoritative",
+            "proxy_media": proxy_media.model_dump(mode="json"),
+            "duration_delta_ms": duration_delta_ms,
+            "original_bytes": args.video.stat().st_size,
+            "proxy_bytes": args.analysis_proxy.stat().st_size,
+            "byte_reduction_ratio": round(
+                1 - args.analysis_proxy.stat().st_size / args.video.stat().st_size, 8
+            ),
+            "grounding_source": str(source_link),
+            "upload_source": str(proxy_link),
+        }
+        write_json(artifact_root / "analysis_proxy.json", proxy_record)
+    upload_started = monotonic()
+    client = GeminiLabClient(temperature=args.temperature)
+    try:
+        uploaded = client.upload_video(upload_source, artifact_root / "upload")
+    finally:
+        client.close()
+    upload_elapsed = monotonic() - upload_started
+    timing = {
+        "upload_and_file_processing_seconds": round(upload_elapsed, 6),
+        "total_prepare_seconds": round(monotonic() - total_started, 6),
+    }
+    write_json(artifact_root / "upload_timing.json", timing)
+    result = {
+        "artifact_root": str(artifact_root),
+        "asset_id": media.asset_id,
+        "uploaded_file_name": uploaded.name,
+        "uploaded_state": uploaded.state.name if uploaded.state else None,
+        "used_analysis_proxy": bool(args.analysis_proxy),
+        "proxy": proxy_record,
+        "timing": timing,
+    }
+    write_json(artifact_root / "upload_result.json", result)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -170,7 +234,8 @@ def command_temporal_repeat(args: argparse.Namespace) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     client = GeminiLabClient(temperature=args.temperature)
     summaries: list[dict[str, object]] = []
-    failures = 0
+    analysis_failures = 0
+    grounding_failures = 0
     try:
         uploaded = client.resume_video_upload(args.artifact_root / "upload")
         for run_number in range(1, args.runs + 1):
@@ -372,6 +437,7 @@ def _mmss_to_ms(value: str) -> int:
 
 
 def command_direct_moment_repeat(args: argparse.Namespace) -> int:
+    pipeline_started = monotonic()
     media = MediaInfo.model_validate(read_json(args.artifact_root / "media.json"))
     source = args.artifact_root / "source.mp4"
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -384,7 +450,10 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
             run_id = f"direct-mmss-{run_number:02d}-{uuid.uuid4().hex[:8]}"
             run_dir = args.output_dir / f"run-{run_number:02d}"
             run_dir.mkdir(parents=True, exist_ok=True)
+            run_started = monotonic()
+            timing: dict[str, object] = {"groundings": []}
             try:
+                analysis_started = monotonic()
                 moments = client.analyze_direct_moments(
                     media=media,
                     uploaded=uploaded,
@@ -392,6 +461,7 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
                     run_id=run_id,
                     run_dir=run_dir,
                 )
+                timing["video_analysis_seconds"] = round(monotonic() - analysis_started, 6)
                 run_summary: dict[str, object] = {
                     "run": f"run-{run_number:02d}",
                     "schema_valid": True,
@@ -413,45 +483,87 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
                     for moment in moments.moments:
                         requested_ms = _mmss_to_ms(moment.timestamp_mmss)
                         moment_dir = run_dir / "moments" / _safe_name(moment.moment_id)
-                        frame = extract_frame(source, requested_ms, moment_dir / "frame.png")
-                        write_json(moment_dir / "frame.json", frame)
-                        grounding_dir = moment_dir / "grounding"
-                        proposal = client.ground_frame(
-                            media=media,
-                            frame=frame,
-                            event_id=moment.moment_id,
-                            event_description=f"{moment.label}；{moment.observable_evidence}",
-                            entity_id=moment.grounding_target_id,
-                            target_description=moment.grounding_target_description,
-                            prompt_template=_load_prompt("grounding_native_yxyx_zh-TW.txt"),
-                            run_id=run_id,
-                            output_dir=grounding_dir,
-                        )
-                        overlay_path = grounding_dir / "debug.png"
-                        draw_grounding_overlay(Path(frame.path), proposal, overlay_path)
-                        timeline_results.append(
-                            (moment.moment_id, requested_ms, frame.frame_time_ms, overlay_path, proposal)
-                        )
-                        grounding_summary.append(
-                            {
+                        extraction_started = monotonic()
+                        grounding_started: float | None = None
+                        try:
+                            frame = extract_frame(source, requested_ms, moment_dir / "frame.png")
+                            write_json(moment_dir / "frame.json", frame)
+                            extraction_seconds = monotonic() - extraction_started
+                            grounding_dir = moment_dir / "grounding"
+                            grounding_started = monotonic()
+                            proposal = client.ground_frame(
+                                media=media,
+                                frame=frame,
+                                event_id=moment.moment_id,
+                                event_description=f"{moment.label}；{moment.observable_evidence}",
+                                entity_id=moment.grounding_target_id,
+                                target_description=moment.grounding_target_description,
+                                prompt_template=_load_prompt("grounding_native_yxyx_zh-TW.txt"),
+                                run_id=run_id,
+                                output_dir=grounding_dir,
+                            )
+                            grounding_seconds = monotonic() - grounding_started
+                            overlay_path = grounding_dir / "debug.png"
+                            draw_grounding_overlay(Path(frame.path), proposal, overlay_path)
+                            timeline_results.append(
+                                (
+                                    moment.moment_id,
+                                    requested_ms,
+                                    frame.frame_time_ms,
+                                    overlay_path,
+                                    proposal,
+                                )
+                            )
+                            grounding_row = {
                                 "moment_id": moment.moment_id,
+                                "ok": True,
                                 "requested_ms": requested_ms,
                                 "frame_time_ms": frame.frame_time_ms,
                                 "visible": proposal.visible,
                                 "candidate_count": len(proposal.candidates),
+                                "frame_extraction_seconds": round(extraction_seconds, 6),
+                                "grounding_seconds": round(grounding_seconds, 6),
                             }
+                        except Exception as error:
+                            grounding_failures += 1
+                            extraction_seconds = monotonic() - extraction_started
+                            grounding_seconds = (
+                                monotonic() - grounding_started
+                                if grounding_started is not None
+                                else 0.0
+                            )
+                            append_error(
+                                run_dir,
+                                f"direct_moment_grounding:{moment.moment_id}",
+                                error,
+                            )
+                            grounding_row = {
+                                "moment_id": moment.moment_id,
+                                "ok": False,
+                                "requested_ms": requested_ms,
+                                "error_type": type(error).__name__,
+                                "error": str(error),
+                                "frame_extraction_seconds": round(extraction_seconds, 6),
+                                "grounding_seconds": round(grounding_seconds, 6),
+                            }
+                        grounding_summary.append(grounding_row)
+                        timing["groundings"].append(grounding_row)
+                    if timeline_results:
+                        render_direct_moment_timeline(
+                            moment_map=moments,
+                            video_path=source,
+                            results=timeline_results,
+                            output_path=run_dir / "index.html",
                         )
-                    render_direct_moment_timeline(
-                        moment_map=moments,
-                        video_path=source,
-                        results=timeline_results,
-                        output_path=run_dir / "index.html",
-                    )
                     run_summary["groundings"] = grounding_summary
+                timing["run_total_seconds"] = round(monotonic() - run_started, 6)
+                write_json(run_dir / "timing.json", timing)
                 summaries.append(run_summary)
             except Exception as error:
-                failures += 1
+                analysis_failures += 1
                 append_error(run_dir, "direct_moment_pipeline", error)
+                timing["run_total_seconds"] = round(monotonic() - run_started, 6)
+                write_json(run_dir / "timing.json", timing)
                 summaries.append(
                     {
                         "run": f"run-{run_number:02d}",
@@ -462,18 +574,24 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
                 )
     finally:
         client.close()
+    pricing = summarize_usage_and_list_price(args.output_dir)
+    write_json(args.output_dir / "pricing.json", pricing)
     result = {
         "model": "gemini-3.5-flash",
         "method": "direct Gemini MM:SS salient moments",
         "runs_requested": args.runs,
-        "runs_succeeded": args.runs - failures,
+        "runs_succeeded": args.runs - analysis_failures,
         "grounded_runs": min(args.ground_runs, args.runs),
-        "failure_count": failures,
+        "analysis_failure_count": analysis_failures,
+        "grounding_failure_count": grounding_failures,
+        "failure_count": analysis_failures + grounding_failures,
+        "pipeline_elapsed_seconds": round(monotonic() - pipeline_started, 6),
+        "pricing": pricing,
         "runs": summaries,
     }
     write_json(args.output_dir / "summary.json", result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if failures == 0 else 1
+    return 0 if analysis_failures == 0 and grounding_failures == 0 else 1
 
 
 def command_run(args: argparse.Namespace) -> int:
@@ -642,6 +760,16 @@ def build_parser() -> argparse.ArgumentParser:
     probe_parser.add_argument("video", type=Path)
     probe_parser.add_argument("--output", type=Path)
     probe_parser.set_defaults(handler=command_probe)
+
+    upload_parser = subparsers.add_parser(
+        "upload", help="Prepare an artifact and upload an original video or analysis proxy"
+    )
+    upload_parser.add_argument("video", type=Path)
+    upload_parser.add_argument("--analysis-proxy", type=Path)
+    upload_parser.add_argument("--max-proxy-duration-delta-ms", type=int, default=100)
+    upload_parser.add_argument("--temperature", type=float, default=0.2)
+    upload_parser.add_argument("--output", type=Path, required=True)
+    upload_parser.set_defaults(handler=command_upload)
 
     extract_parser = subparsers.add_parser("extract", help="Extract orientation-corrected frame with exact PTS")
     extract_parser.add_argument("video", type=Path)
