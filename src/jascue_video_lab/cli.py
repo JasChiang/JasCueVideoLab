@@ -29,6 +29,7 @@ from .models import (
 from .overlay import draw_grounding_overlay
 from .review import render_manual_review
 from .repeat import run_repeated_grounding
+from .sam_tracking import compare_segmentation_to_bbox_track, track_bbox_sam21
 from .storage import append_error, read_json, write_json
 from .timeline import render_direct_moment_timeline, render_temporal_timeline, render_timeline
 from .tracking import track_bbox_csrt
@@ -400,6 +401,49 @@ def command_track_csrt(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
+    return 0
+
+
+def command_track_sam21(args: argparse.Namespace) -> int:
+    if args.grounding_json:
+        grounding = GroundingProposal.model_validate(read_json(args.grounding_json))
+        if not grounding.visible or not grounding.candidates:
+            raise ValueError("grounding seed must be visible and contain at least one candidate")
+        seed_time_ms = grounding.frame_time_ms
+        seed_box = grounding.candidates[0].box_2d
+        seed_source = f"Gemini GroundingProposal:{args.grounding_json}"
+        asset_id = grounding.asset_id
+    else:
+        if args.seed_time_ms is None or args.seed_box is None:
+            raise ValueError("provide --grounding-json or both --seed-time-ms and --seed-box")
+        seed_time_ms = args.seed_time_ms
+        seed_box = args.seed_box
+        seed_source = "manual canonical bbox"
+        asset_id = None
+    result = track_bbox_sam21(
+        video_path=args.video,
+        checkpoint_path=args.checkpoint,
+        seed_time_ms=seed_time_ms,
+        seed_box_2d=seed_box,
+        target_description=args.target_description,
+        output_dir=args.output_dir,
+        seed_source=seed_source,
+        asset_id=asset_id,
+        analysis_fps=args.analysis_fps,
+        max_side=args.max_side,
+        device=args.device,
+        scene_cut_threshold=args.scene_cut_threshold,
+        seed_box_padding_ratio=args.seed_box_padding_ratio,
+    )
+    print(result.model_dump_json(indent=2, exclude={"samples"}))
+    return 0
+
+
+def command_compare_trackers(args: argparse.Namespace) -> int:
+    result = compare_segmentation_to_bbox_track(
+        args.segmentation_json, args.reference_bbox_json, args.output
+    )
+    print(result.model_dump_json(indent=2, exclude={"samples"}))
     return 0
 
 
@@ -1193,6 +1237,35 @@ def build_parser() -> argparse.ArgumentParser:
     tracking_parser.add_argument("--appearance-threshold", type=float, default=0.25)
     tracking_parser.add_argument("--output-dir", type=Path, required=True)
     tracking_parser.set_defaults(handler=command_track_csrt)
+
+    sam_tracking_parser = subparsers.add_parser(
+        "track-sam21",
+        help="Experimental Gemini/manual bbox to SAM 2.1 mask propagation",
+    )
+    sam_tracking_parser.add_argument("video", type=Path)
+    sam_tracking_parser.add_argument("--checkpoint", type=Path, required=True)
+    sam_tracking_parser.add_argument("--grounding-json", type=Path)
+    sam_tracking_parser.add_argument("--seed-time-ms", type=int)
+    sam_tracking_parser.add_argument("--seed-box", type=int, nargs=4)
+    sam_tracking_parser.add_argument("--target-description", required=True)
+    sam_tracking_parser.add_argument("--analysis-fps", type=float, default=2.0)
+    sam_tracking_parser.add_argument("--max-side", type=int, default=960)
+    sam_tracking_parser.add_argument(
+        "--device", choices=["auto", "cpu", "mps", "cuda"], default="auto"
+    )
+    sam_tracking_parser.add_argument("--scene-cut-threshold", type=float, default=0.28)
+    sam_tracking_parser.add_argument("--seed-box-padding-ratio", type=float, default=0.0)
+    sam_tracking_parser.add_argument("--output-dir", type=Path, required=True)
+    sam_tracking_parser.set_defaults(handler=command_track_sam21)
+
+    tracker_comparison_parser = subparsers.add_parser(
+        "compare-trackers",
+        help="Compare SAM mask-derived boxes with a bbox tracker as agreement, not accuracy",
+    )
+    tracker_comparison_parser.add_argument("segmentation_json", type=Path)
+    tracker_comparison_parser.add_argument("reference_bbox_json", type=Path)
+    tracker_comparison_parser.add_argument("--output", type=Path, required=True)
+    tracker_comparison_parser.set_defaults(handler=command_compare_trackers)
     return parser
 
 

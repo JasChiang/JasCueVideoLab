@@ -475,3 +475,138 @@ class RunStatus(StrictModel):
     stage: str
     ok: bool
     errors: list[dict[str, object]] = Field(default_factory=list)
+
+
+class TrackingState(StrEnum):
+    """Geometry state; it must not be mistaken for semantic identity confidence."""
+
+    TRACKED = "tracked"
+    REACQUIRED = "reacquired"
+    OCCLUDED = "occluded"
+    LOW_CONFIDENCE = "low_confidence"
+    DRIFT_SUSPECTED = "drift_suspected"
+    LOST = "lost"
+
+
+class SemanticIdentityStatus(StrEnum):
+    SEED_GROUNDED = "seed_grounded"
+    NOT_REVALIDATED = "not_revalidated"
+    REVALIDATION_REQUIRED = "revalidation_required"
+    REVALIDATION_FAILED = "revalidation_failed"
+
+
+class SegmentationModelProvenance(StrictModel):
+    model_id: str
+    implementation: str
+    implementation_revision: str
+    checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    device: str
+    torch_version: str
+    generated_at: str
+
+
+class SegmentationSample(StrictModel):
+    sample_index: int = Field(ge=0)
+    analysis_sample_time_ms: int = Field(ge=0)
+    source_pts: int | None = None
+    timing_basis: Literal["uniform_ffmpeg_analysis_sample"]
+    mask_path: str | None
+    mask_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    mask_area_pixels: int = Field(ge=0)
+    mask_area_ratio: float = Field(ge=0.0, le=1.0)
+    connected_components: int = Field(ge=0)
+    derived_tracking_box: list[NormalizedCoordinate] | None
+    center_2d: list[float] | None
+    mean_positive_probability: float | None = Field(default=None, ge=0.0, le=1.0)
+    scene_cut_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    shot_boundary: bool
+    tracking_state: TrackingState
+    state_reasons: list[str]
+    semantic_identity_status: SemanticIdentityStatus
+
+    @model_validator(mode="after")
+    def validate_mask_geometry(self) -> "SegmentationSample":
+        if self.derived_tracking_box is not None:
+            if len(self.derived_tracking_box) != 4:
+                raise ValueError("derived_tracking_box must contain four coordinates")
+            x_min, y_min, x_max, y_max = self.derived_tracking_box
+            if x_min >= x_max or y_min >= y_max:
+                raise ValueError("derived_tracking_box must satisfy xmin < xmax and ymin < ymax")
+        if self.mask_area_pixels == 0:
+            if self.mask_path is not None or self.mask_sha256 is not None:
+                raise ValueError("empty masks cannot reference a mask artifact")
+            if self.derived_tracking_box is not None or self.center_2d is not None:
+                raise ValueError("empty masks cannot contain geometry")
+            if self.tracking_state != TrackingState.LOST:
+                raise ValueError("empty masks must use tracking_state=lost")
+        elif self.mask_path is None or self.mask_sha256 is None:
+            raise ValueError("non-empty masks must reference a hashed mask artifact")
+        return self
+
+
+class SegmentationTrack(StrictModel):
+    method: Literal["gemini_bbox_seed_sam2_video_mask_propagation"]
+    asset_id: str
+    video_path: str
+    target_description: str
+    seed_source: str
+    seed_time_ms: int = Field(ge=0)
+    seed_sample_index: int = Field(ge=0)
+    semantic_seed_box: list[NormalizedCoordinate]
+    sam_prompt_box: list[NormalizedCoordinate]
+    seed_box_padding_ratio: float = Field(ge=0.0, le=1.0)
+    refined_seed_mask_path: str
+    analysis_fps: float = Field(gt=0, le=60)
+    analysis_width: int = Field(gt=0)
+    analysis_height: int = Field(gt=0)
+    timing_warning: str
+    semantic_warning: str
+    total_samples: int = Field(gt=0)
+    state_counts: dict[TrackingState, int]
+    elapsed_seconds: float = Field(ge=0)
+    effective_fps: float = Field(ge=0)
+    model_provenance: SegmentationModelProvenance
+    samples: list[SegmentationSample]
+
+    @model_validator(mode="after")
+    def validate_track(self) -> "SegmentationTrack":
+        if len(self.semantic_seed_box) != 4:
+            raise ValueError("semantic_seed_box must contain four coordinates")
+        x_min, y_min, x_max, y_max = self.semantic_seed_box
+        if x_min >= x_max or y_min >= y_max:
+            raise ValueError("semantic_seed_box must satisfy xmin < xmax and ymin < ymax")
+        if len(self.sam_prompt_box) != 4:
+            raise ValueError("sam_prompt_box must contain four coordinates")
+        prompt_x_min, prompt_y_min, prompt_x_max, prompt_y_max = self.sam_prompt_box
+        if prompt_x_min >= prompt_x_max or prompt_y_min >= prompt_y_max:
+            raise ValueError("sam_prompt_box must satisfy xmin < xmax and ymin < ymax")
+        if self.total_samples != len(self.samples):
+            raise ValueError("total_samples must equal len(samples)")
+        if sum(self.state_counts.values()) != self.total_samples:
+            raise ValueError("state_counts must cover every sample")
+        if self.seed_sample_index >= self.total_samples:
+            raise ValueError("seed_sample_index is outside sampled frames")
+        return self
+
+
+class TrackerAgreementSample(StrictModel):
+    analysis_sample_time_ms: int = Field(ge=0)
+    reference_time_ms: float = Field(ge=0)
+    segmentation_box: list[NormalizedCoordinate]
+    reference_box: list[NormalizedCoordinate]
+    bbox_iou: float = Field(ge=0.0, le=1.0)
+    center_distance_normalized: float = Field(ge=0.0)
+
+
+class TrackerAgreementReport(StrictModel):
+    interpretation: Literal["tracker_agreement_not_accuracy"]
+    segmentation_path: str
+    reference_path: str
+    reference_method: str
+    aligned_samples: int = Field(gt=0)
+    mean_bbox_iou: float = Field(ge=0.0, le=1.0)
+    min_bbox_iou: float = Field(ge=0.0, le=1.0)
+    mean_center_distance_normalized: float = Field(ge=0.0)
+    max_center_distance_normalized: float = Field(ge=0.0)
+    warning: str
+    samples: list[TrackerAgreementSample]
