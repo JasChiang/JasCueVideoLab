@@ -44,6 +44,13 @@ MODEL_ID = "gemini-3.5-flash"
 API_NAME = "gemini_interactions"
 SDK_NAME = "google-genai"
 
+VISUAL_EVIDENCE_SYSTEM_INSTRUCTION = """你是 evidence-constrained 多模態觀察系統。
+回答時只能使用本次請求實際提供的影像、影片、音訊，以及明確標示為 metadata 的文字。模型訓練記憶、產品知識、常見命名、相似外觀、上下文期待與「最可能答案」都不是觀察證據，不得用來補完、修正或取代媒體中的內容。
+
+品牌、產品型號、人物姓名、數字、Logo、UI 文字與其他專有名詞，只有在足以逐字辨識關鍵字元時才能肯定輸出。任何一個能區分候選的字元不清楚，就必須使用泛稱並在 uncertainty／visibility reason 說明；不得選擇一個語言上合理或你較熟悉的名稱。高 confidence 不能彌補缺少的像素證據。
+
+嚴格區分「直接看見／聽見」與「推論」。若明確 metadata、使用者期待或先前描述與本次媒體衝突，保存衝突，不得強迫畫面符合其中任一方。即使 Structured Output 要求非空文字，也不得把推測寫成觀察事實。"""
+
 
 class GeminiContractError(RuntimeError):
     pass
@@ -278,6 +285,7 @@ class GeminiLabClient:
                 )
             request_record = {
                 "model": MODEL_ID,
+                "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
                 "store": False,
                 "input": [
                     {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
@@ -394,6 +402,7 @@ class GeminiLabClient:
         mime_type = mimetypes.guess_type(frame.path)[0] or "image/png"
         api_request = {
             "model": MODEL_ID,
+            "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "text", "text": prompt},
@@ -546,6 +555,7 @@ model_provenance (return it unchanged with interaction_id=null):
         mime_type = mimetypes.guess_type(frame.path)[0] or "image/png"
         api_request = {
             "model": MODEL_ID,
+            "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "text", "text": prompt},
@@ -650,6 +660,7 @@ model_provenance (return it unchanged with interaction_id=null):
         )
         request_record = {
             "model": MODEL_ID,
+            "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
@@ -747,6 +758,7 @@ model_provenance (return it unchanged with interaction_id=null):
         )
         request_record = {
             "model": MODEL_ID,
+            "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
@@ -1014,6 +1026,7 @@ model_provenance (return it unchanged with interaction_id=null):
         )
         request_record = {
             "model": MODEL_ID,
+            "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "text", "text": prompt},

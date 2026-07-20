@@ -13,7 +13,7 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .billing import summarize_usage_and_list_price, summarize_usage_files
-from .gemini import GeminiLabClient, MODEL_ID
+from .gemini import GeminiLabClient, MODEL_ID, VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
 from .media import create_analysis_proxy, extract_frame, has_audio_stream, probe_video, sha256_file
 from .models import (
     ClipShotCatalog,
@@ -313,6 +313,7 @@ def _saved_request_matches_prompt(run_dir: Path, prompt: str) -> bool:
         request_inputs = request["input"]
         return bool(
             request.get("model") == MODEL_ID
+            and request.get("system_instruction") == VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
             and request_inputs
             and request_inputs[0].get("text", "").startswith(prompt)
         )

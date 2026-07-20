@@ -22,6 +22,7 @@ from jascue_video_lab.full_v1 import (
     run_selected_full_clips,
     selected_clip_ids_from_feature_plan,
 )
+from jascue_video_lab.gemini import VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
 from jascue_video_lab.media import create_analysis_proxy, has_audio_stream, probe_video
 from jascue_video_lab.models import (
     DenseEventSelection,
@@ -466,6 +467,7 @@ def test_saved_raw_clip_card_can_be_revalidated_without_another_api_call(
         json.dumps(
             {
                 "model": "gemini-3.5-flash",
+                "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
                 "input": [{"type": "text", "text": prompt + "\nmetadata"}],
             }
         ),
@@ -494,6 +496,7 @@ def test_saved_raw_clip_card_is_not_reused_after_prompt_change(tmp_path: Path) -
         json.dumps(
             {
                 "model": "gemini-3.5-flash",
+                "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
                 "input": [{"type": "text", "text": "old prompt\nmetadata"}],
             }
         ),
@@ -505,6 +508,35 @@ def test_saved_raw_clip_card_is_not_reused_after_prompt_change(tmp_path: Path) -
         card.proxy_asset_id,
         card.duration_ms,
         "new prompt",
+    )
+    assert recovered is None
+
+
+def test_saved_raw_clip_card_is_not_reused_without_current_system_instruction(
+    tmp_path: Path,
+) -> None:
+    card = _card()
+    prompt = "clip card prompt"
+    run_dir = tmp_path / "gemini"
+    run_dir.mkdir()
+    (run_dir / "clip_card.raw_output.json").write_text(
+        json.dumps({"output_text": card.model_dump_json()}), encoding="utf-8"
+    )
+    (run_dir / "clip_card.request.json").write_text(
+        json.dumps(
+            {
+                "model": "gemini-3.5-flash",
+                "input": [{"type": "text", "text": prompt + "\nmetadata"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    recovered = _revalidate_saved_clip_card(
+        run_dir,
+        card.source_asset_id,
+        card.proxy_asset_id,
+        card.duration_ms,
+        prompt,
     )
     assert recovered is None
 
