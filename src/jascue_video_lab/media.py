@@ -112,6 +112,26 @@ def probe_video(path: Path) -> MediaInfo:
     )
 
 
+def has_audio_stream(path: Path) -> bool:
+    """Return whether the media contains at least one audio stream."""
+    source = path.expanduser().resolve(strict=True)
+    result = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "json",
+            str(source),
+        ]
+    )
+    return bool(json.loads(result.stdout).get("streams"))
+
+
 _SHOWINFO_RE = re.compile(r"pts:\s*(?P<pts>-?\d+)\s+pts_time:(?P<time>-?[0-9.]+)")
 
 
@@ -185,6 +205,7 @@ def create_analysis_proxy(
     if max_side < 320 or fps < 1:
         raise ValueError("analysis proxy max_side and fps must be positive practical values")
     source_media = probe_video(source)
+    source_has_audio = has_audio_stream(source)
     output.parent.mkdir(parents=True, exist_ok=True)
     command = [
             "ffmpeg",
@@ -224,6 +245,7 @@ def create_analysis_proxy(
     )
     _run(command)
     proxy_media = probe_video(output)
+    proxy_has_audio = has_audio_stream(output)
     duration_delta_ms = abs(proxy_media.duration_ms - source_media.duration_ms)
     if duration_delta_ms > max_duration_delta_ms:
         raise MediaCommandError(
@@ -238,6 +260,8 @@ def create_analysis_proxy(
         "max_side": max_side,
         "fps": fps,
         "preserve_audio": preserve_audio,
+        "source_has_audio": source_has_audio,
+        "proxy_has_audio": proxy_has_audio,
         "original_bytes": source_media.size_bytes,
         "proxy_bytes": proxy_media.size_bytes,
         "byte_reduction_ratio": round(1 - proxy_media.size_bytes / source_media.size_bytes, 8),

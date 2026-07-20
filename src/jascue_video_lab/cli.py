@@ -536,6 +536,7 @@ def command_full_clip(args: argparse.Namespace) -> int:
         dense_prompt=_load_prompt("dense_event_frame_selection_zh-TW.txt"),
         proxy_max_side=args.proxy_max_side,
         proxy_fps=args.proxy_fps,
+        audio_mode=args.audio_mode,
         scdet_threshold=args.scdet_threshold,
         temperature=args.temperature,
         dense_mode=args.dense_mode,
@@ -558,6 +559,7 @@ def command_full_library(args: argparse.Namespace) -> int:
         max_clips=args.max_clips,
         proxy_max_side=args.proxy_max_side,
         proxy_fps=args.proxy_fps,
+        audio_mode=args.audio_mode,
         scdet_threshold=args.scdet_threshold,
         temperature=args.temperature,
         prepare_only=args.prepare_only,
@@ -1458,6 +1460,12 @@ def build_parser() -> argparse.ArgumentParser:
     full_clip_parser.add_argument("video", type=Path)
     full_clip_parser.add_argument("--proxy-max-side", type=int, default=1280)
     full_clip_parser.add_argument("--proxy-fps", type=int, default=30)
+    full_clip_parser.add_argument(
+        "--audio-mode",
+        choices=["auto", "off", "required"],
+        default="auto",
+        help="auto preserves audio when present; off strips it; required rejects silent sources",
+    )
     full_clip_parser.add_argument("--scdet-threshold", type=float, default=4.0)
     full_clip_parser.add_argument("--temperature", type=float, default=0.2)
     full_clip_parser.add_argument(
@@ -1491,6 +1499,12 @@ def build_parser() -> argparse.ArgumentParser:
     full_library_parser.add_argument("--max-clips", type=int)
     full_library_parser.add_argument("--proxy-max-side", type=int, default=1280)
     full_library_parser.add_argument("--proxy-fps", type=int, default=30)
+    full_library_parser.add_argument(
+        "--audio-mode",
+        choices=["auto", "off", "required"],
+        default="auto",
+        help="auto preserves audio when present; off strips it; required rejects silent sources",
+    )
     full_library_parser.add_argument("--scdet-threshold", type=float, default=4.0)
     full_library_parser.add_argument("--temperature", type=float, default=0.2)
     full_library_parser.add_argument(

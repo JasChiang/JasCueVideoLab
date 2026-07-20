@@ -29,5 +29,6 @@
 - `framing_intent` 只描述要保留什麼，不輸出 crop 座標。
 - `card_opportunities` 只指出適合功能字卡、步驟字卡或物件 callout 的事件，不輸出像素位置。
 - 使用音訊作證據時必須正確標示 evidence modality，但不得輸出 ASR 或 transcript。
+- 影片可能沒有音軌或沒有可用聲音；這不是錯誤。此時只依 visual evidence 分析，不得捏造旁白、音效或 audio evidence。
 
 只回傳符合 Structured Output schema 的資料。

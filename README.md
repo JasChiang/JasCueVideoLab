@@ -32,11 +32,11 @@
 
 ## Full v1：完整逐片 Clip Card，按需才做 geometry
 
-Full v1 不會把整支毛片切成數百張圖片送入模型。每支影片先建立含音訊的 720p analysis proxy，讓 Gemini 看完整影片並以 Structured Output 寫一張 `MM:SS` Clip Card；FFmpeg shot detection 只保存切點資料與每個 shot 一張 960px 中間 JPEG 供稽核。只有使用者或剪輯 brief 選中事件、且確實需要 9:16 reframe／callout／去背時，才從原始影片抽一張 exact frame 取得 bbox，並選配 SAM 2.1 在該事件與 shot 內追蹤。
+Full v1 不會把整支毛片切成數百張圖片送入模型。每支影片先建立 720p analysis proxy，讓 Gemini 看完整影片並以 Structured Output 寫一張 `MM:SS` Clip Card；音訊採選配，預設 `auto` 是來源有音軌才保留，沒有音軌就只依視覺分析。FFmpeg shot detection 只保存切點資料與每個 shot 一張 960px 中間 JPEG 供稽核。只有使用者或剪輯 brief 選中事件、且確實需要 9:16 reframe／callout／去背時，才從原始影片抽一張 exact frame 取得 bbox，並選配 SAM 2.1 在該事件與 shot 內追蹤。
 
 ```text
 毛片資料夾
-  → 每支 720p proxy（保留音訊）
+  → 每支 720p proxy（音訊 auto／off／required）
   → Gemini 完整觀看 → MM:SS Clip Card
   → 本機驗證事件、Entity、target kind 與片長
   → Clip Cards 可重用於不同剪輯 brief
@@ -70,6 +70,8 @@ uv run jascue-video-lab full-clip VIDEO.mp4 \
   --dense-event EVENT_ID --dense-fps 8 --dense-window-ms 4000 \
   --output-dir artifacts/full-v1-clip
 ```
+
+`--audio-mode auto` 是預設值：有音軌就保留，無音軌也正常完成；`off` 明確移除音訊；`required` 只適合音訊證據不可缺少的實驗，來源沒有音軌時會保存錯誤並停止該片。artifact 會記錄 `source_has_audio` 與 `proxy_has_audio`，Clip Card 不得為 silent source 捏造 audio evidence。
 
 cache 會同時驗證 source hash、proxy hash、模型、schema、prompt fingerprint 與實際保存的 raw request；prompt 改變一定重跑。File API cache 以 exact proxy SHA-256 跨 library 共用，並在每次使用前查詢遠端 `ACTIVE` 狀態；不同編碼／解析度的 proxy、原始 4K 與整批 analysis reel 不會互相冒用。成本報告分成本次新增請求 `execution-pricing.json` 與含歷史的 artifact lifetime `pricing.json`。公開 library index 不含使用者名稱、絕對路徑或原始檔名；這些資訊只保存在 gitignored private manifest。
 

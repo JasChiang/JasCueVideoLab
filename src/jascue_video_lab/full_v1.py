@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .billing import summarize_usage_and_list_price, summarize_usage_files
 from .gemini import GeminiLabClient, MODEL_ID
-from .media import create_analysis_proxy, extract_frame, probe_video, sha256_file
+from .media import create_analysis_proxy, extract_frame, has_audio_stream, probe_video, sha256_file
 from .models import (
     ClipShotCatalog,
     DenseEventSelection,
@@ -418,6 +418,7 @@ def run_full_clip(
     dense_prompt: str,
     proxy_max_side: int = 1280,
     proxy_fps: int = 30,
+    audio_mode: str = "auto",
     scdet_threshold: float = 4.0,
     temperature: float = 0.2,
     dense_mode: str = "none",
@@ -431,11 +432,17 @@ def run_full_clip(
         raise ValueError("dense_mode must be none, required, flagged, or all")
     if dense_fps_override not in {None, 4.0, 8.0}:
         raise ValueError("dense_fps_override must be 4 or 8 FPS")
+    if audio_mode not in {"auto", "off", "required"}:
+        raise ValueError("audio_mode must be auto, off, or required")
     output_dir.mkdir(parents=True, exist_ok=True)
     timings: dict[str, float] = {}
     started = monotonic()
     stage = monotonic()
     source_media = probe_video(video_path)
+    source_has_audio = has_audio_stream(video_path)
+    if audio_mode == "required" and not source_has_audio:
+        raise ValueError("audio_mode=required but the source has no audio stream")
+    include_audio = source_has_audio and audio_mode != "off"
     write_json(output_dir / "source.media.json", source_media)
     write_json(
         output_dir / "private-source.json",
@@ -449,14 +456,29 @@ def run_full_clip(
     if proxy_path.exists():
         proxy_media = probe_video(proxy_path)
         proxy_record = read_json(output_dir / "analysis-proxy.json")
+        proxy_has_audio = has_audio_stream(proxy_path)
+        if proxy_has_audio != include_audio:
+            raise ValueError(
+                "existing analysis proxy audio policy differs from --audio-mode; "
+                "use a new output directory"
+            )
+        proxy_record.update(
+            {
+                "audio_mode": audio_mode,
+                "source_has_audio": source_has_audio,
+                "proxy_has_audio": proxy_has_audio,
+            }
+        )
+        write_json(output_dir / "analysis-proxy.json", proxy_record)
     else:
         proxy_media, proxy_record = create_analysis_proxy(
             video_path,
             proxy_path,
             max_side=proxy_max_side,
             fps=proxy_fps,
-            preserve_audio=True,
+            preserve_audio=include_audio,
         )
+        proxy_record["audio_mode"] = audio_mode
         write_json(output_dir / "analysis-proxy.json", proxy_record)
     timings["probe_and_proxy_seconds"] = round(monotonic() - stage, 3)
 
@@ -484,6 +506,9 @@ def run_full_clip(
             "source_asset_id": source_media.asset_id,
             "proxy_asset_id": proxy_media.asset_id,
             "duration_ms": source_media.duration_ms,
+            "audio_mode": audio_mode,
+            "source_has_audio": source_has_audio,
+            "proxy_has_audio": bool(proxy_record["proxy_has_audio"]),
             "shot_catalog_path": str(shot_catalog_path.resolve()),
             "shot_count": len(shots.shots),
             "shot_representative_frame_count": len(shot_catalog.frames),
@@ -659,6 +684,9 @@ def run_full_clip(
         "shot_representative_frame_count": len(shot_catalog.frames),
         "event_count": len(card.events),
         "duration_ms": source_media.duration_ms,
+        "audio_mode": audio_mode,
+        "source_has_audio": source_has_audio,
+        "proxy_has_audio": bool(proxy_record["proxy_has_audio"]),
         "dense_event_count": len(selections),
         "review_path": str(review_path.resolve()),
         "pricing": pricing,
@@ -713,6 +741,7 @@ def run_full_library(
     max_clips: int | None = None,
     proxy_max_side: int = 1280,
     proxy_fps: int = 30,
+    audio_mode: str = "auto",
     scdet_threshold: float = 4.0,
     temperature: float = 0.2,
     prepare_only: bool = False,
@@ -721,6 +750,8 @@ def run_full_library(
     """Create one resumable Clip Card per unique source without automatic geometry work."""
     if not source_dir.is_dir():
         raise NotADirectoryError(source_dir)
+    if audio_mode not in {"auto", "off", "required"}:
+        raise ValueError("audio_mode must be auto, off, or required")
     if max_clips is not None and max_clips < 1:
         raise ValueError("max_clips must be at least one")
     iterator = source_dir.rglob("*") if recursive else source_dir.glob("*")
@@ -784,6 +815,7 @@ def run_full_library(
                 dense_prompt=dense_prompt,
                 proxy_max_side=proxy_max_side,
                 proxy_fps=proxy_fps,
+                audio_mode=audio_mode,
                 scdet_threshold=scdet_threshold,
                 temperature=temperature,
                 dense_mode="none",
@@ -804,6 +836,8 @@ def run_full_library(
                 {
                     "source_asset_id": media.asset_id,
                     "duration_ms": media.duration_ms,
+                    "source_has_audio": result["source_has_audio"],
+                    "proxy_has_audio": result["proxy_has_audio"],
                     "status": "prepared_local" if prepare_only else "ok",
                     "clip_run": f"clips/{asset_key}",
                     "event_count": result["event_count"] if not prepare_only else None,
@@ -847,6 +881,7 @@ def run_full_library(
                     ),
                     "geometry_policy": "deferred_until_event_selected",
                     "dense_policy": "disabled_by_default_local_event_fallback_only",
+                    "audio_mode": audio_mode,
                     "clips": public_entries,
                     "generated_at": utc_now(),
                 },
@@ -862,6 +897,7 @@ def run_full_library(
         "estimated_total_cost_usd": round(total_cost, 8),
         "cost_scope": "new Gemini requests made during this execution only",
         "prepare_only": prepare_only,
+        "audio_mode": audio_mode,
         "elapsed_seconds": round(monotonic() - started, 3),
         "library_index_path": str((output_dir / "library-index.json").resolve()),
         "private_library_path": str((output_dir / "private-library.json").resolve()),

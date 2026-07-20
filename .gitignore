@@ -9,6 +9,8 @@ __pycache__/
 .env.local
 .env.*.local
 artifacts/
+output/
+tmp/
 fixtures/generated/*.mp4
 fixtures/generated/*.mov
 fixtures/generated/*.png

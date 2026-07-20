@@ -19,7 +19,7 @@ from jascue_video_lab.full_v1 import (
     run_full_clip,
     run_full_library,
 )
-from jascue_video_lab.media import create_analysis_proxy, probe_video
+from jascue_video_lab.media import create_analysis_proxy, has_audio_stream, probe_video
 from jascue_video_lab.models import (
     DenseEventSelection,
     Entity,
@@ -129,6 +129,27 @@ def _make_av_video(path: Path, duration: float = 2) -> None:
             "yuv420p",
             "-c:a",
             "aac",
+            str(path),
+        ],
+        check=True,
+    )
+
+
+def _make_video_only(path: Path, duration: float = 2) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=s=320x180:r=30:d={duration}",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
             str(path),
         ],
         check=True,
@@ -319,6 +340,62 @@ def test_analysis_proxy_can_preserve_audio(tmp_path: Path) -> None:
     stream_types = {stream["codec_type"] for stream in json.loads(probe.stdout)["streams"]}
     assert stream_types == {"video", "audio"}
     assert record["preserve_audio"] is True
+    assert record["source_has_audio"] is True
+    assert record["proxy_has_audio"] is True
+
+
+def test_full_clip_audio_auto_accepts_video_only_source(tmp_path: Path) -> None:
+    source = tmp_path / "video-only.mp4"
+    output = tmp_path / "prepared"
+    _make_video_only(source, duration=1)
+
+    result = run_full_clip(
+        source,
+        output,
+        clip_card_prompt="unused",
+        dense_prompt="unused",
+        audio_mode="auto",
+        prepare_only=True,
+    )
+
+    assert result["source_has_audio"] is False
+    assert result["proxy_has_audio"] is False
+    assert has_audio_stream(output / "analysis-proxy.mp4") is False
+    assert json.loads((output / "analysis-proxy.json").read_text())["audio_mode"] == "auto"
+
+
+def test_full_clip_audio_off_strips_existing_audio(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "prepared"
+    _make_av_video(source, duration=1)
+
+    result = run_full_clip(
+        source,
+        output,
+        clip_card_prompt="unused",
+        dense_prompt="unused",
+        audio_mode="off",
+        prepare_only=True,
+    )
+
+    assert result["source_has_audio"] is True
+    assert result["proxy_has_audio"] is False
+    assert has_audio_stream(output / "analysis-proxy.mp4") is False
+
+
+def test_full_clip_audio_required_rejects_video_only_source(tmp_path: Path) -> None:
+    source = tmp_path / "video-only.mp4"
+    _make_video_only(source, duration=1)
+
+    with pytest.raises(ValueError, match="source has no audio"):
+        run_full_clip(
+            source,
+            tmp_path / "prepared",
+            clip_card_prompt="unused",
+            dense_prompt="unused",
+            audio_mode="required",
+            prepare_only=True,
+        )
 
 
 def test_invisible_dense_selection_has_no_ids_or_target() -> None:
