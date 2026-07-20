@@ -25,11 +25,15 @@ from .models import (
     TargetCandidateMap,
     TemporalEvent,
     TemporalMap,
+    RushesCatalog,
+    RushesEditPlan,
 )
 from .overlay import draw_grounding_overlay
 from .review import render_manual_review
 from .repeat import run_repeated_grounding
+from .rushes import create_rushes_catalog, render_rushes_edit, run_rushes_experiment
 from .sam_tracking import compare_segmentation_to_bbox_track, track_bbox_sam21
+from .shots import detect_shots_ffmpeg
 from .storage import append_error, read_json, write_json
 from .timeline import render_direct_moment_timeline, render_temporal_timeline, render_timeline
 from .tracking import track_bbox_csrt
@@ -432,7 +436,7 @@ def command_track_sam21(args: argparse.Namespace) -> int:
         analysis_fps=args.analysis_fps,
         max_side=args.max_side,
         device=args.device,
-        scene_cut_threshold=args.scene_cut_threshold,
+        ffmpeg_scdet_threshold=args.ffmpeg_scdet_threshold,
         seed_box_padding_ratio=args.seed_box_padding_ratio,
     )
     print(result.model_dump_json(indent=2, exclude={"samples"}))
@@ -444,6 +448,65 @@ def command_compare_trackers(args: argparse.Namespace) -> int:
         args.segmentation_json, args.reference_bbox_json, args.output
     )
     print(result.model_dump_json(indent=2, exclude={"samples"}))
+    return 0
+
+
+def command_detect_shots(args: argparse.Namespace) -> int:
+    result = detect_shots_ffmpeg(
+        args.video, threshold=args.threshold, output_path=args.output
+    )
+    print(result.model_dump_json(indent=2))
+    return 0
+
+
+def command_catalog_rushes(args: argparse.Namespace) -> int:
+    catalog = create_rushes_catalog(
+        args.source_directory,
+        args.output_dir,
+        sample_interval_ms=args.sample_interval_ms,
+        max_width=args.max_width,
+    )
+    print(
+        json.dumps(
+            {
+                "catalog_id": catalog.catalog_id,
+                "clip_count": len(catalog.clips),
+                "frame_count": len(catalog.frames),
+                "total_duration_ms": catalog.total_duration_ms,
+                "analysis_reel_path": catalog.analysis_reel_path,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def command_rushes_run(args: argparse.Namespace) -> int:
+    result = run_rushes_experiment(
+        args.source_directory,
+        args.output_dir,
+        prompt_template=_load_prompt("rushes_selects_zh-TW.txt"),
+        sample_interval_ms=args.sample_interval_ms,
+        temperature=args.temperature,
+        scdet_threshold=args.scdet_threshold,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_render_rushes(args: argparse.Namespace) -> int:
+    catalog = RushesCatalog.model_validate(read_json(args.catalog_json))
+    plan = RushesEditPlan.model_validate(read_json(args.plan_json))
+    if plan.catalog_id != catalog.catalog_id:
+        raise ValueError("edit plan catalog_id does not match catalog.json")
+    result = render_rushes_edit(
+        catalog,
+        plan,
+        args.output_dir,
+        scdet_threshold=args.scdet_threshold,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1253,7 +1316,7 @@ def build_parser() -> argparse.ArgumentParser:
     sam_tracking_parser.add_argument(
         "--device", choices=["auto", "cpu", "mps", "cuda"], default="auto"
     )
-    sam_tracking_parser.add_argument("--scene-cut-threshold", type=float, default=0.28)
+    sam_tracking_parser.add_argument("--ffmpeg-scdet-threshold", type=float, default=4.0)
     sam_tracking_parser.add_argument("--seed-box-padding-ratio", type=float, default=0.0)
     sam_tracking_parser.add_argument("--output-dir", type=Path, required=True)
     sam_tracking_parser.set_defaults(handler=command_track_sam21)
@@ -1266,6 +1329,42 @@ def build_parser() -> argparse.ArgumentParser:
     tracker_comparison_parser.add_argument("reference_bbox_json", type=Path)
     tracker_comparison_parser.add_argument("--output", type=Path, required=True)
     tracker_comparison_parser.set_defaults(handler=command_compare_trackers)
+
+    shot_parser = subparsers.add_parser(
+        "detect-shots", help="Detect exact decoded-frame shot boundaries with FFmpeg scdet"
+    )
+    shot_parser.add_argument("video", type=Path)
+    shot_parser.add_argument("--threshold", type=float, default=4.0)
+    shot_parser.add_argument("--output", type=Path, required=True)
+    shot_parser.set_defaults(handler=command_detect_shots)
+
+    catalog_parser = subparsers.add_parser(
+        "catalog-rushes", help="Build a labeled immutable-frame-ID catalog reel from rushes"
+    )
+    catalog_parser.add_argument("source_directory", type=Path)
+    catalog_parser.add_argument("--sample-interval-ms", type=int, default=2000)
+    catalog_parser.add_argument("--max-width", type=int, default=640)
+    catalog_parser.add_argument("--output-dir", type=Path, required=True)
+    catalog_parser.set_defaults(handler=command_catalog_rushes)
+
+    rushes_parser = subparsers.add_parser(
+        "rushes-run", help="Catalog rushes, ask Gemini for frame-ID selects, and render rough cuts"
+    )
+    rushes_parser.add_argument("source_directory", type=Path)
+    rushes_parser.add_argument("--sample-interval-ms", type=int, default=2000)
+    rushes_parser.add_argument("--scdet-threshold", type=float, default=4.0)
+    rushes_parser.add_argument("--temperature", type=float, default=0.2)
+    rushes_parser.add_argument("--output-dir", type=Path, required=True)
+    rushes_parser.set_defaults(handler=command_rushes_run)
+
+    render_rushes_parser = subparsers.add_parser(
+        "render-rushes", help="Render a validated frame-ID edit plan without another model call"
+    )
+    render_rushes_parser.add_argument("catalog_json", type=Path)
+    render_rushes_parser.add_argument("plan_json", type=Path)
+    render_rushes_parser.add_argument("--scdet-threshold", type=float, default=4.0)
+    render_rushes_parser.add_argument("--output-dir", type=Path, required=True)
+    render_rushes_parser.set_defaults(handler=command_render_rushes)
     return parser
 
 

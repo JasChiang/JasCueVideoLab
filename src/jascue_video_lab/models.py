@@ -518,7 +518,7 @@ class SegmentationSample(StrictModel):
     derived_tracking_box: list[NormalizedCoordinate] | None
     center_2d: list[float] | None
     mean_positive_probability: float | None = Field(default=None, ge=0.0, le=1.0)
-    scene_cut_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    scene_cut_score: float | None = Field(default=None, ge=0.0, le=100.0)
     shot_boundary: bool
     tracking_state: TrackingState
     state_reasons: list[str]
@@ -610,3 +610,71 @@ class TrackerAgreementReport(StrictModel):
     max_center_distance_normalized: float = Field(ge=0.0)
     warning: str
     samples: list[TrackerAgreementSample]
+
+
+class RushClip(StrictModel):
+    clip_id: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    duration_ms: int = Field(gt=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    frame_rate: str
+    size_bytes: int = Field(gt=0)
+
+
+class RushFrame(StrictModel):
+    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    clip_id: str
+    requested_time_ms: int = Field(ge=0)
+    image_path: str
+
+
+class RushesCatalog(StrictModel):
+    catalog_id: str
+    source_directory: str
+    sample_interval_ms: int = Field(ge=500)
+    total_duration_ms: int = Field(gt=0)
+    clips: list[RushClip]
+    frames: list[RushFrame]
+    analysis_reel_path: str
+    generated_at: str
+
+
+class RushesSelectShot(StrictModel):
+    select_id: str = Field(min_length=1)
+    representative_frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    suggested_duration_seconds: float = Field(ge=1.5, le=6.0)
+    role: Literal["opening", "establishing", "product", "detail", "movement", "transition", "closing"]
+    visual_description: str
+    selection_reason: str
+    quality_risks: list[str]
+    vertical_focus: Literal["left", "center", "right"]
+    confidence: Confidence
+
+
+class RushesTimelinePlan(StrictModel):
+    aspect_ratio: Literal["16:9", "9:16"]
+    title: str
+    editorial_intent: str
+    shots: list[RushesSelectShot] = Field(min_length=1, max_length=16)
+
+
+class RushesEditPlan(StrictModel):
+    project_id: str
+    catalog_id: str
+    summary: str
+    timelines: list[RushesTimelinePlan]
+    uncertainties: list[str]
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_timelines(self) -> "RushesEditPlan":
+        aspects = [timeline.aspect_ratio for timeline in self.timelines]
+        if sorted(aspects) != ["16:9", "9:16"]:
+            raise ValueError("timelines must contain exactly one 16:9 and one 9:16 plan")
+        for timeline in self.timelines:
+            ids = [shot.select_id for shot in timeline.shots]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"duplicate select_id in {timeline.aspect_ratio} timeline")
+        return self

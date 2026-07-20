@@ -9,7 +9,15 @@ from pydantic import BaseModel
 # Interactions structured output supports a documented JSON Schema subset.
 # Pydantic emits a few validation-only keywords outside that subset; keep
 # those constraints in local model validation and send only supported syntax.
-_DROP_KEYS = {"default", "examples", "minLength", "maxLength", "pattern"}
+_DROP_KEYS = {
+    "default",
+    "examples",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "pattern",
+}
 
 
 def gemini_response_schema(model: type[BaseModel]) -> dict[str, Any]:

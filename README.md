@@ -14,6 +14,40 @@
         → Pillow debug overlay
 ```
 
+## 毛片挑帶與雙比例粗剪實驗
+
+一般人版本：把一整個拍攝資料夾交給程式後，本機先做有固定編號的低解析度「看帶影片」；Gemini 只挑它看中的編號與說明用途，不負責猜精確剪輯時間。程式再從編號查回原片位置，用 FFmpeg 的真實時間與切鏡邊界取出乾淨片段，分別組成 16:9 與 9:16 人工審核版。
+
+```text
+原始毛片（不上傳整批 4K）
+  → 本機 ffprobe／SHA-256／每 2 秒代表幀
+  → 烙印 immutable frame ID 的低解析 analysis reel
+  → Gemini Structured Output 只選 frame ID、用途與直式構圖意圖
+  → 本機 frame ID 映射回原片時間
+  → FFmpeg scdet 的 decoded-frame PTS 限制片段不跨硬切鏡
+  → 輸出 16:9／9:16 silent rough cuts 與 HTML review page
+```
+
+這個設計刻意不把 Gemini timestamp 當 cut point。模型回傳的 frame ID 必須存在於 catalog，Pydantic contract 才會接受；實際 `source_in_ms`／`source_out_ms` 由本機資料生成並 clamp 在單一 shot。9:16 目前只有 `left`／`center`／`right` 三種固定構圖意圖，不是逐幀 crop tracking；要做可用的動態構圖，下一步才接 SAM 2.1／EdgeTAM mask propagation 與重新定位 gate。
+
+```bash
+# 一次完成 catalog、Gemini selects、雙比例粗剪、review HTML 與成本／計時
+uv run jascue-video-lab rushes-run /path/to/CLIP \
+  --sample-interval-ms 2000 \
+  --scdet-threshold 4 \
+  --output-dir artifacts/my-rushes-run
+
+# 不呼叫 Gemini，只建立可重用的 catalog／analysis reel
+uv run jascue-video-lab catalog-rushes /path/to/CLIP \
+  --sample-interval-ms 2000 \
+  --output-dir artifacts/my-rushes-run
+
+# 單支影片保存 FFmpeg scdet 的精確 decoded-frame PTS
+uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
+```
+
+2026-07-20 的真實測試使用 51 支 4K 毛片（18,999,617,273 bytes、總長 844.847 秒），建立 429 個 frame IDs 與 7.2 MB analysis reel。Gemini 選出 10 段 16:9 與 9 段 9:16；成品分別為 37.5 秒與 34.5 秒。獨立量測後的 cold catalog、fresh upload、模型規劃與渲染合計約 376.181 秒；成功請求耗用 29,071 input tokens、3,158 output tokens，依當日 Gemini 3.5 Flash Standard 公開牌價估算為 US$0.0720285。實際帳單可能因 free tier 或方案而不同。完整證據、hash、QA 與限制見 [REPORT-RUSHES-SELECTS.md](REPORT-RUSHES-SELECTS.md)。
+
 ## 重要界線
 
 - `start_ms`、`end_ms` 與 `recommended_keyframe_ms` 是 **coarse semantic time**，只用於搜尋與人工瀏覽，不是 frame-accurate cut point。

@@ -11,6 +11,7 @@ from jascue_video_lab.models import (
     GroundingCandidate,
     GroundingProposal,
     Occlusion,
+    RushesEditPlan,
     TargetCandidateMap,
     TemporalMap,
 )
@@ -86,8 +87,18 @@ def test_invalid_normalized_boxes_are_rejected(box) -> None:
 
 def test_api_schema_uses_only_supported_constraint_keywords() -> None:
     schema_text = str(gemini_response_schema(GroundingProposal))
-    for unsupported in ("const", "exclusiveMinimum", "exclusiveMaximum", "pattern", "default"):
+    rushes_schema_text = str(gemini_response_schema(RushesEditPlan))
+    for unsupported in (
+        "const",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "pattern",
+        "default",
+        "minItems",
+        "maxItems",
+    ):
         assert unsupported not in schema_text
+        assert unsupported not in rushes_schema_text
     assert "prefixItems" in schema_text
 
 

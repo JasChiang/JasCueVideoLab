@@ -21,6 +21,7 @@ from .models import (
     SemanticIdentityStatus,
     TrackingState,
 )
+from .shots import detect_shots_ffmpeg
 from .storage import utc_now, write_json
 
 
@@ -343,13 +344,13 @@ def track_bbox_sam21(
     analysis_fps: float = 2.0,
     max_side: int = 960,
     device: str = "auto",
-    scene_cut_threshold: float = 0.28,
+    ffmpeg_scdet_threshold: float = 4.0,
     seed_box_padding_ratio: float = 0.0,
 ) -> SegmentationTrack:
     """Refine a Gemini/manual bbox into a SAM mask and propagate it in both directions."""
     np, torch, build_sam2_video_predictor = _require_segmentation_dependencies()
-    if not 0 < scene_cut_threshold <= 1:
-        raise ValueError("scene_cut_threshold must be in (0, 1]")
+    if not 0 <= ffmpeg_scdet_threshold <= 100:
+        raise ValueError("ffmpeg_scdet_threshold must be in [0, 100]")
     if not video_path.exists():
         raise FileNotFoundError(video_path)
     if not checkpoint_path.exists():
@@ -357,6 +358,11 @@ def track_bbox_sam21(
     output_dir.mkdir(parents=True, exist_ok=True)
     frame_paths, width, height = _extract_analysis_frames(
         video_path, output_dir / "analysis-frames", analysis_fps, max_side
+    )
+    shot_manifest = detect_shots_ffmpeg(
+        video_path,
+        threshold=ffmpeg_scdet_threshold,
+        output_path=output_dir / "shots.json",
     )
     seed_index = min(
         range(len(frame_paths)),
@@ -396,12 +402,17 @@ def track_bbox_sam21(
     ):
         logits_by_index[frame_idx] = mask_logits[0, 0].detach().float().cpu().numpy()
     elapsed = monotonic() - started
-    cut_scores = _scene_cut_scores(frame_paths)
-    boundary_indices = [
-        index
-        for index, score in enumerate(cut_scores)
-        if score is not None and score >= scene_cut_threshold
-    ]
+    cut_scores: list[float | None] = [None] * len(frame_paths)
+    boundary_pts: dict[int, int] = {}
+    for boundary in shot_manifest.boundaries:
+        sample_index = min(
+            range(len(frame_paths)),
+            key=lambda index: abs(round(index * 1000 / analysis_fps) - boundary.frame_time_ms),
+        )
+        if cut_scores[sample_index] is None or boundary.score > cut_scores[sample_index]:
+            cut_scores[sample_index] = boundary.score
+            boundary_pts[sample_index] = boundary.frame_pts
+    boundary_indices = sorted(boundary_pts)
     masks_dir = output_dir / "masks"
     overlays_dir = output_dir / "overlays"
     samples: list[SegmentationSample] = []
@@ -423,7 +434,7 @@ def track_bbox_sam21(
             mask_hash = None
             mask_path = None
         cut_score = cut_scores[index]
-        shot_boundary = bool(cut_score is not None and cut_score >= scene_cut_threshold)
+        shot_boundary = index in boundary_pts
         comparison_areas = [] if index == seed_index else previous_areas
         comparison_center = None if index == seed_index else previous_center
         state, reasons = classify_tracking_state(
@@ -452,7 +463,7 @@ def track_bbox_sam21(
         sample = SegmentationSample(
             sample_index=index,
             analysis_sample_time_ms=round(index * 1000 / analysis_fps),
-            source_pts=None,
+            source_pts=boundary_pts.get(index),
             timing_basis="uniform_ffmpeg_analysis_sample",
             mask_path=mask_path,
             mask_sha256=mask_hash,

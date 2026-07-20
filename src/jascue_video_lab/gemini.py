@@ -24,6 +24,8 @@ from .models import (
     IndexedStoryboardMap,
     MediaInfo,
     ModelProvenance,
+    RushesCatalog,
+    RushesEditPlan,
     TargetCandidateMap,
     TemporalMap,
 )
@@ -846,4 +848,83 @@ class GeminiLabClient:
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "direct_moments", error)
+            raise
+
+    def plan_rushes_edit(
+        self,
+        *,
+        catalog: RushesCatalog,
+        uploaded: Any,
+        prompt_template: str,
+        project_id: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> RushesEditPlan:
+        """Select immutable catalog frame IDs; Gemini never emits source cut timestamps."""
+        provenance = _provenance(run_id)
+        prompt = (
+            prompt_template
+            + "\n\n## 本次不可變 catalog metadata\n"
+            + f"project_id 必須原樣回傳：{project_id}\n"
+            + f"catalog_id 必須原樣回傳：{catalog.catalog_id}\n"
+            + f"合法 frame ID 數量：{len(catalog.frames)}\n"
+            + "只能引用畫面左上角實際可見的 RF frame ID。不要輸出來源時間碼或自行計算 cut point。\n"
+            + "model_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        request_record = {
+            "model": MODEL_ID,
+            "store": False,
+            "input": [
+                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {"type": "text", "text": prompt},
+            ],
+            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(RushesEditPlan),
+            },
+        }
+        write_json(run_dir / "rushes_edit_plan.request.json", request_record)
+        try:
+            interaction = self.client.interactions.create(**request_record)
+            write_json(run_dir / "rushes_edit_plan.raw_interaction.json", _raw_dump(interaction))
+            write_json(
+                run_dir / "rushes_edit_plan.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = RushesEditPlan.model_validate_json(interaction.output_text)
+            if parsed.project_id != project_id or parsed.catalog_id != catalog.catalog_id:
+                raise GeminiContractError("Rushes Edit Plan echoed immutable metadata incorrectly")
+            valid_frame_ids = {frame.frame_id for frame in catalog.frames}
+            invalid = sorted(
+                {
+                    shot.representative_frame_id
+                    for timeline in parsed.timelines
+                    for shot in timeline.shots
+                    if shot.representative_frame_id not in valid_frame_ids
+                }
+            )
+            if invalid:
+                raise GeminiContractError(f"Rushes Edit Plan referenced unknown frame IDs: {invalid}")
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "rushes_edit_plan.json", final)
+            write_json(
+                run_dir / "rushes_edit_plan.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "rushes_edit_plan.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(run_dir, "rushes_edit_plan", error)
             raise
