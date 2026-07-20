@@ -547,6 +547,8 @@ class GeminiLabClient:
         prompt_template: str,
         run_id: str,
         run_dir: Path,
+        locked_target_id: str | None = None,
+        locked_target_description: str | None = None,
     ) -> DirectMomentMap:
         """Ask directly for a few MM:SS screenshot moments, without event boundaries."""
         provenance = _provenance(run_id)
@@ -560,6 +562,16 @@ class GeminiLabClient:
             + "model_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
             + provenance.model_dump_json()
         )
+        if locked_target_id is not None or locked_target_description is not None:
+            if not locked_target_id or not locked_target_description:
+                raise ValueError("locked target id and description must be provided together")
+            prompt += (
+                "\n\n## 使用者指定的不可變 Grounding target\n"
+                + f"grounding_target_id 必須逐字回傳：{locked_target_id}\n"
+                + "grounding_target_description 必須逐字回傳："
+                + locked_target_description
+                + "\n不得改選背板、相似物件或其他展示品。"
+            )
         request_record = {
             "model": MODEL_ID,
             "store": False,
@@ -585,6 +597,17 @@ class GeminiLabClient:
             parsed = DirectMomentMap.model_validate_json(interaction.output_text)
             if parsed.asset_id != media.asset_id or parsed.duration_ms != media.duration_ms:
                 raise GeminiContractError("Direct Moment Map echoed metadata incorrectly")
+            if locked_target_id is not None:
+                target_mismatches = [
+                    moment.moment_id
+                    for moment in parsed.moments
+                    if moment.grounding_target_id != locked_target_id
+                    or moment.grounding_target_description != locked_target_description
+                ]
+                if target_mismatches:
+                    raise GeminiContractError(
+                        f"Direct Moment Map changed locked target in moments: {target_mismatches}"
+                    )
             final = parsed.model_copy(
                 update={
                     "model_provenance": parsed.model_provenance.model_copy(

@@ -142,6 +142,20 @@ def render_direct_moment_timeline(
     by_id = {moment_id: (requested_ms, actual_ms, image, proposal) for moment_id, requested_ms, actual_ms, image, proposal in results}
     cards: list[str] = []
     for moment in moment_map.moments:
+        if moment.moment_id not in by_id:
+            requested_ms = int(moment.timestamp_mmss.split(":")[0]) * 60_000 + int(
+                moment.timestamp_mmss.split(":")[1]
+            ) * 1_000
+            cards.append(
+                f'''<article class="event" tabindex="0" role="button" onclick="seekTo({requested_ms})"
+                onkeydown="if(event.key==='Enter')seekTo({requested_ms})"><div>
+                <span class="time">Gemini {html.escape(moment.timestamp_mmss)} · requested {requested_ms} ms</span>
+                <h2>{html.escape(moment.label)}</h2><p>{html.escape(moment.observable_evidence)}</p>
+                <p><strong>Target:</strong> {html.escape(moment.grounding_target_description)}</p>
+                <p><strong>Grounding:</strong> 此 moment 未送出單幀 Grounding，沒有 bbox proposal。</p>
+                </div></article>'''
+            )
+            continue
         requested_ms, actual_ms, image_path, proposal = by_id[moment.moment_id]
         relative_image = _relative(output_path.parent, image_path)
         candidates = ", ".join(

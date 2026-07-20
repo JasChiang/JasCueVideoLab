@@ -131,6 +131,14 @@ def command_upload(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_pricing(args: argparse.Namespace) -> int:
+    summary = summarize_usage_and_list_price(args.artifact_root)
+    output = args.output or (args.artifact_root / "pricing.json")
+    write_json(output, summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_fixtures(args: argparse.Namespace) -> int:
     paths = generate_fixtures(args.output_dir)
     for path in paths:
@@ -234,8 +242,7 @@ def command_temporal_repeat(args: argparse.Namespace) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     client = GeminiLabClient(temperature=args.temperature)
     summaries: list[dict[str, object]] = []
-    analysis_failures = 0
-    grounding_failures = 0
+    failures = 0
     try:
         uploaded = client.resume_video_upload(args.artifact_root / "upload")
         for run_number in range(1, args.runs + 1):
@@ -436,14 +443,36 @@ def _mmss_to_ms(value: str) -> int:
     return (minutes * 60 + seconds) * 1000
 
 
+def _jpeg_transport_frame(frame: ExtractedFrame, moment_dir: Path) -> ExtractedFrame:
+    output = moment_dir / "frame.transport.jpg"
+    with Image.open(frame.path) as image:
+        image.convert("RGB").save(output, format="JPEG", quality=95, subsampling=0, optimize=True)
+    transport = frame.model_copy(
+        update={"path": str(output.resolve()), "frame_hash": sha256_file(output)}
+    )
+    write_json(
+        moment_dir / "frame.transport.json",
+        {
+            **transport.model_dump(mode="json"),
+            "transport": "same-dimension JPEG quality=95 subsampling=0",
+            "source_frame_path": frame.path,
+            "source_frame_hash": frame.frame_hash,
+        },
+    )
+    return transport
+
+
 def command_direct_moment_repeat(args: argparse.Namespace) -> int:
     pipeline_started = monotonic()
     media = MediaInfo.model_validate(read_json(args.artifact_root / "media.json"))
     source = args.artifact_root / "source.mp4"
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if bool(args.target_id) != bool(args.target_description):
+        raise ValueError("--target-id and --target-description must be provided together")
     client = GeminiLabClient(temperature=args.temperature)
     summaries: list[dict[str, object]] = []
-    failures = 0
+    analysis_failures = 0
+    grounding_failures = 0
     try:
         uploaded = client.resume_video_upload(args.artifact_root / "upload")
         for run_number in range(1, args.runs + 1):
@@ -457,9 +486,15 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
                 moments = client.analyze_direct_moments(
                     media=media,
                     uploaded=uploaded,
-                    prompt_template=_load_prompt("direct_moments_mmss_zh-TW.txt"),
+                    prompt_template=_load_prompt(
+                        "target_moments_mmss_zh-TW.txt"
+                        if args.target_id
+                        else "direct_moments_mmss_zh-TW.txt"
+                    ),
                     run_id=run_id,
                     run_dir=run_dir,
+                    locked_target_id=args.target_id,
+                    locked_target_description=args.target_description,
                 )
                 timing["video_analysis_seconds"] = round(monotonic() - analysis_started, 6)
                 run_summary: dict[str, object] = {
@@ -480,7 +515,7 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
                 if run_number <= args.ground_runs:
                     timeline_results: list[tuple[str, int, int, Path, GroundingProposal]] = []
                     grounding_summary: list[dict[str, object]] = []
-                    for moment in moments.moments:
+                    for moment in moments.moments[: args.ground_moments_per_run]:
                         requested_ms = _mmss_to_ms(moment.timestamp_mmss)
                         moment_dir = run_dir / "moments" / _safe_name(moment.moment_id)
                         extraction_started = monotonic()
@@ -488,12 +523,17 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
                         try:
                             frame = extract_frame(source, requested_ms, moment_dir / "frame.png")
                             write_json(moment_dir / "frame.json", frame)
+                            grounding_frame = (
+                                _jpeg_transport_frame(frame, moment_dir)
+                                if args.ground_transport_jpeg
+                                else frame
+                            )
                             extraction_seconds = monotonic() - extraction_started
                             grounding_dir = moment_dir / "grounding"
                             grounding_started = monotonic()
                             proposal = client.ground_frame(
                                 media=media,
-                                frame=frame,
+                                frame=grounding_frame,
                                 event_id=moment.moment_id,
                                 event_description=f"{moment.label}；{moment.observable_evidence}",
                                 entity_id=moment.grounding_target_id,
@@ -771,6 +811,13 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser.add_argument("--output", type=Path, required=True)
     upload_parser.set_defaults(handler=command_upload)
 
+    pricing_parser = subparsers.add_parser(
+        "pricing", help="Summarize saved raw interaction usage using public list prices"
+    )
+    pricing_parser.add_argument("artifact_root", type=Path)
+    pricing_parser.add_argument("--output", type=Path)
+    pricing_parser.set_defaults(handler=command_pricing)
+
     extract_parser = subparsers.add_parser("extract", help="Extract orientation-corrected frame with exact PTS")
     extract_parser.add_argument("video", type=Path)
     extract_parser.add_argument("time_ms", type=int)
@@ -872,6 +919,10 @@ def build_parser() -> argparse.ArgumentParser:
     direct_parser.add_argument("artifact_root", type=Path)
     direct_parser.add_argument("--runs", type=int, default=3)
     direct_parser.add_argument("--ground-runs", type=int, default=1)
+    direct_parser.add_argument("--ground-moments-per-run", type=int, default=1)
+    direct_parser.add_argument("--ground-transport-jpeg", action="store_true")
+    direct_parser.add_argument("--target-id")
+    direct_parser.add_argument("--target-description")
     direct_parser.add_argument("--temperature", type=float, default=0.2)
     direct_parser.add_argument("--output-dir", type=Path, required=True)
     direct_parser.set_defaults(handler=command_direct_moment_repeat)
@@ -906,6 +957,8 @@ def main() -> None:
         parser.error("--interval-ms must be at least 250")
     if getattr(args, "ground_runs", 0) < 0:
         parser.error("--ground-runs cannot be negative")
+    if getattr(args, "ground_moments_per_run", 1) < 1:
+        parser.error("--ground-moments-per-run must be at least 1")
     try:
         status = args.handler(args)
     except KeyboardInterrupt:
