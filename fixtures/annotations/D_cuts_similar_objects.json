@@ -1,0 +1,15 @@
+{
+  "fixture_id": "D_cuts_similar_objects",
+  "notes": "Synthetic human-authored reference with hard cuts at 4 s and 8 s.",
+  "events": [
+    {"label": "two phones on table", "start_ms": 0, "end_ms": 4000},
+    {"label": "left phone close-up", "start_ms": 4000, "end_ms": 8000},
+    {"label": "right phone being operated", "start_ms": 8000, "end_ms": 12000}
+  ],
+  "boxes": [
+    {"frame_time_ms": 2000, "entity_label": "left phone", "box_2d": [180, 230, 390, 790]},
+    {"frame_time_ms": 2000, "entity_label": "right phone", "box_2d": [610, 230, 820, 790]},
+    {"frame_time_ms": 10000, "entity_label": "operated right phone", "box_2d": [420, 170, 680, 850]}
+  ]
+}
+

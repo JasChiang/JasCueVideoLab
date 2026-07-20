@@ -1,0 +1,13 @@
+{
+  "fixture_id": "B_person_phone_motion_16x9",
+  "notes": "Synthetic human-authored reference.",
+  "events": [
+    {"label": "person raises phone", "start_ms": 0, "end_ms": 6000},
+    {"label": "person presents moving phone", "start_ms": 6000, "end_ms": 12000}
+  ],
+  "boxes": [
+    {"frame_time_ms": 8000, "entity_label": "person face", "box_2d": [140, 145, 310, 445]},
+    {"frame_time_ms": 8000, "entity_label": "phone", "box_2d": [560, 370, 680, 710]}
+  ]
+}
+

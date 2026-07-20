@@ -1,0 +1,42 @@
+{
+  "asset_id": "sha256:e83cd2088978e7eb779481988fd0dc0f4a81e55ac3ef76ca0ef152aa18579300",
+  "duration_ms": 12000,
+  "format_metadata": {
+    "compatible_brands": "isomiso2avc1mp41",
+    "encoder": "Lavf62.12.101",
+    "major_brand": "isom",
+    "minor_version": "512"
+  },
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "path": "/path/to/JasCueVideoLab/fixtures/generated/B_person_phone_motion_16x9.mp4",
+  "sha256": "e83cd2088978e7eb779481988fd0dc0f4a81e55ac3ef76ca0ef152aa18579300",
+  "size_bytes": 77135,
+  "video": {
+    "average_frame_rate": {
+      "denominator": 1,
+      "numerator": 10
+    },
+    "codec_name": "h264",
+    "coded_height": 720,
+    "coded_width": 1280,
+    "display_height": 720,
+    "display_width": 1280,
+    "duration_ts": 122880,
+    "index": 0,
+    "metadata": {
+      "encoder": "Lavc62.28.101 libx264",
+      "handler_name": "VideoHandler",
+      "language": "und"
+    },
+    "real_frame_rate": {
+      "denominator": 1,
+      "numerator": 10
+    },
+    "rotation_degrees": 0,
+    "start_pts": 0,
+    "time_base": {
+      "denominator": 10240,
+      "numerator": 1
+    }
+  }
+}

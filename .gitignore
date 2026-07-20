@@ -1,0 +1,14 @@
+.DS_Store
+.venv/
+.uv-cache/
+__pycache__/
+.pytest_cache/
+.playwright-mcp/
+*.py[cod]
+.env
+.env.local
+.env.*.local
+artifacts/
+fixtures/generated/*.mp4
+fixtures/generated/*.mov
+fixtures/generated/*.png

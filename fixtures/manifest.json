@@ -1,0 +1,29 @@
+{
+  "fixtures": [
+    {
+      "id": "A_silent_phone_ui",
+      "description": "30 秒無旁白的手機 UI 操作，含首頁、選單、設定與完成狀態",
+      "file": "generated/A_silent_phone_ui.mp4",
+      "annotations": "annotations/A_silent_phone_ui.json"
+    },
+    {
+      "id": "B_person_phone_motion_16x9",
+      "description": "人物與手機同時移動的 16:9 畫面",
+      "file": "generated/B_person_phone_motion_16x9.mp4",
+      "annotations": "annotations/B_person_phone_motion_16x9.json"
+    },
+    {
+      "id": "C_fast_transient_ui",
+      "description": "按鈕按下狀態只維持 0.3 秒的快速 UI 影片",
+      "file": "generated/C_fast_transient_ui.mp4",
+      "annotations": "annotations/C_fast_transient_ui.json"
+    },
+    {
+      "id": "D_cuts_similar_objects",
+      "description": "多次切鏡且包含兩支相似手機",
+      "file": "generated/D_cuts_similar_objects.mp4",
+      "annotations": "annotations/D_cuts_similar_objects.json"
+    }
+  ]
+}
+

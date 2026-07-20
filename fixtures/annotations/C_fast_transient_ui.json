@@ -1,0 +1,13 @@
+{
+  "fixture_id": "C_fast_transient_ui",
+  "notes": "Pressed state exists only on [2800, 3100) ms and can be missed by 1 FPS sampling.",
+  "events": [
+    {"label": "idle button", "start_ms": 0, "end_ms": 2800},
+    {"label": "brief pressed state", "start_ms": 2800, "end_ms": 3100},
+    {"label": "success state", "start_ms": 3100, "end_ms": 6000}
+  ],
+  "boxes": [
+    {"frame_time_ms": 2900, "entity_label": "pressed button", "box_2d": [360, 420, 640, 580]}
+  ]
+}
+

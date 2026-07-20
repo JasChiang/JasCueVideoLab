@@ -1,0 +1,37 @@
+{
+  "fixture_id": "real_continuity_public",
+  "source_sha256": "04cbad9187a9871614b612d7551f00574184089525adc6559de070ec09889ca2",
+  "annotation_provenance": {
+    "author_type": "ai_assistant_reviewer",
+    "author": "Codex",
+    "method": "Visual inspection of sampled video frames followed by manual entry of approximate normalized coordinates.",
+    "independent_human_verified": false,
+    "automation_model": null
+  },
+  "notes": "Codex reviewer reference created after visually inspecting the public source at 5-second intervals and the original frames at 19, 30, and 48 seconds. It is not independent human ground truth. Semantic boundaries are coarse and are not cut points.",
+  "events": [
+    {"label": "Title Screen", "start_ms": 0, "end_ms": 4000},
+    {"label": "Introduction to Continuity", "start_ms": 4000, "end_ms": 10000},
+    {"label": "AirDrop Demonstration", "start_ms": 10000, "end_ms": 25000},
+    {"label": "Universal Clipboard Demonstration", "start_ms": 25000, "end_ms": 35000},
+    {"label": "iPhone Mirroring Demonstration", "start_ms": 35000, "end_ms": 55000},
+    {"label": "Outro Logo Screen", "start_ms": 55000, "end_ms": 61862}
+  ],
+  "boxes": [
+    {
+      "frame_time_ms": 19000,
+      "entity_label": "iPhone Screen",
+      "box_2d": [495, 29, 775, 927]
+    },
+    {
+      "frame_time_ms": 30000,
+      "entity_label": "MacBook Screen",
+      "box_2d": [0, 0, 1000, 1000]
+    },
+    {
+      "frame_time_ms": 48000,
+      "entity_label": "MacBook Screen",
+      "box_2d": [175, 47, 875, 907]
+    }
+  ]
+}

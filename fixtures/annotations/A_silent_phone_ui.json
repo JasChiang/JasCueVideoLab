@@ -1,0 +1,15 @@
+{
+  "fixture_id": "A_silent_phone_ui",
+  "notes": "Synthetic human-authored reference; semantic intervals are intentionally coarse.",
+  "events": [
+    {"label": "phone home screen", "start_ms": 0, "end_ms": 7000},
+    {"label": "open settings menu", "start_ms": 7000, "end_ms": 15000},
+    {"label": "toggle feature", "start_ms": 15000, "end_ms": 23000},
+    {"label": "completed state", "start_ms": 23000, "end_ms": 30000}
+  ],
+  "boxes": [
+    {"frame_time_ms": 5000, "entity_label": "phone", "box_2d": [330, 80, 670, 920]},
+    {"frame_time_ms": 10000, "entity_label": "phone screen", "box_2d": [355, 125, 645, 875]}
+  ]
+}
+
