@@ -10,6 +10,7 @@ from jascue_video_lab.models import (
     GroundingCandidate,
     GroundingProposal,
     Occlusion,
+    TargetCandidateMap,
     TemporalMap,
 )
 from jascue_video_lab.schema import gemini_response_schema
@@ -164,3 +165,48 @@ def test_direct_moments_reject_bad_or_out_of_range_mmss(
     payload["moments"] = [payload["moments"][0] | {"timestamp_mmss": timestamp}]
     with pytest.raises(ValidationError):
         DirectMomentMap.model_validate(payload)
+
+
+def _target_candidate_payload(content_map: ContentMap) -> dict:
+    return {
+        "asset_id": content_map.asset_id,
+        "duration_ms": 22_022,
+        "summary": "Selectable visible objects",
+        "candidates": [
+            {
+                "candidate_id": "center-purple-phone",
+                "label": "中央紫色手機",
+                "entity_kind": "phone",
+                "target_description": "中央偏左、背面朝向鏡頭的紫色手機；排除背板與白色手機。",
+                "distinguishing_features": "紫色、中央偏左、實體手機",
+                "representative_timestamp_mmss": "00:10",
+                "selection_reason": "跨鏡頭可見且邊界清楚",
+                "confidence": 0.95,
+            }
+        ],
+        "uncertainties": [],
+        "model_provenance": content_map.model_provenance.model_dump(mode="json"),
+    }
+
+
+def test_target_candidate_map_accepts_selectable_target(content_map: ContentMap) -> None:
+    parsed = TargetCandidateMap.model_validate(_target_candidate_payload(content_map))
+    assert parsed.candidates[0].candidate_id == "center-purple-phone"
+    assert parsed.candidates[0].entity_kind.value == "phone"
+
+
+def test_target_candidate_map_rejects_duplicate_ids(content_map: ContentMap) -> None:
+    payload = _target_candidate_payload(content_map)
+    payload["candidates"].append(dict(payload["candidates"][0]))
+    with pytest.raises(ValidationError):
+        TargetCandidateMap.model_validate(payload)
+
+
+@pytest.mark.parametrize("timestamp", ["00:23", "0:10", "00:61"])
+def test_target_candidate_map_rejects_invalid_representative_time(
+    content_map: ContentMap, timestamp: str
+) -> None:
+    payload = _target_candidate_payload(content_map)
+    payload["candidates"][0]["representative_timestamp_mmss"] = timestamp
+    with pytest.raises(ValidationError):
+        TargetCandidateMap.model_validate(payload)

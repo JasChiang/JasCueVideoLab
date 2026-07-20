@@ -22,6 +22,7 @@ from .models import (
     IndexedStoryboardMap,
     MediaInfo,
     ModelProvenance,
+    TargetCandidateMap,
     TemporalMap,
 )
 from .schema import gemini_response_schema
@@ -53,6 +54,16 @@ def _raw_dump(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json", exclude_none=False)
     return value
+
+
+def _is_file_api_not_found(error: BaseException) -> bool:
+    values = [
+        getattr(error, "code", None),
+        getattr(error, "status_code", None),
+        getattr(error, "status", None),
+    ]
+    text = " ".join(str(value) for value in values if value is not None).upper()
+    return "404" in text or "NOT_FOUND" in text
 
 
 class GeminiLabClient:
@@ -113,6 +124,108 @@ class GeminiLabClient:
             return uploaded
         except Exception as error:
             append_error(artifact_dir, "file_upload_resume", error)
+            raise
+
+    def ensure_video_upload(
+        self,
+        path: Path,
+        artifact_dir: Path,
+        timeout_seconds: int = 900,
+        *,
+        force_reupload: bool = False,
+    ) -> tuple[Any, bool]:
+        """Reuse an ACTIVE saved File API object; reupload only after a confirmed 404."""
+        initial_path = artifact_dir / "file_upload_initial.json"
+        if initial_path.exists() and not force_reupload:
+            try:
+                uploaded = self.resume_video_upload(artifact_dir, timeout_seconds)
+                write_json(
+                    artifact_dir / "file_cache.json",
+                    {"reused": True, "reason": "saved_file_api_object_is_active", "checked_at": utc_now()},
+                )
+                return uploaded, True
+            except Exception as error:
+                if not _is_file_api_not_found(error):
+                    raise
+                reason = "saved_file_api_object_expired_or_deleted"
+        else:
+            reason = "force_reupload" if force_reupload else "no_saved_file_api_object"
+
+        if initial_path.exists():
+            history_dir = artifact_dir / "history" / utc_now().replace(":", "-")
+            for filename in ("file_upload_initial.json", "file_upload_final.json", "file_cache.json"):
+                old_path = artifact_dir / filename
+                if old_path.exists():
+                    write_json(history_dir / filename, json.loads(old_path.read_text(encoding="utf-8")))
+        uploaded = self.upload_video(path, artifact_dir, timeout_seconds)
+        write_json(
+            artifact_dir / "file_cache.json",
+            {"reused": False, "reason": reason, "checked_at": utc_now()},
+        )
+        return uploaded, False
+
+    def suggest_targets(
+        self,
+        *,
+        media: MediaInfo,
+        uploaded: Any,
+        prompt_template: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> TargetCandidateMap:
+        """Propose user-selectable targets without producing any boxes or tracking data."""
+        provenance = _provenance(run_id)
+        last_valid_mmss = max(0, (media.duration_ms - 1) // 1000)
+        prompt = (
+            prompt_template
+            + "\n\n## 本次不可變輸入 metadata\n"
+            + f"asset_id 必須原樣回傳：{media.asset_id}\n"
+            + f"duration_ms 必須原樣回傳：{media.duration_ms}\n"
+            + f"最後允許的整秒是 {last_valid_mmss // 60:02d}:{last_valid_mmss % 60:02d}\n"
+            + "model_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        request_record = {
+            "model": MODEL_ID,
+            "store": False,
+            "input": [
+                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {"type": "text", "text": prompt},
+            ],
+            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(TargetCandidateMap),
+            },
+        }
+        write_json(run_dir / "target_candidates.request.json", request_record)
+        try:
+            interaction = self.client.interactions.create(**request_record)
+            write_json(run_dir / "target_candidates.raw_interaction.json", _raw_dump(interaction))
+            write_json(
+                run_dir / "target_candidates.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = TargetCandidateMap.model_validate_json(interaction.output_text)
+            if parsed.asset_id != media.asset_id or parsed.duration_ms != media.duration_ms:
+                raise GeminiContractError("Target Candidate Map echoed metadata incorrectly")
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "target_candidates.json", final)
+            write_json(run_dir / "target_candidates.schema_validation.json", {"ok": True, "errors": []})
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "target_candidates.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(run_dir, "target_candidates", error)
             raise
 
     def analyze_video(

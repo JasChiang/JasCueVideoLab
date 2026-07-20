@@ -17,7 +17,15 @@ from .compare import compare_runs
 from .fixtures import generate_fixtures
 from .gemini import GeminiLabClient
 from .media import extract_frame, probe_video, sha256_file
-from .models import ContentMap, ExtractedFrame, GroundingProposal, MediaInfo, TemporalEvent, TemporalMap
+from .models import (
+    ContentMap,
+    ExtractedFrame,
+    GroundingProposal,
+    MediaInfo,
+    TargetCandidateMap,
+    TemporalEvent,
+    TemporalMap,
+)
 from .overlay import draw_grounding_overlay
 from .review import render_manual_review
 from .repeat import run_repeated_grounding
@@ -41,6 +49,23 @@ def _load_prompt(name: str) -> str:
 def _default_artifact_root(asset_hash: str) -> Path:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return PROJECT_ROOT / "artifacts" / asset_hash[:12] / stamp
+
+
+def _artifact_upload_source(artifact_root: Path) -> Path:
+    identity_path = artifact_root / "upload_source_identity.json"
+    if identity_path.exists():
+        identity = read_json(identity_path)
+        if not identity.get("used_analysis_proxy", False):
+            sources = sorted(artifact_root.glob("source.*"))
+            if sources:
+                return sources[0]
+    proxy = artifact_root / "analysis-proxy.mp4"
+    if proxy.exists():
+        return proxy
+    sources = sorted(artifact_root.glob("source.*"))
+    if not sources:
+        raise FileNotFoundError(f"no analysis-proxy.mp4 or source.* in {artifact_root}")
+    return sources[0]
 
 
 def _find_proposals(run_dir: Path) -> list[tuple[GroundingProposal, Path]]:
@@ -74,11 +99,28 @@ def command_upload(args: argparse.Namespace) -> int:
     media = probe_video(args.video)
     artifact_root = args.output
     artifact_root.mkdir(parents=True, exist_ok=True)
-    write_json(artifact_root / "media.json", media)
+    existing_media_path = artifact_root / "media.json"
+    existing_upload_asset_id: str | None = None
+    if existing_media_path.exists():
+        existing_media = MediaInfo.model_validate(read_json(existing_media_path))
+        if existing_media.asset_id != media.asset_id:
+            raise ValueError(
+                "artifact root already belongs to a different source asset; use a new output directory"
+            )
+        existing_upload_asset_id = existing_media.asset_id
+    upload_identity_path = artifact_root / "upload_source_identity.json"
+    if upload_identity_path.exists():
+        saved_identity = read_json(upload_identity_path)
+        existing_upload_asset_id = saved_identity.get("upload_asset_id")
+    elif (artifact_root / "analysis_proxy.json").exists():
+        saved_proxy = read_json(artifact_root / "analysis_proxy.json")
+        existing_upload_asset_id = saved_proxy.get("proxy_media", {}).get("asset_id")
+    write_json(existing_media_path, media)
     source_link = artifact_root / ("source" + args.video.suffix.lower())
     if not source_link.exists():
         source_link.symlink_to(args.video.resolve(strict=True))
     upload_source = source_link
+    upload_asset_id = media.asset_id
     proxy_record: dict[str, object] | None = None
     if args.analysis_proxy:
         proxy_media = probe_video(args.analysis_proxy)
@@ -92,6 +134,7 @@ def command_upload(args: argparse.Namespace) -> int:
         if not proxy_link.exists():
             proxy_link.symlink_to(args.analysis_proxy.resolve(strict=True))
         upload_source = proxy_link
+        upload_asset_id = proxy_media.asset_id
         proxy_record = {
             "purpose": "Gemini semantic video analysis only; original source remains authoritative",
             "proxy_media": proxy_media.model_dump(mode="json"),
@@ -104,13 +147,36 @@ def command_upload(args: argparse.Namespace) -> int:
             "grounding_source": str(source_link),
             "upload_source": str(proxy_link),
         }
+    if (
+        (artifact_root / "upload" / "file_upload_initial.json").exists()
+        and existing_upload_asset_id
+        and existing_upload_asset_id != upload_asset_id
+        and not args.force_reupload
+    ):
+        raise ValueError(
+            "saved File API object was created from a different upload source; "
+            "use a new artifact root or explicitly pass --force-reupload"
+        )
+    if proxy_record is not None:
         write_json(artifact_root / "analysis_proxy.json", proxy_record)
     upload_started = monotonic()
     client = GeminiLabClient(temperature=args.temperature)
     try:
-        uploaded = client.upload_video(upload_source, artifact_root / "upload")
+        uploaded, reused = client.ensure_video_upload(
+            upload_source,
+            artifact_root / "upload",
+            force_reupload=args.force_reupload,
+        )
     finally:
         client.close()
+    write_json(
+        upload_identity_path,
+        {
+            "source_asset_id": media.asset_id,
+            "upload_asset_id": upload_asset_id,
+            "used_analysis_proxy": bool(args.analysis_proxy),
+        },
+    )
     upload_elapsed = monotonic() - upload_started
     timing = {
         "upload_and_file_processing_seconds": round(upload_elapsed, 6),
@@ -122,6 +188,7 @@ def command_upload(args: argparse.Namespace) -> int:
         "asset_id": media.asset_id,
         "uploaded_file_name": uploaded.name,
         "uploaded_state": uploaded.state.name if uploaded.state else None,
+        "reused_file_api_object": reused,
         "used_analysis_proxy": bool(args.analysis_proxy),
         "proxy": proxy_record,
         "timing": timing,
@@ -129,6 +196,101 @@ def command_upload(args: argparse.Namespace) -> int:
     write_json(artifact_root / "upload_result.json", result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
+
+
+def _run_target_suggestions(
+    *,
+    artifact_root: Path,
+    output_dir: Path,
+    runs: int,
+    temperature: float,
+) -> int:
+    started = monotonic()
+    media = MediaInfo.model_validate(read_json(artifact_root / "media.json"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    client = GeminiLabClient(temperature=temperature)
+    summaries: list[dict[str, object]] = []
+    failures = 0
+    try:
+        uploaded, reused = client.ensure_video_upload(
+            _artifact_upload_source(artifact_root), artifact_root / "upload"
+        )
+        for run_number in range(1, runs + 1):
+            run_dir = output_dir / f"run-{run_number:02d}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            run_id = f"target-candidates-{run_number:02d}-{uuid.uuid4().hex[:8]}"
+            run_started = monotonic()
+            try:
+                candidate_map = client.suggest_targets(
+                    media=media,
+                    uploaded=uploaded,
+                    prompt_template=_load_prompt("target_candidates_mmss_zh-TW.txt"),
+                    run_id=run_id,
+                    run_dir=run_dir,
+                )
+                summaries.append(
+                    {
+                        "run": f"run-{run_number:02d}",
+                        "schema_valid": True,
+                        "elapsed_seconds": round(monotonic() - run_started, 6),
+                        "candidates": [
+                            {
+                                "candidate_id": candidate.candidate_id,
+                                "label": candidate.label,
+                                "entity_kind": candidate.entity_kind.value,
+                                "target_description": candidate.target_description,
+                                "representative_timestamp_mmss": (
+                                    candidate.representative_timestamp_mmss
+                                ),
+                                "confidence": candidate.confidence,
+                            }
+                            for candidate in candidate_map.candidates
+                        ],
+                    }
+                )
+            except Exception as error:
+                failures += 1
+                append_error(run_dir, "target_candidate_pipeline", error)
+                summaries.append(
+                    {
+                        "run": f"run-{run_number:02d}",
+                        "schema_valid": False,
+                        "elapsed_seconds": round(monotonic() - run_started, 6),
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    }
+                )
+    finally:
+        client.close()
+    pricing = summarize_usage_and_list_price(output_dir)
+    result = {
+        "model": "gemini-3.5-flash",
+        "method": "user-selectable target candidates before timing or Grounding",
+        "file_api_object_reused": reused,
+        "runs_requested": runs,
+        "runs_succeeded": runs - failures,
+        "failure_count": failures,
+        "elapsed_seconds": round(monotonic() - started, 6),
+        "pricing": pricing,
+        "runs": summaries,
+        "next_step": (
+            "Pass --candidate-map RUN/target_candidates.json and --candidate-id ID "
+            "to direct-moment-repeat."
+        ),
+    }
+    write_json(output_dir / "pricing.json", pricing)
+    write_json(output_dir / "summary.json", result)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if failures == 0 else 1
+
+
+def command_suggest_targets(args: argparse.Namespace) -> int:
+    return _run_target_suggestions(
+        artifact_root=args.artifact_root,
+        output_dir=args.output_dir,
+        runs=args.runs,
+        temperature=args.temperature,
+    )
 
 
 def command_pricing(args: argparse.Namespace) -> int:
@@ -244,7 +406,9 @@ def command_temporal_repeat(args: argparse.Namespace) -> int:
     summaries: list[dict[str, object]] = []
     failures = 0
     try:
-        uploaded = client.resume_video_upload(args.artifact_root / "upload")
+        uploaded, _ = client.ensure_video_upload(
+            _artifact_upload_source(args.artifact_root), args.artifact_root / "upload"
+        )
         for run_number in range(1, args.runs + 1):
             run_id = f"temporal-{run_number:02d}-{uuid.uuid4().hex[:8]}"
             run_dir = args.output_dir / f"run-{run_number:02d}"
@@ -469,12 +633,49 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if bool(args.target_id) != bool(args.target_description):
         raise ValueError("--target-id and --target-description must be provided together")
+    if bool(args.candidate_map) != bool(args.candidate_id):
+        raise ValueError("--candidate-map and --candidate-id must be provided together")
+    if args.target_id and args.candidate_id:
+        raise ValueError("use either an explicit target or a saved candidate, not both")
+
+    target_id = args.target_id
+    target_description = args.target_description
+    if args.candidate_map:
+        candidates = TargetCandidateMap.model_validate(read_json(args.candidate_map))
+        selected = next(
+            (
+                candidate
+                for candidate in candidates.candidates
+                if candidate.candidate_id == args.candidate_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError(f"candidate_id {args.candidate_id!r} not found in {args.candidate_map}")
+        if candidates.asset_id != media.asset_id:
+            raise ValueError("candidate map belongs to a different asset")
+        target_id = selected.candidate_id
+        target_description = selected.target_description
+
+    if not target_id:
+        print(
+            "No target was specified; proposing user-selectable candidates before timing or Grounding.",
+            file=sys.stderr,
+        )
+        return _run_target_suggestions(
+            artifact_root=args.artifact_root,
+            output_dir=args.output_dir,
+            runs=args.runs,
+            temperature=args.temperature,
+        )
     client = GeminiLabClient(temperature=args.temperature)
     summaries: list[dict[str, object]] = []
     analysis_failures = 0
     grounding_failures = 0
     try:
-        uploaded = client.resume_video_upload(args.artifact_root / "upload")
+        uploaded, _ = client.ensure_video_upload(
+            _artifact_upload_source(args.artifact_root), args.artifact_root / "upload"
+        )
         for run_number in range(1, args.runs + 1):
             run_id = f"direct-mmss-{run_number:02d}-{uuid.uuid4().hex[:8]}"
             run_dir = args.output_dir / f"run-{run_number:02d}"
@@ -488,13 +689,13 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
                     uploaded=uploaded,
                     prompt_template=_load_prompt(
                         "target_moments_mmss_zh-TW.txt"
-                        if args.target_id
+                        if target_id
                         else "direct_moments_mmss_zh-TW.txt"
                     ),
                     run_id=run_id,
                     run_dir=run_dir,
-                    locked_target_id=args.target_id,
-                    locked_target_description=args.target_description,
+                    locked_target_id=target_id,
+                    locked_target_description=target_description,
                 )
                 timing["video_analysis_seconds"] = round(monotonic() - analysis_started, 6)
                 run_summary: dict[str, object] = {
@@ -650,10 +851,11 @@ def command_run(args: argparse.Namespace) -> int:
     run_dirs: list[Path] = []
     try:
         client = GeminiLabClient(temperature=args.temperature)
-        if args.resume_upload:
-            uploaded = client.resume_video_upload(artifact_root / "upload")
-        else:
-            uploaded = client.upload_video(source_link, artifact_root / "upload")
+        uploaded, _ = client.ensure_video_upload(
+            source_link,
+            artifact_root / "upload",
+            force_reupload=args.force_reupload,
+        )
         for run_number in range(1, args.runs + 1):
             run_id = f"run-{run_number:02d}-{uuid.uuid4().hex[:8]}"
             run_dir = artifact_root / f"run-{run_number:02d}"
@@ -808,6 +1010,11 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser.add_argument("--analysis-proxy", type=Path)
     upload_parser.add_argument("--max-proxy-duration-delta-ms", type=int, default=100)
     upload_parser.add_argument("--temperature", type=float, default=0.2)
+    upload_parser.add_argument(
+        "--force-reupload",
+        action="store_true",
+        help="Ignore an ACTIVE saved File API object and upload again",
+    )
     upload_parser.add_argument("--output", type=Path, required=True)
     upload_parser.set_defaults(handler=command_upload)
 
@@ -844,7 +1051,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--resume-upload",
         action="store_true",
-        help="Resume a saved File API upload instead of uploading the video again",
+        help=argparse.SUPPRESS,
+    )
+    run_parser.add_argument(
+        "--force-reupload",
+        action="store_true",
+        help="Ignore an ACTIVE saved File API object and upload again",
     )
     run_parser.set_defaults(handler=command_run)
 
@@ -912,6 +1124,16 @@ def build_parser() -> argparse.ArgumentParser:
     storyboard_parser.add_argument("--output-dir", type=Path, required=True)
     storyboard_parser.set_defaults(handler=command_storyboard_temporal)
 
+    candidates_parser = subparsers.add_parser(
+        "suggest-targets",
+        help="When no target was requested, propose user-selectable objects without Grounding",
+    )
+    candidates_parser.add_argument("artifact_root", type=Path)
+    candidates_parser.add_argument("--runs", type=int, default=1)
+    candidates_parser.add_argument("--temperature", type=float, default=0.2)
+    candidates_parser.add_argument("--output-dir", type=Path, required=True)
+    candidates_parser.set_defaults(handler=command_suggest_targets)
+
     direct_parser = subparsers.add_parser(
         "direct-moment-repeat",
         help="Ask Gemini directly for official MM:SS screenshot moments and optionally ground them",
@@ -923,6 +1145,8 @@ def build_parser() -> argparse.ArgumentParser:
     direct_parser.add_argument("--ground-transport-jpeg", action="store_true")
     direct_parser.add_argument("--target-id")
     direct_parser.add_argument("--target-description")
+    direct_parser.add_argument("--candidate-map", type=Path)
+    direct_parser.add_argument("--candidate-id")
     direct_parser.add_argument("--temperature", type=float, default=0.2)
     direct_parser.add_argument("--output-dir", type=Path, required=True)
     direct_parser.set_defaults(handler=command_direct_moment_repeat)

@@ -252,6 +252,46 @@ class DirectMomentMap(StrictModel):
         return self
 
 
+class TargetCandidate(StrictModel):
+    """A user-selectable object proposal; this stage deliberately has no bbox."""
+
+    candidate_id: str = Field(min_length=1)
+    label: str
+    entity_kind: EntityKind
+    target_description: str
+    distinguishing_features: str
+    representative_timestamp_mmss: str = Field(pattern=r"^\d{2,}:[0-5]\d$")
+    selection_reason: str
+    confidence: Confidence
+
+
+class TargetCandidateMap(StrictModel):
+    asset_id: str = Field(min_length=1)
+    duration_ms: int = Field(gt=0)
+    summary: str
+    candidates: list[TargetCandidate]
+    uncertainties: list[str]
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_candidates(self) -> "TargetCandidateMap":
+        ids = [candidate.candidate_id for candidate in self.candidates]
+        if not ids:
+            raise ValueError("at least one target candidate is required")
+        if len(ids) != len(set(ids)):
+            raise ValueError("candidate_id values must be unique")
+        for candidate in self.candidates:
+            minutes, seconds = (
+                int(part) for part in candidate.representative_timestamp_mmss.split(":")
+            )
+            timestamp_ms = (minutes * 60 + seconds) * 1000
+            if timestamp_ms >= self.duration_ms:
+                raise ValueError(
+                    f"candidate {candidate.candidate_id} representative timestamp exceeds duration"
+                )
+        return self
+
+
 class GroundingCandidate(StrictModel):
     box_2d: tuple[
         NormalizedCoordinate,

@@ -2,6 +2,8 @@
 
 這是一個**完全獨立、實驗性**的 Gemini 3.5 Flash 影片理解與單幀 Grounding 驗證專案。它不是 JasCue 正式產品，不引用也不修改任何 JasCue 程式碼；實驗未通過前，不應將這裡的程式合併回 JasCue。
 
+最新的 target-first 方法採用「未指定 target 就先提出候選，使用者選定後才找時間與 bbox」，完整的通俗說明、技術分析、實測數據與可分享摘要見 [METHODOLOGY.md](METHODOLOGY.md)。
+
 目前的最小垂直切片是：
 
 ```text
@@ -93,8 +95,19 @@ uv run jascue-video-lab storyboard-temporal ARTIFACT \
   --interval-ms 4000 --output-dir ARTIFACT/storyboard-pts-grid-4s-live
 
 # 讓 Gemini 推薦少量官方 MM:SS 截圖時刻，本機驗證、抽幀並 Grounding
+# 若未提供 target，這個命令只會提出候選並停止，不會自行挑物件 Grounding
 uv run jascue-video-lab direct-moment-repeat ARTIFACT \
   --runs 3 --ground-runs 1 --output-dir ARTIFACT/direct-mmss-3runs-live
+
+# 明確的候選階段；沒有 bbox，也不做 tracking
+uv run jascue-video-lab suggest-targets ARTIFACT \
+  --output-dir ARTIFACT/target-candidates
+
+# 使用者選定候選後，鎖定 target 才找時間與 Grounding
+uv run jascue-video-lab direct-moment-repeat ARTIFACT \
+  --candidate-map ARTIFACT/target-candidates/run-01/target_candidates.json \
+  --candidate-id phone_purple_center \
+  --runs 3 --ground-runs 1 --output-dir ARTIFACT/purple-phone
 
 # 僅限 experiment/dynamic-tracking branch；用 Gemini GroundingProposal 當 seed
 uv sync --extra tracking
@@ -143,6 +156,8 @@ artifacts/<asset-sha-prefix>/<UTC timestamp>/
 ├── comparison.json
 └── result.json
 ```
+
+Gemini File API 物件依官方文件保存 48 小時。命令會先以已保存的 file name 查詢：仍為 `ACTIVE` 就重用；只有明確收到 `404/NOT_FOUND` 才重新上傳，其他不確定錯誤會保存並停止。`upload/file_cache.json` 記錄是否 reuse，舊 metadata 在重傳前移到 `upload/history/`；只有明確傳入 `upload --force-reupload` 才無條件重傳。參考：[Files API](https://ai.google.dev/gemini-api/docs/files)、[File input methods](https://ai.google.dev/gemini-api/docs/file-input-methods)。
 
 API Structured Output 仍會由本機 Pydantic 再驗證。原始 Interaction response 與原始 `output_text` 都先保存；若 JSON 或語意 contract 失敗，錯誤、類型與 traceback 會寫入 `errors.json`，不會以假資料補值。請注意 request 使用 `store=false`，以本機 artifacts 作為實驗紀錄。
 
