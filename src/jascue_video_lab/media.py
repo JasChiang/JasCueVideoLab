@@ -115,14 +115,26 @@ def probe_video(path: Path) -> MediaInfo:
 _SHOWINFO_RE = re.compile(r"pts:\s*(?P<pts>-?\d+)\s+pts_time:(?P<time>-?[0-9.]+)")
 
 
-def extract_frame(source: Path, requested_time_ms: int, output: Path) -> ExtractedFrame:
+def extract_frame(
+    source: Path,
+    requested_time_ms: int,
+    output: Path,
+    *,
+    max_width: int | None = None,
+) -> ExtractedFrame:
     if requested_time_ms < 0:
         raise ValueError("requested_time_ms must be non-negative")
     output.parent.mkdir(parents=True, exist_ok=True)
     seconds = requested_time_ms / 1000
     # select runs after FFmpeg's default orientation correction. showinfo records
     # the exact chosen source PTS rather than pretending the semantic time is exact.
-    filter_graph = f"select=gte(t\\,{seconds:.6f}),showinfo"
+    if max_width is not None and max_width < 64:
+        raise ValueError("max_width must be at least 64 when provided")
+    filters = [f"select=gte(t\\,{seconds:.6f})"]
+    if max_width is not None:
+        filters.append(f"scale='min({max_width},iw)':-2")
+    filters.append("showinfo")
+    filter_graph = ",".join(filters)
     completed = _run(
         [
             "ffmpeg",
@@ -166,6 +178,7 @@ def create_analysis_proxy(
     *,
     max_side: int = 1920,
     fps: int = 30,
+    preserve_audio: bool = False,
     max_duration_delta_ms: int = 100,
 ) -> tuple[MediaInfo, dict[str, object]]:
     """Create a small orientation-corrected semantic-analysis proxy; geometry stays on source."""
@@ -173,8 +186,7 @@ def create_analysis_proxy(
         raise ValueError("analysis proxy max_side and fps must be positive practical values")
     source_media = probe_video(source)
     output.parent.mkdir(parents=True, exist_ok=True)
-    _run(
-        [
+    command = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
@@ -183,11 +195,17 @@ def create_analysis_proxy(
             str(source.expanduser().resolve(strict=True)),
             "-map",
             "0:v:0",
+    ]
+    if preserve_audio:
+        command.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "128k"])
+    else:
+        command.append("-an")
+    command.extend(
+        [
             "-vf",
             f"scale={max_side}:{max_side}:force_original_aspect_ratio=decrease:force_divisible_by=2",
             "-r",
             str(fps),
-            "-an",
             "-c:v",
             "libx264",
             "-preset",
@@ -198,10 +216,13 @@ def create_analysis_proxy(
             "yuv420p",
             "-movflags",
             "+faststart",
+            "-t",
+            f"{source_media.duration_ms / 1000:.3f}",
             "-y",
             str(output),
         ]
     )
+    _run(command)
     proxy_media = probe_video(output)
     duration_delta_ms = abs(proxy_media.duration_ms - source_media.duration_ms)
     if duration_delta_ms > max_duration_delta_ms:
@@ -216,6 +237,7 @@ def create_analysis_proxy(
         "duration_delta_ms": duration_delta_ms,
         "max_side": max_side,
         "fps": fps,
+        "preserve_audio": preserve_audio,
         "original_bytes": source_media.size_bytes,
         "proxy_bytes": proxy_media.size_bytes,
         "byte_reduction_ratio": round(1 - proxy_media.size_bytes / source_media.size_bytes, 8),

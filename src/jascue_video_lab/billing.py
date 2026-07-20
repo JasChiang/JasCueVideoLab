@@ -11,13 +11,13 @@ GEMINI_35_FLASH_STANDARD_INPUT_USD_PER_MILLION = 1.50
 GEMINI_35_FLASH_STANDARD_OUTPUT_USD_PER_MILLION = 9.00
 
 
-def summarize_usage_and_list_price(root: Path) -> dict[str, Any]:
+def summarize_usage_files(paths: list[Path], *, relative_to: Path | None = None) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     total_input = 0
     total_output = 0
     total_thought = 0
     input_by_modality: dict[str, int] = defaultdict(int)
-    for path in sorted(root.rglob("*.raw_interaction.json")):
+    for path in sorted(paths):
         payload = read_json(path)
         usage = payload.get("usage") or {}
         if not usage:
@@ -36,7 +36,7 @@ def summarize_usage_and_list_price(root: Path) -> dict[str, Any]:
             input_by_modality[modality] += tokens
         records.append(
             {
-                "path": str(path.relative_to(root)),
+                "path": str(path.relative_to(relative_to)) if relative_to else str(path),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "thought_tokens": thought_tokens,
@@ -66,3 +66,9 @@ def summarize_usage_and_list_price(root: Path) -> dict[str, Any]:
         "estimated_total_cost_usd": round(input_cost + output_cost, 8),
         "requests": records,
     }
+
+
+def summarize_usage_and_list_price(root: Path) -> dict[str, Any]:
+    return summarize_usage_files(
+        list(root.rglob("*.raw_interaction.json")), relative_to=root
+    )

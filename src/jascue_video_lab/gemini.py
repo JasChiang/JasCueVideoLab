@@ -16,9 +16,13 @@ from .models import (
     ContentMap,
     DirectVideoGroundingProposal,
     DirectMomentMap,
+    DenseEventSelection,
+    DenseFrameCatalog,
     ExtractedFrame,
     FeatureEditBrief,
     FeatureEditPlan,
+    FullClipCard,
+    FullClipEvent,
     GeminiNativeGroundingProposal,
     GeminiNativeSegmentationProposal,
     GeminiNativeDirectVideoGroundingProposal,
@@ -392,8 +396,8 @@ class GeminiLabClient:
             "model": MODEL_ID,
             "store": False,
             "input": [
-                {"type": "image", "data": image_data, "mime_type": mime_type},
                 {"type": "text", "text": prompt},
+                {"type": "image", "data": image_data, "mime_type": mime_type},
             ],
             "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
             "response_format": {
@@ -405,8 +409,8 @@ class GeminiLabClient:
         request_record = {
             **api_request,
             "input": [
+                api_request["input"][0],
                 {"type": "image", "mime_type": mime_type, "sha256": frame.frame_hash},
-                api_request["input"][1],
             ],
             "api_coordinate_order": "ymin,xmin,ymax,xmax",
             "canonical_coordinate_order": "xmin,ymin,xmax,ymax",
@@ -977,6 +981,218 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "direct_moments", error)
+            raise
+
+    def analyze_full_clip(
+        self,
+        *,
+        source_media: MediaInfo,
+        proxy_media: MediaInfo,
+        uploaded: Any,
+        prompt_template: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> FullClipCard:
+        """Analyze one complete proxy while keeping model event time in MM:SS."""
+        run_dir.mkdir(parents=True, exist_ok=True)
+        provenance = _provenance(run_id)
+        last_start_second = max(0, (source_media.duration_ms - 1) // 1000)
+        last_end_second = source_media.duration_ms // 1000
+        prompt = (
+            prompt_template
+            + "\n\n## 本次不可變 metadata\n"
+            + f"source_asset_id 必須原樣回傳：{source_media.asset_id}\n"
+            + f"proxy_asset_id 必須原樣回傳：{proxy_media.asset_id}\n"
+            + f"duration_ms 必須原樣回傳：{source_media.duration_ms}\n"
+            + "所有事件時間欄位只准使用 MM:SS，不得輸出毫秒、浮點秒或 frame number。\n"
+            + "start/keyframe 最後允許整秒："
+            + f"{last_start_second // 60:02d}:{last_start_second % 60:02d}\n"
+            + "end 最後允許整秒："
+            + f"{last_end_second // 60:02d}:{last_end_second % 60:02d}\n"
+            + "model_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        request_record = {
+            "model": MODEL_ID,
+            "store": False,
+            "input": [
+                {"type": "text", "text": prompt},
+                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+            ],
+            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(FullClipCard),
+            },
+        }
+        write_json(run_dir / "clip_card.request.json", request_record)
+        try:
+            interaction = self.client.interactions.create(**request_record)
+            write_json(run_dir / "clip_card.raw_interaction.json", _raw_dump(interaction))
+            write_json(
+                run_dir / "clip_card.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = FullClipCard.model_validate_json(interaction.output_text)
+            expected = {
+                "source_asset_id": source_media.asset_id,
+                "proxy_asset_id": proxy_media.asset_id,
+                "duration_ms": source_media.duration_ms,
+            }
+            mismatches = {
+                key: {"expected": value, "actual": getattr(parsed, key)}
+                for key, value in expected.items()
+                if getattr(parsed, key) != value
+            }
+            if mismatches:
+                raise GeminiContractError(f"Clip Card metadata mismatch: {mismatches}")
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "clip_card.json", final)
+            write_json(run_dir / "clip_card.schema_validation.json", {"ok": True, "errors": []})
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "clip_card.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(run_dir, "clip_card", error)
+            raise
+
+    def select_dense_event_frames(
+        self,
+        *,
+        event: FullClipEvent,
+        catalog: DenseFrameCatalog,
+        prompt_template: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> DenseEventSelection:
+        """Select immutable dense frame IDs; the model never emits source time."""
+        run_dir.mkdir(parents=True, exist_ok=True)
+        provenance = _provenance(run_id)
+        prompt = (
+            prompt_template
+            + "\n\n## 本次不可變 metadata\n"
+            + f"source_asset_id 必須原樣回傳：{catalog.source_asset_id}\n"
+            + f"event_id 必須原樣回傳：{event.event_id}\n"
+            + f"合法 dense frame ID 數量：{len(catalog.frames)}\n"
+            + "合法 dense frame IDs（依時間順序）："
+            + ", ".join(frame.frame_id for frame in catalog.frames)
+            + "\n"
+            + "只能引用下方實際提供的 DF frame ID，不得輸出時間碼、毫秒或不存在的 ID。\n"
+            + "若目標或事件證據在所有影格都不可確認，回傳 visible=false 且三個 frame ID 都為 null。\n"
+            + "\n## Coarse Clip Card event\n"
+            + event.model_dump_json(indent=2)
+            + "\n\nmodel_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        api_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        recorded_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        ordered_ids: list[str] = []
+        ordered_ids.extend(frame.frame_id for frame in catalog.frames)
+        for page_number, (page_path, page_hash) in enumerate(
+            zip(catalog.contact_sheet_paths, catalog.contact_sheet_hashes, strict=True),
+            start=1,
+        ):
+            label = f"CONTACT_SHEET_PAGE={page_number}"
+            data = base64.b64encode(Path(page_path).read_bytes()).decode("ascii")
+            mime_type = mimetypes.guess_type(page_path)[0] or "image/jpeg"
+            api_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {"type": "image", "data": data, "mime_type": mime_type},
+                ]
+            )
+            recorded_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image",
+                        "mime_type": mime_type,
+                        "sha256": page_hash,
+                    },
+                ]
+            )
+        api_request = {
+            "model": MODEL_ID,
+            "store": False,
+            "input": api_input,
+            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(DenseEventSelection),
+            },
+        }
+        write_json(
+            run_dir / "dense_selection.request.json",
+            {**api_request, "input": recorded_input, "frame_ids_in_order": ordered_ids},
+        )
+        try:
+            interaction = self.client.interactions.create(**api_request)
+            write_json(run_dir / "dense_selection.raw_interaction.json", _raw_dump(interaction))
+            write_json(
+                run_dir / "dense_selection.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = DenseEventSelection.model_validate_json(interaction.output_text)
+            if (
+                parsed.source_asset_id != catalog.source_asset_id
+                or parsed.event_id != event.event_id
+            ):
+                raise GeminiContractError("Dense selection changed immutable metadata")
+            if parsed.visible:
+                positions = {frame_id: index for index, frame_id in enumerate(ordered_ids)}
+                selected_ids = [
+                    parsed.first_frame_id,
+                    parsed.recommended_frame_id,
+                    parsed.last_frame_id,
+                ]
+                unknown = [frame_id for frame_id in selected_ids if frame_id not in positions]
+                if unknown:
+                    raise GeminiContractError(f"unknown dense frame IDs: {unknown}")
+                first, recommended, last = (
+                    positions[str(frame_id)] for frame_id in selected_ids
+                )
+                if not first <= recommended <= last:
+                    raise GeminiContractError(
+                        "dense frame IDs are not ordered first <= recommended <= last"
+                    )
+                valid_targets = {
+                    (target.entity_id, target.target_description)
+                    for target in event.grounding_targets
+                }
+                selected_target = (parsed.target_entity_id, parsed.target_description)
+                if valid_targets and selected_target not in valid_targets:
+                    raise GeminiContractError("Dense selection changed the Clip Card target")
+                if not valid_targets and selected_target != (None, None):
+                    raise GeminiContractError("Dense selection invented a Grounding target")
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "dense_selection.json", final)
+            write_json(
+                run_dir / "dense_selection.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "dense_selection.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(run_dir, "dense_selection", error)
             raise
 
     def plan_rushes_edit(

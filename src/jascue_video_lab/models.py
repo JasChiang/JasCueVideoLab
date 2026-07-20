@@ -8,10 +8,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 NormalizedCoordinate = Annotated[int, Field(ge=0, le=1000)]
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+MmSs = Annotated[str, Field(pattern=r"^\d{2,}:[0-5]\d$")]
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+def _mmss_to_ms(value: str) -> int:
+    minutes, seconds = (int(part) for part in value.split(":"))
+    return (minutes * 60 + seconds) * 1000
 
 
 def _proper_segments_intersect(
@@ -253,6 +259,248 @@ class IndexedStoryboardMap(StrictModel):
         ids = [event.event_id for event in self.events]
         if len(ids) != len(set(ids)):
             raise ValueError("event_id values must be unique")
+        return self
+
+
+class FullClipGroundingTarget(StrictModel):
+    entity_id: str = Field(min_length=1)
+    target_kind: EntityKind
+    target_description: str = Field(min_length=1)
+    purpose: Literal["reframe", "callout", "isolation", "identity_check"]
+
+
+class FullClipEvent(StrictModel):
+    """Gemini semantic event with second-level MM:SS anchors, never model milliseconds."""
+
+    event_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    start_mmss: MmSs
+    end_mmss: MmSs
+    recommended_keyframe_mmss: MmSs | None
+    label: str
+    description: str
+    observable_evidence: str
+    evidence_modalities: EvidenceModality
+    entity_ids: list[str]
+    primary_entity_ids: list[str]
+    required_entity_ids: list[str]
+    optional_entity_ids: list[str]
+    avoid_overlay_entity_ids: list[str]
+    keyframe_reason: str
+    boundary_precision: BoundaryPrecision
+    confidence: Confidence
+    action_completeness: Literal["complete", "partial", "uncertain"]
+    editing_uses: list[
+        Literal[
+            "opening",
+            "establishing",
+            "hero",
+            "detail",
+            "demo",
+            "reaction",
+            "transition",
+            "ending",
+        ]
+    ]
+    quality_risks: list[str]
+    framing_intent: str
+    card_opportunities: list[CardOpportunity]
+    dense_refinement: Literal["required", "recommended", "not_needed"]
+    dense_refinement_reasons: list[str]
+    grounding_targets: list[FullClipGroundingTarget]
+
+    @model_validator(mode="after")
+    def validate_mmss_interval(self) -> "FullClipEvent":
+        start_ms = _mmss_to_ms(self.start_mmss)
+        end_ms = _mmss_to_ms(self.end_mmss)
+        if end_ms <= start_ms:
+            raise ValueError("event MM:SS interval must be non-empty and half-open")
+        if self.recommended_keyframe_mmss is not None:
+            keyframe_ms = _mmss_to_ms(self.recommended_keyframe_mmss)
+            if not start_ms <= keyframe_ms < end_ms:
+                raise ValueError("recommended MM:SS keyframe must be inside [start, end)")
+        return self
+
+
+class FullClipCard(StrictModel):
+    """Complete per-clip semantic record produced from a full analysis proxy."""
+
+    source_asset_id: str = Field(min_length=1)
+    proxy_asset_id: str = Field(min_length=1)
+    duration_ms: int = Field(gt=0)
+    summary: str
+    content_type: str
+    entities: list[Entity]
+    events: list[FullClipEvent]
+    clip_uses: list[str]
+    portrait_reframe_feasibility: Literal["good", "conditional", "poor", "uncertain"]
+    uncertainties: list[str]
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_timeline_and_references(self) -> "FullClipCard":
+        entity_ids = [entity.entity_id for entity in self.entities]
+        if len(entity_ids) != len(set(entity_ids)):
+            raise ValueError("entity_id values must be unique")
+        event_ids = [event.event_id for event in self.events]
+        if not event_ids:
+            raise ValueError("a full Clip Card must contain at least one event")
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("event_id values must be unique")
+        known_entities = set(entity_ids)
+        entity_kinds = {entity.entity_id: entity.kind for entity in self.entities}
+        previous_end = 0
+        for event in self.events:
+            start_ms = _mmss_to_ms(event.start_mmss)
+            end_ms = _mmss_to_ms(event.end_mmss)
+            if end_ms > self.duration_ms:
+                raise ValueError(f"event {event.event_id} MM:SS exceeds duration")
+            if start_ms < previous_end:
+                raise ValueError(f"event {event.event_id} overlaps or is out of order")
+            previous_end = end_ms
+            references = (
+                event.entity_ids
+                + event.primary_entity_ids
+                + event.required_entity_ids
+                + event.optional_entity_ids
+                + event.avoid_overlay_entity_ids
+                + [target.entity_id for target in event.grounding_targets]
+            )
+            unknown = sorted(set(references) - known_entities)
+            if unknown:
+                raise ValueError(
+                    f"event {event.event_id} references unknown entities: {unknown}"
+                )
+            for target in event.grounding_targets:
+                if entity_kinds[target.entity_id] != target.target_kind:
+                    raise ValueError(
+                        f"event {event.event_id} Grounding target kind differs from Entity kind"
+                    )
+            for opportunity in event.card_opportunities:
+                unknown_card_entities = sorted(
+                    set(opportunity.entity_ids) - known_entities
+                )
+                if unknown_card_entities:
+                    raise ValueError(
+                        f"event {event.event_id} card references unknown entities: "
+                        f"{unknown_card_entities}"
+                    )
+        return self
+
+
+class DerivedClipEvent(StrictModel):
+    """Local conversion of model MM:SS plus FFmpeg shot membership."""
+
+    event_id: str
+    start_mmss: MmSs
+    end_mmss: MmSs
+    recommended_keyframe_mmss: MmSs | None
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    recommended_keyframe_ms: int | None = Field(default=None, ge=0)
+    shot_ids: list[str]
+    boundary_source: Literal["gemini_mmss_local_conversion"]
+    exact_frame_required: bool
+
+    @model_validator(mode="after")
+    def validate_derived_interval(self) -> "DerivedClipEvent":
+        if self.start_ms != _mmss_to_ms(self.start_mmss):
+            raise ValueError("start_ms must be locally derived from start_mmss")
+        if self.end_ms != _mmss_to_ms(self.end_mmss):
+            raise ValueError("end_ms must be locally derived from end_mmss")
+        expected_keyframe = (
+            _mmss_to_ms(self.recommended_keyframe_mmss)
+            if self.recommended_keyframe_mmss is not None
+            else None
+        )
+        if self.recommended_keyframe_ms != expected_keyframe:
+            raise ValueError("recommended_keyframe_ms must be locally derived from MM:SS")
+        if self.end_ms <= self.start_ms:
+            raise ValueError("derived event interval must be non-empty")
+        return self
+
+
+class DerivedClipTimeline(StrictModel):
+    source_asset_id: str
+    duration_ms: int = Field(gt=0)
+    events: list[DerivedClipEvent]
+    generated_at: str
+
+
+class ShotRepresentativeFrame(StrictModel):
+    frame_id: str = Field(pattern=r"^CF[0-9]{6}$")
+    shot_id: str
+    role: Literal["start", "middle", "end"]
+    requested_time_ms: int = Field(ge=0)
+    frame_time_ms: int = Field(ge=0)
+    frame_pts: int
+    frame_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    image_path: str
+
+
+class ClipShotCatalog(StrictModel):
+    source_asset_id: str
+    duration_ms: int = Field(gt=0)
+    frames: list[ShotRepresentativeFrame]
+    generated_at: str
+
+
+class DenseFrame(StrictModel):
+    frame_id: str = Field(pattern=r"^DF[0-9]{6}$")
+    event_id: str
+    requested_time_ms: int = Field(ge=0)
+    frame_time_ms: int = Field(ge=0)
+    frame_pts: int
+    frame_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    image_path: str
+    transport_image_path: str
+    transport_image_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DenseFrameCatalog(StrictModel):
+    source_asset_id: str
+    event_id: str
+    sampling_fps: float = Field(gt=0, le=8)
+    source_start_ms: int = Field(ge=0)
+    source_end_ms: int = Field(gt=0)
+    frames: list[DenseFrame] = Field(min_length=1, max_length=3600)
+    contact_sheet_paths: list[str] = Field(min_length=1)
+    contact_sheet_hashes: list[str] = Field(min_length=1)
+    generated_at: str
+
+    @model_validator(mode="after")
+    def validate_contact_sheets(self) -> "DenseFrameCatalog":
+        if len(self.contact_sheet_paths) != len(self.contact_sheet_hashes):
+            raise ValueError("contact sheet paths and hashes must align")
+        return self
+
+
+class DenseEventSelection(StrictModel):
+    source_asset_id: str
+    event_id: str
+    visible: bool
+    first_frame_id: str | None = Field(default=None, pattern=r"^DF[0-9]{6}$")
+    recommended_frame_id: str | None = Field(default=None, pattern=r"^DF[0-9]{6}$")
+    last_frame_id: str | None = Field(default=None, pattern=r"^DF[0-9]{6}$")
+    target_entity_id: str | None = None
+    target_description: str | None = None
+    observable_evidence: str
+    selection_reason: str
+    uncertainties: list[str]
+    confidence: Confidence
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_visibility(self) -> "DenseEventSelection":
+        frame_ids = [self.first_frame_id, self.recommended_frame_id, self.last_frame_id]
+        if self.visible:
+            if any(frame_id is None for frame_id in frame_ids):
+                raise ValueError("visible dense selections require first/recommended/last IDs")
+            if bool(self.target_entity_id) != bool(self.target_description):
+                raise ValueError("dense selection target ID and description must appear together")
+        elif any(frame_id is not None for frame_id in frame_ids):
+            raise ValueError("invisible dense selections cannot reference frame IDs")
         return self
 
 

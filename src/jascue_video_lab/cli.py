@@ -16,6 +16,7 @@ from .billing import summarize_usage_and_list_price
 from .compare import compare_runs
 from .feature_cut import run_feature_cut_experiment
 from .fixtures import generate_fixtures
+from .full_v1 import run_full_clip, run_full_event_geometry, run_full_library
 from .gemini import GeminiLabClient
 from .media import extract_frame, probe_video, sha256_file
 from .models import (
@@ -522,6 +523,60 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         temperature=args.temperature,
         scdet_threshold=args.scdet_threshold,
         sam_analysis_fps=args.sam_analysis_fps,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_full_clip(args: argparse.Namespace) -> int:
+    result = run_full_clip(
+        args.video,
+        args.output_dir,
+        clip_card_prompt=_load_prompt("full_clip_card_mmss_zh-TW.txt"),
+        dense_prompt=_load_prompt("dense_event_frame_selection_zh-TW.txt"),
+        proxy_max_side=args.proxy_max_side,
+        proxy_fps=args.proxy_fps,
+        scdet_threshold=args.scdet_threshold,
+        temperature=args.temperature,
+        dense_mode=args.dense_mode,
+        dense_event_ids=set(args.dense_event),
+        dense_window_ms=args.dense_window_ms,
+        dense_fps_override=args.dense_fps,
+        file_cache_root=args.file_cache_root,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_full_library(args: argparse.Namespace) -> int:
+    result = run_full_library(
+        args.source_dir,
+        args.output_dir,
+        clip_card_prompt=_load_prompt("full_clip_card_mmss_zh-TW.txt"),
+        dense_prompt=_load_prompt("dense_event_frame_selection_zh-TW.txt"),
+        recursive=args.recursive,
+        max_clips=args.max_clips,
+        proxy_max_side=args.proxy_max_side,
+        proxy_fps=args.proxy_fps,
+        scdet_threshold=args.scdet_threshold,
+        temperature=args.temperature,
+        prepare_only=args.prepare_only,
+        file_cache_root=args.file_cache_root,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_full_ground_event(args: argparse.Namespace) -> int:
+    result = run_full_event_geometry(
+        args.clip_run_dir,
+        args.event_id,
+        grounding_prompt=_load_prompt("grounding_native_yxyx_zh-TW.txt"),
+        checkpoint_path=args.sam_checkpoint,
+        target_entity_id=args.target_entity_id,
+        target_description=args.target_description,
+        sam_analysis_fps=args.sam_analysis_fps,
+        temperature=args.temperature,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1395,6 +1450,70 @@ def build_parser() -> argparse.ArgumentParser:
     feature_cut_parser.add_argument("--temperature", type=float, default=0.2)
     feature_cut_parser.add_argument("--output-dir", type=Path, required=True)
     feature_cut_parser.set_defaults(handler=command_feature_cut)
+
+    full_clip_parser = subparsers.add_parser(
+        "full-clip",
+        help="Analyze one complete proxy into an MM:SS Clip Card and dense frame-ID evidence",
+    )
+    full_clip_parser.add_argument("video", type=Path)
+    full_clip_parser.add_argument("--proxy-max-side", type=int, default=1280)
+    full_clip_parser.add_argument("--proxy-fps", type=int, default=30)
+    full_clip_parser.add_argument("--scdet-threshold", type=float, default=4.0)
+    full_clip_parser.add_argument("--temperature", type=float, default=0.2)
+    full_clip_parser.add_argument(
+        "--dense-mode",
+        choices=["none", "required", "flagged", "all"],
+        default="none",
+    )
+    full_clip_parser.add_argument(
+        "--dense-event",
+        action="append",
+        default=[],
+        help="Explicit event ID to refine; may be repeated and overrides dense-mode for that event",
+    )
+    full_clip_parser.add_argument("--dense-window-ms", type=int, default=4000)
+    full_clip_parser.add_argument(
+        "--dense-fps",
+        type=float,
+        choices=[4.0, 8.0],
+        help="Explicit local fallback FPS for selected dense events",
+    )
+    full_clip_parser.add_argument("--output-dir", type=Path, required=True)
+    full_clip_parser.add_argument("--file-cache-root", type=Path)
+    full_clip_parser.set_defaults(handler=command_full_clip)
+
+    full_library_parser = subparsers.add_parser(
+        "full-library",
+        help="Build resumable per-clip MM:SS Clip Cards for a rushes directory",
+    )
+    full_library_parser.add_argument("source_dir", type=Path)
+    full_library_parser.add_argument("--recursive", action="store_true")
+    full_library_parser.add_argument("--max-clips", type=int)
+    full_library_parser.add_argument("--proxy-max-side", type=int, default=1280)
+    full_library_parser.add_argument("--proxy-fps", type=int, default=30)
+    full_library_parser.add_argument("--scdet-threshold", type=float, default=4.0)
+    full_library_parser.add_argument("--temperature", type=float, default=0.2)
+    full_library_parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Create local proxies, hashes, shots, and audit frames without Gemini network calls",
+    )
+    full_library_parser.add_argument("--output-dir", type=Path, required=True)
+    full_library_parser.add_argument("--file-cache-root", type=Path)
+    full_library_parser.set_defaults(handler=command_full_library)
+
+    full_ground_parser = subparsers.add_parser(
+        "full-ground-event",
+        help="Ground one selected Clip Card event and optionally propagate SAM in that interval",
+    )
+    full_ground_parser.add_argument("clip_run_dir", type=Path)
+    full_ground_parser.add_argument("event_id")
+    full_ground_parser.add_argument("--target-entity-id")
+    full_ground_parser.add_argument("--target-description")
+    full_ground_parser.add_argument("--sam-checkpoint", type=Path)
+    full_ground_parser.add_argument("--sam-analysis-fps", type=float, default=2.0)
+    full_ground_parser.add_argument("--temperature", type=float, default=0.2)
+    full_ground_parser.set_defaults(handler=command_full_ground_event)
     return parser
 
 

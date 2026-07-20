@@ -2,7 +2,7 @@
 
 這是一個**完全獨立、實驗性**的 Gemini 3.5 Flash 影片理解與單幀 Grounding 驗證專案。它不是 JasCue 正式產品，不引用也不修改任何 JasCue 程式碼；實驗未通過前，不應將這裡的程式合併回 JasCue。
 
-最新的 target-first 方法採用「未指定 target 就先提出候選，使用者選定後才找時間與 bbox」，完整的通俗說明、技術分析、實測數據與可分享摘要見 [METHODOLOGY.md](METHODOLOGY.md)。要將毛片實驗升級為 coarse-to-fine 全量流程，請見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)；該文件是下一階段設計，**不是已完成能力清單**。Gemini 原生 polygon segmentation 與 SAM seed A/B 見 [REPORT-GEMINI-SEGMENTATION-SEED.md](REPORT-GEMINI-SEGMENTATION-SEED.md)。
+最新的 target-first 方法採用「未指定 target 就先提出候選，使用者選定後才找時間與 bbox」，完整的通俗說明、技術分析、實測數據與可分享摘要見 [METHODOLOGY.md](METHODOLOGY.md)。毛片 coarse-to-fine 全量流程見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)，目前已完成 per-clip Full v1 垂直切片與批次入口，實跑證據見 [REPORT-FULL-V1.md](REPORT-FULL-V1.md)。Gemini 原生 polygon segmentation 與 SAM seed A/B 見 [REPORT-GEMINI-SEGMENTATION-SEED.md](REPORT-GEMINI-SEGMENTATION-SEED.md)。
 
 目前的最小垂直切片是：
 
@@ -30,6 +30,58 @@
 
 這個設計刻意不把 Gemini timestamp 當 cut point。模型回傳的 frame ID 必須存在於 catalog，Pydantic contract 才會接受；實際 `source_in_ms`／`source_out_ms` 由本機資料生成並 clamp 在單一 shot。9:16 目前只有 `left`／`center`／`right` 三種固定構圖意圖，不是逐幀 crop tracking；要做可用的動態構圖，下一步才接 SAM 2.1／EdgeTAM mask propagation 與重新定位 gate。
 
+## Full v1：完整逐片 Clip Card，按需才做 geometry
+
+Full v1 不會把整支毛片切成數百張圖片送入模型。每支影片先建立含音訊的 720p analysis proxy，讓 Gemini 看完整影片並以 Structured Output 寫一張 `MM:SS` Clip Card；FFmpeg shot detection 只保存切點資料與每個 shot 一張 960px 中間 JPEG 供稽核。只有使用者或剪輯 brief 選中事件、且確實需要 9:16 reframe／callout／去背時，才從原始影片抽一張 exact frame 取得 bbox，並選配 SAM 2.1 在該事件與 shot 內追蹤。
+
+```text
+毛片資料夾
+  → 每支 720p proxy（保留音訊）
+  → Gemini 完整觀看 → MM:SS Clip Card
+  → 本機驗證事件、Entity、target kind 與片長
+  → Clip Cards 可重用於不同剪輯 brief
+
+只有選中的事件需要空間座標時：
+  → FFmpeg 抽原始 exact frame／PTS／hash
+  → Gemini image bbox
+  → SAM 2.1 shot-local mask propagation
+
+只有快速 UI／短暫狀態不確定時：
+  → 事件內 1–5 秒局部 4／8 FPS frame-ID contact sheet
+  → Gemini 只選既有 ID；時間仍由本機映射
+```
+
+```bash
+# 一支完整毛片；預設不做 dense、不做 bbox/SAM
+uv run jascue-video-lab full-clip VIDEO.mp4 \
+  --output-dir artifacts/full-v1-clip
+
+# 一個毛片資料夾逐片建立可續跑 Clip Cards
+uv run jascue-video-lab full-library /path/to/rushes \
+  --output-dir artifacts/full-v1-library
+
+# 只有被選中的事件才抽原始影格並選配 SAM
+uv run jascue-video-lab full-ground-event \
+  artifacts/full-v1-library/clips/ASSET_PREFIX EVENT_ID \
+  --sam-checkpoint artifacts/models/sam2.1_hiera_tiny.pt
+
+# 明確要求某個短暫事件進入 4／8 FPS 局部 fallback
+uv run jascue-video-lab full-clip VIDEO.mp4 \
+  --dense-event EVENT_ID --dense-fps 8 --dense-window-ms 4000 \
+  --output-dir artifacts/full-v1-clip
+```
+
+cache 會同時驗證 source hash、proxy hash、模型、schema、prompt fingerprint 與實際保存的 raw request；prompt 改變一定重跑。File API cache 以 exact proxy SHA-256 跨 library 共用，並在每次使用前查詢遠端 `ACTIVE` 狀態；不同編碼／解析度的 proxy、原始 4K 與整批 analysis reel 不會互相冒用。成本報告分成本次新增請求 `execution-pricing.json` 與含歷史的 artifact lifetime `pricing.json`。公開 library index 不含使用者名稱、絕對路徑或原始檔名；這些資訊只保存在 gitignored private manifest。
+
+若執行環境禁止批次外傳，可先完全離線準備；此模式不建立 Gemini client：
+
+```bash
+uv run jascue-video-lab full-library /path/to/rushes \
+  --prepare-only --output-dir artifacts/full-v1-library
+```
+
+之後在允許連線的環境移除 `--prepare-only` 重跑同一 output directory，會重用 proxy、shot manifest 與 audit frames，只執行尚未完成的 File API／Clip Card 階段。
+
 ```bash
 # 一次完成 catalog、Gemini selects、雙比例粗剪、review HTML 與成本／計時
 uv run jascue-video-lab rushes-run /path/to/CLIP \
@@ -48,7 +100,7 @@ uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
 
 2026-07-20 的真實測試使用一組經授權的 51 支 4K 公開毛片（約 19 GB、總長 844.847 秒），建立 429 個 frame IDs 與 7.2 MB analysis reel。Gemini 選出 10 段 16:9 與 9 段 9:16；成品分別為 37.5 秒與 34.5 秒。獨立量測後的 cold catalog、fresh upload、模型規劃與渲染合計約 376.181 秒；成功請求耗用 29,071 input tokens、3,158 output tokens，依當日 Gemini 3.5 Flash Standard 公開牌價估算為 US$0.0720285。實際帳單可能因 free tier 或方案而不同。完整證據、hash、QA 與限制見 [REPORT-RUSHES-SELECTS.md](REPORT-RUSHES-SELECTS.md)。
 
-兩秒抽樣只適合第一輪粗看帶，不能當成泛用的唯一視覺取樣。0.2–0.5 秒 UI、快速手勢與短暫對焦狀態可能完全落在兩張索引幀之間。目前 `storyboard-temporal` 已能建立 immutable frame IDs，並曾以 4 秒間隔在真實影片實跑；其間隔可手動降到 250 ms（4 FPS）。但「從 coarse 候選自動縮小區間、局部加密到 4–8 FPS、再讓 Gemini 重選 dense frame ID」仍未自動化，8 FPS 也尚未支援。因此本分支仍是 review-cut 實驗，不宣稱 Full v1 或泛用挑帶已完成。
+兩秒抽樣只適合舊版第一輪粗看帶，不能當成泛用的唯一視覺取樣。Full v1 已改為完整 proxy Clip Card；0.2–0.5 秒 UI、快速手勢與短暫對焦狀態則可在指定事件與單一 shot 內建立 4／8 FPS immutable dense frame IDs。dense fallback 預設關閉，不會把整支影片或整個資料夾全量抽成圖片。
 
 ### Brief-ordered feature cut 與安全 Reframe
 
