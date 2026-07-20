@@ -685,12 +685,15 @@ class FeatureChapterBrief(StrictModel):
     title: str
     detail_lines: list[str]
     target_duration_seconds: float = Field(ge=3.0, le=10.0)
+    vertical_primary_target_description: str | None = None
+    vertical_crop_mode: Literal["strict", "primary_center"] = "strict"
 
 
 class FeatureEditBrief(StrictModel):
     project_id: str
     title: str
     target_duration_seconds: float = Field(ge=60.0, le=90.0)
+    render_title_overlays: bool = True
     chapters: list[FeatureChapterBrief] = Field(min_length=1, max_length=16)
 
     @model_validator(mode="after")

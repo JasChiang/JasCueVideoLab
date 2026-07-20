@@ -59,11 +59,11 @@ uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
   → 指定主體 exact-frame Gemini bbox
   → SAM 2.1 在單一 shot 內傳播 mask
   → 16:9：剪輯 zoom intent ∩ mask 安全倍率 ∩ 4K→1080 解析度上限
-  → 9:16：平滑 tracked crop；太寬或不可靠則 fit-with-background
-  → 功能字卡 + 原始現場音 + H.264/AAC review cuts
+  → 9:16：平滑 tracked crop；strict 與 primary-center 分開記錄
+  → 可選字卡 + 原始現場音 + H.264/AAC review cuts
 ```
 
-SAM 只提供幾何，不自行決定剪輯美學。16:9 的 `none`／`subtle`／`detail` 由 feature plan 表示 editorial intent，實際倍率不得超過 mask 安全值；9:16 若單一 crop 無法保留必要內容，就完整顯示橫式畫面，而不是硬切正中間。使用者 brief 的規格文字與模型觀察到的畫面證據分開保存，沒有 ASR 或 transcript。
+SAM 只提供幾何，不自行決定剪輯美學。16:9 的 `none`／`subtle`／`detail` 由 feature plan 表示 editorial intent，實際倍率不得超過 mask 安全值。9:16 的 `strict` 要求完整保留指定物件；人工 `primary_center` 則允許犧牲次要人物或 context，集中呈現指定主視覺。這個 sacrifice 必須寫入 brief／manifest，不能由 tracker 默默決定。使用者 brief 的規格文字與模型觀察到的畫面證據分開保存，沒有 ASR 或 transcript。
 
 ```bash
 uv run jascue-video-lab feature-cut \
@@ -74,7 +74,7 @@ uv run jascue-video-lab feature-cut \
   --output-dir artifacts/my-feature-cut
 ```
 
-OPPO Reno16 真實實跑輸出兩支 74.176 秒影片。16:9 只有 3 章通過幾何 gate 後套用 1.12–1.35× reframe；9:16 有 5 章採動態 tracked crop、6 章採完整畫面＋模糊背景。14/14 Grounding schema 通過，全部 bbox 經 contact-sheet 視覺檢查；15 個 Gemini requests 的牌價估算為 US$0.178737。詳見 [REPORT-OPPO-RENO16-FEATURE-CUT.md](REPORT-OPPO-RENO16-FEATURE-CUT.md)。
+OPPO Reno16 真實實跑輸出兩支 74.176 秒無燒錄字卡影片。16:9 有 3 章通過幾何 gate 後套用 1.12–1.35× reframe；9:16 的 11 章皆採動態 tracked crop，其中 hero 與 3D 星球以明確 `primary_center` 犧牲部分次要 context，沒有模糊背景。累積 18/18 Grounding schema 通過，全部 bbox 與每 2 秒 contact sheet 經視覺檢查；19 個 Gemini requests 的牌價估算為 US$0.2095485。詳見 [REPORT-OPPO-RENO16-FEATURE-CUT.md](REPORT-OPPO-RENO16-FEATURE-CUT.md)。
 
 ## 重要界線
 

@@ -39,6 +39,27 @@ def test_feature_brief_requires_unique_chapter_ids() -> None:
         )
 
 
+def test_feature_brief_can_disable_titles_and_choose_primary_center_crop() -> None:
+    brief = FeatureEditBrief(
+        project_id="clean-cut",
+        title="clean",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id="hero",
+                title="hero",
+                detail_lines=[],
+                target_duration_seconds=6,
+                vertical_primary_target_description="presenter holding the white phone",
+                vertical_crop_mode="primary_center",
+            )
+        ],
+    )
+    assert brief.render_title_overlays is False
+    assert brief.chapters[0].vertical_crop_mode == "primary_center"
+
+
 def test_tracked_reframe_requires_target_and_nonzero_intent() -> None:
     payload = {
         "feature_id": "ui",
@@ -131,6 +152,21 @@ def test_dynamic_crop_filter_renders_video_and_audio(tmp_path: Path) -> None:
     video = next(stream for stream in streams if stream["codec_type"] == "video")
     assert (video["width"], video["height"]) == (1080, 1920)
     assert any(stream["codec_type"] == "audio" for stream in streams)
+
+    clean_output = tmp_path / "vertical-clean.mp4"
+    _render_source_segment(
+        source_path=source,
+        start_ms=0,
+        end_ms=500,
+        overlay_path=None,
+        base_filter=(
+            "[0:v]fps=30,scale=3414:1920,"
+            "crop=1080:1920:x=500:y=0,setsar=1[base]"
+        ),
+        output_path=clean_output,
+    )
+    assert clean_output.exists()
+    assert not (tmp_path / ".vertical-clean.partial.mp4").exists()
 
 
 def test_concat_decodes_each_mp4_instead_of_stream_copy(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import math
@@ -38,6 +39,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
+_RENDER_PIPELINE_VERSION = "feature-cut-v2-primary-center-atomic"
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -151,18 +153,24 @@ def _render_source_segment(
     source_path: Path,
     start_ms: int,
     end_ms: int,
-    overlay_path: Path,
+    overlay_path: Path | None,
     base_filter: str,
     output_path: Path,
 ) -> None:
     duration = (end_ms - start_ms) / 1000
     audio_fade_out = max(0.0, duration - 0.12)
-    filter_graph = (
-        base_filter
-        + ";[1:v]format=rgba[card];"
-        + "[base][card]overlay=0:0:shortest=1[v]"
-    )
+    if overlay_path is None:
+        filter_graph = base_filter + ";[base]null[v]"
+        overlay_input: list[str] = []
+    else:
+        filter_graph = (
+            base_filter
+            + ";[1:v]format=rgba[card];"
+            + "[base][card]overlay=0:0:shortest=1[v]"
+        )
+        overlay_input = ["-loop", "1", "-i", str(overlay_path)]
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f".{output_path.stem}.partial.mp4")
     _run_segment_encoder(
         [
             "ffmpeg",
@@ -174,10 +182,7 @@ def _render_source_segment(
             f"{start_ms / 1000:.3f}",
             "-i",
             str(source_path),
-            "-loop",
-            "1",
-            "-i",
-            str(overlay_path),
+            *overlay_input,
             "-t",
             f"{duration:.3f}",
             "-filter_complex",
@@ -209,9 +214,29 @@ def _render_source_segment(
             "2",
             "-movflags",
             "+faststart",
-            str(output_path),
+            str(temporary_path),
         ]
     )
+    _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(temporary_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    temporary_path.replace(output_path)
+
+
 def _render_missing_segment(
     chapter: FeatureChapterBrief,
     output_path: Path,
@@ -272,6 +297,8 @@ def _concat_segments(segment_paths: Sequence[Path], output_path: Path) -> None:
         inputs.extend(["-i", str(path.resolve())])
         filter_inputs.extend([f"[{index}:v:0]", f"[{index}:a:0]"])
     filter_graph = "".join(filter_inputs) + f"concat=n={len(segment_paths)}:v=1:a=1[v][a]"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f".{output_path.stem}.partial.mp4")
     _run_segment_encoder(
         [
             "ffmpeg",
@@ -304,11 +331,11 @@ def _concat_segments(segment_paths: Sequence[Path], output_path: Path) -> None:
             "2",
             "-movflags",
             "+faststart",
-            str(output_path),
+            str(temporary_path),
         ]
     )
     expected_duration = sum(_probe_duration_seconds(path) for path in segment_paths)
-    actual_duration = _probe_duration_seconds(output_path)
+    actual_duration = _probe_duration_seconds(temporary_path)
     if abs(actual_duration - expected_duration) > 0.25:
         raise RuntimeError(
             f"assembled duration mismatch: expected={expected_duration:.3f}s "
@@ -321,7 +348,7 @@ def _concat_segments(segment_paths: Sequence[Path], output_path: Path) -> None:
             "-loglevel",
             "error",
             "-i",
-            str(output_path),
+            str(temporary_path),
             "-map",
             "0:v:0",
             "-map",
@@ -331,6 +358,7 @@ def _concat_segments(segment_paths: Sequence[Path], output_path: Path) -> None:
             "-",
         ]
     )
+    temporary_path.replace(output_path)
 
 
 def _output_media_metadata(path: Path) -> dict[str, Any]:
@@ -577,6 +605,8 @@ def _horizontal_original_filter() -> str:
 
 def _vertical_filter_from_track(
     track: SegmentationTrack,
+    *,
+    allow_subject_clipping: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     times, centers_x, boxes = _usable_track_centers(track)
     if len(times) < 2:
@@ -587,10 +617,11 @@ def _vertical_filter_from_track(
     scaled_width = 3414
     crop_width_normalized = 1080 * 1000 / scaled_width
     max_target_width = max(box[2] - box[0] for box in boxes)
-    if max_target_width * 1.30 > crop_width_normalized:
+    if not allow_subject_clipping and max_target_width * 1.08 > crop_width_normalized:
         return _vertical_fit_filter(), {
             "applied_strategy": "fit_with_background",
             "fallback_reason": "tracked_subject_too_wide_for_safe_9x16_crop",
+            "subject_clipping_allowed": False,
         }
     x_values = [
         max(0.0, min(scaled_width - 1080, center * scaled_width / 1000 - 540))
@@ -600,7 +631,11 @@ def _vertical_filter_from_track(
     return (
         f"[0:v]fps=30,scale={scaled_width}:1920,"
         f"crop=1080:1920:x='{x_expression}':y=0,setsar=1[base]",
-        {"applied_strategy": "tracked_crop", "fallback_reason": None},
+        {
+            "applied_strategy": "tracked_crop",
+            "fallback_reason": None,
+            "subject_clipping_allowed": allow_subject_clipping,
+        },
     )
 
 
@@ -687,6 +722,11 @@ def _render_review_html(
     plan: FeatureEditPlan,
     manifest: dict[str, Any],
 ) -> None:
+    overlay_note = (
+        "成片不燒錄實驗字卡；使用者 brief 只作審查 metadata。"
+        if not brief.render_title_overlays
+        else "成片字卡來自使用者 editorial brief。"
+    )
     rows: list[str] = []
     by_id = {chapter.feature_id: chapter for chapter in plan.chapters}
     for brief_chapter in brief.chapters:
@@ -719,7 +759,9 @@ def _render_review_html(
     (output_dir / "index.html").write_text(
         """<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><title>OPPO Reno16 feature cut review</title>
 <style>body{font:15px system-ui;background:#101214;color:#eee;max-width:1500px;margin:24px auto;padding:0 20px}section{background:#1b1f24;padding:20px;margin:20px 0;border-radius:12px}video{width:min(100%,960px);max-height:76vh;background:#000}table{border-collapse:collapse;width:100%}th,td{border:1px solid #3b424a;padding:8px;text-align:left;vertical-align:top}a{color:#71e59c}</style>
-<h1>OPPO Reno16 feature cut review</h1><p>字卡來自使用者 editorial brief；畫面證據、frame ID、Gemini bbox、SAM tracking 與 fallback 分開保存。</p>"""
+<h1>OPPO Reno16 feature cut review</h1><p>"""
+        + html.escape(overlay_note)
+        + " 畫面證據、frame ID、Gemini bbox、SAM tracking 與 fallback 分開保存。</p>"
         + f"<section><h2>16:9</h2><video controls src=\"{html.escape(str(Path(manifest['horizontal']['output_path']).relative_to(output_dir.resolve())))}\"></video></section>"
         + f"<section><h2>9:16</h2><video controls src=\"{html.escape(str(Path(manifest['vertical']['output_path']).relative_to(output_dir.resolve())))}\"></video></section>"
         + "<table><thead><tr><th>chapter</th><th>evidence</th><th>16:9 frame</th><th>zoom</th><th>9:16 frame</th><th>vertical</th><th>debug</th><th>observed evidence</th><th>risks</th></tr></thead><tbody>"
@@ -787,9 +829,27 @@ def run_feature_cut_experiment(
         shots_dir = output_dir / "shots"
         horizontal_segments: list[Path] = []
         vertical_segments: list[Path] = []
+        render_config = {
+            "pipeline_version": _RENDER_PIPELINE_VERSION,
+            "brief": brief.model_dump(mode="json"),
+            "plan": plan.model_dump(mode="json"),
+            "sam_analysis_fps": sam_analysis_fps,
+            "scdet_threshold": scdet_threshold,
+        }
+        render_key = hashlib.sha256(
+            json.dumps(render_config, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        render_variant = (
+            f"with-titles-{render_key}"
+            if brief.render_title_overlays
+            else f"clean-{render_key}"
+        )
         manifest: dict[str, Any] = {
             "project_id": brief.project_id,
             "catalog_id": catalog.catalog_id,
+            "render_title_overlays": brief.render_title_overlays,
+            "render_pipeline_version": _RENDER_PIPELINE_VERSION,
+            "render_cache_key": render_key,
             "horizontal": {"chapters": []},
             "vertical": {"chapters": []},
         }
@@ -799,8 +859,12 @@ def run_feature_cut_experiment(
             brief_chapter = brief_by_id[selected.feature_id]
             horizontal_overlay = output_dir / "overlays" / "16x9" / f"{index:02d}.png"
             vertical_overlay = output_dir / "overlays" / "9x16" / f"{index:02d}.png"
-            horizontal_segment = output_dir / "segments" / "16x9" / f"{index:02d}.mp4"
-            vertical_segment = output_dir / "segments" / "9x16" / f"{index:02d}.mp4"
+            horizontal_segment = (
+                output_dir / "segments" / render_variant / "16x9" / f"{index:02d}.mp4"
+            )
+            vertical_segment = (
+                output_dir / "segments" / render_variant / "9x16" / f"{index:02d}.mp4"
+            )
             if selected.evidence_status == "not_found":
                 if not _segment_is_valid(
                     horizontal_segment,
@@ -851,12 +915,13 @@ def run_feature_cut_experiment(
                     shots_dir,
                     scdet_threshold,
                 )
-                _render_text_layer(
-                    brief_chapter, horizontal_overlay, dimensions=(1920, 1080)
-                )
-                _render_text_layer(
-                    brief_chapter, vertical_overlay, dimensions=(1080, 1920)
-                )
+                if brief.render_title_overlays:
+                    _render_text_layer(
+                        brief_chapter, horizontal_overlay, dimensions=(1920, 1080)
+                    )
+                    _render_text_layer(
+                        brief_chapter, vertical_overlay, dimensions=(1080, 1920)
+                    )
                 horizontal_filter = _horizontal_original_filter()
                 horizontal_geometry = {
                     "requested_zoom": None,
@@ -914,7 +979,7 @@ def run_feature_cut_experiment(
                         source_path=Path(horizontal_clip.path),
                         start_ms=h_start,
                         end_ms=h_end,
-                        overlay_path=horizontal_overlay,
+                        overlay_path=(horizontal_overlay if brief.render_title_overlays else None),
                         base_filter=horizontal_filter,
                         output_path=horizontal_segment,
                     )
@@ -924,10 +989,14 @@ def run_feature_cut_experiment(
                     "fallback_reason": None,
                 }
                 vertical_debug: Path | None = None
-                if selected.vertical_strategy == "tracked_crop":
-                    target = selected.vertical_target_description or ""
+                vertical_primary_override = brief_chapter.vertical_primary_target_description
+                if selected.vertical_strategy == "tracked_crop" or vertical_primary_override:
+                    target = vertical_primary_override or selected.vertical_target_description or ""
                     cache_key = (vertical_frame.frame_id, target, v_start, v_end)
                     track_root = output_dir / "geometry" / selected.feature_id / "vertical"
+                    if vertical_primary_override:
+                        target_key = hashlib.sha256(target.encode("utf-8")).hexdigest()[:10]
+                        track_root = track_root / f"primary-{target_key}"
                     try:
                         if cache_key not in track_cache:
                             proposal, track = _build_track(
@@ -949,7 +1018,12 @@ def run_feature_cut_experiment(
                             )
                             track_cache[cache_key] = (proposal, track, track_root)
                         _, track, track_root = track_cache[cache_key]
-                        vertical_filter, vertical_geometry = _vertical_filter_from_track(track)
+                        vertical_filter, vertical_geometry = _vertical_filter_from_track(
+                            track,
+                            allow_subject_clipping=(
+                                brief_chapter.vertical_crop_mode == "primary_center"
+                            ),
+                        )
                         vertical_debug = track_root / "grounding" / "debug.png"
                     except Exception as error:
                         vertical_geometry = {
@@ -965,7 +1039,7 @@ def run_feature_cut_experiment(
                         source_path=Path(vertical_clip.path),
                         start_ms=v_start,
                         end_ms=v_end,
-                        overlay_path=vertical_overlay,
+                        overlay_path=(vertical_overlay if brief.render_title_overlays else None),
                         base_filter=vertical_filter,
                         output_path=vertical_segment,
                     )
@@ -986,6 +1060,10 @@ def run_feature_cut_experiment(
                     "source_in_ms": v_start,
                     "source_out_ms": v_end,
                     "source_shot_id": v_shot,
+                    "target_description": (
+                        vertical_primary_override or selected.vertical_target_description
+                    ),
+                    "primary_target_override": vertical_primary_override is not None,
                     "grounding_debug": str(vertical_debug.resolve()) if vertical_debug else None,
                     **vertical_geometry,
                 }
@@ -996,8 +1074,13 @@ def run_feature_cut_experiment(
         timings["geometry_and_segment_render_seconds"] = round(monotonic() - stage, 3)
     finally:
         client.close()
-    horizontal_output = output_dir / "renders" / "oppo-reno16-feature-16x9.mp4"
-    vertical_output = output_dir / "renders" / "oppo-reno16-feature-9x16.mp4"
+    output_suffix = "" if brief.render_title_overlays else "-clean"
+    horizontal_output = (
+        output_dir / "renders" / f"oppo-reno16-feature-16x9{output_suffix}.mp4"
+    )
+    vertical_output = (
+        output_dir / "renders" / f"oppo-reno16-feature-9x16{output_suffix}.mp4"
+    )
     horizontal_output.parent.mkdir(parents=True, exist_ok=True)
     stage = monotonic()
     _concat_segments(horizontal_segments, horizontal_output)

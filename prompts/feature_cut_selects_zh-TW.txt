@@ -30,7 +30,9 @@
 不能再只回答 left／center／right。
 
 - 如果一個可持續辨識的主要人物、手機、手機螢幕或配件能由 bbox + mask tracking 保留，使用 `tracked_crop`，並寫出精確、可區分相似物件的 `vertical_target_description`。
-- 如果同時要保留的主體太寬、兩人分居左右、物件無法可靠追蹤，或單一 9:16 crop 會切掉必要資訊，使用 `fit_with_background`。此模式會在模糊直式背景上完整保留 16:9 畫面。
+- 若 brief 提供 `vertical_primary_target_description`，它是人工指定的直式主視覺。優先回傳 `tracked_crop`，不得為保留次要人物或背景而自行改成 `fit_with_background`。
+- 未指定人工主視覺時，若同時要保留的必要主體太寬、兩人分居左右、物件無法可靠追蹤，或單一 9:16 crop 會切掉必要資訊，才使用 `fit_with_background`。
+- `primary_center` 代表可以裁掉次要人物、肩膀、手臂、手機外框或背景 context，但指定的臉、產品、UI 狀態或功能證據仍須可見；不得把它誤解成可任意截斷主要證據。
 - 不得為了強行使用 crop 而犧牲必要人物、手機或 UI。
 - `vertical_target_description` 必須指定實例與層級，例如「畫面右側手中、螢幕顯示法文菜單的白色手機螢幕」，不可只寫「手機」。
 
