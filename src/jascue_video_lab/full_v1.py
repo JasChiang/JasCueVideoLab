@@ -756,7 +756,18 @@ def run_selected_full_clips(
         selected_ids = selected_ids[:max_clips]
     clips = {clip.clip_id: clip for clip in catalog.clips}
     output_dir.mkdir(parents=True, exist_ok=True)
-    entries: list[dict[str, Any]] = []
+    manifest_path = output_dir / "selected-clip-cards.json"
+    entries_by_id: dict[str, dict[str, Any]] = {}
+    if manifest_path.exists():
+        previous = read_json(manifest_path)
+        if (
+            previous.get("catalog_id") == catalog.catalog_id
+            and previous.get("project_id") == plan.project_id
+            and previous.get("selection_source") == "feature_edit_plan"
+        ):
+            entries_by_id = {
+                str(entry["clip_id"]): entry for entry in previous.get("clips", [])
+            }
     total_cost = 0.0
     started = monotonic()
 
@@ -790,35 +801,36 @@ def run_selected_full_clips(
                     file_cache_root=file_cache_root,
                 )
             execution_cost = float(result["execution_pricing"]["estimated_total_cost_usd"])
-            total_cost += execution_cost
-            entries.append(
-                {
-                    "position": position,
-                    "clip_id": clip_id,
-                    "source_asset_id": result["source_asset_id"],
-                    "clip_run": str(clip_dir.resolve()),
-                    "status": "prepared_local" if prepare_only else "ok",
-                    "event_count": None if prepare_only else result["event_count"],
-                    "execution_cost_usd": execution_cost,
-                    "elapsed_seconds": round(monotonic() - clip_started, 3),
-                }
+            lifetime_cost = float(
+                result.get("pricing", {}).get("estimated_total_cost_usd", execution_cost)
             )
+            total_cost += execution_cost
+            entries_by_id[clip_id] = {
+                "position": position,
+                "clip_id": clip_id,
+                "source_asset_id": result["source_asset_id"],
+                "clip_run": str(clip_dir.resolve()),
+                "status": "prepared_local" if prepare_only else "ok",
+                "event_count": None if prepare_only else result["event_count"],
+                "execution_cost_usd": execution_cost,
+                "artifact_lifetime_cost_usd": lifetime_cost,
+                "elapsed_seconds": round(monotonic() - clip_started, 3),
+            }
         except Exception as error:
             append_error(output_dir / "errors", f"clip-{position:03d}", error)
-            entries.append(
-                {
-                    "position": position,
-                    "clip_id": clip_id,
-                    "source_asset_id": f"sha256:{clip.sha256}",
-                    "clip_run": str(clip_dir.resolve()),
-                    "status": "error",
-                    "error_type": type(error).__name__,
-                    "elapsed_seconds": round(monotonic() - clip_started, 3),
-                }
-            )
+            entries_by_id[clip_id] = {
+                "position": position,
+                "clip_id": clip_id,
+                "source_asset_id": f"sha256:{clip.sha256}",
+                "clip_run": str(clip_dir.resolve()),
+                "status": "error",
+                "error_type": type(error).__name__,
+                "elapsed_seconds": round(monotonic() - clip_started, 3),
+            }
 
+        entries = [entries_by_id[item] for item in selected_ids if item in entries_by_id]
         write_json(
-            output_dir / "selected-clip-cards.json",
+            manifest_path,
             {
                 "catalog_id": catalog.catalog_id,
                 "project_id": plan.project_id,
@@ -830,17 +842,18 @@ def run_selected_full_clips(
             },
         )
 
+    entries = [entries_by_id[item] for item in selected_ids if item in entries_by_id]
     succeeded = sum(entry["status"] != "error" for entry in entries)
     result = {
         "catalog_id": catalog.catalog_id,
         "project_id": plan.project_id,
         "selected_clip_count": len(selected_ids),
         "succeeded": succeeded,
-        "failed": len(entries) - succeeded,
+        "failed": len(selected_ids) - succeeded,
         "prepare_only": prepare_only,
         "estimated_new_cost_usd": round(total_cost, 8),
         "elapsed_seconds": round(monotonic() - started, 3),
-        "manifest_path": str((output_dir / "selected-clip-cards.json").resolve()),
+        "manifest_path": str(manifest_path.resolve()),
     }
     write_json(output_dir / "result.json", result)
     return result
