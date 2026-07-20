@@ -13,6 +13,7 @@ from jascue_video_lab.sam_tracking import (
     classify_tracking_state,
     crossed_shot_boundary,
     normalized_box_to_xyxy,
+    normalized_polygon_to_mask,
     pad_normalized_box,
 )
 
@@ -29,6 +30,15 @@ def test_normalized_box_to_xyxy_is_x_first() -> None:
 def test_padding_preserves_semantic_box_order_and_clamps() -> None:
     assert pad_normalized_box([100, 200, 600, 800], 0.1) == [50, 140, 650, 860]
     assert pad_normalized_box([0, 0, 1000, 1000], 0.5) == [0, 0, 1000, 1000]
+
+
+def test_normalized_polygon_rasterizes_in_x_y_order() -> None:
+    mask = normalized_polygon_to_mask(
+        [(100, 200), (600, 200), (600, 800), (100, 800)], 200, 100
+    )
+    geometry = binary_mask_geometry(mask)
+    assert geometry["box_2d"] == pytest.approx([100, 200, 600, 800], abs=6)
+    assert geometry["area_ratio"] == pytest.approx(0.3, abs=0.02)
 
 
 def test_binary_mask_geometry_and_components() -> None:

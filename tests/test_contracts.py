@@ -9,6 +9,8 @@ from jascue_video_lab.models import (
     DirectMomentMap,
     FeatureEditPlan,
     GeminiNativeGroundingProposal,
+    GeminiNativeSegmentationCandidate,
+    GeminiNativeSegmentationProposal,
     GroundingCandidate,
     GroundingProposal,
     Occlusion,
@@ -109,6 +111,53 @@ def test_native_grounding_schema_names_y_first_field_explicitly() -> None:
     schema_text = str(gemini_response_schema(GeminiNativeGroundingProposal))
     assert "box_2d_yxyx" in schema_text
     assert "box_2d'" not in schema_text
+
+
+def test_native_segmentation_schema_preserves_bbox_and_polygon_orders() -> None:
+    schema_text = str(gemini_response_schema(GeminiNativeSegmentationProposal))
+    assert "box_2d_yxyx" in schema_text
+    assert "mask" in schema_text
+    candidate = GeminiNativeSegmentationCandidate(
+        box_2d_yxyx=(100, 200, 800, 900),
+        mask=[(200, 100), (900, 100), (900, 800), (200, 800)],
+        label="phone",
+        confidence=0.9,
+        disambiguation_reason="requested instance",
+    )
+    assert candidate.mask[0] == (200, 100)
+
+
+def test_native_segmentation_rejects_degenerate_polygon() -> None:
+    with pytest.raises(ValidationError, match="non-zero area"):
+        GeminiNativeSegmentationCandidate(
+            box_2d_yxyx=(100, 200, 800, 900),
+            mask=[(200, 100), (300, 200), (400, 300)],
+            label="phone",
+            confidence=0.9,
+            disambiguation_reason="collinear points",
+        )
+
+
+def test_native_segmentation_rejects_polygon_outside_bbox() -> None:
+    with pytest.raises(ValidationError, match="inside its bounding box"):
+        GeminiNativeSegmentationCandidate(
+            box_2d_yxyx=(100, 200, 800, 900),
+            mask=[(100, 100), (900, 100), (900, 800), (100, 800)],
+            label="phone",
+            confidence=0.9,
+            disambiguation_reason="polygon includes another object",
+        )
+
+
+def test_native_segmentation_rejects_self_intersection() -> None:
+    with pytest.raises(ValidationError, match="must not self-intersect"):
+        GeminiNativeSegmentationCandidate(
+            box_2d_yxyx=(100, 100, 900, 900),
+            mask=[(200, 200), (800, 800), (800, 200), (200, 800)],
+            label="phone",
+            confidence=0.9,
+            disambiguation_reason="bow-tie polygon",
+        )
 
 
 def test_temporal_map_rejects_event_past_duration(content_map: ContentMap) -> None:

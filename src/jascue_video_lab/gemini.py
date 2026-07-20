@@ -20,6 +20,7 @@ from .models import (
     FeatureEditBrief,
     FeatureEditPlan,
     GeminiNativeGroundingProposal,
+    GeminiNativeSegmentationProposal,
     GeminiNativeDirectVideoGroundingProposal,
     GroundingCandidate,
     GroundingProposal,
@@ -486,6 +487,132 @@ class GeminiLabClient:
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(output_dir, "grounding", error)
+            raise
+
+    def segment_frame(
+        self,
+        *,
+        media: MediaInfo,
+        frame: ExtractedFrame,
+        event_id: str,
+        event_description: str,
+        entity_id: str,
+        target_description: str,
+        run_id: str,
+        output_dir: Path,
+    ) -> GeminiNativeSegmentationProposal:
+        """Request a target-specific bbox and single polygon mask from one exact frame."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        provenance = _provenance(run_id)
+        prompt = f"""You are a single-frame object Grounding and segmentation system.
+
+Find only this requested target in the provided exact source frame:
+{target_description}
+
+Event context:
+{event_description}
+
+Return a tight object-detection box in `box_2d_yxyx` order
+`[y_min, x_min, y_max, x_max]`, normalized to 0-1000.
+Return the visible object contour in `mask` as one polygon of `[x, y]` points,
+also normalized to 0-1000 with the top-left origin. Do not return an axis-swapped
+polygon. Keep the polygon tight to the requested semantic object and exclude hands,
+stands, shadows, reflections, and background unless they are explicitly part of the
+target. Do not invent off-frame geometry.
+
+If the target is fully invisible, return visible=false and candidates=[]. If it is
+partially occluded, return visible=true, occlusion=partial, lower confidence, and state
+which contour portions are inferred. If multiple instances plausibly match, return all
+reasonable candidates ordered by confidence. Respect the requested object level: a
+phone screen is not the whole phone, and a camera module is not the whole phone.
+
+The following metadata is immutable and must be echoed exactly:
+asset_id: {media.asset_id}
+event_id: {event_id}
+entity_id: {entity_id}
+frame_pts: {frame.frame_pts}
+frame_time_ms: {frame.frame_time_ms}
+frame_hash: {frame.frame_hash}
+source_width: {frame.width}
+source_height: {frame.height}
+model_provenance (return it unchanged with interaction_id=null):
+{provenance.model_dump_json()}
+"""
+        image_data = base64.b64encode(Path(frame.path).read_bytes()).decode("ascii")
+        mime_type = mimetypes.guess_type(frame.path)[0] or "image/png"
+        api_request = {
+            "model": MODEL_ID,
+            "store": False,
+            "input": [
+                {"type": "text", "text": prompt},
+                {"type": "image", "data": image_data, "mime_type": mime_type},
+            ],
+            "generation_config": {
+                "temperature": self.temperature,
+                "thinking_level": "minimal",
+            },
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(GeminiNativeSegmentationProposal),
+            },
+        }
+        write_json(
+            output_dir / "segmentation.request.json",
+            {
+                **api_request,
+                "input": [
+                    api_request["input"][0],
+                    {"type": "image", "mime_type": mime_type, "sha256": frame.frame_hash},
+                ],
+                "bbox_coordinate_order": "ymin,xmin,ymax,xmax",
+                "polygon_coordinate_order": "x,y",
+            },
+        )
+        try:
+            interaction = self.client.interactions.create(**api_request)
+            write_json(output_dir / "segmentation.raw_interaction.json", _raw_dump(interaction))
+            write_json(
+                output_dir / "segmentation.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = GeminiNativeSegmentationProposal.model_validate_json(interaction.output_text)
+            expected = {
+                "asset_id": media.asset_id,
+                "event_id": event_id,
+                "entity_id": entity_id,
+                "frame_pts": frame.frame_pts,
+                "frame_time_ms": frame.frame_time_ms,
+                "frame_hash": frame.frame_hash,
+                "source_width": frame.width,
+                "source_height": frame.height,
+            }
+            mismatches = {
+                key: {"expected": value, "actual": getattr(parsed, key)}
+                for key, value in expected.items()
+                if getattr(parsed, key) != value
+            }
+            if mismatches:
+                raise GeminiContractError(f"Segmentation metadata mismatch: {mismatches}")
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(output_dir / "segmentation.json", final)
+            write_json(
+                output_dir / "segmentation.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                output_dir / "segmentation.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(output_dir, "segmentation", error)
             raise
 
     def ground_video_at_moment(

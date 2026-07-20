@@ -89,6 +89,36 @@ def pad_normalized_box(box_2d: Sequence[int], padding_ratio: float) -> list[int]
     ]
 
 
+def normalized_polygon_to_mask(
+    polygon_xy: Sequence[Sequence[int]], width: int, height: int
+) -> Any:
+    """Rasterize a normalized x/y polygon into an analysis-resolution binary mask."""
+    np, _, _ = _require_segmentation_dependencies()
+    if width <= 0 or height <= 0:
+        raise ValueError("mask dimensions must be positive")
+    if len(polygon_xy) < 3:
+        raise ValueError("mask polygon must contain at least three points")
+    pixels: list[tuple[int, int]] = []
+    for point in polygon_xy:
+        if len(point) != 2:
+            raise ValueError("each mask polygon point must contain x and y")
+        x, y = point
+        if not (0 <= x <= 1000 and 0 <= y <= 1000):
+            raise ValueError("mask polygon coordinates must be within 0..1000")
+        pixels.append(
+            (
+                round(x * (width - 1) / 1000),
+                round(y * (height - 1) / 1000),
+            )
+        )
+    image = Image.new("1", (width, height), 0)
+    ImageDraw.Draw(image).polygon(pixels, fill=1)
+    mask = np.asarray(image, dtype=bool)
+    if not mask.any():
+        raise ValueError("rasterized mask polygon is empty")
+    return mask
+
+
 def binary_mask_geometry(mask: Any) -> dict[str, Any]:
     """Return canonical x-first geometry for a 2-D NumPy-compatible binary mask."""
     np, _, _ = _require_segmentation_dependencies()
@@ -346,8 +376,9 @@ def track_bbox_sam21(
     device: str = "auto",
     ffmpeg_scdet_threshold: float = 4.0,
     seed_box_padding_ratio: float = 0.0,
+    seed_mask_polygon_xy: Sequence[Sequence[int]] | None = None,
 ) -> SegmentationTrack:
-    """Refine a Gemini/manual bbox into a SAM mask and propagate it in both directions."""
+    """Use a Gemini/manual bbox or polygon mask seed and propagate it in both directions."""
     np, torch, build_sam2_video_predictor = _require_segmentation_dependencies()
     if not 0 <= ffmpeg_scdet_threshold <= 100:
         raise ValueError("ffmpeg_scdet_threshold must be in [0, 100]")
@@ -382,14 +413,30 @@ def track_bbox_sam21(
         offload_state_to_cpu=resolved_device != "cpu",
         async_loading_frames=False,
     )
-    sam_prompt_box = pad_normalized_box(seed_box_2d, seed_box_padding_ratio)
-    seed_box_xyxy = normalized_box_to_xyxy(sam_prompt_box, width, height)
-    _, _, seed_logits = predictor.add_new_points_or_box(
-        inference_state=inference_state,
-        frame_idx=seed_index,
-        obj_id="target",
-        box=np.asarray(seed_box_xyxy, dtype=np.float32),
-    )
+    if seed_mask_polygon_xy is not None:
+        if seed_box_padding_ratio != 0:
+            raise ValueError("seed_box_padding_ratio cannot be used with a polygon mask seed")
+        seed_mask = normalized_polygon_to_mask(seed_mask_polygon_xy, width, height)
+        _, _, seed_logits = predictor.add_new_mask(
+            inference_state=inference_state,
+            frame_idx=seed_index,
+            obj_id="target",
+            mask=seed_mask,
+        )
+        sam_prompt_box = None
+        method = "gemini_polygon_seed_sam2_video_mask_propagation"
+        seed_prompt_type = "mask_polygon"
+    else:
+        sam_prompt_box = pad_normalized_box(seed_box_2d, seed_box_padding_ratio)
+        seed_box_xyxy = normalized_box_to_xyxy(sam_prompt_box, width, height)
+        _, _, seed_logits = predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=seed_index,
+            obj_id="target",
+            box=np.asarray(seed_box_xyxy, dtype=np.float32),
+        )
+        method = "gemini_bbox_seed_sam2_video_mask_propagation"
+        seed_prompt_type = "box"
     logits_by_index: dict[int, Any] = {
         seed_index: seed_logits[0, 0].detach().float().cpu().numpy()
     }
@@ -495,7 +542,7 @@ def track_bbox_sam21(
             previous_center = geometry["center_2d"]
     state_counts = Counter(sample.tracking_state for sample in samples)
     track = SegmentationTrack(
-        method="gemini_bbox_seed_sam2_video_mask_propagation",
+        method=method,
         asset_id=asset_id or f"sha256:{sha256_file(video_path)}",
         video_path=str(video_path.resolve()),
         target_description=target_description,
@@ -503,7 +550,13 @@ def track_bbox_sam21(
         seed_time_ms=seed_time_ms,
         seed_sample_index=seed_index,
         semantic_seed_box=list(seed_box_2d),
+        seed_prompt_type=seed_prompt_type,
         sam_prompt_box=sam_prompt_box,
+        sam_prompt_mask_polygon_xy=(
+            [tuple(point) for point in seed_mask_polygon_xy]
+            if seed_mask_polygon_xy is not None
+            else None
+        ),
         seed_box_padding_ratio=seed_box_padding_ratio,
         refined_seed_mask_path=str(Path("masks") / f"{seed_index:06d}.png"),
         analysis_fps=analysis_fps,

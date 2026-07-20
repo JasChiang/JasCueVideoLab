@@ -14,6 +14,49 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _proper_segments_intersect(
+    a: tuple[int, int],
+    b: tuple[int, int],
+    c: tuple[int, int],
+    d: tuple[int, int],
+) -> bool:
+    def orientation(
+        first: tuple[int, int], second: tuple[int, int], third: tuple[int, int]
+    ) -> int:
+        return (second[0] - first[0]) * (third[1] - first[1]) - (
+            second[1] - first[1]
+        ) * (third[0] - first[0])
+
+    return (
+        orientation(a, b, c) * orientation(a, b, d) < 0
+        and orientation(c, d, a) * orientation(c, d, b) < 0
+    )
+
+
+def _polygon_has_proper_self_intersection(points: list[tuple[int, int]]) -> bool:
+    compact = [
+        point
+        for index, point in enumerate(points)
+        if index == 0 or point != points[index - 1]
+    ]
+    if len(compact) > 1 and compact[0] == compact[-1]:
+        compact.pop()
+    count = len(compact)
+    for left_index in range(count):
+        left_start = compact[left_index]
+        left_end = compact[(left_index + 1) % count]
+        for right_index in range(left_index + 1, count):
+            if right_index in {left_index, (left_index + 1) % count}:
+                continue
+            if left_index == (right_index + 1) % count:
+                continue
+            right_start = compact[right_index]
+            right_end = compact[(right_index + 1) % count]
+            if _proper_segments_intersect(left_start, left_end, right_start, right_end):
+                return True
+    return False
+
+
 class BoundaryPrecision(StrEnum):
     COARSE = "coarse"
     SECOND_LEVEL = "second_level"
@@ -332,6 +375,50 @@ class GeminiNativeGroundingCandidate(StrictModel):
         return self
 
 
+class GeminiNativeSegmentationCandidate(StrictModel):
+    """Gemini single-image bbox plus polygon mask in documented native orders."""
+
+    box_2d_yxyx: tuple[
+        NormalizedCoordinate,
+        NormalizedCoordinate,
+        NormalizedCoordinate,
+        NormalizedCoordinate,
+    ]
+    mask: list[tuple[NormalizedCoordinate, NormalizedCoordinate]]
+    label: str
+    confidence: Confidence
+    disambiguation_reason: str
+
+    @model_validator(mode="after")
+    def validate_geometry(self) -> "GeminiNativeSegmentationCandidate":
+        y_min, x_min, y_max, x_max = self.box_2d_yxyx
+        if y_min >= y_max or x_min >= x_max:
+            raise ValueError("box_2d_yxyx must satisfy ymin < ymax and xmin < xmax")
+        if len(self.mask) < 3:
+            raise ValueError("segmentation mask polygon must contain at least three points")
+        twice_area = abs(
+            sum(
+                x1 * y2 - x2 * y1
+                for (x1, y1), (x2, y2) in zip(self.mask, self.mask[1:] + self.mask[:1])
+            )
+        )
+        if _polygon_has_proper_self_intersection(self.mask):
+            raise ValueError("segmentation mask polygon must not self-intersect")
+        if twice_area == 0:
+            raise ValueError("segmentation mask polygon must have non-zero area")
+        xs = [point[0] for point in self.mask]
+        ys = [point[1] for point in self.mask]
+        tolerance = 5
+        if (
+            min(xs) < x_min - tolerance
+            or max(xs) > x_max + tolerance
+            or min(ys) < y_min - tolerance
+            or max(ys) > y_max + tolerance
+        ):
+            raise ValueError("segmentation mask polygon must remain inside its bounding box")
+        return self
+
+
 class GroundingProposal(StrictModel):
     asset_id: str
     event_id: str
@@ -375,6 +462,32 @@ class GeminiNativeGroundingProposal(StrictModel):
 
     @model_validator(mode="after")
     def validate_visibility(self) -> "GeminiNativeGroundingProposal":
+        if not self.visible and self.candidates:
+            raise ValueError("invisible targets must have an empty candidates array")
+        if self.visible and not self.candidates:
+            raise ValueError("visible targets must have at least one candidate")
+        return self
+
+
+class GeminiNativeSegmentationProposal(StrictModel):
+    """Structured Gemini single-frame segmentation response; polygons remain x/y ordered."""
+
+    asset_id: str
+    event_id: str
+    entity_id: str
+    frame_pts: int
+    frame_time_ms: int = Field(ge=0)
+    frame_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_width: int = Field(gt=0)
+    source_height: int = Field(gt=0)
+    visible: bool
+    occlusion: Occlusion
+    visibility_reason: str
+    candidates: list[GeminiNativeSegmentationCandidate]
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_visibility(self) -> "GeminiNativeSegmentationProposal":
         if not self.visible and self.candidates:
             raise ValueError("invisible targets must have an empty candidates array")
         if self.visible and not self.candidates:
@@ -545,7 +658,10 @@ class SegmentationSample(StrictModel):
 
 
 class SegmentationTrack(StrictModel):
-    method: Literal["gemini_bbox_seed_sam2_video_mask_propagation"]
+    method: Literal[
+        "gemini_bbox_seed_sam2_video_mask_propagation",
+        "gemini_polygon_seed_sam2_video_mask_propagation",
+    ]
     asset_id: str
     video_path: str
     target_description: str
@@ -553,7 +669,11 @@ class SegmentationTrack(StrictModel):
     seed_time_ms: int = Field(ge=0)
     seed_sample_index: int = Field(ge=0)
     semantic_seed_box: list[NormalizedCoordinate]
-    sam_prompt_box: list[NormalizedCoordinate]
+    seed_prompt_type: Literal["box", "mask_polygon"] = "box"
+    sam_prompt_box: list[NormalizedCoordinate] | None
+    sam_prompt_mask_polygon_xy: list[
+        tuple[NormalizedCoordinate, NormalizedCoordinate]
+    ] | None = None
     seed_box_padding_ratio: float = Field(ge=0.0, le=1.0)
     refined_seed_mask_path: str
     analysis_fps: float = Field(gt=0, le=60)
@@ -575,11 +695,22 @@ class SegmentationTrack(StrictModel):
         x_min, y_min, x_max, y_max = self.semantic_seed_box
         if x_min >= x_max or y_min >= y_max:
             raise ValueError("semantic_seed_box must satisfy xmin < xmax and ymin < ymax")
-        if len(self.sam_prompt_box) != 4:
-            raise ValueError("sam_prompt_box must contain four coordinates")
-        prompt_x_min, prompt_y_min, prompt_x_max, prompt_y_max = self.sam_prompt_box
-        if prompt_x_min >= prompt_x_max or prompt_y_min >= prompt_y_max:
-            raise ValueError("sam_prompt_box must satisfy xmin < xmax and ymin < ymax")
+        if self.seed_prompt_type == "box":
+            if self.sam_prompt_box is None or len(self.sam_prompt_box) != 4:
+                raise ValueError("box prompts require four sam_prompt_box coordinates")
+            prompt_x_min, prompt_y_min, prompt_x_max, prompt_y_max = self.sam_prompt_box
+            if prompt_x_min >= prompt_x_max or prompt_y_min >= prompt_y_max:
+                raise ValueError("sam_prompt_box must satisfy xmin < xmax and ymin < ymax")
+            if self.sam_prompt_mask_polygon_xy is not None:
+                raise ValueError("box prompts cannot contain a mask polygon")
+        else:
+            if self.sam_prompt_box is not None:
+                raise ValueError("mask polygon prompts cannot contain sam_prompt_box")
+            if (
+                self.sam_prompt_mask_polygon_xy is None
+                or len(self.sam_prompt_mask_polygon_xy) < 3
+            ):
+                raise ValueError("mask polygon prompts require at least three points")
         if self.total_samples != len(self.samples):
             raise ValueError("total_samples must equal len(samples)")
         if sum(self.state_counts.values()) != self.total_samples:
