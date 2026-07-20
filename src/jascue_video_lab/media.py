@@ -159,3 +159,65 @@ def extract_frame(source: Path, requested_time_ms: int, output: Path) -> Extract
         height=height,
     )
 
+
+def create_analysis_proxy(
+    source: Path,
+    output: Path,
+    *,
+    max_side: int = 1920,
+    fps: int = 30,
+    max_duration_delta_ms: int = 100,
+) -> tuple[MediaInfo, dict[str, object]]:
+    """Create a small orientation-corrected semantic-analysis proxy; geometry stays on source."""
+    if max_side < 320 or fps < 1:
+        raise ValueError("analysis proxy max_side and fps must be positive practical values")
+    source_media = probe_video(source)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source.expanduser().resolve(strict=True)),
+            "-map",
+            "0:v:0",
+            "-vf",
+            f"scale={max_side}:{max_side}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "-r",
+            str(fps),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-y",
+            str(output),
+        ]
+    )
+    proxy_media = probe_video(output)
+    duration_delta_ms = abs(proxy_media.duration_ms - source_media.duration_ms)
+    if duration_delta_ms > max_duration_delta_ms:
+        raise MediaCommandError(
+            f"analysis proxy duration differs by {duration_delta_ms} ms; "
+            f"maximum is {max_duration_delta_ms} ms"
+        )
+    record = {
+        "purpose": "Gemini semantic analysis only; original source remains geometry authority",
+        "source_asset_id": source_media.asset_id,
+        "proxy_asset_id": proxy_media.asset_id,
+        "duration_delta_ms": duration_delta_ms,
+        "max_side": max_side,
+        "fps": fps,
+        "original_bytes": source_media.size_bytes,
+        "proxy_bytes": proxy_media.size_bytes,
+        "byte_reduction_ratio": round(1 - proxy_media.size_bytes / source_media.size_bytes, 8),
+    }
+    return proxy_media, record

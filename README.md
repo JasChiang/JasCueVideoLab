@@ -47,6 +47,31 @@ export GEMINI_API_KEY='...'
 
 只使用官方 `google-genai` SDK；模型 ID 固定為穩定版 `gemini-3.5-flash`。程式不依賴已淘汰的 `google-generativeai`，也沒有舊 Gemini model ID。
 
+## 本機 Blind Review Web App
+
+不想透過 Codex 代為判讀時，可直接啟動 human-first 審核介面：
+
+```bash
+cd ~/Experiments/JasCueVideoLab
+set -a; source .env; set +a
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab serve-review
+```
+
+瀏覽器開啟 `http://127.0.0.1:8765`，直接拖入影片。預設只綁定本機 loopback，沒有登入系統；除非完全理解風險，請勿使用 `--allow-network` 對區網開放。
+
+App 的固定順序是：
+
+1. 影片串流寫入本機，ffprobe 與 SHA-256 驗證後建立 session。
+2. 可選擇建立 1080p／30fps analysis proxy；Gemini 語意分析使用 proxy，bbox 仍從原始影片抽幀。
+3. 沒有 target 時只顯示候選卡，且不預選、不顯示候選 confidence。
+4. 使用者選擇候選或自行輸入精確 target，才允許產生 target-locked `MM:SS` 時刻。
+5. 選一個時刻後，FFmpeg 保存原始 frame PTS，再執行單幀 Grounding。
+6. Blind review 只顯示 `Candidate A/B` 框；提交「正確／錯物件／太大／太小／不可見／無法判斷」前，reveal API 會拒絕提供模型 label、confidence 與理由。
+7. 可在畫面拖曳人工修正框；人工判定寫入後才能揭露完整 Gemini proposal。
+8. `匯出完整 JSON` 包含 media identity、human annotations、已揭露 proposals 與尚未審核清單。
+
+持久資料位於被 Git 排除的 `artifacts/blind-review-app/<session-id>/`；跨 session 的 Gemini File API cache 依 analysis source SHA-256 位於 `artifacts/blind-review-file-cache/`。同一 upload identity 在官方 48 小時保存期內會重用。App 不會把 API key 傳到瀏覽器，也不以 browser storage 當實驗資料來源。
+
 ## 產生四種真實影片 fixture
 
 Fixture 是由 Pillow 畫面經 FFmpeg 編碼而成的真實 MP4，不是 API mock。A 是 30 秒無旁白手機 UI 操作；B 是人物與手機同時移動的 16:9 畫面；C 含 0.3 秒快速按鈕狀態；D 含硬切鏡與兩支相似手機。

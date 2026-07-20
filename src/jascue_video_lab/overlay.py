@@ -42,3 +42,37 @@ def draw_grounding_overlay(
     image.save(output_path, format="PNG")
     return output_path
 
+
+def draw_blind_review_overlay(
+    frame_path: Path, proposal: GroundingProposal, output_path: Path
+) -> Path:
+    """Draw neutral candidate letters without model labels, confidence, or reasoning."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(frame_path).convert("RGB") as source:
+        image = source.copy()
+    if image.size != (proposal.source_width, proposal.source_height):
+        raise ValueError("blind-review frame and proposal dimensions differ")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=max(12, round(min(image.size) / 45)))
+    line_width = max(2, round(min(image.size) / 250))
+    for index, candidate in enumerate(proposal.candidates):
+        color = COLORS[index % len(COLORS)]
+        pixels = normalized_to_pixels(candidate.box_2d, *image.size)
+        draw.rectangle(pixels, outline=color, width=line_width)
+        label = f"Candidate {chr(65 + index)}"
+        text_box = draw.textbbox((pixels[0], pixels[1]), label, font=font)
+        label_width = text_box[2] - text_box[0] + 12
+        label_height = text_box[3] - text_box[1] + 10
+        top = max(0, pixels[1] - label_height)
+        draw.rectangle(
+            (pixels[0], top, min(image.width, pixels[0] + label_width), top + label_height),
+            fill=color,
+        )
+        draw.text((pixels[0] + 6, top + 4), label, fill="#080b10", font=font)
+    if not proposal.candidates:
+        message = "NO BOX PROPOSED"
+        height = max(32, image.height // 12)
+        draw.rectangle((0, 0, image.width, height), fill="#6d7480")
+        draw.text((10, 8), message, fill="white", font=font)
+    image.save(output_path, format="PNG")
+    return output_path

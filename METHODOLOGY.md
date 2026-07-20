@@ -153,3 +153,16 @@ uv run jascue-video-lab direct-moment-repeat ARTIFACT \
 - 模型信心分數不能取代人工檢查。
 
 可重現性依賴保存 raw API response、Structured Output schema validation、原始 frame hash、exact PTS、debug overlay、模型與 SDK provenance，以及同一輸入的多次比較；不能只保存整理後的漂亮結果。
+
+## 本機 Blind Review App
+
+Repository 內提供可直接拖放影片的本機 Web App。它不是展示報告，而是把上述方法論變成有狀態的審核流程：候選不預選、target 必須由使用者鎖定、Grounding 結果只顯示中性 Candidate 字母，且 reveal endpoint 在人工判定 JSON 寫入前一律拒絕存取模型 label、confidence 與理由。
+
+人工判定至少保存 reviewer type、target、semantic request、exact frame PTS、frame hash、verdict、備註、選填的人工修正 bbox，以及 `model_details_revealed_before_annotation=false`。這能證明操作順序，但 reviewer 仍應如實填寫身分；系統不能單靠欄位宣稱某份標註具有獨立 ground-truth 品質。
+
+```bash
+set -a; source .env; set +a
+uv run jascue-video-lab serve-review
+```
+
+開啟 `http://127.0.0.1:8765`。預設 local-only，影片、raw response、人工標註與匯出資料都保存在被 Git 排除的本機 artifacts。

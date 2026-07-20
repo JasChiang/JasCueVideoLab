@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>JasCueVideoLab · Blind Review</title>
+    <meta name="description" content="Local human-first Gemini video Grounding validation." />
+    <link rel="stylesheet" href="/static/app.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">JasCue<span>VideoLab</span></a>
+      <div class="trust"><i></i> Local blind review</div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <p class="eyebrow">HUMAN-FIRST VALIDATION</p>
+        <h1>先選對物件，<br /><em>再檢查框得準不準。</em></h1>
+        <p class="lede">影片、API key、raw response 與人工判定都留在你的 Mac。提交判定前，不顯示模型 confidence 或理由。</p>
+      </section>
+
+      <section id="upload-section" class="panel upload-panel">
+        <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="選擇或拖入影片">
+          <div class="drop-icon">＋</div>
+          <h2>拖入一支影片</h2>
+          <p>或點此選擇 MP4／MOV；最大 2 GB</p>
+          <input id="video-file" type="file" accept="video/*,.mp4,.mov,.m4v" hidden />
+        </div>
+        <label class="proxy-toggle">
+          <input id="use-proxy" type="checkbox" checked />
+          <span><strong>建立 analysis proxy</strong><small>建議開啟：語意分析用 1080p／30fps，bbox 仍取原始影片影格。</small></span>
+        </label>
+      </section>
+
+      <section id="workspace" class="workspace hidden">
+        <div class="session-strip">
+          <div><span>SESSION</span><code id="session-id"></code></div>
+          <div id="stage-badge" class="stage-badge">UPLOADED</div>
+          <a id="export-link" class="text-link" href="#">匯出完整 JSON</a>
+        </div>
+
+        <div class="media-grid">
+          <div class="video-shell"><video id="source-video" controls playsinline></video></div>
+          <div class="media-facts">
+            <p class="eyebrow">SOURCE OF TRUTH</p>
+            <h2 id="asset-name">Video</h2>
+            <dl>
+              <div><dt>Duration</dt><dd id="media-duration">—</dd></div>
+              <div><dt>Display</dt><dd id="media-dimensions">—</dd></div>
+              <div><dt>Frame rate</dt><dd id="media-fps">—</dd></div>
+              <div><dt>SHA-256</dt><dd><code id="media-hash">—</code></dd></div>
+            </dl>
+          </div>
+        </div>
+
+        <section class="workflow-step" id="target-step">
+          <div class="step-heading"><span>01</span><div><p class="eyebrow">TARGET SELECTION</p><h2>你要驗證哪一個物件？</h2></div></div>
+          <p class="step-copy">沒有指定目標時，Gemini 只提出候選，不會自動進入 Grounding。候選卡不顯示 confidence。</p>
+          <div class="action-row">
+            <button id="suggest-button" class="primary-button">讓 Gemini 提出候選</button>
+            <span class="or">或自行描述</span>
+          </div>
+          <form id="manual-target-form" class="manual-form">
+            <label>Target ID<input id="manual-target-id" placeholder="center-purple-phone" /></label>
+            <label class="wide">精確描述<textarea id="manual-target-description" rows="3" placeholder="描述物件層級、顏色、位置，以及應排除的相似物件。"></textarea></label>
+            <button class="secondary-button" type="submit">使用我的 target</button>
+          </form>
+          <div id="candidate-meta" class="callout hidden"></div>
+          <div id="candidate-grid" class="candidate-grid"></div>
+          <div id="selection-summary" class="selection-summary hidden"></div>
+        </section>
+
+        <section class="workflow-step locked" id="moment-step">
+          <div class="step-heading"><span>02</span><div><p class="eyebrow">COARSE SEMANTIC TIME</p><h2>找物件清楚可見的時刻</h2></div></div>
+          <p class="step-copy">Gemini 只回傳 MM:SS。它是搜尋提示，不是 frame-accurate 剪輯點。</p>
+          <button id="moments-button" class="primary-button">產生 target-locked 時刻</button>
+          <div id="moment-grid" class="moment-grid"></div>
+        </section>
+
+        <section class="workflow-step locked" id="review-step">
+          <div class="step-heading"><span>03</span><div><p class="eyebrow">BLIND BBOX REVIEW</p><h2>先判斷，再揭露模型細節</h2></div></div>
+          <p class="step-copy">框只標為 Candidate A／B。你提交判定前，API 也不會提供模型 label、confidence 或 disambiguation reason。</p>
+          <div id="review-empty" class="empty-state">從上一階段選一個時刻進行 Grounding。</div>
+          <div id="review-card" class="review-card hidden">
+            <div class="review-toolbar">
+              <div><span>Target</span><strong id="review-target"></strong></div>
+              <div><span>Semantic request</span><strong id="review-request-time"></strong></div>
+              <div><span>Exact frame PTS</span><strong id="review-frame-time"></strong></div>
+            </div>
+            <div class="canvas-shell"><canvas id="review-canvas"></canvas></div>
+            <div class="correction-tools">
+              <button id="draw-correction" class="ghost-button" type="button">畫人工修正框</button>
+              <button id="clear-correction" class="ghost-button" type="button">清除修正框</button>
+              <code id="correction-value">尚未提供人工框</code>
+            </div>
+            <form id="review-form" class="review-form">
+              <label>Reviewer（選填）<input id="reviewer-name" placeholder="你的名字或代號" /></label>
+              <fieldset>
+                <legend>你的判定</legend>
+                <div class="verdict-grid">
+                  <label><input type="radio" name="verdict" value="correct" required /><span>正確</span></label>
+                  <label><input type="radio" name="verdict" value="wrong_object" /><span>選錯物件</span></label>
+                  <label><input type="radio" name="verdict" value="box_too_large" /><span>框太大</span></label>
+                  <label><input type="radio" name="verdict" value="box_too_small" /><span>框太小</span></label>
+                  <label><input type="radio" name="verdict" value="target_not_visible" /><span>目標不可見</span></label>
+                  <label><input type="radio" name="verdict" value="unable_to_judge" /><span>無法判定</span></label>
+                </div>
+              </fieldset>
+              <label>備註<textarea id="review-notes" rows="3" placeholder="記錄遮擋、相似物件、框線問題或其他觀察。"></textarea></label>
+              <button class="primary-button" type="submit">鎖定人工判定並揭露</button>
+            </form>
+          </div>
+          <div id="reveal-card" class="reveal-card hidden">
+            <div><p class="eyebrow">MODEL DETAILS · REVEALED AFTER REVIEW</p><h3>人工判定已保存</h3></div>
+            <img id="revealed-image" alt="揭露模型標籤與 confidence 的 bbox 圖" />
+            <pre id="reveal-json"></pre>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div id="busy" class="busy hidden" role="status" aria-live="polite"><div class="spinner"></div><strong id="busy-title">處理中</strong><span id="busy-copy">請勿關閉此頁。</span></div>
+    <div id="toast" class="toast hidden" role="alert"></div>
+  </body>
+</html>

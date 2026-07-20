@@ -5,9 +5,12 @@ description = "Isolated Gemini 3.5 Flash video understanding and single-frame gr
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "fastapi>=0.116.0,<1",
   "google-genai>=2.3.0,<3",
   "pillow>=11.3.0,<12",
   "pydantic>=2.11.0,<3",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn>=0.35.0,<1",
 ]
 
 [dependency-groups]
@@ -33,4 +36,3 @@ packages = ["src/jascue_video_lab"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-

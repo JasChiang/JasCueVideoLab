@@ -293,6 +293,21 @@ def command_suggest_targets(args: argparse.Namespace) -> int:
     )
 
 
+def command_serve_review(args: argparse.Namespace) -> int:
+    if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.allow_network:
+        raise ValueError("non-loopback host requires explicit --allow-network")
+    import uvicorn
+
+    uvicorn.run(
+        "jascue_video_lab.webapp:app",
+        host=args.host,
+        port=args.port,
+        reload=False,
+        access_log=True,
+    )
+    return 0
+
+
 def command_pricing(args: argparse.Namespace) -> int:
     summary = summarize_usage_and_list_price(args.artifact_root)
     output = args.output or (args.artifact_root / "pricing.json")
@@ -1024,6 +1039,19 @@ def build_parser() -> argparse.ArgumentParser:
     pricing_parser.add_argument("artifact_root", type=Path)
     pricing_parser.add_argument("--output", type=Path)
     pricing_parser.set_defaults(handler=command_pricing)
+
+    serve_parser = subparsers.add_parser(
+        "serve-review",
+        help="Start the local blind-review web app",
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="Explicitly allow binding beyond this Mac; no authentication is provided",
+    )
+    serve_parser.set_defaults(handler=command_serve_review)
 
     extract_parser = subparsers.add_parser("extract", help="Extract orientation-corrected frame with exact PTS")
     extract_parser.add_argument("video", type=Path)
