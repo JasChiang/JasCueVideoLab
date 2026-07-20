@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import subprocess
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -174,8 +175,14 @@ def _render_tracking_video(
     label: str,
     cv2: Any,
 ) -> None:
+    intermediate_path = output_path.with_name(
+        f"{output_path.stem}.mp4v{output_path.suffix}"
+    )
     writer = cv2.VideoWriter(
-        str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), analysis_fps, (width, height)
+        str(intermediate_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        analysis_fps,
+        (width, height),
     )
     if not writer.isOpened():
         raise RuntimeError("OpenCV could not initialize the MP4 debug writer")
@@ -212,6 +219,30 @@ def _render_tracking_video(
             writer.write(frame)
     finally:
         writer.release()
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(intermediate_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        check=True,
+    )
+    intermediate_path.unlink()
 
 
 def _render_tracking_html(output_dir: Path, result: dict[str, Any]) -> Path:
