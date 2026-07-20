@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from jascue_video_lab.full_v1 import (
+    _render_dense_contact_sheets,
     _revalidate_saved_clip_card,
     _shared_upload_dir,
     create_dense_event_catalog,
@@ -18,15 +19,20 @@ from jascue_video_lab.full_v1 import (
     mmss_to_ms,
     run_full_clip,
     run_full_library,
+    run_selected_full_clips,
+    selected_clip_ids_from_feature_plan,
 )
 from jascue_video_lab.media import create_analysis_proxy, has_audio_stream, probe_video
 from jascue_video_lab.models import (
     DenseEventSelection,
+    DenseFrame,
     Entity,
     EntityKind,
     FullClipCard,
     FullClipEvent,
     ModelProvenance,
+    FeatureEditPlan,
+    RushesCatalog,
 )
 from jascue_video_lab.shots import ShotManifest, ShotSegment
 
@@ -276,6 +282,30 @@ def test_dense_catalog_preserves_exact_pts_and_separate_transport(tmp_path: Path
     assert all(Path(frame.transport_image_path).exists() for frame in catalog.frames)
     assert all(frame.frame_pts >= 0 for frame in catalog.frames)
     assert all(frame.frame_hash != frame.transport_image_hash for frame in catalog.frames)
+
+
+def test_dense_contact_sheet_letterboxes_without_stretching(tmp_path: Path) -> None:
+    transport = tmp_path / "portrait.jpg"
+    from PIL import Image
+
+    Image.new("RGB", (100, 200), "#ff0000").save(transport)
+    frame = DenseFrame(
+        frame_id="DF000001",
+        event_id="event-demo",
+        requested_time_ms=0,
+        frame_time_ms=0,
+        frame_pts=0,
+        frame_hash="1" * 64,
+        width=100,
+        height=200,
+        image_path=str(transport),
+        transport_image_path=str(transport),
+        transport_image_hash="2" * 64,
+    )
+    paths, _ = _render_dense_contact_sheets([frame], tmp_path / "sheets")
+    with Image.open(paths[0]).convert("RGB") as sheet:
+        assert sheet.getpixel((10, 100))[0] < 80
+        assert sheet.getpixel((160, 100))[0] > 180
 
 
 def test_shot_catalog_keeps_one_lightweight_middle_jpeg(tmp_path: Path) -> None:
@@ -559,3 +589,125 @@ def test_shared_upload_cache_migrates_only_exact_proxy_hash(tmp_path: Path) -> N
     assert resolved == shared_root / proxy_hash / "upload"
     assert json.loads((resolved / "file_cache.json").read_text())["file_name"] == "files/existing"
     assert json.loads((resolved / "migration.json").read_text())["proxy_sha256"] == proxy_hash
+
+
+def _rushes_catalog(tmp_path: Path) -> RushesCatalog:
+    clips = []
+    frames = []
+    for index in range(3):
+        clip_id = f"clip-{index + 1}"
+        source = tmp_path / f"source-{index + 1}.mp4"
+        source.touch()
+        clips.append(
+            {
+                "clip_id": clip_id,
+                "path": str(source),
+                "sha256": str(index + 1) * 64,
+                "duration_ms": 1000,
+                "width": 1920,
+                "height": 1080,
+                "frame_rate": "30/1",
+                "size_bytes": 1,
+            }
+        )
+        frames.append(
+            {
+                "frame_id": f"RF{index + 1:06d}",
+                "clip_id": clip_id,
+                "requested_time_ms": 0,
+                "image_path": str(tmp_path / f"frame-{index + 1}.jpg"),
+            }
+        )
+    return RushesCatalog.model_validate(
+        {
+            "catalog_id": "catalog-test",
+            "source_directory": str(tmp_path),
+            "sample_interval_ms": 2000,
+            "total_duration_ms": 3000,
+            "clips": clips,
+            "frames": frames,
+            "analysis_reel_path": str(tmp_path / "reel.mp4"),
+            "generated_at": "now",
+        }
+    )
+
+
+def _feature_plan() -> FeatureEditPlan:
+    chapter_defaults = {
+        "evidence_status": "supported",
+        "observed_visual_evidence": "visible product",
+        "selection_reason": "clear shot",
+        "horizontal_strategy": "original",
+        "horizontal_zoom_intent": "none",
+        "horizontal_target_description": None,
+        "vertical_strategy": "fit_with_background",
+        "vertical_target_description": None,
+        "quality_risks": [],
+        "confidence": 0.9,
+    }
+    return FeatureEditPlan.model_validate(
+        {
+            "project_id": "project-test",
+            "catalog_id": "catalog-test",
+            "title": "test",
+            "chapters": [
+                {
+                    **chapter_defaults,
+                    "feature_id": "feature-a",
+                    "horizontal_frame_id": "RF000001",
+                    "vertical_frame_id": "RF000002",
+                },
+                {
+                    **chapter_defaults,
+                    "feature_id": "feature-b",
+                    "horizontal_frame_id": "RF000001",
+                    "vertical_frame_id": "RF000001",
+                },
+            ],
+            "uncertainties": [],
+            "model_provenance": _provenance().model_dump(mode="json"),
+        }
+    )
+
+
+def test_selected_clip_ids_are_unique_and_preserve_plan_order(tmp_path: Path) -> None:
+    assert selected_clip_ids_from_feature_plan(_rushes_catalog(tmp_path), _feature_plan()) == [
+        "clip-1",
+        "clip-2",
+    ]
+
+
+def test_selected_full_clips_touch_only_plan_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog = _rushes_catalog(tmp_path)
+    plan = _feature_plan()
+    catalog_path = tmp_path / "catalog.json"
+    plan_path = tmp_path / "plan.json"
+    catalog_path.write_text(catalog.model_dump_json(), encoding="utf-8")
+    plan_path.write_text(plan.model_dump_json(), encoding="utf-8")
+    prepared = tmp_path / "prepared"
+    for clip in catalog.clips[:2]:
+        clip_dir = prepared / "clips" / clip.sha256[:16]
+        clip_dir.mkdir(parents=True)
+        (clip_dir / "analysis-proxy.mp4").touch()
+
+    def fake_run_full_clip(path: Path, output_dir: Path, **kwargs):
+        raise AssertionError("prepare-only selected validation must make no API/run calls")
+
+    monkeypatch.setattr("jascue_video_lab.full_v1.run_full_clip", fake_run_full_clip)
+    result = run_selected_full_clips(
+        catalog_path=catalog_path,
+        plan_path=plan_path,
+        prepared_library_dir=prepared,
+        output_dir=tmp_path / "selected",
+        clip_card_prompt="clip",
+        dense_prompt="dense",
+        prepare_only=True,
+    )
+
+    assert result["selected_clip_count"] == 2
+    assert result["failed"] == 0
+    assert "source-3.mp4" not in json.dumps(
+        json.loads((tmp_path / "selected" / "selected-clip-cards.json").read_text())
+    )

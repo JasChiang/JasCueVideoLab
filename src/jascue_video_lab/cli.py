@@ -16,7 +16,12 @@ from .billing import summarize_usage_and_list_price
 from .compare import compare_runs
 from .feature_cut import run_feature_cut_experiment
 from .fixtures import generate_fixtures
-from .full_v1 import run_full_clip, run_full_event_geometry, run_full_library
+from .full_v1 import (
+    run_full_clip,
+    run_full_event_geometry,
+    run_full_library,
+    run_selected_full_clips,
+)
 from .gemini import GeminiLabClient
 from .media import extract_frame, probe_video, sha256_file
 from .models import (
@@ -567,6 +572,24 @@ def command_full_library(args: argparse.Namespace) -> int:
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
+
+
+def command_full_selected(args: argparse.Namespace) -> int:
+    result = run_selected_full_clips(
+        catalog_path=args.catalog_json,
+        plan_path=args.plan_json,
+        prepared_library_dir=args.prepared_library,
+        output_dir=args.output_dir,
+        clip_card_prompt=_load_prompt("full_clip_card_mmss_zh-TW.txt"),
+        dense_prompt=_load_prompt("dense_event_frame_selection_zh-TW.txt"),
+        max_clips=args.max_clips,
+        temperature=args.temperature,
+        audio_mode=args.audio_mode,
+        prepare_only=args.prepare_only,
+        file_cache_root=args.file_cache_root,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["failed"] == 0 else 1
 
 
 def command_full_ground_event(args: argparse.Namespace) -> int:
@@ -1515,6 +1538,29 @@ def build_parser() -> argparse.ArgumentParser:
     full_library_parser.add_argument("--output-dir", type=Path, required=True)
     full_library_parser.add_argument("--file-cache-root", type=Path)
     full_library_parser.set_defaults(handler=command_full_library)
+
+    full_selected_parser = subparsers.add_parser(
+        "full-selected",
+        help="Run Full Clip Cards only for source clips referenced by a feature edit plan",
+    )
+    full_selected_parser.add_argument("catalog_json", type=Path)
+    full_selected_parser.add_argument("plan_json", type=Path)
+    full_selected_parser.add_argument("--prepared-library", type=Path, required=True)
+    full_selected_parser.add_argument("--max-clips", type=int)
+    full_selected_parser.add_argument("--temperature", type=float, default=0.2)
+    full_selected_parser.add_argument(
+        "--audio-mode",
+        choices=["auto", "off", "required"],
+        default="auto",
+    )
+    full_selected_parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Resolve and validate selected prepared proxies without Gemini network calls",
+    )
+    full_selected_parser.add_argument("--file-cache-root", type=Path)
+    full_selected_parser.add_argument("--output-dir", type=Path, required=True)
+    full_selected_parser.set_defaults(handler=command_full_selected)
 
     full_ground_parser = subparsers.add_parser(
         "full-ground-event",

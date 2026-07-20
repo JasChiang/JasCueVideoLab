@@ -32,7 +32,7 @@
 
 ## Full v1：完整逐片 Clip Card，按需才做 geometry
 
-Full v1 不會把整支毛片切成數百張圖片送入模型。每支影片先建立 720p analysis proxy，讓 Gemini 看完整影片並以 Structured Output 寫一張 `MM:SS` Clip Card；音訊採選配，預設 `auto` 是來源有音軌才保留，沒有音軌就只依視覺分析。FFmpeg shot detection 只保存切點資料與每個 shot 一張 960px 中間 JPEG 供稽核。只有使用者或剪輯 brief 選中事件、且確實需要 9:16 reframe／callout／去背時，才從原始影片抽一張 exact frame 取得 bbox，並選配 SAM 2.1 在該事件與 shot 內追蹤。
+Full v1 不會把整支毛片切成數百張圖片送入模型。每支影片先建立 720p analysis proxy，讓 Gemini 看完整影片並以 Structured Output 寫一張 `MM:SS` Clip Card；音訊採選配，預設 `auto` 是來源有音軌才保留，沒有音軌就只依視覺分析。FFmpeg shot detection 只保存切點資料與每個 shot 一張 960px 中間 JPEG 供稽核。只有使用者或剪輯 brief 選中事件、且確實需要 9:16 reframe／callout／去背時，才從原始影片抽一張 exact frame 取得 bbox，並選配 SAM 2.1。shot-local propagation 是正式目標；目前實驗版仍需完成下方 production-readiness gate 才能作剪輯輸入。
 
 ```text
 毛片資料夾
@@ -60,6 +60,13 @@ uv run jascue-video-lab full-clip VIDEO.mp4 \
 uv run jascue-video-lab full-library /path/to/rushes \
   --output-dir artifacts/full-v1-library
 
+# 已有 feature plan 時，只替實際入選的 source clips 建立 Clip Cards
+uv run jascue-video-lab full-selected \
+  artifacts/my-rushes-run/catalog.json \
+  artifacts/my-feature-cut/gemini-plan/feature_edit_plan.json \
+  --prepared-library artifacts/full-v1-library-prepared \
+  --output-dir artifacts/my-selected-clip-cards
+
 # 只有被選中的事件才抽原始影格並選配 SAM
 uv run jascue-video-lab full-ground-event \
   artifacts/full-v1-library/clips/ASSET_PREFIX EVENT_ID \
@@ -73,7 +80,9 @@ uv run jascue-video-lab full-clip VIDEO.mp4 \
 
 `--audio-mode auto` 是預設值：有音軌就保留，無音軌也正常完成；`off` 明確移除音訊；`required` 只適合音訊證據不可缺少的實驗，來源沒有音軌時會保存錯誤並停止該片。artifact 會記錄 `source_has_audio` 與 `proxy_has_audio`，Clip Card 不得為 silent source 捏造 audio evidence。
 
-cache 會同時驗證 source hash、proxy hash、模型、schema、prompt fingerprint 與實際保存的 raw request；prompt 改變一定重跑。File API cache 以 exact proxy SHA-256 跨 library 共用，並在每次使用前查詢遠端 `ACTIVE` 狀態；不同編碼／解析度的 proxy、原始 4K 與整批 analysis reel 不會互相冒用。成本報告分成本次新增請求 `execution-pricing.json` 與含歷史的 artifact lifetime `pricing.json`。公開 library index 不含使用者名稱、絕對路徑或原始檔名；這些資訊只保存在 gitignored private manifest。
+Clip Card response reuse 會驗證 source hash、proxy hash、模型、schema、prompt fingerprint 與實際保存的 raw request；prompt 改變一定重跑。File API cache 以 exact proxy SHA-256 跨 library 共用，並在每次使用前查詢遠端 `ACTIVE` 狀態；不同編碼／解析度的 proxy、原始 4K 與整批 analysis reel 不會互相冒用。成本報告分成本次新增請求 `execution-pricing.json` 與含歷史的 artifact lifetime `pricing.json`。公開 library index 不含使用者名稱、絕對路徑或原始檔名；這些資訊只保存在 gitignored private manifest。
+
+這不代表所有階段 cache 都已達 production 級。2026-07 的架構審查發現 proxy、shot／dense catalog、Grounding 與 SAM 的部分重用仍以「檔案存在」為主，尚未把所有來源、frame、target、prompt、schema、模型、checkpoint 與 FFmpeg/SAM 參數綁成單一 fingerprint。完成前不要在同一 output directory 偷換來源或參數，也不要把 cache hit 當成內容身分已驗證。
 
 若執行環境禁止批次外傳，可先完全離線準備；此模式不建立 Gemini client：
 
@@ -83,6 +92,19 @@ uv run jascue-video-lab full-library /path/to/rushes \
 ```
 
 之後在允許連線的環境移除 `--prepare-only` 重跑同一 output directory，會重用 proxy、shot manifest 與 audit frames，只執行尚未完成的 File API／Clip Card 階段。
+
+若批次上傳被政策阻擋，但已經有一份 feature plan，可以先用 `full-selected --prepare-only` 在本機解析實際入選的 clip IDs。此模式只驗證既有 prepared proxies，完全不建立 Gemini client；之後在使用者自己的允許環境，以相同指令移除 `--prepare-only`，依序處理入選素材，而不是重跑整個資料夾。
+
+### Production-readiness gate
+
+目前最可信的輸出是「可搜尋的 Clip Card」與「exact-frame bbox proposal」。下列四項完成前，本專案不宣稱已形成 production 自動剪輯器：
+
+1. seed 必須先映射到唯一 shot，SAM 的實際輸入影片要裁成 `event ∩ seed shot`；不能先跨鏡追蹤，再只把結果標成可疑。
+2. 多候選或相似物件不得只取最高 model confidence；必須進入 `needs_human_review`，保存候選身分、可見特徵與排除特徵。
+3. 每階段 cache manifest 必須綁定 source/proxy/frame hash、target/candidate、prompt/schema/model、shot bounds、checkpoint 與處理參數；任一輸入改變皆 fail closed。
+4. renderer 只能消費人工核准的 in/out、seed、track 與 crop；每個 tracking sample 要能回映原始 source PTS，並保存 identity verification 狀態。
+
+另外，silent source 不得生成 audio evidence、失敗但已有 usage 的 API response 仍必須計價、公開匯出需採 allowlist sanitizer。完整測試還要加入 non-zero PTS、VFR、B-frame、rotation/edit-list、快速 UI 命中，以及相似物件跨鏡 identity-switch 等 fixture。
 
 ```bash
 # 一次完成 catalog、Gemini selects、雙比例粗剪、review HTML 與成本／計時
@@ -131,6 +153,8 @@ uv run jascue-video-lab feature-cut \
 ```
 
 OPPO Reno16 真實實跑輸出兩支 74.176 秒無燒錄字卡影片。16:9 有 3 章通過幾何 gate 後套用 1.12–1.35× reframe；9:16 的 11 章皆採動態 tracked crop，其中 hero 與 3D 星球以明確 `primary_center` 犧牲部分次要 context，沒有模糊背景。累積 18/18 Grounding schema 通過，全部 bbox 與每 2 秒 contact sheet 經視覺檢查；19 個 Gemini requests 的牌價估算為 US$0.2095485。詳見 [REPORT-OPPO-RENO16-FEATURE-CUT.md](REPORT-OPPO-RENO16-FEATURE-CUT.md)。
+
+若 geometry 與片段已經渲染，只想比較另一種敘事順序，不需要再呼叫 Gemini。`scripts/resequence_segments.py` 讀取明確的 trim/sequence JSON，重新編排現有編號 A/V segments，並輸出包含每段來源、trim 與新時間軸的 manifest。這只適合可稽核的 picture-edit A/B；它不會把既有片段描述冒充成新 Full Clip Card，也不能取代原片層級的 take selection。
 
 ## 重要界線
 

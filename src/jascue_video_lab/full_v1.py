@@ -10,7 +10,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .billing import summarize_usage_and_list_price, summarize_usage_files
 from .gemini import GeminiLabClient, MODEL_ID
@@ -24,7 +24,9 @@ from .models import (
     DerivedClipTimeline,
     FullClipCard,
     FullClipEvent,
+    FeatureEditPlan,
     GroundingProposal,
+    RushesCatalog,
     SegmentationTrack,
     ShotRepresentativeFrame,
 )
@@ -149,7 +151,13 @@ def _render_dense_contact_sheets(frames: list[DenseFrame], output_dir: Path) -> 
         canvas = Image.new("RGB", (cell_width * columns, cell_height * rows), "#101418")
         for local_index, frame in enumerate(frames[start : start + page_size]):
             with Image.open(frame.transport_image_path).convert("RGB") as source:
-                fitted = source.resize((cell_width, cell_height))
+                fitted = ImageOps.pad(
+                    source,
+                    (cell_width, cell_height),
+                    method=Image.Resampling.LANCZOS,
+                    color="#101418",
+                    centering=(0.5, 0.5),
+                )
             x = (local_index % columns) * cell_width
             y = (local_index // columns) * cell_height
             canvas.paste(fitted, (x, y))
@@ -699,6 +707,143 @@ def run_full_clip(
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv"}
 DEFAULT_FILE_CACHE_ROOT = Path(__file__).resolve().parents[2] / "artifacts" / "full-v1-file-cache"
+
+
+def selected_clip_ids_from_feature_plan(
+    catalog: RushesCatalog,
+    plan: FeatureEditPlan,
+) -> list[str]:
+    """Resolve the unique source clips actually referenced by an edit plan."""
+    if plan.catalog_id != catalog.catalog_id:
+        raise ValueError("feature plan and rushes catalog IDs differ")
+    frames = {frame.frame_id: frame for frame in catalog.frames}
+    selected: list[str] = []
+    seen: set[str] = set()
+    for chapter in plan.chapters:
+        for frame_id in (chapter.horizontal_frame_id, chapter.vertical_frame_id):
+            if frame_id is None:
+                continue
+            if frame_id not in frames:
+                raise ValueError(f"feature plan references unknown frame ID: {frame_id}")
+            clip_id = frames[frame_id].clip_id
+            if clip_id not in seen:
+                seen.add(clip_id)
+                selected.append(clip_id)
+    return selected
+
+
+def run_selected_full_clips(
+    *,
+    catalog_path: Path,
+    plan_path: Path,
+    prepared_library_dir: Path,
+    output_dir: Path,
+    clip_card_prompt: str,
+    dense_prompt: str,
+    max_clips: int | None = None,
+    temperature: float = 0.2,
+    audio_mode: str = "auto",
+    prepare_only: bool = False,
+    file_cache_root: Path | None = None,
+) -> dict[str, Any]:
+    """Run Full Clip Cards only for clips already selected by a feature plan."""
+    if max_clips is not None and max_clips < 1:
+        raise ValueError("max_clips must be at least one")
+    catalog = RushesCatalog.model_validate(read_json(catalog_path))
+    plan = FeatureEditPlan.model_validate(read_json(plan_path))
+    selected_ids = selected_clip_ids_from_feature_plan(catalog, plan)
+    if max_clips is not None:
+        selected_ids = selected_ids[:max_clips]
+    clips = {clip.clip_id: clip for clip in catalog.clips}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    total_cost = 0.0
+    started = monotonic()
+
+    for position, clip_id in enumerate(selected_ids, start=1):
+        clip = clips.get(clip_id)
+        if clip is None:
+            raise ValueError(f"selected frame belongs to unknown clip: {clip_id}")
+        clip_dir = prepared_library_dir / "clips" / clip.sha256[:16]
+        if not (clip_dir / "analysis-proxy.mp4").exists():
+            raise FileNotFoundError(
+                f"prepared analysis proxy missing for selected clip {clip_id}: {clip_dir}"
+            )
+        clip_started = monotonic()
+        try:
+            if prepare_only:
+                result = {
+                    "source_asset_id": f"sha256:{clip.sha256}",
+                    "event_count": None,
+                    "execution_pricing": {"estimated_total_cost_usd": 0.0},
+                }
+            else:
+                result = run_full_clip(
+                    Path(clip.path),
+                    clip_dir,
+                    clip_card_prompt=clip_card_prompt,
+                    dense_prompt=dense_prompt,
+                    temperature=temperature,
+                    audio_mode=audio_mode,
+                    dense_mode="none",
+                    prepare_only=False,
+                    file_cache_root=file_cache_root,
+                )
+            execution_cost = float(result["execution_pricing"]["estimated_total_cost_usd"])
+            total_cost += execution_cost
+            entries.append(
+                {
+                    "position": position,
+                    "clip_id": clip_id,
+                    "source_asset_id": result["source_asset_id"],
+                    "clip_run": str(clip_dir.resolve()),
+                    "status": "prepared_local" if prepare_only else "ok",
+                    "event_count": None if prepare_only else result["event_count"],
+                    "execution_cost_usd": execution_cost,
+                    "elapsed_seconds": round(monotonic() - clip_started, 3),
+                }
+            )
+        except Exception as error:
+            append_error(output_dir / "errors", f"clip-{position:03d}", error)
+            entries.append(
+                {
+                    "position": position,
+                    "clip_id": clip_id,
+                    "source_asset_id": f"sha256:{clip.sha256}",
+                    "clip_run": str(clip_dir.resolve()),
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "elapsed_seconds": round(monotonic() - clip_started, 3),
+                }
+            )
+
+        write_json(
+            output_dir / "selected-clip-cards.json",
+            {
+                "catalog_id": catalog.catalog_id,
+                "project_id": plan.project_id,
+                "selection_source": "feature_edit_plan",
+                "prepare_only": prepare_only,
+                "selected_clip_count": len(selected_ids),
+                "clips": entries,
+                "generated_at": utc_now(),
+            },
+        )
+
+    succeeded = sum(entry["status"] != "error" for entry in entries)
+    result = {
+        "catalog_id": catalog.catalog_id,
+        "project_id": plan.project_id,
+        "selected_clip_count": len(selected_ids),
+        "succeeded": succeeded,
+        "failed": len(entries) - succeeded,
+        "prepare_only": prepare_only,
+        "estimated_new_cost_usd": round(total_cost, 8),
+        "elapsed_seconds": round(monotonic() - started, 3),
+        "manifest_path": str((output_dir / "selected-clip-cards.json").resolve()),
+    }
+    write_json(output_dir / "result.json", result)
+    return result
 
 
 def _shared_upload_dir(
