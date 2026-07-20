@@ -9,6 +9,19 @@ from .models import GroundingProposal
 
 
 COLORS = ["#ff3155", "#00c2ff", "#ffd43b", "#7cfc6b", "#c77dff"]
+_CJK_FONT_CANDIDATES = (
+    Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+    Path("/System/Library/Fonts/STHeiti Light.ttc"),
+    Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+)
+
+
+def _overlay_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in _CJK_FONT_CANDIDATES:
+        if path.exists():
+            return ImageFont.truetype(str(path), size=size)
+    return ImageFont.load_default(size=size)
 
 
 def draw_grounding_overlay(
@@ -23,7 +36,7 @@ def draw_grounding_overlay(
             f"{proposal.source_width}x{proposal.source_height}"
         )
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default(size=max(12, round(min(image.size) / 45)))
+    font = _overlay_font(max(12, round(min(image.size) / 45)))
     line_width = max(2, round(min(image.size) / 250))
     for index, candidate in enumerate(proposal.candidates):
         color = COLORS[index % len(COLORS)]
@@ -53,7 +66,7 @@ def draw_blind_review_overlay(
     if image.size != (proposal.source_width, proposal.source_height):
         raise ValueError("blind-review frame and proposal dimensions differ")
     draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default(size=max(12, round(min(image.size) / 45)))
+    font = _overlay_font(max(12, round(min(image.size) / 45)))
     line_width = max(2, round(min(image.size) / 250))
     for index, candidate in enumerate(proposal.candidates):
         color = COLORS[index % len(COLORS)]

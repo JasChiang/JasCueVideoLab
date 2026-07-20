@@ -8,7 +8,7 @@
     "minor_version": "512"
   },
   "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
-  "path": "/path/to/JasCueVideoLab/fixtures/generated/C_fast_transient_ui.mp4",
+  "path": "fixtures/generated/C_fast_transient_ui.mp4",
   "sha256": "0031396af972b5c43d5eed67df9592bd6c8a9b0ec74fcbfc8f1e00e8dfbc8d10",
   "size_bytes": 27455,
   "video": {

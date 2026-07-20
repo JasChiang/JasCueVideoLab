@@ -2,7 +2,7 @@
 
 這是一個**完全獨立、實驗性**的 Gemini 3.5 Flash 影片理解與單幀 Grounding 驗證專案。它不是 JasCue 正式產品，不引用也不修改任何 JasCue 程式碼；實驗未通過前，不應將這裡的程式合併回 JasCue。
 
-最新的 target-first 方法採用「未指定 target 就先提出候選，使用者選定後才找時間與 bbox」，完整的通俗說明、技術分析、實測數據與可分享摘要見 [METHODOLOGY.md](METHODOLOGY.md)。
+最新的 target-first 方法採用「未指定 target 就先提出候選，使用者選定後才找時間與 bbox」，完整的通俗說明、技術分析、實測數據與可分享摘要見 [METHODOLOGY.md](METHODOLOGY.md)。要將毛片實驗升級為 coarse-to-fine 全量流程，請見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)。
 
 目前的最小垂直切片是：
 
@@ -46,7 +46,9 @@ uv run jascue-video-lab catalog-rushes /path/to/CLIP \
 uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
 ```
 
-2026-07-20 的真實測試使用 51 支 4K 毛片（18,999,617,273 bytes、總長 844.847 秒），建立 429 個 frame IDs 與 7.2 MB analysis reel。Gemini 選出 10 段 16:9 與 9 段 9:16；成品分別為 37.5 秒與 34.5 秒。獨立量測後的 cold catalog、fresh upload、模型規劃與渲染合計約 376.181 秒；成功請求耗用 29,071 input tokens、3,158 output tokens，依當日 Gemini 3.5 Flash Standard 公開牌價估算為 US$0.0720285。實際帳單可能因 free tier 或方案而不同。完整證據、hash、QA 與限制見 [REPORT-RUSHES-SELECTS.md](REPORT-RUSHES-SELECTS.md)。
+2026-07-20 的真實測試使用一組經授權的 51 支 4K 公開毛片（約 19 GB、總長 844.847 秒），建立 429 個 frame IDs 與 7.2 MB analysis reel。Gemini 選出 10 段 16:9 與 9 段 9:16；成品分別為 37.5 秒與 34.5 秒。獨立量測後的 cold catalog、fresh upload、模型規劃與渲染合計約 376.181 秒；成功請求耗用 29,071 input tokens、3,158 output tokens，依當日 Gemini 3.5 Flash Standard 公開牌價估算為 US$0.0720285。實際帳單可能因 free tier 或方案而不同。完整證據、hash、QA 與限制見 [REPORT-RUSHES-SELECTS.md](REPORT-RUSHES-SELECTS.md)。
+
+兩秒抽樣只適合第一輪粗看帶，不能當成泛用的唯一視覺取樣。0.2–0.5 秒 UI、快速手勢與短暫對焦狀態可能完全落在兩張索引幀之間。可泛化版本必須採 coarse-to-fine：全庫每兩秒找候選 clip／shot，再對候選附近以 4–8 FPS 建立第二層 immutable frame IDs（或送一支 shot-local 短影片），最後才回原片抽 exact frame。這個 dense refinement 目前尚未自動化，因此本分支仍是 review-cut 實驗，不宣稱泛用挑帶已完成。
 
 ### Brief-ordered feature cut 與安全 Reframe
 
@@ -85,7 +87,7 @@ OPPO Reno16 真實實跑輸出兩支 74.176 秒無燒錄字卡影片。16:9 有 
 - `main` baseline 沒有 ASR、transcript、字幕、temporal tracker、SAM/EdgeTAM/Apple Vision、逐幀追蹤、自動裁切、NLE timeline、FCP/Motion/FxPlug 或成片輸出。
 - `experiment/dynamic-tracking` branch 另有一條明確隔離的 optional CSRT bbox propagation 實驗。它不屬於 baseline，也不得把輸出稱為 Gemini 原生 tracking 或正式 SpatialTrack。
 - `experiment/sam21-video-segmentation` branch 把 Gemini／人工 bbox 當語意 seed，交由 SAM 2.1 產生並傳播 mask；原始 seed、SAM prompt box、mask 與 mask-derived bbox 分開保存。詳見 [REPORT-SAM21-TRACKING.md](REPORT-SAM21-TRACKING.md)。
-- `REPORT-SAMPLE-CONTINUITY-COST-TIMING.md` 記錄 analysis proxy、Gemini raw usage 牌價估算、API latency 與 tracker geometric drift。成本只依官方 Standard list price 估算；free tier 與沒有 usage response 的失敗請求不得假裝成已知帳單金額。
+- [產品展示測例成本與時間報告](REPORT-PRODUCT-DEMO-COST-TIMING.md)記錄 analysis proxy、Gemini raw usage 牌價估算、API latency 與 tracker geometric drift。成本只依官方 Standard list price 估算；free tier 與沒有 usage response 的失敗請求不得假裝成已知帳單金額。
 - Interactions API 的影片視覺處理預設約 1 FPS；官方目前未在 Interactions API 開放 `video_metadata` 自訂 FPS。因此 0.2–0.5 秒 UI 狀態可能漏掉。本實驗以完整影片 Content Map 對照「抽出的原始單幀 Grounding」量測這個限制，不把未觀察到的狀態靜默補上。
 
 官方依據：
@@ -135,7 +137,7 @@ App 的固定順序是：
 
 每個時刻提供兩個隔離模式：A 是預設且可驗證的「FFmpeg exact frame → image Grounding」；B 是實驗性的「完整影片 → 指定 `MM:SS` → bbox」。Google 官方明確文件化的是 image object detection bbox，而 File API 影片預設以 1 FPS 保存／處理；官方沒有提供 B 模式實際採用 frame 的 PTS 或 hash。因此 B 的 contract 永遠標記 `unknown_gemini_video_sample`，投影到 FFmpeg frame 的圖只供 A/B 診斷，不能成為 production geometry。兩種方法都經獨立盲審後，export 才會計算第一候選 bbox IoU 與 center distance。
 
-SAMPLE-CONTINUITY 的首次 live B 模式在 `00:02` 選中正確中央紫色手機，bbox `[413, 664, 466, 842]`；既有 A 模式為 `[412, 684, 467, 871]`，IoU 0.738123、center distance 24.5。這是 Codex 視覺檢查而非獨立 human ground truth，且 B 的 reference frame 仍不可知。
+匿名化的 22 秒產品展示測例首次 live B 模式在 `00:02` 選中正確中央紫色手機，bbox `[413, 664, 466, 842]`；既有 A 模式為 `[412, 684, 467, 871]`，IoU 0.738123、center distance 24.5。這是 Codex 視覺檢查而非獨立 human ground truth，且 B 的 reference frame 仍不可知。
 
 持久資料位於被 Git 排除的 `artifacts/blind-review-app/<session-id>/`；跨 session 的 Gemini File API cache 依 analysis source SHA-256 位於 `artifacts/blind-review-file-cache/`。同一 upload identity 在官方 48 小時保存期內會重用。App 不會把 API key 傳到瀏覽器，也不以 browser storage 當實驗資料來源。
 
@@ -285,7 +287,7 @@ Contract tests 驗證 schema、entity reference、半開事件區間、禁止 `f
 
 ## 實際公開影片結果（2026-07-20）
 
-已對公開影片 `【接續互通：與 iPhone 完美配合】(clean).mp4` 使用 `gemini-3.5-flash` 完成三次獨立 live run，產物在 `artifacts/real-continuity-public-3runs/`：
+已對匿名化的公開手機操作影片 A 使用 `gemini-3.5-flash` 完成三次獨立 live run，產物只保存在 Git 排除的本機 artifacts：
 
 - 三次 Content Map 與 16 個 Grounding Proposal 全部通過本機 schema validation；`result.json` 為 `ok=true`、`failure_count=0`。
 - 事件數為 5、5、6。第三次將 Introduction 獨立切出；對齊後 AirDrop start 最大差 6,000 ms，Clipboard keyframe 最大差 2,000 ms。
@@ -300,7 +302,7 @@ Contract tests 驗證 schema、entity reference、半開事件區間、禁止 `f
 - 舊泛化描述 5 次中有 3 次輸出看似「橫向大框」，但將 raw box 按官方 y-first 讀取後，實際 IoU 為 0.959–0.967；另 2 次則違反指示、直接使用 x-first。真正問題是模型在自訂非原生座標順序下會混用 convention。
 - 現行解法不是做 heuristic auto-swap，而是在 Structured Output field 名稱與 prompt 上都固定官方 `box_2d_yxyx`，再由本機 deterministic conversion。
 
-第二支公開影片 `public-continuity-demo.mp4` 暴露了時間軸限制：
+匿名化的公開手機操作影片 B 暴露了時間軸限制：
 
 - ffprobe 為 116,883 ms，Gemini File API metadata 也為 117 秒；但完整影片 Content Map 反覆產生 119,000、136,000、145,000、148,000 ms 等超界時間。
 - 加入 exact duration 與更短的 temporal-only schema 仍是 0/3 通過，證明問題不只來自原 prompt 複雜度。
@@ -308,7 +310,7 @@ Contract tests 驗證 schema、entity reference、半開事件區間、禁止 `f
 - 實用 fallback 改用 4 秒 FFmpeg PTS storyboard：30 張縮圖各有 immutable frame ID，Gemini 只選 ID、不輸出時間。本機映射出 6 個事件，全部落在 0–116,883 ms；Codex 逐張檢查 6 張代表幀，片頭、四個手勢與片尾皆符合標籤。
 - 三支相似 iPhone 同畫面的 70.003 秒原始影格，指定「中間手機螢幕」重跑 5 次，5/5 完全相同 bbox `[431,188,576,727]`、pairwise IoU 1.0；Codex 視覺抽查確認選中正確實例。這仍不是獨立真人 ground truth。
 
-後續在同一支 61.862 秒接續互通影片做 A/B：直接 `MM:SS` 三次皆通過 schema 與片長檢查；第一輪 4 個時刻為 00:04、00:19、00:29、00:46，抽到的實際 PTS 為 4,004、19,019、29,029、46,013 ms，4/4 Grounding overlay 經 Codex 視覺抽查符合目標。PTS storyboard 則有 5/6 Grounding 成功，另 1 個 frame-ID 的事件描述誤稱黃色 iPhone 可見；單幀 gate 正確回傳 `visible=false`，沒有猜 bbox。
+後續在同一支 61.862 秒的匿名化公開手機操作影片做 A/B：直接 `MM:SS` 三次皆通過 schema 與片長檢查；第一輪 4 個時刻為 00:04、00:19、00:29、00:46，抽到的實際 PTS 為 4,004、19,019、29,029、46,013 ms，4/4 Grounding overlay 經 Codex 視覺抽查符合目標。PTS storyboard 則有 5/6 Grounding 成功，另 1 個 frame-ID 的事件描述誤稱黃色 iPhone 可見；單幀 gate 正確回傳 `visible=false`，沒有猜 bbox。
 
 更關鍵的隔離測試是：原本會輸出 148 秒超界時間的 116.883 秒 iPhone 手勢影片，改成少量 `MM:SS` 截圖候選後三次全部合法且未超界，主要候選穩定落在 00:23、00:38–00:39、00:56–00:58、01:11–01:12、01:31–01:32。這表示問題主要是完整 Content Map 的複雜時間算術與任務負擔，而不是影片 metadata。
 

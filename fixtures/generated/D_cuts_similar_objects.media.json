@@ -8,7 +8,7 @@
     "minor_version": "512"
   },
   "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
-  "path": "/path/to/JasCueVideoLab/fixtures/generated/D_cuts_similar_objects.mp4",
+  "path": "fixtures/generated/D_cuts_similar_objects.mp4",
   "sha256": "f298b118378057c6d8eca0156461419b58cbf5bee3130304b030a5a917d2f4c4",
   "size_bytes": 40387,
   "video": {

@@ -3,6 +3,7 @@ from __future__ import annotations
 from PIL import Image
 
 from jascue_video_lab.models import GroundingCandidate, GroundingProposal, Occlusion
+from jascue_video_lab.overlay import _overlay_font, draw_grounding_overlay
 from jascue_video_lab.review import render_manual_review
 from jascue_video_lab.storage import write_json
 
@@ -70,3 +71,36 @@ def test_render_manual_review_creates_overlay_and_html(tmp_path, provenance) -> 
     assert "PASS 1" in document
     assert "IoU 1.000" in document
     assert (output.parent / "run-01-01-phone-1.png").exists()
+
+
+def test_grounding_overlay_uses_distinct_cjk_glyphs(tmp_path, provenance) -> None:
+    font = _overlay_font(32)
+    assert bytes(font.getmask("鏡")) != bytes(font.getmask("頭"))
+
+    frame_path = tmp_path / "frame.png"
+    output_path = tmp_path / "debug.png"
+    Image.new("RGB", (640, 360), "white").save(frame_path)
+    proposal = GroundingProposal(
+        asset_id="sha256:" + "a" * 64,
+        event_id="camera",
+        entity_id="camera-module",
+        frame_pts=1,
+        frame_time_ms=100,
+        frame_hash="b" * 64,
+        source_width=640,
+        source_height=360,
+        visible=True,
+        occlusion=Occlusion.NONE,
+        visibility_reason="清楚可見",
+        candidates=[
+            GroundingCandidate(
+                box_2d=(100, 100, 900, 900),
+                label="手機相機鏡頭模組",
+                confidence=0.98,
+                disambiguation_reason="指定的白色手機",
+            )
+        ],
+        model_provenance=provenance,
+    )
+    draw_grounding_overlay(frame_path, proposal, output_path)
+    assert output_path.exists()

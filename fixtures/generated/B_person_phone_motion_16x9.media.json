@@ -8,7 +8,7 @@
     "minor_version": "512"
   },
   "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
-  "path": "/path/to/JasCueVideoLab/fixtures/generated/B_person_phone_motion_16x9.mp4",
+  "path": "fixtures/generated/B_person_phone_motion_16x9.mp4",
   "sha256": "e83cd2088978e7eb779481988fd0dc0f4a81e55ac3ef76ca0ef152aa18579300",
   "size_bytes": 77135,
   "video": {

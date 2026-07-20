@@ -35,7 +35,7 @@ Gemini 建議 MM:SS → 本機驗證片長 → FFmpeg 抽原始幀／保存 PTS
 
 ## 實際觀察
 
-在 22 秒的 SAMPLE-CONTINUITY 展示影片中，未指定 target 的泛化實驗三次雖都產生合法結果，但模型有時選招牌、有時選紫色手機。改用候選階段後，Gemini 一次提出 5 個可選實例：
+在 22 秒的匿名化產品展示影片中，未指定 target 的泛化實驗三次雖都產生合法結果，但模型有時選招牌、有時選紫色手機。改用候選階段後，Gemini 一次提出 5 個可選實例：
 
 - 左側白色手機
 - 中央紫色手機
@@ -173,4 +173,4 @@ App 另提供隔離的 B 模式，直接把完整影片、target 與 `MM:SS` 交
 
 B 的 normalized bbox 可以投影到相同 `MM:SS` 所抽到的 FFmpeg 原始幀供人觀察，但投影圖必須標示 sample unknown。只有 A 與 B 都完成獨立盲審後，系統才計算 bbox IoU 與 center distance；這些數字量測的是兩個 proposal 的幾何差，不證明它們來自同一影格。
 
-首次 SAMPLE-CONTINUITY live A/B 使用相同的中央紫色手機 target 與 `00:02`：原始 2.002 秒單幀方法為 `[412, 684, 467, 871]`，direct-video 方法為 `[413, 664, 466, 842]`，IoU 0.738123、normalized center distance 24.5。Direct-video 確實選中正確紫色手機，牌價估算 US$0.007224；但框較短且實際影片取樣幀未知，所以這項結果只能說「值得繼續 A/B」，不能取代原始單幀 Grounding。視覺檢查由 Codex 執行，尚未成為獨立 human annotation。
+首次匿名化產品展示測例的 live A/B 使用相同的中央紫色手機 target 與 `00:02`：原始 2.002 秒單幀方法為 `[412, 684, 467, 871]`，direct-video 方法為 `[413, 664, 466, 842]`，IoU 0.738123、normalized center distance 24.5。Direct-video 確實選中正確紫色手機，牌價估算 US$0.007224；但框較短且實際影片取樣幀未知，所以這項結果只能說「值得繼續 A/B」，不能取代原始單幀 Grounding。視覺檢查由 Codex 執行，尚未成為獨立 human annotation。

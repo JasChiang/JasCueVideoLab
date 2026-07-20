@@ -8,7 +8,7 @@
     "minor_version": "512"
   },
   "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
-  "path": "/path/to/JasCueVideoLab/fixtures/generated/A_silent_phone_ui.mp4",
+  "path": "fixtures/generated/A_silent_phone_ui.mp4",
   "sha256": "825be0ec0db6f52af9865af83faddc92dc589618ddbbd3c5c86a961ece6019cc",
   "size_bytes": 100652,
   "video": {
