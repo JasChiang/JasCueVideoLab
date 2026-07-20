@@ -18,6 +18,11 @@ dev = [
 [project.scripts]
 jascue-video-lab = "jascue_video_lab.cli:main"
 
+[project.optional-dependencies]
+tracking = [
+    "opencv-contrib-python-headless>=5.0.0.93",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

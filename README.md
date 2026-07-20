@@ -18,7 +18,8 @@
 - 對 Gemini 原生影片理解索取少量截圖候選時，API contract 使用官方文件慣例 `MM:SS`，不要求模型計算毫秒。程式只把合法且未超界的 `MM:SS` 換算成 FFmpeg seek 值；換算結果仍不是精確 frame time。
 - `frame_pts` 與 `frame_time_ms` 是 FFmpeg 實際抽到之原始影格的媒體時間；每張 `frame.png` 都另外保存 SHA-256。
 - Gemini bbox 是單張影格的人工審核 proposal，不是 pixel mask，也不是 production-ready tracking data。
-- 專案沒有 ASR、transcript、字幕、temporal tracker、SAM/EdgeTAM/Apple Vision、逐幀追蹤、自動裁切、NLE timeline、FCP/Motion/FxPlug 或成片輸出。
+- `main` baseline 沒有 ASR、transcript、字幕、temporal tracker、SAM/EdgeTAM/Apple Vision、逐幀追蹤、自動裁切、NLE timeline、FCP/Motion/FxPlug 或成片輸出。
+- `experiment/dynamic-tracking` branch 另有一條明確隔離的 optional CSRT bbox propagation 實驗。它不屬於 baseline，也不得把輸出稱為 Gemini 原生 tracking 或正式 SpatialTrack。
 - Interactions API 的影片視覺處理預設約 1 FPS；官方目前未在 Interactions API 開放 `video_metadata` 自訂 FPS。因此 0.2–0.5 秒 UI 狀態可能漏掉。本實驗以完整影片 Content Map 對照「抽出的原始單幀 Grounding」量測這個限制，不把未觀察到的狀態靜默補上。
 
 官方依據：
@@ -93,6 +94,13 @@ uv run jascue-video-lab storyboard-temporal ARTIFACT \
 # 讓 Gemini 推薦少量官方 MM:SS 截圖時刻，本機驗證、抽幀並 Grounding
 uv run jascue-video-lab direct-moment-repeat ARTIFACT \
   --runs 3 --ground-runs 1 --output-dir ARTIFACT/direct-mmss-3runs-live
+
+# 僅限 experiment/dynamic-tracking branch；用 Gemini GroundingProposal 當 seed
+uv sync --extra tracking
+uv run jascue-video-lab track-csrt VIDEO.mp4 \
+  --grounding-json ARTIFACT/events/EVENT/groundings/ENTITY/grounding.json \
+  --target-description '中央紫色 OPPO Reno16 手機' \
+  --output-dir ARTIFACT/tracking-purple-phone
 ```
 
 ## 產出
