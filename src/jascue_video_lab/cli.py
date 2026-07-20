@@ -14,6 +14,7 @@ from PIL import Image
 from .ab_review import render_grounding_ab_review
 from .billing import summarize_usage_and_list_price
 from .compare import compare_runs
+from .feature_cut import run_feature_cut_experiment
 from .fixtures import generate_fixtures
 from .gemini import GeminiLabClient
 from .media import extract_frame, probe_video, sha256_file
@@ -505,6 +506,22 @@ def command_render_rushes(args: argparse.Namespace) -> int:
         plan,
         args.output_dir,
         scdet_threshold=args.scdet_threshold,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_feature_cut(args: argparse.Namespace) -> int:
+    result = run_feature_cut_experiment(
+        catalog_path=args.catalog_json,
+        brief_path=args.brief_json,
+        checkpoint_path=args.sam_checkpoint,
+        output_dir=args.output_dir,
+        plan_prompt=_load_prompt("feature_cut_selects_zh-TW.txt"),
+        grounding_prompt=_load_prompt("grounding_native_yxyx_zh-TW.txt"),
+        temperature=args.temperature,
+        scdet_threshold=args.scdet_threshold,
+        sam_analysis_fps=args.sam_analysis_fps,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1365,6 +1382,19 @@ def build_parser() -> argparse.ArgumentParser:
     render_rushes_parser.add_argument("--scdet-threshold", type=float, default=4.0)
     render_rushes_parser.add_argument("--output-dir", type=Path, required=True)
     render_rushes_parser.set_defaults(handler=command_render_rushes)
+
+    feature_cut_parser = subparsers.add_parser(
+        "feature-cut",
+        help="Build brief-ordered 16:9 and SAM-tracked 9:16 feature review cuts",
+    )
+    feature_cut_parser.add_argument("catalog_json", type=Path)
+    feature_cut_parser.add_argument("brief_json", type=Path)
+    feature_cut_parser.add_argument("--sam-checkpoint", type=Path, required=True)
+    feature_cut_parser.add_argument("--sam-analysis-fps", type=float, default=2.0)
+    feature_cut_parser.add_argument("--scdet-threshold", type=float, default=4.0)
+    feature_cut_parser.add_argument("--temperature", type=float, default=0.2)
+    feature_cut_parser.add_argument("--output-dir", type=Path, required=True)
+    feature_cut_parser.set_defaults(handler=command_feature_cut)
     return parser
 
 

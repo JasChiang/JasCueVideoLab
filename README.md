@@ -48,6 +48,34 @@ uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
 
 2026-07-20 的真實測試使用 51 支 4K 毛片（18,999,617,273 bytes、總長 844.847 秒），建立 429 個 frame IDs 與 7.2 MB analysis reel。Gemini 選出 10 段 16:9 與 9 段 9:16；成品分別為 37.5 秒與 34.5 秒。獨立量測後的 cold catalog、fresh upload、模型規劃與渲染合計約 376.181 秒；成功請求耗用 29,071 input tokens、3,158 output tokens，依當日 Gemini 3.5 Flash Standard 公開牌價估算為 US$0.0720285。實際帳單可能因 free tier 或方案而不同。完整證據、hash、QA 與限制見 [REPORT-RUSHES-SELECTS.md](REPORT-RUSHES-SELECTS.md)。
 
+### Brief-ordered feature cut 與安全 Reframe
+
+固定 `left`／`center`／`right` crop 已被真實 9:16 輸出證明不可靠：人物或手機移動後仍可能被裁掉。`feature-cut` 改以使用者提供的章節 brief 控制敘事順序，Gemini 分別選橫式／直式 take 與明確 reframe target，再以 exact-frame image Grounding + SAM 2.1 mask propagation 約束 16:9 punch-in 與 9:16 crop。
+
+```text
+使用者功能 brief（文案事實來源）
+  → Gemini 只找每章的可見影片證據與 frame IDs
+  → FFmpeg shot PTS 決定 source handles
+  → 指定主體 exact-frame Gemini bbox
+  → SAM 2.1 在單一 shot 內傳播 mask
+  → 16:9：剪輯 zoom intent ∩ mask 安全倍率 ∩ 4K→1080 解析度上限
+  → 9:16：平滑 tracked crop；太寬或不可靠則 fit-with-background
+  → 功能字卡 + 原始現場音 + H.264/AAC review cuts
+```
+
+SAM 只提供幾何，不自行決定剪輯美學。16:9 的 `none`／`subtle`／`detail` 由 feature plan 表示 editorial intent，實際倍率不得超過 mask 安全值；9:16 若單一 crop 無法保留必要內容，就完整顯示橫式畫面，而不是硬切正中間。使用者 brief 的規格文字與模型觀察到的畫面證據分開保存，沒有 ASR 或 transcript。
+
+```bash
+uv run jascue-video-lab feature-cut \
+  artifacts/my-rushes-run/catalog.json \
+  briefs/oppo_reno16_features_zh-TW.json \
+  --sam-checkpoint artifacts/models/sam2.1_hiera_tiny.pt \
+  --sam-analysis-fps 2 \
+  --output-dir artifacts/my-feature-cut
+```
+
+OPPO Reno16 真實實跑輸出兩支 74.176 秒影片。16:9 只有 3 章通過幾何 gate 後套用 1.12–1.35× reframe；9:16 有 5 章採動態 tracked crop、6 章採完整畫面＋模糊背景。14/14 Grounding schema 通過，全部 bbox 經 contact-sheet 視覺檢查；15 個 Gemini requests 的牌價估算為 US$0.178737。詳見 [REPORT-OPPO-RENO16-FEATURE-CUT.md](REPORT-OPPO-RENO16-FEATURE-CUT.md)。
+
 ## 重要界線
 
 - `start_ms`、`end_ms` 與 `recommended_keyframe_ms` 是 **coarse semantic time**，只用於搜尋與人工瀏覽，不是 frame-accurate cut point。

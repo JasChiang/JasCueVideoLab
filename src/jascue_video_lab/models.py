@@ -678,3 +678,74 @@ class RushesEditPlan(StrictModel):
             if len(ids) != len(set(ids)):
                 raise ValueError(f"duplicate select_id in {timeline.aspect_ratio} timeline")
         return self
+
+
+class FeatureChapterBrief(StrictModel):
+    feature_id: str = Field(pattern=r"^[a-z0-9_-]+$")
+    title: str
+    detail_lines: list[str]
+    target_duration_seconds: float = Field(ge=3.0, le=10.0)
+
+
+class FeatureEditBrief(StrictModel):
+    project_id: str
+    title: str
+    target_duration_seconds: float = Field(ge=60.0, le=90.0)
+    chapters: list[FeatureChapterBrief] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_chapters(self) -> "FeatureEditBrief":
+        ids = [chapter.feature_id for chapter in self.chapters]
+        if len(ids) != len(set(ids)):
+            raise ValueError("feature brief chapter IDs must be unique")
+        return self
+
+
+class FeatureChapterSelect(StrictModel):
+    feature_id: str
+    evidence_status: Literal["supported", "partial", "not_found"]
+    horizontal_frame_id: str | None = Field(default=None, pattern=r"^RF[0-9]{6}$")
+    vertical_frame_id: str | None = Field(default=None, pattern=r"^RF[0-9]{6}$")
+    observed_visual_evidence: str
+    selection_reason: str
+    horizontal_strategy: Literal["original", "tracked_reframe"]
+    horizontal_zoom_intent: Literal["none", "subtle", "detail"]
+    horizontal_target_description: str | None
+    vertical_strategy: Literal["tracked_crop", "fit_with_background"]
+    vertical_target_description: str | None
+    quality_risks: list[str]
+    confidence: Confidence
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> "FeatureChapterSelect":
+        if self.evidence_status == "not_found":
+            if self.horizontal_frame_id is not None or self.vertical_frame_id is not None:
+                raise ValueError("not_found feature chapters cannot reference catalog frames")
+        elif self.horizontal_frame_id is None or self.vertical_frame_id is None:
+            raise ValueError("supported/partial feature chapters require both aspect frame IDs")
+        if self.horizontal_strategy == "tracked_reframe":
+            if self.horizontal_zoom_intent == "none" or not self.horizontal_target_description:
+                raise ValueError(
+                    "tracked_reframe requires a zoom intent and precise horizontal target"
+                )
+        elif self.horizontal_zoom_intent != "none":
+            raise ValueError("original horizontal strategy must use zoom intent none")
+        if self.vertical_strategy == "tracked_crop" and not self.vertical_target_description:
+            raise ValueError("tracked_crop requires a precise vertical_target_description")
+        return self
+
+
+class FeatureEditPlan(StrictModel):
+    project_id: str
+    catalog_id: str
+    title: str
+    chapters: list[FeatureChapterSelect]
+    uncertainties: list[str]
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_chapters(self) -> "FeatureEditPlan":
+        ids = [chapter.feature_id for chapter in self.chapters]
+        if len(ids) != len(set(ids)):
+            raise ValueError("feature plan chapter IDs must be unique")
+        return self

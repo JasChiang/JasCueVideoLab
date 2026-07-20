@@ -7,6 +7,7 @@ from jascue_video_lab.models import (
     ContentMap,
     DirectVideoGroundingProposal,
     DirectMomentMap,
+    FeatureEditPlan,
     GeminiNativeGroundingProposal,
     GroundingCandidate,
     GroundingProposal,
@@ -88,6 +89,7 @@ def test_invalid_normalized_boxes_are_rejected(box) -> None:
 def test_api_schema_uses_only_supported_constraint_keywords() -> None:
     schema_text = str(gemini_response_schema(GroundingProposal))
     rushes_schema_text = str(gemini_response_schema(RushesEditPlan))
+    feature_schema_text = str(gemini_response_schema(FeatureEditPlan))
     for unsupported in (
         "const",
         "exclusiveMinimum",
@@ -99,6 +101,7 @@ def test_api_schema_uses_only_supported_constraint_keywords() -> None:
     ):
         assert unsupported not in schema_text
         assert unsupported not in rushes_schema_text
+        assert unsupported not in feature_schema_text
     assert "prefixItems" in schema_text
 
 

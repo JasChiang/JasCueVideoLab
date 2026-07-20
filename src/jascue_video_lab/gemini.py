@@ -17,6 +17,8 @@ from .models import (
     DirectVideoGroundingProposal,
     DirectMomentMap,
     ExtractedFrame,
+    FeatureEditBrief,
+    FeatureEditPlan,
     GeminiNativeGroundingProposal,
     GeminiNativeDirectVideoGroundingProposal,
     GroundingCandidate,
@@ -927,4 +929,91 @@ class GeminiLabClient:
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "rushes_edit_plan", error)
+            raise
+
+    def plan_feature_edit(
+        self,
+        *,
+        catalog: RushesCatalog,
+        brief: FeatureEditBrief,
+        uploaded: Any,
+        prompt_template: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> FeatureEditPlan:
+        """Select evidence-backed frame IDs for a user-authored feature brief."""
+        provenance = _provenance(run_id)
+        prompt = (
+            prompt_template
+            + "\n\n## 本次不可變 metadata\n"
+            + f"project_id 必須原樣回傳：{brief.project_id}\n"
+            + f"catalog_id 必須原樣回傳：{catalog.catalog_id}\n"
+            + f"合法 frame ID 數量：{len(catalog.frames)}\n"
+            + "chapters 必須依 brief 順序完整回傳，一個 feature_id 恰好一次。\n"
+            + "\n## 使用者提供的 editorial brief（文字可用，但不等於影片證據）\n"
+            + brief.model_dump_json(indent=2)
+            + "\n\nmodel_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        request_record = {
+            "model": MODEL_ID,
+            "store": False,
+            "input": [
+                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {"type": "text", "text": prompt},
+            ],
+            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(FeatureEditPlan),
+            },
+        }
+        write_json(run_dir / "feature_edit_plan.request.json", request_record)
+        try:
+            interaction = self.client.interactions.create(**request_record)
+            write_json(run_dir / "feature_edit_plan.raw_interaction.json", _raw_dump(interaction))
+            write_json(
+                run_dir / "feature_edit_plan.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = FeatureEditPlan.model_validate_json(interaction.output_text)
+            expected_ids = [chapter.feature_id for chapter in brief.chapters]
+            actual_ids = [chapter.feature_id for chapter in parsed.chapters]
+            if parsed.project_id != brief.project_id or parsed.catalog_id != catalog.catalog_id:
+                raise GeminiContractError("Feature Edit Plan echoed immutable metadata incorrectly")
+            if actual_ids != expected_ids:
+                raise GeminiContractError(
+                    f"Feature Edit Plan chapters differ from brief: expected={expected_ids}, actual={actual_ids}"
+                )
+            valid_frame_ids = {frame.frame_id for frame in catalog.frames}
+            invalid = sorted(
+                {
+                    frame_id
+                    for chapter in parsed.chapters
+                    for frame_id in (chapter.horizontal_frame_id, chapter.vertical_frame_id)
+                    if frame_id is not None and frame_id not in valid_frame_ids
+                }
+            )
+            if invalid:
+                raise GeminiContractError(f"Feature Edit Plan referenced unknown frame IDs: {invalid}")
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "feature_edit_plan.json", final)
+            write_json(
+                run_dir / "feature_edit_plan.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "feature_edit_plan.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(run_dir, "feature_edit_plan", error)
             raise
