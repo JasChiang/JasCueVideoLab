@@ -123,7 +123,7 @@ function renderMoments(momentMap) {
   momentMap.moments.forEach((moment) => {
     const card = document.createElement("article");
     card.className = "moment";
-    card.innerHTML = `<header><h3></h3><time></time></header><p></p><button class="secondary-button">抽原始幀並 Ground</button>`;
+    card.innerHTML = `<header><h3></h3><time></time></header><p></p><button class="secondary-button exact">A · 原始單幀 Grounding</button><button class="ghost-button direct">B · 直接影片 bbox（實驗）</button>`;
     card.querySelector("h3").textContent = moment.label;
     card.querySelector("time").textContent = moment.timestamp_mmss;
     card.querySelector("p").textContent = moment.observable_evidence;
@@ -132,7 +132,8 @@ function renderMoments(momentMap) {
       $("#source-video").currentTime = minutes * 60 + seconds;
       $("#source-video").play();
     });
-    card.querySelector("button").addEventListener("click", () => groundMoment(moment.moment_id));
+    card.querySelector(".exact").addEventListener("click", () => groundMoment(moment.moment_id, "exact_frame"));
+    card.querySelector(".direct").addEventListener("click", () => groundMoment(moment.moment_id, "direct_video"));
     grid.appendChild(card);
   });
   unlock("#review-step");
@@ -185,10 +186,11 @@ async function analyzeMoments() {
   } catch (error) { toast(error.message); } finally { idle(); }
 }
 
-async function groundMoment(momentId) {
-  busy("正在抽原始影格並 Grounding", "FFmpeg 會保存 exact frame PTS；Gemini 接收的是這張單幀影像。");
+async function groundMoment(momentId, mode) {
+  const direct = mode === "direct_video";
+  busy(direct ? "正在執行直接影片 bbox" : "正在抽原始影格並 Grounding", direct ? "此模式的 Gemini 取樣 frame 不可知，只供 A/B 診斷。" : "FFmpeg 會保存 exact frame PTS；Gemini 接收的是這張單幀影像。");
   try {
-    const review = await api(`/api/sessions/${state.session.session_id}/ground`, jsonPost({ moment_id: momentId }));
+    const review = await api(`/api/sessions/${state.session.session_id}/ground`, jsonPost({ moment_id: momentId, mode }));
     renderReview(review);
   } catch (error) { toast(error.message); } finally { idle(); }
 }
@@ -197,6 +199,8 @@ function renderRestoredReview(manifest) {
   renderReview({
     review_id: manifest.review_id,
     target_description: manifest.target_description,
+    grounding_method: manifest.grounding_method,
+    bbox_reference_frame: manifest.bbox_reference_frame,
     requested_timestamp_mmss: manifest.requested_timestamp_mmss,
     requested_time_ms: manifest.requested_time_ms,
     frame_pts: manifest.frame_pts,
@@ -213,6 +217,7 @@ function renderReview(review) {
   $("#review-card").classList.remove("hidden");
   $("#reveal-card").classList.add("hidden");
   $("#review-target").textContent = review.target_description;
+  $("#review-method").textContent = review.grounding_method === "direct_video_unknown_sample" ? "B · Direct video · sample unknown" : "A · Exact frame image";
   $("#review-request-time").textContent = `${review.requested_timestamp_mmss} (${review.requested_time_ms} ms)`;
   $("#review-frame-time").textContent = `${review.frame_time_ms} ms · PTS ${review.frame_pts}`;
   updateStage("blind_review_pending");

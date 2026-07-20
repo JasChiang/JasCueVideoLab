@@ -166,3 +166,11 @@ uv run jascue-video-lab serve-review
 ```
 
 開啟 `http://127.0.0.1:8765`。預設 local-only，影片、raw response、人工標註與匯出資料都保存在被 Git 排除的本機 artifacts。
+
+### Direct-video bbox A/B
+
+App 另提供隔離的 B 模式，直接把完整影片、target 與 `MM:SS` 交給 Gemini 要求 bbox。這不是官方 image object detection 範例所保證的 exact-frame 行為：官方影片文件說明 File API 影片預設以 1 FPS 保存／處理，但 API 不回傳被模型採用的 frame PTS 或 hash。因此 B 模式 schema 禁止宣稱 exact frame，固定保存 `reference_frame_status=unknown_gemini_video_sample`。
+
+B 的 normalized bbox 可以投影到相同 `MM:SS` 所抽到的 FFmpeg 原始幀供人觀察，但投影圖必須標示 sample unknown。只有 A 與 B 都完成獨立盲審後，系統才計算 bbox IoU 與 center distance；這些數字量測的是兩個 proposal 的幾何差，不證明它們來自同一影格。
+
+首次 SAMPLE-CONTINUITY live A/B 使用相同的中央紫色手機 target 與 `00:02`：原始 2.002 秒單幀方法為 `[412, 684, 467, 871]`，direct-video 方法為 `[413, 664, 466, 842]`，IoU 0.738123、normalized center distance 24.5。Direct-video 確實選中正確紫色手機，牌價估算 US$0.007224；但框較短且實際影片取樣幀未知，所以這項結果只能說「值得繼續 A/B」，不能取代原始單幀 Grounding。視覺檢查由 Codex 執行，尚未成為獨立 human annotation。

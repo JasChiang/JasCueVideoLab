@@ -11,6 +11,7 @@ from jascue_video_lab.blind_review import BlindReviewService, ReviewVerdict
 from jascue_video_lab.models import (
     DirectMoment,
     DirectMomentMap,
+    DirectVideoGroundingProposal,
     EntityKind,
     GroundingCandidate,
     GroundingProposal,
@@ -120,6 +121,40 @@ class FakeGeminiClient:
         write_json(output_dir / "grounding.json", result)
         return result
 
+    def ground_video_at_moment(
+        self,
+        *,
+        media,
+        requested_timestamp_mmss,
+        event_id,
+        entity_id,
+        run_id,
+        output_dir,
+        **_kwargs,
+    ):
+        result = DirectVideoGroundingProposal(
+            asset_id=media.asset_id,
+            event_id=event_id,
+            entity_id=entity_id,
+            requested_timestamp_mmss=requested_timestamp_mmss,
+            reference_frame_status="unknown_gemini_video_sample",
+            reference_frame_description="A sampled frame near the requested second.",
+            visible=True,
+            occlusion=Occlusion.NONE,
+            visibility_reason="target visible in sampled video frame",
+            candidates=[
+                GroundingCandidate(
+                    box_2d=(260, 210, 740, 840),
+                    label="blue phone",
+                    confidence=0.88,
+                    disambiguation_reason="central blue object",
+                )
+            ],
+            model_provenance=_provenance(run_id),
+        )
+        write_json(output_dir / "direct_video_grounding.json", result)
+        return result
+
 
 @pytest.fixture
 def sample_video(tmp_path: Path) -> Path:
@@ -180,8 +215,20 @@ def test_blind_review_requires_annotation_before_reveal(
     )
     assert reveal["annotation"]["model_details_revealed_before_annotation"] is False
     assert reveal["proposal"]["candidates"][0]["confidence"] == 0.94
+    direct_review = service.ground_moment(
+        session["session_id"], moment_id="moment-01", mode="direct_video"
+    )
+    assert direct_review["bbox_reference_frame"] == "unknown_gemini_video_sample"
+    direct_reveal = service.submit_review(
+        session["session_id"],
+        direct_review["review_id"],
+        verdict=ReviewVerdict.SAMPLE_FRAME_MISMATCH,
+        notes="diagnostic A/B only",
+    )
+    assert direct_reveal["method_comparison"]["comparable"] is True
+    assert 0 < direct_reveal["method_comparison"]["bbox_iou"] <= 1
     exported = service.export_session(session["session_id"])
-    assert len(exported["human_annotations"]) == 1
+    assert len(exported["human_annotations"]) == 2
     assert exported["pending_review_ids"] == []
 
 
@@ -211,6 +258,8 @@ def test_http_app_runs_complete_blind_review_workflow(
         f"/api/sessions/{session_id}/ground", json={"moment_id": "moment-01"}
     )
     assert grounded.status_code == 200
+    assert "proposal" not in grounded.json()
+    assert "confidence" not in grounded.text
     review_id = grounded.json()["review_id"]
     assert client.get(
         f"/api/sessions/{session_id}/reviews/{review_id}/reveal"

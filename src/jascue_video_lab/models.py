@@ -382,6 +382,52 @@ class GeminiNativeGroundingProposal(StrictModel):
         return self
 
 
+class DirectVideoGroundingProposal(StrictModel):
+    """Experimental video-input bbox whose exact sampled source frame is unknowable locally."""
+
+    asset_id: str
+    event_id: str
+    entity_id: str
+    requested_timestamp_mmss: str = Field(pattern=r"^\d{2,}:[0-5]\d$")
+    reference_frame_status: Literal["unknown_gemini_video_sample"]
+    reference_frame_description: str
+    visible: bool
+    occlusion: Occlusion
+    visibility_reason: str
+    candidates: list[GroundingCandidate]
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_visibility(self) -> "DirectVideoGroundingProposal":
+        if not self.visible and self.candidates:
+            raise ValueError("invisible targets must have an empty candidates array")
+        if self.visible and not self.candidates:
+            raise ValueError("visible targets must have at least one candidate")
+        return self
+
+
+class GeminiNativeDirectVideoGroundingProposal(StrictModel):
+    asset_id: str
+    event_id: str
+    entity_id: str
+    requested_timestamp_mmss: str = Field(pattern=r"^\d{2,}:[0-5]\d$")
+    reference_frame_status: Literal["unknown_gemini_video_sample"]
+    reference_frame_description: str
+    visible: bool
+    occlusion: Occlusion
+    visibility_reason: str
+    candidates: list[GeminiNativeGroundingCandidate]
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="after")
+    def validate_visibility(self) -> "GeminiNativeDirectVideoGroundingProposal":
+        if not self.visible and self.candidates:
+            raise ValueError("invisible targets must have an empty candidates array")
+        if self.visible and not self.candidates:
+            raise ValueError("visible targets must have at least one candidate")
+        return self
+
+
 class Rational(StrictModel):
     numerator: int
     denominator: int = Field(gt=0)

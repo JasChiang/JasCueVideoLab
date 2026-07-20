@@ -14,9 +14,11 @@ from google import genai
 from .geometry import native_yxyx_to_canonical_xyxy
 from .models import (
     ContentMap,
+    DirectVideoGroundingProposal,
     DirectMomentMap,
     ExtractedFrame,
     GeminiNativeGroundingProposal,
+    GeminiNativeDirectVideoGroundingProposal,
     GroundingCandidate,
     GroundingProposal,
     IndexedStoryboardMap,
@@ -480,6 +482,113 @@ class GeminiLabClient:
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(output_dir, "grounding", error)
+            raise
+
+    def ground_video_at_moment(
+        self,
+        *,
+        media: MediaInfo,
+        uploaded: Any,
+        requested_timestamp_mmss: str,
+        event_id: str,
+        event_description: str,
+        entity_id: str,
+        target_description: str,
+        prompt_template: str,
+        run_id: str,
+        output_dir: Path,
+    ) -> DirectVideoGroundingProposal:
+        """Experimental video-input bbox; the Gemini-sampled reference frame stays unknown."""
+        provenance = _provenance(run_id)
+        prompt = (
+            prompt_template
+            + "\n\n## 本次不可變輸入\n"
+            + f"asset_id 必須原樣回傳：{media.asset_id}\n"
+            + f"event_id 必須原樣回傳：{event_id}\n"
+            + f"entity_id 必須原樣回傳：{entity_id}\n"
+            + f"requested_timestamp_mmss 必須原樣回傳：{requested_timestamp_mmss}\n"
+            + f"相關事件描述：{event_description}\n"
+            + f"指定 target：{target_description}\n"
+            + "reference_frame_status 必須回傳 unknown_gemini_video_sample。\n"
+            + "model_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        request_record = {
+            "model": MODEL_ID,
+            "store": False,
+            "input": [
+                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+                {"type": "text", "text": prompt},
+            ],
+            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(GeminiNativeDirectVideoGroundingProposal),
+            },
+        }
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_json(output_dir / "direct_video_grounding.request.json", request_record)
+        try:
+            interaction = self.client.interactions.create(**request_record)
+            write_json(
+                output_dir / "direct_video_grounding.raw_interaction.json", _raw_dump(interaction)
+            )
+            write_json(
+                output_dir / "direct_video_grounding.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = GeminiNativeDirectVideoGroundingProposal.model_validate_json(
+                interaction.output_text
+            )
+            if (
+                parsed.asset_id != media.asset_id
+                or parsed.event_id != event_id
+                or parsed.entity_id != entity_id
+                or parsed.requested_timestamp_mmss != requested_timestamp_mmss
+            ):
+                raise GeminiContractError("Direct Video Grounding changed immutable identifiers")
+            native_final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(output_dir / "direct_video_grounding.native.json", native_final)
+            final = DirectVideoGroundingProposal(
+                asset_id=native_final.asset_id,
+                event_id=native_final.event_id,
+                entity_id=native_final.entity_id,
+                requested_timestamp_mmss=native_final.requested_timestamp_mmss,
+                reference_frame_status=native_final.reference_frame_status,
+                reference_frame_description=native_final.reference_frame_description,
+                visible=native_final.visible,
+                occlusion=native_final.occlusion,
+                visibility_reason=native_final.visibility_reason,
+                candidates=[
+                    GroundingCandidate(
+                        box_2d=native_yxyx_to_canonical_xyxy(candidate.box_2d_yxyx),
+                        label=candidate.label,
+                        confidence=candidate.confidence,
+                        disambiguation_reason=candidate.disambiguation_reason,
+                    )
+                    for candidate in native_final.candidates
+                ],
+                model_provenance=native_final.model_provenance,
+            )
+            write_json(output_dir / "direct_video_grounding.json", final)
+            write_json(
+                output_dir / "direct_video_grounding.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                output_dir / "direct_video_grounding.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(output_dir, "direct_video_grounding", error)
             raise
 
     def analyze_temporal_video(

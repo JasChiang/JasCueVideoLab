@@ -97,7 +97,7 @@ input:focus, textarea:focus { border-color: var(--mint); box-shadow: 0 0 0 3px r
 
 .empty-state { margin-left: 54px; padding: 54px; border: 1px dashed var(--line); color: var(--muted); text-align: center; border-radius: 12px; }
 .review-card { margin: 24px 0 0 54px; }
-.review-toolbar { display: grid; grid-template-columns: 2fr 1fr 1fr; background: #0d1012; border: 1px solid var(--line); border-radius: 12px 12px 0 0; }
+.review-toolbar { display: grid; grid-template-columns: 2fr 1.3fr 1fr 1fr; background: #0d1012; border: 1px solid var(--line); border-radius: 12px 12px 0 0; }
 .review-toolbar div { padding: 16px; border-right: 1px solid var(--line); min-width: 0; }
 .review-toolbar div:last-child { border: 0; }
 .review-toolbar span { color: var(--muted); font-size: 11px; display: block; margin-bottom: 6px; text-transform: uppercase; }

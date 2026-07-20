@@ -87,6 +87,7 @@
           <div id="review-card" class="review-card hidden">
             <div class="review-toolbar">
               <div><span>Target</span><strong id="review-target"></strong></div>
+              <div><span>Method</span><strong id="review-method"></strong></div>
               <div><span>Semantic request</span><strong id="review-request-time"></strong></div>
               <div><span>Exact frame PTS</span><strong id="review-frame-time"></strong></div>
             </div>
@@ -106,6 +107,7 @@
                   <label><input type="radio" name="verdict" value="box_too_large" /><span>框太大</span></label>
                   <label><input type="radio" name="verdict" value="box_too_small" /><span>框太小</span></label>
                   <label><input type="radio" name="verdict" value="target_not_visible" /><span>目標不可見</span></label>
+                  <label><input type="radio" name="verdict" value="sample_frame_mismatch" /><span>疑似取樣幀不一致</span></label>
                   <label><input type="radio" name="verdict" value="unable_to_judge" /><span>無法判定</span></label>
                 </div>
               </fieldset>

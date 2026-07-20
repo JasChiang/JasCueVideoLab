@@ -70,6 +70,10 @@ App 的固定順序是：
 7. 可在畫面拖曳人工修正框；人工判定寫入後才能揭露完整 Gemini proposal。
 8. `匯出完整 JSON` 包含 media identity、human annotations、已揭露 proposals 與尚未審核清單。
 
+每個時刻提供兩個隔離模式：A 是預設且可驗證的「FFmpeg exact frame → image Grounding」；B 是實驗性的「完整影片 → 指定 `MM:SS` → bbox」。Google 官方明確文件化的是 image object detection bbox，而 File API 影片預設以 1 FPS 保存／處理；官方沒有提供 B 模式實際採用 frame 的 PTS 或 hash。因此 B 的 contract 永遠標記 `unknown_gemini_video_sample`，投影到 FFmpeg frame 的圖只供 A/B 診斷，不能成為 production geometry。兩種方法都經獨立盲審後，export 才會計算第一候選 bbox IoU 與 center distance。
+
+SAMPLE-CONTINUITY 的首次 live B 模式在 `00:02` 選中正確中央紫色手機，bbox `[413, 664, 466, 842]`；既有 A 模式為 `[412, 684, 467, 871]`，IoU 0.738123、center distance 24.5。這是 Codex 視覺檢查而非獨立 human ground truth，且 B 的 reference frame 仍不可知。
+
 持久資料位於被 Git 排除的 `artifacts/blind-review-app/<session-id>/`；跨 session 的 Gemini File API cache 依 analysis source SHA-256 位於 `artifacts/blind-review-file-cache/`。同一 upload identity 在官方 48 小時保存期內會重用。App 不會把 API key 傳到瀏覽器，也不以 browser storage 當實驗資料來源。
 
 ## 產生四種真實影片 fixture

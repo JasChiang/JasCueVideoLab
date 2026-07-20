@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import uuid
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -48,6 +48,7 @@ class MomentRequest(StrictModel):
 
 class GroundRequest(StrictModel):
     moment_id: str = Field(min_length=1)
+    mode: Literal["exact_frame", "direct_video"] = "exact_frame"
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
 
 
@@ -177,7 +178,10 @@ def create_app(service: BlindReviewService | None = None) -> FastAPI:
     @app.post("/api/sessions/{session_id}/ground")
     def ground(session_id: str, body: GroundRequest) -> dict[str, object]:
         return workflow.ground_moment(
-            session_id, moment_id=body.moment_id, temperature=body.temperature
+            session_id,
+            moment_id=body.moment_id,
+            temperature=body.temperature,
+            mode=body.mode,
         )
 
     def _review_dir(session_id: str, review_id: str) -> Path:

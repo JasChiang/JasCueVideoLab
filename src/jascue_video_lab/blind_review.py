@@ -14,8 +14,16 @@ from pydantic import Field, model_validator
 
 from .billing import summarize_usage_and_list_price
 from .gemini import GeminiLabClient
+from .geometry import box_iou, center_distance
 from .media import create_analysis_proxy, extract_frame, probe_video
-from .models import DirectMomentMap, GroundingProposal, MediaInfo, StrictModel, TargetCandidateMap
+from .models import (
+    DirectMomentMap,
+    DirectVideoGroundingProposal,
+    GroundingProposal,
+    MediaInfo,
+    StrictModel,
+    TargetCandidateMap,
+)
 from .overlay import draw_blind_review_overlay, draw_grounding_overlay
 from .storage import append_error, read_json, utc_now, write_json
 
@@ -33,6 +41,7 @@ class ReviewVerdict(StrEnum):
     TOO_LARGE = "box_too_large"
     TOO_SMALL = "box_too_small"
     TARGET_NOT_VISIBLE = "target_not_visible"
+    SAMPLE_FRAME_MISMATCH = "sample_frame_mismatch"
     UNABLE_TO_JUDGE = "unable_to_judge"
 
 
@@ -54,6 +63,8 @@ class HumanReviewAnnotation(StrictModel):
     reviewer_name: str | None = None
     target_id: str
     target_description: str
+    grounding_method: Literal["exact_frame_image", "direct_video_unknown_sample"]
+    bbox_reference_frame: Literal["exact_ffmpeg_frame", "unknown_gemini_video_sample"]
     requested_timestamp_mmss: str
     requested_time_ms: int = Field(ge=0)
     frame_pts: int
@@ -403,7 +414,12 @@ class BlindReviewService:
         return result
 
     def ground_moment(
-        self, session_id: str, *, moment_id: str, temperature: float = 0.2
+        self,
+        session_id: str,
+        *,
+        moment_id: str,
+        temperature: float = 0.2,
+        mode: Literal["exact_frame", "direct_video"] = "exact_frame",
     ) -> dict[str, Any]:
         session = self._session(session_id)
         if not session.get("current_moment_map") or not session.get("current_selection"):
@@ -426,27 +442,73 @@ class BlindReviewService:
         client = self.client_factory(temperature=temperature)
         started = monotonic()
         try:
-            proposal = client.ground_frame(
-                media=media,
-                frame=frame,
-                event_id=moment.moment_id,
-                event_description=f"{moment.label}；{moment.observable_evidence}",
-                entity_id=selection.target_id,
-                target_description=selection.target_description,
-                prompt_template=_prompt("grounding_native_yxyx_zh-TW.txt"),
-                run_id=f"blind-grounding-{uuid.uuid4().hex[:8]}",
-                output_dir=review_dir / "grounding",
-            )
+            if mode == "exact_frame":
+                proposal: GroundingProposal | DirectVideoGroundingProposal = client.ground_frame(
+                    media=media,
+                    frame=frame,
+                    event_id=moment.moment_id,
+                    event_description=f"{moment.label}；{moment.observable_evidence}",
+                    entity_id=selection.target_id,
+                    target_description=selection.target_description,
+                    prompt_template=_prompt("grounding_native_yxyx_zh-TW.txt"),
+                    run_id=f"blind-grounding-{uuid.uuid4().hex[:8]}",
+                    output_dir=review_dir / "grounding",
+                )
+                projection = proposal
+                proposal_path = "grounding/grounding.json"
+                proposal_type = "exact_frame_grounding"
+                grounding_method = "exact_frame_image"
+                bbox_reference_frame = "exact_ffmpeg_frame"
+            else:
+                uploaded, _, _ = self._ensure_upload(client, session)
+                proposal = client.ground_video_at_moment(
+                    media=media,
+                    uploaded=uploaded,
+                    requested_timestamp_mmss=moment.timestamp_mmss,
+                    event_id=moment.moment_id,
+                    event_description=f"{moment.label}；{moment.observable_evidence}",
+                    entity_id=selection.target_id,
+                    target_description=selection.target_description,
+                    prompt_template=_prompt("direct_video_grounding_native_yxyx_zh-TW.txt"),
+                    run_id=f"blind-direct-video-{uuid.uuid4().hex[:8]}",
+                    output_dir=review_dir / "direct-video-grounding",
+                )
+                projection = GroundingProposal(
+                    asset_id=media.asset_id,
+                    event_id=moment.moment_id,
+                    entity_id=selection.target_id,
+                    frame_pts=frame.frame_pts,
+                    frame_time_ms=frame.frame_time_ms,
+                    frame_hash=frame.frame_hash,
+                    source_width=frame.width,
+                    source_height=frame.height,
+                    visible=proposal.visible,
+                    occlusion=proposal.occlusion,
+                    visibility_reason=(
+                        "Projection only; model reference is an unknown video sample. "
+                        + proposal.visibility_reason
+                    ),
+                    candidates=proposal.candidates,
+                    model_provenance=proposal.model_provenance,
+                )
+                write_json(review_dir / "direct-video-projection.json", projection)
+                proposal_path = "direct-video-grounding/direct_video_grounding.json"
+                proposal_type = "direct_video_grounding"
+                grounding_method = "direct_video_unknown_sample"
+                bbox_reference_frame = "unknown_gemini_video_sample"
         finally:
             client.close()
-        blind_path = draw_blind_review_overlay(frame.path, proposal, review_dir / "blind.png")
-        draw_grounding_overlay(frame.path, proposal, review_dir / "revealed.png")
+        blind_path = draw_blind_review_overlay(frame.path, projection, review_dir / "blind.png")
+        draw_grounding_overlay(frame.path, projection, review_dir / "revealed.png")
         manifest = {
             "review_id": review_id,
             "status": "pending_human_review",
             "created_at": utc_now(),
             "target_id": selection.target_id,
             "target_description": selection.target_description,
+            "grounding_method": grounding_method,
+            "bbox_reference_frame": bbox_reference_frame,
+            "proposal_type": proposal_type,
             "moment_id": moment.moment_id,
             "requested_timestamp_mmss": moment.timestamp_mmss,
             "requested_time_ms": requested_ms,
@@ -454,7 +516,7 @@ class BlindReviewService:
             "frame_time_ms": frame.frame_time_ms,
             "frame_hash": frame.frame_hash,
             "blind_image": str(blind_path.relative_to(review_dir)),
-            "proposal_path": "grounding/grounding.json",
+            "proposal_path": proposal_path,
             "annotation_path": None,
             "model_details_revealed": False,
             "grounding_seconds": round(monotonic() - started, 6),
@@ -469,6 +531,8 @@ class BlindReviewService:
             "status": manifest["status"],
             "target_id": selection.target_id,
             "target_description": selection.target_description,
+            "grounding_method": grounding_method,
+            "bbox_reference_frame": bbox_reference_frame,
             "requested_timestamp_mmss": moment.timestamp_mmss,
             "requested_time_ms": requested_ms,
             "frame_pts": frame.frame_pts,
@@ -506,6 +570,8 @@ class BlindReviewService:
             reviewer_name=reviewer_name.strip() if reviewer_name and reviewer_name.strip() else None,
             target_id=manifest["target_id"],
             target_description=manifest["target_description"],
+            grounding_method=manifest["grounding_method"],
+            bbox_reference_frame=manifest["bbox_reference_frame"],
             requested_timestamp_mmss=manifest["requested_timestamp_mmss"],
             requested_time_ms=manifest["requested_time_ms"],
             frame_pts=manifest["frame_pts"],
@@ -543,14 +609,65 @@ class BlindReviewService:
         annotation = HumanReviewAnnotation.model_validate(
             read_json(review_dir / "human_annotation.json")
         )
-        proposal = GroundingProposal.model_validate(read_json(review_dir / manifest["proposal_path"]))
-        return {
+        proposal_payload = read_json(review_dir / manifest["proposal_path"])
+        if manifest["proposal_type"] == "direct_video_grounding":
+            proposal = DirectVideoGroundingProposal.model_validate(proposal_payload)
+        else:
+            proposal = GroundingProposal.model_validate(proposal_payload)
+        result = {
             "annotation": annotation.model_dump(mode="json"),
             "proposal": proposal.model_dump(mode="json"),
             "revealed_image_url": (
                 f"/api/sessions/{session_id}/reviews/{review_id}/revealed-image"
             ),
         }
+        comparison = self._review_method_comparison(session_id, review_id)
+        if comparison is not None:
+            result["method_comparison"] = comparison
+        return result
+
+    def _review_method_comparison(
+        self, session_id: str, review_id: str
+    ) -> dict[str, Any] | None:
+        session = self._session(session_id)
+        current_dir = self._session_dir(session_id) / "reviews" / review_id
+        current = read_json(current_dir / "review.json")
+        if current["status"] != "reviewed":
+            return None
+        for sibling_id in session["reviews"]:
+            if sibling_id == review_id:
+                continue
+            sibling_dir = self._session_dir(session_id) / "reviews" / sibling_id
+            sibling = read_json(sibling_dir / "review.json")
+            if (
+                sibling["status"] != "reviewed"
+                or sibling["moment_id"] != current["moment_id"]
+                or sibling["target_id"] != current["target_id"]
+                or sibling["grounding_method"] == current["grounding_method"]
+            ):
+                continue
+            proposals: dict[str, list[Any]] = {}
+            for manifest, directory in ((current, current_dir), (sibling, sibling_dir)):
+                payload = read_json(directory / manifest["proposal_path"])
+                proposals[manifest["grounding_method"]] = payload.get("candidates") or []
+            exact = proposals.get("exact_frame_image", [])
+            direct = proposals.get("direct_video_unknown_sample", [])
+            if not exact or not direct:
+                return {
+                    "comparable": False,
+                    "reason": "one method returned no visible candidate",
+                }
+            exact_box = exact[0]["box_2d"]
+            direct_box = direct[0]["box_2d"]
+            return {
+                "comparable": True,
+                "warning": "Direct-video bbox reference frame is unknown; this is diagnostic only.",
+                "exact_frame_box_2d": exact_box,
+                "direct_video_box_2d": direct_box,
+                "bbox_iou": round(box_iou(exact_box, direct_box), 6),
+                "bbox_center_distance": round(center_distance(exact_box, direct_box), 6),
+            }
+        return None
 
     def session_view(self, session_id: str) -> dict[str, Any]:
         session = self._session(session_id)

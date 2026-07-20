@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from jascue_video_lab.models import (
     ContentMap,
+    DirectVideoGroundingProposal,
     DirectMomentMap,
     GeminiNativeGroundingProposal,
     GroundingCandidate,
@@ -210,3 +211,21 @@ def test_target_candidate_map_rejects_invalid_representative_time(
     payload["candidates"][0]["representative_timestamp_mmss"] = timestamp
     with pytest.raises(ValidationError):
         TargetCandidateMap.model_validate(payload)
+
+
+def test_direct_video_grounding_cannot_claim_exact_frame_identity(provenance) -> None:
+    payload = {
+        "asset_id": "sha256:" + "a" * 64,
+        "event_id": "moment-01",
+        "entity_id": "phone-1",
+        "requested_timestamp_mmss": "00:08",
+        "reference_frame_status": "exact_ffmpeg_frame",
+        "reference_frame_description": "unknown sample",
+        "visible": False,
+        "occlusion": "unknown",
+        "visibility_reason": "not observed",
+        "candidates": [],
+        "model_provenance": provenance.model_dump(mode="json"),
+    }
+    with pytest.raises(ValidationError):
+        DirectVideoGroundingProposal.model_validate(payload)
