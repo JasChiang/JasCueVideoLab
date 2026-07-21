@@ -1,0 +1,133 @@
+{
+  "schema_version": "efficienttam-generalization-fixtures.v1",
+  "coordinate_convention": "[x_min, y_min, x_max, y_max], top-left origin, normalized 0..1000",
+  "seed_source": "manual_bbox_proposal_pending_human_review",
+  "analysis_fps": 15,
+  "analysis_max_side": 960,
+  "fixtures": [
+    {
+      "fixture_id": "rigid-whole-object",
+      "targets": [
+        {
+          "target_id": "target.whole-object",
+          "label": "whole rigid object",
+          "box_2d": [45, 0, 620, 1000],
+          "color_bgr": [32, 210, 255]
+        }
+      ]
+    },
+    {
+      "fixture_id": "strict-object-part",
+      "targets": [
+        {
+          "target_id": "target.object-part",
+          "label": "strict object part",
+          "box_2d": [600, 60, 795, 370],
+          "color_bgr": [30, 70, 255]
+        }
+      ]
+    },
+    {
+      "fixture_id": "similar-products",
+      "targets": [
+        {
+          "target_id": "target.similar-left",
+          "label": "similar object A",
+          "box_2d": [130, 290, 365, 650],
+          "color_bgr": [255, 200, 20]
+        },
+        {
+          "target_id": "target.similar-right",
+          "label": "similar object B",
+          "box_2d": [375, 250, 620, 620],
+          "color_bgr": [40, 70, 255]
+        }
+      ]
+    },
+    {
+      "fixture_id": "two-deformable-people",
+      "targets": [
+        {
+          "target_id": "target.person-left",
+          "label": "person A",
+          "box_2d": [315, 160, 600, 1000],
+          "color_bgr": [255, 180, 20]
+        },
+        {
+          "target_id": "target.person-right",
+          "label": "person B",
+          "box_2d": [540, 135, 800, 1000],
+          "color_bgr": [40, 70, 255]
+        }
+      ]
+    },
+    {
+      "fixture_id": "foreground-screen-and-person",
+      "targets": [
+        {
+          "target_id": "target.foreground-screen",
+          "label": "foreground display area",
+          "box_2d": [620, 190, 795, 715],
+          "color_bgr": [40, 70, 255]
+        },
+        {
+          "target_id": "target.background-person",
+          "label": "background person",
+          "box_2d": [90, 75, 470, 1000],
+          "color_bgr": [255, 190, 20]
+        }
+      ]
+    },
+    {
+      "fixture_id": "small-circular-display-touch",
+      "targets": [
+        {
+          "target_id": "target.small-display",
+          "label": "small circular display",
+          "box_2d": [510, 430, 615, 625],
+          "color_bgr": [40, 70, 255]
+        },
+        {
+          "target_id": "target.interacting-hand",
+          "label": "interacting hand",
+          "box_2d": [500, 360, 810, 690],
+          "color_bgr": [255, 190, 20]
+        }
+      ]
+    },
+    {
+      "fixture_id": "part-and-occluding-hand",
+      "targets": [
+        {
+          "target_id": "target.circular-display",
+          "label": "circular display part",
+          "box_2d": [520, 385, 646, 675],
+          "color_bgr": [40, 70, 255]
+        },
+        {
+          "target_id": "target.occluding-hand",
+          "label": "occluding hand",
+          "box_2d": [795, 245, 1000, 700],
+          "color_bgr": [255, 190, 20]
+        }
+      ]
+    },
+    {
+      "fixture_id": "long-screen-operation",
+      "targets": [
+        {
+          "target_id": "target.active-screen",
+          "label": "active screen area",
+          "box_2d": [557, 45, 815, 895],
+          "color_bgr": [40, 70, 255]
+        },
+        {
+          "target_id": "target.scrolling-hand",
+          "label": "scrolling hand",
+          "box_2d": [710, 0, 1000, 335],
+          "color_bgr": [255, 190, 20]
+        }
+      ]
+    }
+  ]
+}
