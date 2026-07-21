@@ -164,6 +164,8 @@ Feature renderer 同樣接受無音軌來源：有原音時保留並淡入淡出
 
 完整的 Clip Card-driven A/B 則分成兩次 Gemini 任務：第一輪逐片產生 Clip Cards；第二輪只讀已驗證 Clip Cards 與使用者 brief，輸出 Structured narrative plan。`scripts/plan_selected_clip_cards.py` 實作第二輪，`scripts/render_clip_card_narrative.py` 只從通過 evidence gate 的 source/event/MM:SS 建立 16:9 review cut。第二輪仍可能產生規格換算錯誤，Clip Card 也可能把局部可見的數字或型號字元誤判成另一個相似值。因此任何 OCR／身分衝突只能觸發 `needs_human_review`，必須回查 orientation-corrected 原始影格後才能採用或排除；schema validation 不能取代 claim validation，也不能把模型 OCR 當成 ground truth。
 
+`scripts/plan_clip_card_feature_cut.py` 將這個方法延伸到完整 feature cut：模型可閱讀整個已驗證 Clip Card library，但只能選 catalog 中既有的 asset／event／RF frame ID；本機會再次驗證影格確實屬於該素材且位在事件區間，才投影成 `feature-cut` 可使用的 plan。選片階段不產生 bbox 或剪點，只有真正入選、需要動態構圖的區間才執行 exact-frame Grounding 與 SAM。實務上的幾何降級順序應保留多個候選：先允許 brief 明示的少量主體裁切，再嘗試同事件的另一 seed／更明確 target，其次換用候選素材，最後才採本機 fallback。`vertical_fallback_strategy=center_crop` 可明確禁止模糊背景；所有 fallback 原因仍寫入 render manifest，不能冒充成功追蹤。
+
 主要影片／圖片辨識請求另使用 Interactions API `system_instruction` 建立 evidence-only 邊界：本次媒體與明確 metadata 是唯一證據，禁止以模型記憶、常見名稱、相似外觀或「最可能答案」補完品牌、型號、數字與 UI 文字。Full Clip Card prompt 也要求任一關鍵字元不清楚時改用泛稱並保存 uncertainty。控制 A/B 曾觀察到舊 prompt 以先驗補完一個相似但錯誤的型號；改用 domain-neutral 規則後該欄位在重跑中恢復正確，模型卻又把另一處模糊小字補成畫面不存在的規格。這證明 prompt guardrail 不是 ground truth：單一正確 claim 不代表整張 Clip Card 都正確，衝突與重要文字仍需 exact-frame 驗證及人工核准。
 
 `scripts/verify_clip_card_text.py` 實作不覆蓋原始 Clip Card 的文字驗證：從原片抽多張 exact frames、保存 PTS／hash、裁出文字證據，以 `resolution=high` 分別做 blind transcription，再以明列 `other`／`unreadable` 的候選式請求交叉檢查。方法不一致時輸出 `needs_human_review`；只有人工核准後才能另外產生 reviewed Clip Card。

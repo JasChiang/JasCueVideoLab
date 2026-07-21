@@ -1787,6 +1787,9 @@ class FeatureEditBrief(StrictModel):
     title: str
     target_duration_seconds: float = Field(ge=60.0, le=90.0)
     render_title_overlays: bool = True
+    vertical_fallback_strategy: Literal["fit_with_background", "center_crop"] = (
+        "fit_with_background"
+    )
     chapters: list[FeatureChapterBrief] = Field(min_length=1, max_length=16)
 
     @model_validator(mode="after")

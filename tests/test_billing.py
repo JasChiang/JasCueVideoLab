@@ -24,3 +24,21 @@ def test_usage_summary_prices_input_output_and_thought_tokens(tmp_path) -> None:
     assert summary["input_tokens_by_modality"] == {"TEXT": 300, "VIDEO": 700}
     assert summary["billed_output_tokens"] == 120
     assert summary["estimated_total_cost_usd"] == 0.00258
+
+
+def test_usage_summary_deduplicates_copied_raw_interactions(tmp_path) -> None:
+    interaction = {
+        "usage": {
+            "total_input_tokens": 1_000,
+            "total_output_tokens": 100,
+            "total_thought_tokens": 20,
+        }
+    }
+    for name in ("attempt.raw_interaction.json", "canonical.raw_interaction.json"):
+        (tmp_path / name).write_text(json.dumps(interaction), encoding="utf-8")
+
+    summary = summarize_usage_and_list_price(tmp_path)
+
+    assert summary["request_count"] == 1
+    assert summary["duplicate_artifact_count"] == 1
+    assert summary["estimated_total_cost_usd"] == 0.00258

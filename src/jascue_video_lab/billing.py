@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,8 +19,19 @@ def summarize_usage_files(paths: list[Path], *, relative_to: Path | None = None)
     total_output = 0
     total_thought = 0
     input_by_modality: dict[str, int] = defaultdict(int)
+    seen_payloads: set[str] = set()
+    duplicate_paths: list[str] = []
     for path in sorted(paths):
         payload = read_json(path)
+        fingerprint = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if fingerprint in seen_payloads:
+            duplicate_paths.append(
+                str(path.relative_to(relative_to)) if relative_to else str(path)
+            )
+            continue
+        seen_payloads.add(fingerprint)
         usage = payload.get("usage") or {}
         if not usage:
             continue
@@ -64,6 +77,8 @@ def summarize_usage_files(paths: list[Path], *, relative_to: Path | None = None)
         "estimated_input_cost_usd": round(input_cost, 8),
         "estimated_output_cost_usd": round(output_cost, 8),
         "estimated_total_cost_usd": round(input_cost + output_cost, 8),
+        "duplicate_artifact_count": len(duplicate_paths),
+        "duplicate_artifact_paths": duplicate_paths,
         "requests": records,
     }
 

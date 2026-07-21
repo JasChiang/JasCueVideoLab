@@ -9,7 +9,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from time import monotonic
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -51,7 +51,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v2-primary-center-atomic"
+_RENDER_PIPELINE_VERSION = "feature-cut-v3-explicit-vertical-fallback"
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
 _TRACKING_SEED_BOX_PADDING_RATIO = 0.04
@@ -645,19 +645,27 @@ def _vertical_filter_from_track(
     track: SegmentationTrack,
     *,
     allow_subject_clipping: bool = False,
+    fallback_strategy: Literal["fit_with_background", "center_crop"] = (
+        "fit_with_background"
+    ),
 ) -> tuple[str, dict[str, Any]]:
+    fallback_filter = (
+        _vertical_center_crop_filter()
+        if fallback_strategy == "center_crop"
+        else _vertical_fit_filter()
+    )
     times, centers_x, boxes = _usable_track_centers(track)
     if len(times) < 2:
-        return _vertical_fit_filter(), {
-            "applied_strategy": "fit_with_background",
+        return fallback_filter, {
+            "applied_strategy": fallback_strategy,
             "fallback_reason": "fewer_than_two_usable_tracking_samples",
         }
     scaled_width = 3414
     crop_width_normalized = 1080 * 1000 / scaled_width
     max_target_width = max(box[2] - box[0] for box in boxes)
     if not allow_subject_clipping and max_target_width * 1.08 > crop_width_normalized:
-        return _vertical_fit_filter(), {
-            "applied_strategy": "fit_with_background",
+        return fallback_filter, {
+            "applied_strategy": fallback_strategy,
             "fallback_reason": "tracked_subject_too_wide_for_safe_9x16_crop",
             "subject_clipping_allowed": False,
         }
@@ -684,6 +692,13 @@ def _vertical_fit_filter() -> str:
         "crop=1080:1920,gblur=sigma=28[background];"
         "[foreground_source]scale=1080:-2[foreground];"
         "[background][foreground]overlay=(W-w)/2:(H-h)/2,setsar=1[base]"
+    )
+
+
+def _vertical_center_crop_filter() -> str:
+    return (
+        "[0:v]fps=30,scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920:x=(iw-ow)/2:y=0,setsar=1[base]"
     )
 
 
@@ -1160,9 +1175,14 @@ def run_feature_cut_experiment(
                         output_path=horizontal_segment,
                         source_has_audio=horizontal_source_has_audio,
                     )
-                vertical_filter = _vertical_fit_filter()
+                vertical_fallback_strategy = brief.vertical_fallback_strategy
+                vertical_filter = (
+                    _vertical_center_crop_filter()
+                    if vertical_fallback_strategy == "center_crop"
+                    else _vertical_fit_filter()
+                )
                 vertical_geometry: dict[str, Any] = {
-                    "applied_strategy": "fit_with_background",
+                    "applied_strategy": vertical_fallback_strategy,
                     "fallback_reason": None,
                 }
                 vertical_debug: Path | None = None
@@ -1203,11 +1223,12 @@ def run_feature_cut_experiment(
                             allow_subject_clipping=(
                                 brief_chapter.vertical_crop_mode == "primary_center"
                             ),
+                            fallback_strategy=vertical_fallback_strategy,
                         )
                         vertical_debug = track_root / "grounding-debug.png"
                     except Exception as error:
                         vertical_geometry = {
-                            "applied_strategy": "fit_with_background",
+                            "applied_strategy": vertical_fallback_strategy,
                             "fallback_reason": f"tracking_or_grounding_failed:{type(error).__name__}:{error}",
                         }
                 vertical_segment_fingerprint = _segment_variant_fingerprint(

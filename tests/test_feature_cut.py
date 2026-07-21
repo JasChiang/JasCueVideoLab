@@ -81,6 +81,24 @@ def test_feature_brief_can_disable_titles_and_choose_primary_center_crop() -> No
     assert brief.chapters[0].vertical_crop_mode == "primary_center"
 
 
+def test_feature_brief_can_forbid_blurred_vertical_fallback() -> None:
+    brief = FeatureEditBrief(
+        project_id="clean-cut",
+        title="clean",
+        target_duration_seconds=60,
+        vertical_fallback_strategy="center_crop",
+        chapters=[
+            FeatureChapterBrief(
+                feature_id="hero",
+                title="hero",
+                detail_lines=[],
+                target_duration_seconds=6,
+            )
+        ],
+    )
+    assert brief.vertical_fallback_strategy == "center_crop"
+
+
 def test_tracked_reframe_requires_target_and_nonzero_intent() -> None:
     payload = {
         "feature_id": "ui",
