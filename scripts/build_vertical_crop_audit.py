@@ -7,23 +7,71 @@ import argparse
 import html
 from pathlib import Path
 
-from jascue_video_lab.feature_cut import _usable_track_centers, _vertical_crop_geometry
+from jascue_video_lab.feature_cut import (
+    _track_geometry_fingerprint,
+    _usable_track_centers,
+    _vertical_crop_geometry,
+)
 from jascue_video_lab.models import SegmentationTrack
 from jascue_video_lab.storage import read_json, write_json
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("open_plan_json", type=Path)
+    parser.add_argument("plan_json", type=Path)
     parser.add_argument("render_manifest_json", type=Path)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--video", type=Path)
     parser.add_argument("--budget-plan", type=Path)
+    parser.add_argument(
+        "--brief-json",
+        type=Path,
+        help="Required when plan_json is a legacy single-select feature plan",
+    )
     args = parser.parse_args()
 
-    plan = read_json(args.open_plan_json)
+    plan = read_json(args.plan_json)
     manifest = read_json(args.render_manifest_json)
     vertical = {item["feature_id"]: item for item in manifest["vertical"]["chapters"]}
+    alternatives_preserved = "shots" in plan
+    if not alternatives_preserved:
+        if not args.brief_json:
+            raise ValueError("legacy feature plans require --brief-json")
+        brief = read_json(args.brief_json)
+        brief_by_id = {item["feature_id"]: item for item in brief["chapters"]}
+        legacy_shots: list[dict[str, object]] = []
+        for chapter in plan["chapters"]:
+            feature_id = chapter["feature_id"]
+            brief_chapter = brief_by_id[feature_id]
+            legacy_shots.append(
+                {
+                    "feature_id": feature_id,
+                    "title": brief_chapter["title"],
+                    "vertical_candidate_id": "legacy_selected",
+                    "candidates": [
+                        {
+                            "candidate_id": "legacy_selected",
+                            "source_asset_id": chapter["vertical_source_asset_id"],
+                            "event_id": chapter["vertical_event_id"],
+                            "frame_id": chapter["vertical_frame_id"],
+                            "observed_visual_evidence": chapter[
+                                "observed_visual_evidence"
+                            ],
+                            "selection_reason": chapter["selection_reason"],
+                            "quality_risks": chapter["quality_risks"],
+                            "vertical_strategy": chapter["vertical_strategy"],
+                            "vertical_target_description": chapter[
+                                "vertical_target_description"
+                            ],
+                            "vertical_crop_mode": brief_chapter["vertical_crop_mode"],
+                        }
+                    ],
+                }
+            )
+        plan = {
+            "project_id": plan["project_id"],
+            "shots": legacy_shots,
+        }
     shots_by_id = {item["feature_id"]: item for item in plan["shots"]}
     ordered_shots = plan["shots"]
     if args.budget_plan:
@@ -62,13 +110,20 @@ def main() -> int:
             )
         )
         track_audit: dict[str, object] | None = None
-        if len(track_files) == 1:
-            track = SegmentationTrack.model_validate(read_json(track_files[0]))
+        matching_tracks: list[tuple[Path, SegmentationTrack]] = []
+        for track_file in track_files:
+            candidate_track = SegmentationTrack.model_validate(read_json(track_file))
+            if _track_geometry_fingerprint(candidate_track) == rendered.get(
+                "track_geometry_fingerprint"
+            ):
+                matching_tracks.append((track_file, candidate_track))
+        if len(matching_tracks) == 1:
+            track_file, track = matching_tracks[0]
             times, centers, boxes = _usable_track_centers(track)
             if times:
                 _, crop_geometry = _vertical_crop_geometry(times, centers, boxes)
                 track_audit = {
-                    "track_path": str(track_files[0].resolve()),
+                    "track_path": str(track_file.resolve()),
                     "target_description": track.target_description,
                     "analysis_fps": track.analysis_fps,
                     "analysis_start_ms": track.analysis_start_ms,
@@ -100,6 +155,12 @@ def main() -> int:
             "source_out_ms": rendered["source_out_ms"],
             "selected_candidate": selected,
             "alternative_candidates": alternatives,
+            "alternative_candidates_preserved": alternatives_preserved,
+            "alternatives_unavailable_reason": (
+                None
+                if alternatives_preserved
+                else "legacy_single-select_plan_did_not_preserve_top_k"
+            ),
             "applied_strategy": rendered.get("applied_strategy"),
             "fallback_reason": rendered.get("fallback_reason"),
             "target_description": rendered.get("target_description"),
@@ -127,7 +188,11 @@ def main() -> int:
         alternatives_html = "<br>".join(
             f"{html.escape(item['candidate_id'])}: {html.escape(item['observed_visual_evidence'])}"
             for item in alternatives
-        ) or "none"
+        ) or (
+            "none"
+            if alternatives_preserved
+            else "未保存：舊版 single-select plan 沒有 Top-K"
+        )
         rows.append(
             "<tr>"
             f"<td>{timeline_cursor_ms / 1000 - duration_ms / 1000:.3f}–{timeline_cursor_ms / 1000:.3f}s</td>"
