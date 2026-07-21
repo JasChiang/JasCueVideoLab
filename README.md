@@ -158,7 +158,7 @@ OPPO Reno16 真實實跑輸出兩支 74.176 秒無燒錄字卡影片。16:9 有 
 
 完整的 Clip Card-driven A/B 則分成兩次 Gemini 任務：第一輪逐片產生 Clip Cards；第二輪只讀已驗證 Clip Cards 與使用者 brief，輸出 Structured narrative plan。`scripts/plan_selected_clip_cards.py` 實作第二輪，`scripts/render_clip_card_narrative.py` 只從通過 evidence gate 的 source/event/MM:SS 建立 16:9 review cut。第二輪仍可能產生規格換算錯誤，Clip Card 也可能把造型字樣中的 `16` 誤讀成 `11`、`10` 或 `12`。因此任何 OCR／型號衝突只能觸發 `needs_human_review`，必須回查 orientation-corrected 原始影格後才能採用或排除；schema validation 不能取代 claim validation，也不能把模型 OCR 當成 ground truth。
 
-主要影片／圖片辨識請求另使用 Interactions API `system_instruction` 建立 evidence-only 邊界：本次媒體與明確 metadata 是唯一證據，禁止以模型記憶、常見產品名稱、相似外觀或「最可能答案」補完品牌、型號、數字與 UI 文字。Full Clip Card prompt 也要求任一關鍵字元不清楚時改用泛稱並保存 uncertainty。相同 720p proxy 的控制 A/B 中，舊 prompt 把 `Reno16 F` 誤讀為 `Reno11 F`；新 system instruction 在 temperature 0 與 0.2 各重跑一次都讀對。但 prompt guardrail 不是 ground truth：獨立 4K crop blind OCR 仍曾讀成另一個錯誤型號，因此衝突仍需 exact-frame 候選驗證與人工核准。
+主要影片／圖片辨識請求另使用 Interactions API `system_instruction` 建立 evidence-only 邊界：本次媒體與明確 metadata 是唯一證據，禁止以模型記憶、常見產品名稱、相似外觀或「最可能答案」補完品牌、型號、數字與 UI 文字。Full Clip Card prompt 也要求任一關鍵字元不清楚時改用泛稱並保存 uncertainty。相同 720p proxy 的控制 A/B 中，舊 prompt 把 `Reno16 F` 誤讀為 `Reno11 F`；新 system instruction 在 temperature 0 與 0.2 各重跑一次都讀對。之後移除品牌／型號特例、改用 domain-neutral 規則的重跑仍讀對型號，但又把機身實際的 `AI CAMERA SYSTEM` 小字寫成不存在的 `50MP`。因此 prompt guardrail 不是 ground truth：單一正確 claim 不代表整張 Clip Card 都正確，衝突與重要文字仍需 exact-frame 驗證及人工核准。
 
 `scripts/verify_clip_card_text.py` 實作不覆蓋原始 Clip Card 的文字驗證：從原片抽多張 exact frames、保存 PTS／hash、裁出文字證據，以 `resolution=high` 分別做 blind transcription，再以明列 `other`／`unreadable` 的候選式請求交叉檢查。方法不一致時輸出 `needs_human_review`；只有人工核准後才能另外產生 reviewed Clip Card。
 

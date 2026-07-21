@@ -541,6 +541,13 @@ def test_saved_raw_clip_card_is_not_reused_without_current_system_instruction(
     assert recovered is None
 
 
+def test_full_clip_prompt_evidence_rule_is_domain_neutral() -> None:
+    prompt = Path("prompts/full_clip_card_mmss_zh-TW.txt").read_text(encoding="utf-8")
+    assert "關鍵字元／音節不清楚" in prompt
+    assert "最具體類別泛稱" in prompt
+    assert "Reno" not in prompt
+
+
 def test_full_library_public_index_omits_source_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
