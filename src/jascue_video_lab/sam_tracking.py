@@ -4,6 +4,7 @@ import json
 import math
 import re
 import subprocess
+import uuid
 from collections import Counter, deque
 from dataclasses import dataclass
 from fractions import Fraction
@@ -17,6 +18,11 @@ from .geometry import box_iou, center_distance
 from .media import probe_video, sha256_file
 from .models import (
     Rational,
+    SharedSam21AnalysisFrame,
+    SharedSam21BBoxSeed,
+    SharedSam21SessionManifest,
+    SharedSam21SessionTarget,
+    SharedSam21SessionTiming,
     SegmentationModelProvenance,
     SegmentationSample,
     SegmentationTrack,
@@ -47,6 +53,20 @@ class _SeedShot:
     end_time_ms: int
     start_frame_pts: int | None
     boundary_score: float | None
+
+
+@dataclass(frozen=True)
+class _MaterializedMaskObservation:
+    """Small per-frame record; full-resolution float logits are never retained."""
+
+    mask_path: str | None
+    mask_sha256: str | None
+    mask_area_pixels: int
+    mask_area_ratio: float
+    connected_components: int
+    derived_tracking_box: list[int] | None
+    center_2d: list[float] | None
+    mean_positive_probability: float | None
 
 
 _SHOWINFO_FRAME_RE = re.compile(
@@ -380,6 +400,10 @@ def require_bbox_track_request_match(
     analysis_start_ms: int,
     analysis_end_ms: int,
     checkpoint_sha256: str,
+    seed_frame_pts: int | None = None,
+    seed_frame_sha256: str | None = None,
+    seed_source_width: int | None = None,
+    seed_source_height: int | None = None,
 ) -> None:
     """Fail closed if a cached SAM artifact is not this bbox-seed request."""
     expected = {
@@ -398,6 +422,13 @@ def require_bbox_track_request_match(
         "analysis_fps": analysis_fps,
         "analysis_start_ms": analysis_start_ms,
         "analysis_end_ms": analysis_end_ms,
+        "target_id": None,
+        "shared_session_id": None,
+        "analysis_frames_manifest_sha256": None,
+        "seed_frame_pts": seed_frame_pts,
+        "seed_frame_sha256": seed_frame_sha256,
+        "seed_source_width": seed_source_width,
+        "seed_source_height": seed_source_height,
     }
     mismatches = {
         field: {"expected": value, "actual": getattr(track, field)}
@@ -437,6 +468,7 @@ def _extract_analysis_frames(
     source_start_pts: int,
     time_base_numerator: int,
     time_base_denominator: int,
+    required_source_pts: Sequence[int] = (),
 ) -> tuple[list[_AnalysisFrame], int, int]:
     if analysis_fps <= 0 or analysis_fps > 60:
         raise ValueError("analysis_fps must be in (0, 60]")
@@ -444,6 +476,33 @@ def _extract_analysis_frames(
         raise ValueError("max_side must be at least 320")
     if not 0 <= start_time_ms < end_time_ms:
         raise ValueError("analysis frame interval must be a non-empty half-open interval")
+    required_pts = list(required_source_pts)
+    if len(required_pts) != len(set(required_pts)):
+        raise ValueError("required_source_pts must not contain duplicates")
+    for pts in required_pts:
+        relative_seconds = Fraction(
+            (pts - source_start_pts) * time_base_numerator,
+            time_base_denominator,
+        )
+        if not Fraction(start_time_ms, 1000) <= relative_seconds < Fraction(
+            end_time_ms, 1000
+        ):
+            raise ValueError(
+                "required source PTS is outside the exact selected analysis interval: "
+                f"{pts}"
+            )
+        timeline_time_ms = _timeline_ms_from_pts(
+            pts,
+            source_start_pts=source_start_pts,
+            time_base_numerator=time_base_numerator,
+            time_base_denominator=time_base_denominator,
+        )
+        if not start_time_ms <= timeline_time_ms < end_time_ms:
+            raise ValueError(
+                "required source PTS is outside the selected analysis interval: "
+                f"{pts} -> {timeline_time_ms} ms not in "
+                f"[{start_time_ms}, {end_time_ms})"
+            )
     frames_dir.mkdir(parents=True, exist_ok=True)
     if any(frames_dir.iterdir()):
         raise FileExistsError(f"analysis frame directory is not empty: {frames_dir}")
@@ -452,11 +511,20 @@ def _extract_analysis_frames(
     absolute_start_seconds = source_origin_seconds + Fraction(start_time_ms, 1000)
     absolute_end_seconds = source_origin_seconds + Fraction(end_time_ms, 1000)
     interval_seconds = Fraction(1, 1) / Fraction(str(analysis_fps))
-    select = (
-        f"gte(t\\,{float(absolute_start_seconds):.9f})*"
+    start_seconds_text = f"{float(absolute_start_seconds):.9f}"
+    interval_seconds_text = f"{float(interval_seconds):.9f}"
+    current_bucket = f"floor((t-{start_seconds_text})/{interval_seconds_text})"
+    previous_bucket = (
+        f"floor(((prev_pts*TB)-{start_seconds_text})/{interval_seconds_text})"
+    )
+    regular_select = (
+        f"gte(t\\,{start_seconds_text})*"
         f"lt(t\\,{float(absolute_end_seconds):.9f})*"
-        "(isnan(prev_selected_t)+"
-        f"gte(t-prev_selected_t\\,{float(interval_seconds):.9f}))"
+        f"(isnan(prev_pts)+gt({current_bucket}\\,{previous_bucket}))"
+    )
+    forced_select = "+".join(f"eq(pts\\,{pts})" for pts in sorted(required_pts))
+    select = (
+        f"({regular_select})+({forced_select})" if forced_select else regular_select
     )
     filter_graph = (
         f"select={select},"
@@ -530,6 +598,13 @@ def _extract_analysis_frames(
                 timeline_time_ms=timeline_time_ms,
             )
         )
+    emitted_pts = {frame.source_pts for frame in frames}
+    missing_required_pts = sorted(set(required_pts) - emitted_pts)
+    if missing_required_pts:
+        raise RuntimeError(
+            "FFmpeg did not emit every required source PTS: "
+            f"{missing_required_pts}"
+        )
     with Image.open(paths[0]) as first:
         width, height = first.size
     return frames, width, height
@@ -552,7 +627,7 @@ def _scene_cut_scores(frame_paths: Sequence[Path]) -> list[float | None]:
 def _save_mask(mask: Any, output_path: Path) -> str:
     np, _, _ = _require_segmentation_dependencies()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255, mode="L").save(output_path)
+    Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255).save(output_path)
     return sha256_file(output_path)
 
 
@@ -568,7 +643,7 @@ def _render_overlay(
         image = source.copy()
     rejected = state in {TrackingState.DRIFT_SUSPECTED, TrackingState.LOST}
     overlay_rgb = (255, 55, 75) if rejected else (0, 255, 170)
-    alpha = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 105, mode="L")
+    alpha = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 105)
     color = Image.new("RGBA", image.size, (*overlay_rgb, 0))
     color.putalpha(alpha)
     image = Image.alpha_composite(image, color)
@@ -618,6 +693,711 @@ def _render_video(overlays_dir: Path, output_path: Path, analysis_fps: float) ->
     )
 
 
+def _logits_by_object_id(obj_ids: Any, mask_logits: Any) -> dict[str, Any]:
+    """Map SAM's current output tensor without copying it into retained CPU arrays."""
+    if obj_ids is None:
+        raise RuntimeError("SAM did not return object IDs for multi-object output")
+    resolved_ids = [str(obj_id) for obj_id in list(obj_ids)]
+    if len(resolved_ids) != len(set(resolved_ids)):
+        raise RuntimeError("SAM returned duplicate object IDs")
+    if len(mask_logits) != len(resolved_ids):
+        raise RuntimeError("SAM object IDs and mask logits have different batch sizes")
+    return {
+        obj_id: mask_logits[offset, 0]
+        for offset, obj_id in enumerate(resolved_ids)
+    }
+
+
+def _materialize_mask_observation(
+    *,
+    np: Any,
+    logits: Any,
+    width: int,
+    height: int,
+    sample_index: int,
+    target_output_dir: Path,
+) -> _MaterializedMaskObservation:
+    """Immediately reduce one SAM output to a mask artifact and compact metadata."""
+    values = logits.detach().float().cpu().numpy()
+    if values.shape != (height, width):
+        raise RuntimeError(
+            "SAM mask dimensions do not match analysis frames: "
+            f"expected {(height, width)}, got {values.shape}"
+        )
+    if not np.isfinite(values).all():
+        raise RuntimeError("SAM returned non-finite mask logits")
+    binary = np.asarray(values > 0, dtype=bool)
+    geometry = binary_mask_geometry(binary)
+    components = approximate_connected_components(binary)
+    if geometry["area_pixels"]:
+        probabilities = 1 / (1 + np.exp(-np.clip(values[binary], -30, 30)))
+        mean_probability = float(probabilities.mean())
+        mask_rel = Path("masks") / f"{sample_index:06d}.png"
+        mask_hash = _save_mask(binary, target_output_dir / mask_rel)
+        mask_path = str(mask_rel)
+    else:
+        mean_probability = None
+        mask_hash = None
+        mask_path = None
+        stale_mask_path = target_output_dir / "masks" / f"{sample_index:06d}.png"
+        if stale_mask_path.exists():
+            stale_mask_path.unlink()
+    return _MaterializedMaskObservation(
+        mask_path=mask_path,
+        mask_sha256=mask_hash,
+        mask_area_pixels=geometry["area_pixels"],
+        mask_area_ratio=geometry["area_ratio"],
+        connected_components=components,
+        derived_tracking_box=geometry["box_2d"],
+        center_2d=geometry["center_2d"],
+        mean_positive_probability=mean_probability,
+    )
+
+
+def _expected_observation_sources(
+    sample_index: int, seed_index: int, *, reverse_seed_overlap: bool
+) -> set[str]:
+    if sample_index < seed_index:
+        return {"reverse"}
+    if sample_index > seed_index:
+        return {"forward"}
+    sources = {"prompt", "forward"}
+    if reverse_seed_overlap:
+        sources.add("reverse")
+    return sources
+
+
+def _record_direction_frame(
+    *,
+    direction: str,
+    frame_idx: int,
+    expected_indexes: set[int],
+    seen_indexes: set[int],
+) -> None:
+    if frame_idx not in expected_indexes:
+        raise RuntimeError(
+            f"SAM {direction} propagation returned out-of-range frame {frame_idx}"
+        )
+    if frame_idx in seen_indexes:
+        raise RuntimeError(
+            f"SAM {direction} propagation returned duplicate frame {frame_idx}"
+        )
+    seen_indexes.add(frame_idx)
+
+
+def _validate_shared_observation_coverage(
+    *,
+    frame_count: int,
+    seed_indexes: dict[str, int],
+    observation_sources: dict[str, dict[int, set[str]]],
+    expected_forward_indexes: set[int],
+    seen_forward_indexes: set[int],
+    expected_reverse_indexes: set[int],
+    seen_reverse_indexes: set[int],
+) -> None:
+    if seen_forward_indexes != expected_forward_indexes:
+        missing = sorted(expected_forward_indexes - seen_forward_indexes)
+        raise RuntimeError(f"SAM forward propagation frame coverage mismatch: missing={missing}")
+    if seen_reverse_indexes != expected_reverse_indexes:
+        missing = sorted(expected_reverse_indexes - seen_reverse_indexes)
+        raise RuntimeError(f"SAM reverse propagation frame coverage mismatch: missing={missing}")
+    expected_sample_indexes = set(range(frame_count))
+    reverse_seed_overlap = bool(expected_reverse_indexes)
+    for target_id, seed_index in seed_indexes.items():
+        actual_indexes = set(observation_sources[target_id])
+        if actual_indexes != expected_sample_indexes:
+            missing = sorted(expected_sample_indexes - actual_indexes)
+            extra = sorted(actual_indexes - expected_sample_indexes)
+            raise RuntimeError(
+                f"SAM target {target_id!r} frame coverage mismatch: "
+                f"missing={missing}, extra={extra}"
+            )
+        for sample_index in range(frame_count):
+            expected_sources = _expected_observation_sources(
+                sample_index,
+                seed_index,
+                reverse_seed_overlap=reverse_seed_overlap,
+            )
+            actual_sources = observation_sources[target_id][sample_index]
+            if actual_sources != expected_sources:
+                raise RuntimeError(
+                    f"SAM target {target_id!r} frame {sample_index} source coverage "
+                    f"mismatch: expected={sorted(expected_sources)}, "
+                    f"actual={sorted(actual_sources)}"
+                )
+
+
+def _resolve_shared_seed_indexes(
+    *,
+    targets: Sequence[SharedSam21BBoxSeed],
+    frame_records: Sequence[SharedSam21AnalysisFrame],
+) -> dict[str, int]:
+    """Resolve upstream evidence by exact source PTS, never nearest timeline time."""
+    by_source_pts = {frame.source_pts: frame for frame in frame_records}
+    if len(by_source_pts) != len(frame_records):
+        raise RuntimeError("analysis frame manifest contains duplicate source PTS values")
+    resolved: dict[str, int] = {}
+    for target in targets:
+        frame = by_source_pts.get(target.seed_frame_pts)
+        if frame is None:
+            raise ValueError(
+                f"seed source PTS is not present in analysis frames for {target.target_id!r}"
+            )
+        if frame.analysis_sample_time_ms != target.seed_time_ms:
+            raise ValueError(
+                f"seed time does not match decoded source PTS for {target.target_id!r}"
+            )
+        resolved[target.target_id] = frame.sample_index
+    return resolved
+
+
+def _build_segmentation_samples(
+    *,
+    np: Any,
+    analysis_frames: Sequence[_AnalysisFrame],
+    width: int,
+    height: int,
+    seed_index: int,
+    observations_by_index: dict[int, _MaterializedMaskObservation],
+    seed_shot: _SeedShot,
+    analysis_start_ms: int,
+    target_output_dir: Path,
+) -> list[SegmentationSample]:
+    begins_at_shot_boundary = (
+        seed_shot.start_time_ms > 0 and analysis_start_ms == seed_shot.start_time_ms
+    )
+    cut_scores: list[float | None] = [None] * len(analysis_frames)
+    if begins_at_shot_boundary:
+        cut_scores[0] = seed_shot.boundary_score
+    overlays_dir = target_output_dir / "overlays"
+    samples: list[SegmentationSample] = []
+    previous_areas: list[float] = []
+    previous_center: Sequence[float] | None = None
+    for index, analysis_frame in enumerate(analysis_frames):
+        observation = observations_by_index[index]
+        if observation.mask_path is not None:
+            mask_artifact = target_output_dir / observation.mask_path
+            if sha256_file(mask_artifact) != observation.mask_sha256:
+                raise RuntimeError(f"materialized mask changed before track assembly: {mask_artifact}")
+            with Image.open(mask_artifact).convert("L") as saved_mask:
+                binary = np.asarray(saved_mask, dtype=np.uint8) > 0
+        else:
+            binary = np.zeros((height, width), bool)
+        comparison_areas = [] if index == seed_index else previous_areas
+        comparison_center = None if index == seed_index else previous_center
+        state, reasons = classify_tracking_state(
+            area_ratio=observation.mask_area_ratio,
+            connected_components=observation.connected_components,
+            mean_positive_probability=observation.mean_positive_probability,
+            previous_area_ratios=comparison_areas,
+            center_2d=observation.center_2d,
+            previous_center_2d=comparison_center,
+            shot_boundary=False,
+        )
+        shot_boundary = index == 0 and begins_at_shot_boundary
+        if shot_boundary:
+            reasons.append("tracker_initialized_inside_new_shot")
+        semantic_status = (
+            SemanticIdentityStatus.SEED_GROUNDED
+            if index == seed_index
+            else SemanticIdentityStatus.REVALIDATION_REQUIRED
+            if state in {TrackingState.DRIFT_SUSPECTED, TrackingState.LOST}
+            else SemanticIdentityStatus.NOT_REVALIDATED
+        )
+        samples.append(
+            SegmentationSample(
+                sample_index=index,
+                analysis_sample_time_ms=analysis_frame.timeline_time_ms,
+                source_pts=analysis_frame.source_pts,
+                timing_basis="decoded_source_pts",
+                mask_path=observation.mask_path,
+                mask_sha256=observation.mask_sha256,
+                mask_area_pixels=observation.mask_area_pixels,
+                mask_area_ratio=round(observation.mask_area_ratio, 8),
+                connected_components=observation.connected_components,
+                derived_tracking_box=observation.derived_tracking_box,
+                center_2d=observation.center_2d,
+                mean_positive_probability=(
+                    round(observation.mean_positive_probability, 6)
+                    if observation.mean_positive_probability is not None
+                    else None
+                ),
+                scene_cut_score=(
+                    round(cut_scores[index], 6)
+                    if cut_scores[index] is not None
+                    else None
+                ),
+                shot_boundary=shot_boundary,
+                tracking_state=state,
+                state_reasons=reasons,
+                semantic_identity_status=semantic_status,
+            )
+        )
+        _render_overlay(
+            analysis_frame.path,
+            binary,
+            observation.derived_tracking_box,
+            state,
+            overlays_dir / f"{index:06d}.jpg",
+        )
+        if index == seed_index:
+            previous_areas.clear()
+            previous_center = None
+        if observation.mask_area_ratio > 0:
+            previous_areas.append(observation.mask_area_ratio)
+            previous_center = observation.center_2d
+    return samples
+
+
+def track_bboxes_shared_sam21(
+    *,
+    video_path: Path,
+    checkpoint_path: Path,
+    targets: Sequence[SharedSam21BBoxSeed],
+    output_dir: Path,
+    asset_id: str,
+    analysis_fps: float = 2.0,
+    max_side: int = 960,
+    device: str = "auto",
+    ffmpeg_scdet_threshold: float = 4.0,
+    seed_box_padding_ratio: float = 0.0,
+    allowed_start_ms: int | None = None,
+    allowed_end_ms: int | None = None,
+    offload_video_to_cpu: bool = True,
+    offload_state_to_cpu: bool = False,
+) -> SharedSam21SessionManifest:
+    """Track bbox-seeded objects in one decode and one SAM inference state."""
+    request_targets = [SharedSam21BBoxSeed.model_validate(target) for target in targets]
+    if len(request_targets) < 2:
+        raise ValueError("shared SAM tracking requires at least two targets")
+    target_ids = [target.target_id for target in request_targets]
+    if len(target_ids) != len(set(target_ids)):
+        raise ValueError("shared SAM target_id values must be unique")
+    if not 0 <= ffmpeg_scdet_threshold <= 100:
+        raise ValueError("ffmpeg_scdet_threshold must be in [0, 100]")
+    if not 0 <= seed_box_padding_ratio <= 1:
+        raise ValueError("seed_box_padding_ratio must be in [0, 1]")
+    if not video_path.exists():
+        raise FileNotFoundError(video_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(checkpoint_path)
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"shared SAM output directory is not empty: {output_dir}")
+    total_started = monotonic()
+    media = probe_video(video_path)
+    if asset_id != media.asset_id:
+        raise ValueError("bbox seed asset_id does not match the supplied tracking video")
+    if (allowed_start_ms is None) != (allowed_end_ms is None):
+        raise ValueError("allowed_start_ms and allowed_end_ms must be provided together")
+    if allowed_start_ms is not None and not (
+        0 <= allowed_start_ms < allowed_end_ms <= media.duration_ms
+    ):
+        raise ValueError("allowed tracking interval must be inside the video duration")
+    source_start_pts = media.video.start_pts or 0
+    time_base_numerator = media.video.time_base.numerator
+    time_base_denominator = media.video.time_base.denominator
+    shot_started = monotonic()
+    detected_shots = detect_shots_ffmpeg(video_path, threshold=ffmpeg_scdet_threshold)
+    shot_manifest = _normalize_shot_manifest(
+        detected_shots,
+        duration_ms=media.duration_ms,
+        source_start_pts=source_start_pts,
+        time_base_numerator=time_base_numerator,
+        time_base_denominator=time_base_denominator,
+    )
+    shot_detection_seconds = monotonic() - shot_started
+    intervals = {
+        resolve_tracking_interval(
+            shot_manifest,
+            seed_time_ms=target.seed_time_ms,
+            allowed_start_ms=allowed_start_ms or 0,
+            allowed_end_ms=(
+                allowed_end_ms if allowed_end_ms is not None else media.duration_ms
+            ),
+        )
+        for target in request_targets
+    }
+    if len(intervals) != 1:
+        raise ValueError("all shared SAM seeds must resolve to the same shot-local interval")
+    analysis_start_ms, analysis_end_ms = intervals.pop()
+    seed_shots = [_seed_shot(shot_manifest.shots, target.seed_time_ms) for target in request_targets]
+    shot_ranges = {(shot.start_time_ms, shot.end_time_ms) for shot in seed_shots}
+    if len(shot_ranges) != 1:
+        raise ValueError("all shared SAM seeds must be inside the same shot")
+    seed_shot = seed_shots[0]
+    shot_segment = next(
+        shot
+        for shot in shot_manifest.shots
+        if shot.start_time_ms == seed_shot.start_time_ms
+        and shot.end_time_ms == seed_shot.end_time_ms
+    )
+
+    np, torch, build_sam2_video_predictor = _require_segmentation_dependencies()
+    resolved_device = resolve_device(device, torch)
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+    session_id = f"shared-sam21-{uuid.uuid4().hex}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / "shots.json", shot_manifest)
+    extract_started = monotonic()
+    analysis_frames, width, height = _extract_analysis_frames(
+        video_path,
+        output_dir / "analysis-frames",
+        analysis_fps,
+        max_side,
+        start_time_ms=analysis_start_ms,
+        end_time_ms=analysis_end_ms,
+        source_start_pts=source_start_pts,
+        time_base_numerator=time_base_numerator,
+        time_base_denominator=time_base_denominator,
+        required_source_pts=sorted(
+            {target.seed_frame_pts for target in request_targets}
+        ),
+    )
+    extraction_seconds = monotonic() - extract_started
+    frame_records = [
+        SharedSam21AnalysisFrame(
+            sample_index=index,
+            analysis_sample_time_ms=frame.timeline_time_ms,
+            source_pts=frame.source_pts,
+            path=str(Path("analysis-frames") / frame.path.name),
+            sha256=sha256_file(frame.path),
+        )
+        for index, frame in enumerate(analysis_frames)
+    ]
+    write_json(
+        output_dir / "analysis-frames-manifest.json",
+        {
+            "timing_basis": "decoded_source_pts",
+            "frames": [frame.model_dump(mode="json") for frame in frame_records],
+        },
+    )
+    frames_manifest_sha256 = sha256_file(output_dir / "analysis-frames-manifest.json")
+    seed_indexes = _resolve_shared_seed_indexes(
+        targets=request_targets,
+        frame_records=frame_records,
+    )
+    target_dirs = {
+        target.target_id: output_dir / "targets" / target.target_id
+        for target in request_targets
+    }
+    for target_dir in target_dirs.values():
+        target_dir.mkdir(parents=True, exist_ok=False)
+
+    init_started = monotonic()
+    predictor = build_sam2_video_predictor(
+        SAM21_CONFIG,
+        str(checkpoint_path),
+        device=resolved_device,
+        apply_postprocessing=False,
+    )
+    inference_state = predictor.init_state(
+        video_path=str(output_dir / "analysis-frames"),
+        offload_video_to_cpu=offload_video_to_cpu,
+        # Meta's own macOS demo keeps MPS state resident and only offloads video
+        # frames. Offloading recurrent state forces a transfer every frame, so it
+        # remains opt-in and is always recorded in the session manifest.
+        offload_state_to_cpu=offload_state_to_cpu,
+        async_loading_frames=False,
+    )
+    initialization_seconds = monotonic() - init_started
+    observations_by_target: dict[
+        str, dict[int, _MaterializedMaskObservation]
+    ] = {
+        target.target_id: {} for target in request_targets
+    }
+    observation_sources: dict[str, dict[int, set[str]]] = {
+        target.target_id: {} for target in request_targets
+    }
+    prompt_boxes: dict[str, list[int]] = {}
+    reverse_seed_overlap = max(seed_indexes.values()) > 0
+
+    def record_observation(
+        *, target_id: str, frame_idx: int, source: str, logits: Any
+    ) -> None:
+        if not 0 <= frame_idx < len(analysis_frames):
+            raise RuntimeError(
+                f"SAM target {target_id!r} returned out-of-range frame {frame_idx}"
+            )
+        expected_sources = _expected_observation_sources(
+            frame_idx,
+            seed_indexes[target_id],
+            reverse_seed_overlap=reverse_seed_overlap,
+        )
+        if source not in expected_sources:
+            raise RuntimeError(
+                f"SAM target {target_id!r} returned unexpected {source} output "
+                f"for frame {frame_idx}"
+            )
+        sources = observation_sources[target_id].setdefault(frame_idx, set())
+        if source in sources:
+            raise RuntimeError(
+                f"SAM target {target_id!r} returned duplicate {source} output "
+                f"for frame {frame_idx}"
+            )
+        observation = _materialize_mask_observation(
+            np=np,
+            logits=logits,
+            width=width,
+            height=height,
+            sample_index=frame_idx,
+            target_output_dir=target_dirs[target_id],
+        )
+        observations_by_target[target_id][frame_idx] = observation
+        sources.add(source)
+
+    prompt_started = monotonic()
+    for target in request_targets:
+        prompt_box = pad_normalized_box(target.seed_box_2d, seed_box_padding_ratio)
+        prompt_boxes[target.target_id] = prompt_box
+        _, obj_ids, seed_logits = predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=seed_indexes[target.target_id],
+            obj_id=target.target_id,
+            box=np.asarray(
+                normalized_box_to_xyxy(prompt_box, width, height), dtype=np.float32
+            ),
+        )
+        outputs = _logits_by_object_id(obj_ids, seed_logits)
+        if target.target_id not in outputs:
+            raise RuntimeError(
+                f"SAM prompt output omitted target_id {target.target_id!r}"
+            )
+        record_observation(
+            target_id=target.target_id,
+            frame_idx=seed_indexes[target.target_id],
+            source="prompt",
+            logits=outputs[target.target_id],
+        )
+    prompt_seconds = monotonic() - prompt_started
+
+    target_id_set = set(target_ids)
+    expected_forward_indexes = set(
+        range(min(seed_indexes.values()), len(analysis_frames))
+    )
+    seen_forward_indexes: set[int] = set()
+    forward_started = monotonic()
+    for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(
+        inference_state, start_frame_idx=min(seed_indexes.values()), reverse=False
+    ):
+        _record_direction_frame(
+            direction="forward",
+            frame_idx=frame_idx,
+            expected_indexes=expected_forward_indexes,
+            seen_indexes=seen_forward_indexes,
+        )
+        outputs = _logits_by_object_id(obj_ids, mask_logits)
+        if set(outputs) != target_id_set:
+            raise RuntimeError(
+                "SAM forward propagation object coverage mismatch: "
+                f"expected={sorted(target_id_set)}, actual={sorted(outputs)}"
+            )
+        for target_id, logits in outputs.items():
+            if frame_idx >= seed_indexes[target_id]:
+                record_observation(
+                    target_id=target_id,
+                    frame_idx=frame_idx,
+                    source="forward",
+                    logits=logits,
+                )
+    forward_seconds = monotonic() - forward_started
+    expected_reverse_indexes = (
+        set(range(0, max(seed_indexes.values()) + 1))
+        if reverse_seed_overlap
+        else set()
+    )
+    seen_reverse_indexes: set[int] = set()
+    reverse_started = monotonic()
+    for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(
+        inference_state, start_frame_idx=max(seed_indexes.values()), reverse=True
+    ):
+        _record_direction_frame(
+            direction="reverse",
+            frame_idx=frame_idx,
+            expected_indexes=expected_reverse_indexes,
+            seen_indexes=seen_reverse_indexes,
+        )
+        outputs = _logits_by_object_id(obj_ids, mask_logits)
+        if set(outputs) != target_id_set:
+            raise RuntimeError(
+                "SAM reverse propagation object coverage mismatch: "
+                f"expected={sorted(target_id_set)}, actual={sorted(outputs)}"
+            )
+        for target_id, logits in outputs.items():
+            if frame_idx <= seed_indexes[target_id]:
+                record_observation(
+                    target_id=target_id,
+                    frame_idx=frame_idx,
+                    source="reverse",
+                    logits=logits,
+                )
+    reverse_seconds = monotonic() - reverse_started
+    _validate_shared_observation_coverage(
+        frame_count=len(analysis_frames),
+        seed_indexes=seed_indexes,
+        observation_sources=observation_sources,
+        expected_forward_indexes=expected_forward_indexes,
+        seen_forward_indexes=seen_forward_indexes,
+        expected_reverse_indexes=expected_reverse_indexes,
+        seen_reverse_indexes=seen_reverse_indexes,
+    )
+    for target in request_targets:
+        seed_observation = observations_by_target[target.target_id][
+            seed_indexes[target.target_id]
+        ]
+        if seed_observation.mask_area_pixels == 0:
+            raise RuntimeError(f"SAM produced an empty seed mask for {target.target_id!r}")
+    for frame, record in zip(analysis_frames, frame_records, strict=True):
+        if sha256_file(frame.path) != record.sha256:
+            raise RuntimeError("shared immutable analysis frames changed during SAM inference")
+
+    provenance = SegmentationModelProvenance(
+        model_id=SAM21_TINY_MODEL_ID,
+        implementation="facebookresearch/sam2",
+        implementation_revision=SAM21_IMPLEMENTATION_REVISION,
+        checkpoint_sha256=checkpoint_sha256,
+        device=resolved_device,
+        torch_version=torch.__version__,
+        generated_at=utc_now(),
+    )
+    artifact_started = monotonic()
+    target_members: list[SharedSam21SessionTarget] = []
+    for target in request_targets:
+        target_dir = target_dirs[target.target_id]
+        samples = _build_segmentation_samples(
+            np=np,
+            analysis_frames=analysis_frames,
+            width=width,
+            height=height,
+            seed_index=seed_indexes[target.target_id],
+            observations_by_index=observations_by_target[target.target_id],
+            seed_shot=seed_shot,
+            analysis_start_ms=analysis_start_ms,
+            target_output_dir=target_dir,
+        )
+        state_counts = Counter(sample.tracking_state for sample in samples)
+        inference_elapsed = prompt_seconds + forward_seconds + reverse_seconds
+        track = SegmentationTrack(
+            method="bbox_seed_sam2_video_mask_propagation",
+            asset_id=asset_id,
+            video_path=str(video_path.resolve()),
+            target_description=target.target_description,
+            seed_source=target.seed_source,
+            seed_time_ms=target.seed_time_ms,
+            seed_sample_index=seed_indexes[target.target_id],
+            seed_frame_pts=target.seed_frame_pts,
+            seed_frame_sha256=target.seed_frame_sha256,
+            seed_source_width=target.seed_source_width,
+            seed_source_height=target.seed_source_height,
+            semantic_seed_box=target.seed_box_2d,
+            seed_prompt_type="box",
+            sam_prompt_box=prompt_boxes[target.target_id],
+            sam_prompt_mask_polygon_xy=None,
+            seed_box_padding_ratio=seed_box_padding_ratio,
+            refined_seed_mask_path=str(
+                Path("masks") / f"{seed_indexes[target.target_id]:06d}.png"
+            ),
+            analysis_fps=analysis_fps,
+            analysis_width=width,
+            analysis_height=height,
+            analysis_start_ms=analysis_start_ms,
+            analysis_end_ms=analysis_end_ms,
+            source_start_pts=source_start_pts,
+            source_time_base={
+                "numerator": time_base_numerator,
+                "denominator": time_base_denominator,
+            },
+            timing_warning=(
+                "Samples share one immutable decoded-frame set and one SAM inference state. "
+                "Per-track elapsed_seconds reports shared prompt and propagation wall time, "
+                "not additive target cost. PTS remains authoritative."
+            ),
+            semantic_warning=(
+                "Each target has an independent bbox semantic seed. Non-seed samples are "
+                "geometry propagation, not semantic identity confirmation."
+            ),
+            total_samples=len(samples),
+            state_counts=dict(state_counts),
+            elapsed_seconds=round(inference_elapsed, 3),
+            effective_fps=(
+                round(len(samples) / inference_elapsed, 4) if inference_elapsed else 0
+            ),
+            model_provenance=provenance,
+            samples=samples,
+            target_id=target.target_id,
+            shared_session_id=session_id,
+            analysis_frames_manifest_sha256=frames_manifest_sha256,
+        )
+        track_path = target_dir / "segmentation-track.json"
+        write_json(track_path, track)
+        _render_video(target_dir / "overlays", target_dir / "segmentation-debug.mp4", analysis_fps)
+        (target_dir / "summary.json").write_text(
+            track.model_dump_json(indent=2, exclude={"samples"}) + "\n",
+            encoding="utf-8",
+        )
+        target_members.append(
+            SharedSam21SessionTarget(
+                target_id=target.target_id,
+                target_description=target.target_description,
+                seed_time_ms=target.seed_time_ms,
+                seed_sample_index=seed_indexes[target.target_id],
+                seed_frame_pts=target.seed_frame_pts,
+                seed_frame_sha256=target.seed_frame_sha256,
+                seed_source_width=target.seed_source_width,
+                seed_source_height=target.seed_source_height,
+                track_path=str(
+                    Path("targets") / target.target_id / "segmentation-track.json"
+                ),
+                track_sha256=sha256_file(track_path),
+                state_counts=dict(state_counts),
+            )
+        )
+    artifact_seconds = monotonic() - artifact_started
+    total_seconds = monotonic() - total_started
+    manifest = SharedSam21SessionManifest(
+        artifact_type="shared_sam21_multi_object_tracking_session",
+        method="bbox_seed_shared_sam2_video_mask_propagation",
+        session_id=session_id,
+        asset_id=asset_id,
+        video_path=str(video_path.resolve()),
+        shot_id=shot_segment.shot_id,
+        analysis_fps=analysis_fps,
+        analysis_width=width,
+        analysis_height=height,
+        analysis_start_ms=analysis_start_ms,
+        analysis_end_ms=analysis_end_ms,
+        source_start_pts=source_start_pts,
+        source_time_base={
+            "numerator": time_base_numerator,
+            "denominator": time_base_denominator,
+        },
+        analysis_frames_path="analysis-frames-manifest.json",
+        analysis_frames_manifest_sha256=frames_manifest_sha256,
+        analysis_frames=frame_records,
+        offload_video_to_cpu=offload_video_to_cpu,
+        offload_state_to_cpu=offload_state_to_cpu,
+        target_count=len(target_members),
+        targets=target_members,
+        model_provenance=provenance,
+        timing=SharedSam21SessionTiming(
+            shot_detection_seconds=round(shot_detection_seconds, 6),
+            analysis_frame_extraction_seconds=round(extraction_seconds, 6),
+            predictor_initialization_seconds=round(initialization_seconds, 6),
+            prompt_seconds=round(prompt_seconds, 6),
+            forward_propagation_seconds=round(forward_seconds, 6),
+            reverse_propagation_seconds=round(reverse_seconds, 6),
+            target_artifact_seconds=round(artifact_seconds, 6),
+            total_seconds=round(total_seconds, 6),
+        ),
+        warning=(
+            "All targets share one decode, predictor, and inference state, but retain "
+            "independent masks, geometry states, semantic status, and artifact provenance."
+        ),
+        generated_at=utc_now(),
+    )
+    write_json(output_dir / "shared-session.json", manifest)
+    return manifest
+
+
 def track_bbox_sam21(
     *,
     video_path: Path,
@@ -628,6 +1408,10 @@ def track_bbox_sam21(
     output_dir: Path,
     seed_source: str,
     asset_id: str | None = None,
+    seed_frame_pts: int | None = None,
+    seed_frame_sha256: str | None = None,
+    seed_source_width: int | None = None,
+    seed_source_height: int | None = None,
     analysis_fps: float = 2.0,
     max_side: int = 960,
     device: str = "auto",
@@ -653,6 +1437,27 @@ def track_bbox_sam21(
         raise ValueError(
             "bbox seed asset_id does not match the supplied tracking video"
         )
+    seed_lineage = (
+        seed_frame_pts,
+        seed_frame_sha256,
+        seed_source_width,
+        seed_source_height,
+    )
+    if any(value is not None for value in seed_lineage) and not all(
+        value is not None for value in seed_lineage
+    ):
+        raise ValueError("seed frame lineage fields must be provided together")
+    if seed_frame_pts is not None:
+        if asset_id is None:
+            raise ValueError("exact seed frame lineage requires asset_id")
+        decoded_seed_time_ms = _timeline_ms_from_pts(
+            seed_frame_pts,
+            source_start_pts=media.video.start_pts or 0,
+            time_base_numerator=media.video.time_base.numerator,
+            time_base_denominator=media.video.time_base.denominator,
+        )
+        if decoded_seed_time_ms != seed_time_ms:
+            raise ValueError("seed_time_ms does not match seed_frame_pts")
     if (allowed_start_ms is None) != (allowed_end_ms is None):
         raise ValueError("allowed_start_ms and allowed_end_ms must be provided together")
     if allowed_start_ms is not None and not (
@@ -695,11 +1500,24 @@ def track_bbox_sam21(
         source_start_pts=source_start_pts,
         time_base_numerator=time_base_numerator,
         time_base_denominator=time_base_denominator,
+        required_source_pts=([seed_frame_pts] if seed_frame_pts is not None else ()),
     )
-    seed_index = min(
-        range(len(analysis_frames)),
-        key=lambda index: abs(analysis_frames[index].timeline_time_ms - seed_time_ms),
-    )
+    if seed_frame_pts is not None:
+        matching_indexes = [
+            index
+            for index, frame in enumerate(analysis_frames)
+            if frame.source_pts == seed_frame_pts
+        ]
+        if len(matching_indexes) != 1:
+            raise RuntimeError(
+                "exact seed source PTS must occur exactly once in analysis frames"
+            )
+        seed_index = matching_indexes[0]
+    else:
+        seed_index = min(
+            range(len(analysis_frames)),
+            key=lambda index: abs(analysis_frames[index].timeline_time_ms - seed_time_ms),
+        )
     resolved_device = resolve_device(device, torch)
     started = monotonic()
     predictor = build_sam2_video_predictor(
@@ -711,7 +1529,10 @@ def track_bbox_sam21(
     inference_state = predictor.init_state(
         video_path=str(output_dir / "analysis-frames"),
         offload_video_to_cpu=True,
-        offload_state_to_cpu=resolved_device != "cpu",
+        # Keep recurrent state on the compute device.  On MPS, Meta's reference
+        # demo offloads video frames to CPU to avoid fragmentation but does not
+        # offload state, which otherwise creates a transfer on every frame.
+        offload_state_to_cpu=False,
         async_loading_frames=False,
     )
     sam_prompt_box = pad_normalized_box(seed_box_2d, seed_box_padding_ratio)
@@ -834,6 +1655,10 @@ def track_bbox_sam21(
         seed_source=seed_source,
         seed_time_ms=seed_time_ms,
         seed_sample_index=seed_index,
+        seed_frame_pts=seed_frame_pts,
+        seed_frame_sha256=seed_frame_sha256,
+        seed_source_width=seed_source_width,
+        seed_source_height=seed_source_height,
         semantic_seed_box=list(seed_box_2d),
         seed_prompt_type="box",
         sam_prompt_box=sam_prompt_box,

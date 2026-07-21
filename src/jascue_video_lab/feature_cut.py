@@ -788,7 +788,7 @@ def _build_track(
     selected_seed = require_tracking_seed_candidate(proposal)
     checkpoint_sha256 = sha256_file(checkpoint_path)
     seed_manifest = {
-        "contract_version": "bbox-seed-v1",
+        "contract_version": "bbox-seed-v2-exact-pts",
         "asset_id": proposal.asset_id,
         "event_id": proposal.event_id,
         "entity_id": proposal.entity_id,
@@ -832,6 +832,10 @@ def _build_track(
             output_dir=track_dir,
             seed_source=str(seed_manifest_path),
             asset_id=proposal.asset_id,
+            seed_frame_pts=proposal.frame_pts,
+            seed_frame_sha256=proposal.frame_hash,
+            seed_source_width=proposal.source_width,
+            seed_source_height=proposal.source_height,
             analysis_fps=analysis_fps,
             max_side=_TRACKING_MAX_SIDE,
             device=_TRACKING_DEVICE,
@@ -852,6 +856,10 @@ def _build_track(
         analysis_start_ms=start_ms,
         analysis_end_ms=end_ms,
         checkpoint_sha256=checkpoint_sha256,
+        seed_frame_pts=proposal.frame_pts,
+        seed_frame_sha256=proposal.frame_hash,
+        seed_source_width=proposal.source_width,
+        seed_source_height=proposal.source_height,
     )
     return proposal, track
 

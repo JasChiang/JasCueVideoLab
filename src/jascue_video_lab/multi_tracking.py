@@ -9,12 +9,17 @@ from typing import Sequence
 
 from PIL import Image, ImageDraw
 
+from .geometry import box_iou, center_distance
 from .media import has_audio_stream, probe_video, sha256_file
 from .models import (
     MultiSegmentationReviewManifest,
     MultiSegmentationReviewMember,
     Rational,
+    SegmentationSample,
+    SegmentationTrackAgreementReport,
+    SegmentationTrackAgreementSample,
     SegmentationTrack,
+    SharedSam21AnalysisFramesManifest,
 )
 from .overlay import _overlay_font
 from .storage import utc_now, write_json
@@ -32,9 +37,14 @@ _REVIEW_COLORS: tuple[tuple[int, int, int], ...] = (
 )
 
 _REVIEW_WARNING = (
-    "This synchronized overlay is a manual-review visualization of independent "
+    "This synchronized overlay is a manual-review visualization of per-target "
     "tracker proposals. It is not an accuracy measurement, independent ground truth, "
     "or production SpatialTrack data."
+)
+
+_AGREEMENT_WARNING = (
+    "These symmetric A/B measurements quantify agreement between two tracker outputs. "
+    "Neither track is ground truth, so higher agreement does not establish accuracy."
 )
 
 
@@ -114,6 +124,101 @@ def _contained_artifact_path(track_dir: Path, relative_path: str) -> Path:
     except ValueError as error:
         raise ValueError(f"track artifact escapes its directory: {relative_path}") from error
     return resolved
+
+
+def _validate_frame_dimensions(path: Path, track: SegmentationTrack) -> None:
+    with Image.open(path) as frame:
+        if frame.size != (track.analysis_width, track.analysis_height):
+            raise ValueError(f"analysis frame dimensions do not match track: {path}")
+
+
+def _resolve_review_frames(
+    *,
+    resolved_track_paths: Sequence[Path],
+    tracks: Sequence[SegmentationTrack],
+    analysis_frames_dir: Path | None,
+) -> tuple[Path, list[Path], str | None]:
+    """Resolve independent or shared frames, fully validating shared provenance."""
+    reference = tracks[0]
+    if analysis_frames_dir is None:
+        if any(
+            track.shared_session_id is not None
+            or track.analysis_frames_manifest_sha256 is not None
+            for track in tracks
+        ):
+            raise ValueError(
+                "shared SAM tracks require an explicit analysis_frames_dir so the "
+                "immutable frame manifest can be validated"
+            )
+        frames_dir = (resolved_track_paths[0].parent / "analysis-frames").resolve()
+        frame_paths: list[Path] = []
+        for sample_index in range(reference.total_samples):
+            frame_path = (frames_dir / f"{sample_index:06d}.jpg").resolve(strict=True)
+            try:
+                frame_path.relative_to(frames_dir)
+            except ValueError as error:
+                raise ValueError(f"analysis frame escapes its directory: {frame_path}") from error
+            _validate_frame_dimensions(frame_path, reference)
+            frame_paths.append(frame_path)
+        return frames_dir, frame_paths, None
+
+    frames_dir = analysis_frames_dir.expanduser().resolve(strict=True)
+    if not frames_dir.is_dir():
+        raise ValueError(f"analysis frames path is not a directory: {frames_dir}")
+    session_ids = {track.shared_session_id for track in tracks}
+    if None in session_ids or len(session_ids) != 1:
+        raise ValueError(
+            "explicit analysis frames require tracks from one shared SAM session"
+        )
+    expected_manifest_hashes = {
+        track.analysis_frames_manifest_sha256 for track in tracks
+    }
+    if None in expected_manifest_hashes or len(expected_manifest_hashes) != 1:
+        raise ValueError(
+            "shared tracks must contain one matching analysis frame manifest hash"
+        )
+    expected_manifest_hash = next(iter(expected_manifest_hashes))
+    assert expected_manifest_hash is not None
+    manifest_path = (frames_dir.parent / "analysis-frames-manifest.json").resolve()
+    try:
+        manifest_path.relative_to(frames_dir.parent)
+    except ValueError as error:
+        raise ValueError("analysis frame manifest escapes the shared session directory") from error
+    if not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
+    actual_manifest_hash = sha256_file(manifest_path)
+    if actual_manifest_hash != expected_manifest_hash:
+        raise ValueError(f"analysis frame manifest hash mismatch: {manifest_path}")
+    manifest = SharedSam21AnalysisFramesManifest.model_validate_json(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    if len(manifest.frames) != reference.total_samples:
+        raise ValueError("analysis frame manifest sample count does not match tracks")
+
+    frame_paths = []
+    for frame_record, sample in zip(manifest.frames, reference.samples, strict=True):
+        if (
+            frame_record.sample_index != sample.sample_index
+            or frame_record.analysis_sample_time_ms != sample.analysis_sample_time_ms
+            or frame_record.source_pts != sample.source_pts
+        ):
+            raise ValueError(
+                "analysis frame manifest index/time/source PTS does not match tracks"
+            )
+        frame_path = (frames_dir.parent / frame_record.path).resolve(strict=True)
+        try:
+            frame_path.relative_to(frames_dir)
+        except ValueError as error:
+            raise ValueError(
+                f"analysis frame path is outside the explicit directory: {frame_record.path}"
+            ) from error
+        if not frame_path.is_file():
+            raise ValueError(f"analysis frame path is not a file: {frame_path}")
+        if sha256_file(frame_path) != frame_record.sha256:
+            raise ValueError(f"analysis frame hash mismatch: {frame_path}")
+        _validate_frame_dimensions(frame_path, reference)
+        frame_paths.append(frame_path)
+    return frames_dir, frame_paths, actual_manifest_hash
 
 
 def _render_overlay_frame(
@@ -347,8 +452,9 @@ def render_multi_segmentation_review(
     labels: Sequence[str],
     output_dir: Path,
     display_fps: float = 30.0,
+    analysis_frames_dir: Path | None = None,
 ) -> MultiSegmentationReviewManifest:
-    """Combine aligned independent SAM tracks into one manual-review MP4."""
+    """Combine aligned SAM tracks into one manual-review MP4."""
     if len(track_json_paths) < 2:
         raise ValueError("multi-track review requires at least two track JSON files")
     if len(labels) != len(track_json_paths):
@@ -380,21 +486,20 @@ def render_multi_segmentation_review(
     if reference.analysis_end_ms > source_media.duration_ms:
         raise ValueError("track analysis interval exceeds source video duration")
 
+    resolved_frames_dir, frame_paths, frames_manifest_sha256 = _resolve_review_frames(
+        resolved_track_paths=resolved_paths,
+        tracks=tracks,
+        analysis_frames_dir=analysis_frames_dir,
+    )
+
     output_dir = output_dir.expanduser().resolve()
     overlays_dir = output_dir / "overlays"
     if overlays_dir.exists() and any(overlays_dir.iterdir()):
         raise FileExistsError(f"combined overlay directory is not empty: {overlays_dir}")
     overlays_dir.mkdir(parents=True, exist_ok=True)
-    reference_frames_dir = resolved_paths[0].parent / "analysis-frames"
     colors = _REVIEW_COLORS[: len(tracks)]
     track_dirs = [path.parent for path in resolved_paths]
-    for sample_index in range(reference.total_samples):
-        frame_path = reference_frames_dir / f"{sample_index:06d}.jpg"
-        if not frame_path.exists():
-            raise FileNotFoundError(frame_path)
-        with Image.open(frame_path) as frame:
-            if frame.size != (reference.analysis_width, reference.analysis_height):
-                raise ValueError(f"analysis frame dimensions do not match track: {frame_path}")
+    for sample_index, frame_path in enumerate(frame_paths):
         _render_overlay_frame(
             frame_path=frame_path,
             tracks=tracks,
@@ -456,6 +561,8 @@ def render_multi_segmentation_review(
         analysis_start_ms=reference.analysis_start_ms,
         analysis_end_ms=reference.analysis_end_ms,
         total_samples=reference.total_samples,
+        analysis_frames_dir=str(resolved_frames_dir),
+        analysis_frames_manifest_sha256=frames_manifest_sha256,
         audio_muxed=bool(rendered["audio_muxed"]),
         output_video_path=str(output_video),
         output_video_sha256=sha256_file(output_video),
@@ -471,3 +578,136 @@ def render_multi_segmentation_review(
     )
     write_json(output_dir / "multi-track-review.json", manifest)
     return manifest
+
+
+def _mask_bits(
+    *, track_dir: Path, sample: SegmentationSample, width: int, height: int
+) -> bytes | None:
+    mask_path_value = sample.mask_path
+    if mask_path_value is None:
+        return None
+    mask_path = _contained_artifact_path(track_dir, mask_path_value)
+    expected_hash = sample.mask_sha256
+    if expected_hash is None or sha256_file(mask_path) != expected_hash:
+        raise ValueError(f"mask hash mismatch: {mask_path}")
+    with Image.open(mask_path).convert("L") as mask:
+        if mask.size != (width, height):
+            raise ValueError(f"mask dimensions do not match track: {mask_path}")
+        binary = mask.point(lambda value: 255 if value else 0).convert("1")
+        bits = binary.tobytes()
+    if not any(bits):
+        raise ValueError(f"non-empty mask artifact contains no positive pixels: {mask_path}")
+    return bits
+
+
+def _mask_iou(left: bytes | None, right: bytes | None) -> float | None:
+    if left is None and right is None:
+        return None
+    if left is None or right is None:
+        return 0.0
+    if len(left) != len(right):
+        raise ValueError("aligned mask buffers have different lengths")
+    intersection = sum((a & b).bit_count() for a, b in zip(left, right, strict=True))
+    union = sum((a | b).bit_count() for a, b in zip(left, right, strict=True))
+    if union == 0:
+        raise ValueError("non-empty aligned masks have an empty union")
+    return intersection / union
+
+
+def compare_aligned_segmentation_tracks(
+    track_a_json_path: Path,
+    track_b_json_path: Path,
+    output_path: Path,
+) -> SegmentationTrackAgreementReport:
+    """Measure symmetric agreement between two exactly aligned mask tracks."""
+    path_a, track_a = _load_track(track_a_json_path)
+    path_b, track_b = _load_track(track_b_json_path)
+    if path_a == path_b:
+        raise ValueError("track A and track B JSON paths must be different")
+    validate_segmentation_track_alignment([track_a, track_b])
+    source_video = Path(track_a.video_path).expanduser().resolve(strict=True)
+    if probe_video(source_video).asset_id != track_a.asset_id:
+        raise ValueError("source video content no longer matches the track asset_id")
+
+    rows: list[SegmentationTrackAgreementSample] = []
+    for sample_a, sample_b in zip(track_a.samples, track_b.samples, strict=True):
+        bits_a = _mask_bits(
+            track_dir=path_a.parent,
+            sample=sample_a,
+            width=track_a.analysis_width,
+            height=track_a.analysis_height,
+        )
+        bits_b = _mask_bits(
+            track_dir=path_b.parent,
+            sample=sample_b,
+            width=track_b.analysis_width,
+            height=track_b.analysis_height,
+        )
+        mask_iou = _mask_iou(bits_a, bits_b)
+        has_both_boxes = (
+            sample_a.derived_tracking_box is not None
+            and sample_b.derived_tracking_box is not None
+        )
+        bbox_agreement = (
+            box_iou(sample_a.derived_tracking_box, sample_b.derived_tracking_box)
+            if has_both_boxes
+            else None
+        )
+        distance = (
+            center_distance(sample_a.derived_tracking_box, sample_b.derived_tracking_box)
+            if has_both_boxes
+            else None
+        )
+        rows.append(
+            SegmentationTrackAgreementSample(
+                sample_index=sample_a.sample_index,
+                analysis_sample_time_ms=sample_a.analysis_sample_time_ms,
+                source_pts=sample_a.source_pts,
+                tracking_state_a=sample_a.tracking_state,
+                tracking_state_b=sample_b.tracking_state,
+                state_agreement=sample_a.tracking_state == sample_b.tracking_state,
+                mask_iou=round(mask_iou, 6) if mask_iou is not None else None,
+                bbox_iou=(
+                    round(bbox_agreement, 6) if bbox_agreement is not None else None
+                ),
+                center_distance_normalized=(
+                    round(distance, 6) if distance is not None else None
+                ),
+            )
+        )
+
+    mask_ious = [row.mask_iou for row in rows if row.mask_iou is not None]
+    bbox_ious = [row.bbox_iou for row in rows if row.bbox_iou is not None]
+    distances = [
+        row.center_distance_normalized
+        for row in rows
+        if row.center_distance_normalized is not None
+    ]
+    state_agreement_samples = sum(row.state_agreement for row in rows)
+    report = SegmentationTrackAgreementReport(
+        artifact_type="segmentation_track_agreement_report",
+        interpretation="peer_agreement_not_accuracy",
+        asset_id=track_a.asset_id,
+        track_a_path=str(path_a),
+        track_a_sha256=sha256_file(path_a),
+        track_a_target_description=track_a.target_description,
+        track_b_path=str(path_b),
+        track_b_sha256=sha256_file(path_b),
+        track_b_target_description=track_b.target_description,
+        total_samples=len(rows),
+        mask_iou_samples=len(mask_ious),
+        mean_mask_iou=(round(sum(mask_ious) / len(mask_ious), 6) if mask_ious else None),
+        bbox_iou_samples=len(bbox_ious),
+        mean_bbox_iou=(round(sum(bbox_ious) / len(bbox_ious), 6) if bbox_ious else None),
+        center_distance_samples=len(distances),
+        mean_center_distance_normalized=(
+            round(sum(distances) / len(distances), 6) if distances else None
+        ),
+        state_agreement_samples=state_agreement_samples,
+        state_agreement_rate=round(state_agreement_samples / len(rows), 6),
+        warning=_AGREEMENT_WARNING,
+        generated_at=utc_now(),
+        samples=rows,
+    )
+    write_json(output_path.expanduser().resolve(), report)
+    return report

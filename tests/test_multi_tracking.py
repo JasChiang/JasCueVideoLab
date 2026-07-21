@@ -15,10 +15,13 @@ from jascue_video_lab.models import (
     SegmentationModelProvenance,
     SegmentationSample,
     SegmentationTrack,
+    SegmentationTrackAgreementReport,
+    SegmentationTrackAgreementSample,
     SemanticIdentityStatus,
     TrackingState,
 )
 from jascue_video_lab.multi_tracking import render_multi_segmentation_review
+from jascue_video_lab.multi_tracking import compare_aligned_segmentation_tracks
 from jascue_video_lab.storage import write_json
 
 
@@ -171,6 +174,46 @@ def _fixture_tracks(tmp_path: Path) -> tuple[Path, Path]:
     return left, right
 
 
+def _shared_analysis_frames(track_paths: tuple[Path, Path], root: Path) -> Path:
+    frames_dir = root / "analysis-frames"
+    frames_dir.mkdir(parents=True)
+    reference = SegmentationTrack.model_validate_json(
+        track_paths[0].read_text(encoding="utf-8")
+    )
+    records = []
+    for sample in reference.samples:
+        source_path = track_paths[0].parent / "analysis-frames" / f"{sample.sample_index:06d}.jpg"
+        target_path = frames_dir / source_path.name
+        shutil.copyfile(source_path, target_path)
+        records.append(
+            {
+                "sample_index": sample.sample_index,
+                "analysis_sample_time_ms": sample.analysis_sample_time_ms,
+                "source_pts": sample.source_pts,
+                "path": f"analysis-frames/{target_path.name}",
+                "sha256": sha256_file(target_path),
+            }
+        )
+    manifest_path = root / "analysis-frames-manifest.json"
+    write_json(
+        manifest_path,
+        {"timing_basis": "decoded_source_pts", "frames": records},
+    )
+    manifest_hash = sha256_file(manifest_path)
+    for target_index, track_path in enumerate(track_paths):
+        payload = json.loads(track_path.read_text(encoding="utf-8"))
+        seed_sample = payload["samples"][payload["seed_sample_index"]]
+        payload["seed_frame_pts"] = seed_sample["source_pts"]
+        payload["seed_frame_sha256"] = "d" * 64
+        payload["seed_source_width"] = payload["analysis_width"]
+        payload["seed_source_height"] = payload["analysis_height"]
+        payload["target_id"] = f"subject-{target_index + 1}"
+        payload["shared_session_id"] = "shared-test-session"
+        payload["analysis_frames_manifest_sha256"] = manifest_hash
+        track_path.write_text(json.dumps(payload), encoding="utf-8")
+    return frames_dir
+
+
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [
@@ -250,6 +293,132 @@ def test_multi_track_review_is_normal_duration_h264_and_muxes_audio(
     assert (output_dir / "multi-track-review.json").exists()
 
 
+def test_multi_track_review_accepts_explicit_shared_analysis_frames(
+    tmp_path: Path,
+) -> None:
+    tracks = _fixture_tracks(tmp_path)
+    frames_dir = _shared_analysis_frames(tracks, tmp_path / "shared")
+
+    manifest = render_multi_segmentation_review(
+        track_json_paths=tracks,
+        labels=["Shared A", "Shared B"],
+        analysis_frames_dir=frames_dir,
+        output_dir=tmp_path / "shared-review",
+    )
+
+    assert manifest.analysis_frames_dir == str(frames_dir.resolve())
+    assert manifest.analysis_frames_manifest_sha256 == sha256_file(
+        frames_dir.parent / "analysis-frames-manifest.json"
+    )
+
+
+def test_shared_tracks_require_explicit_analysis_frames(tmp_path: Path) -> None:
+    tracks = _fixture_tracks(tmp_path)
+    _shared_analysis_frames(tracks, tmp_path / "shared")
+
+    with pytest.raises(ValueError, match="require an explicit analysis_frames_dir"):
+        render_multi_segmentation_review(
+            track_json_paths=tracks,
+            labels=["Shared A", "Shared B"],
+            output_dir=tmp_path / "shared-review",
+        )
+    assert not (tmp_path / "shared-review").exists()
+
+
+def test_explicit_shared_analysis_frames_fail_closed_on_frame_hash(
+    tmp_path: Path,
+) -> None:
+    tracks = _fixture_tracks(tmp_path)
+    frames_dir = _shared_analysis_frames(tracks, tmp_path / "shared")
+    (frames_dir / "000001.jpg").write_bytes(b"changed")
+
+    with pytest.raises(ValueError, match="frame hash mismatch"):
+        render_multi_segmentation_review(
+            track_json_paths=tracks,
+            labels=["Shared A", "Shared B"],
+            analysis_frames_dir=frames_dir,
+            output_dir=tmp_path / "review",
+        )
+    assert not (tmp_path / "review").exists()
+
+
+def test_explicit_shared_analysis_frames_fail_closed_on_pts(
+    tmp_path: Path,
+) -> None:
+    tracks = _fixture_tracks(tmp_path)
+    frames_dir = _shared_analysis_frames(tracks, tmp_path / "shared")
+    manifest_path = frames_dir.parent / "analysis-frames-manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["frames"][1]["source_pts"] += 1
+    write_json(manifest_path, payload)
+    new_hash = sha256_file(manifest_path)
+    for track_path in tracks:
+        track_payload = json.loads(track_path.read_text(encoding="utf-8"))
+        track_payload["analysis_frames_manifest_sha256"] = new_hash
+        track_path.write_text(json.dumps(track_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source PTS"):
+        render_multi_segmentation_review(
+            track_json_paths=tracks,
+            labels=["Shared A", "Shared B"],
+            analysis_frames_dir=frames_dir,
+            output_dir=tmp_path / "review",
+        )
+
+
+def test_explicit_shared_analysis_frames_fail_closed_on_dimensions(
+    tmp_path: Path,
+) -> None:
+    tracks = _fixture_tracks(tmp_path)
+    frames_dir = _shared_analysis_frames(tracks, tmp_path / "shared")
+    frame_path = frames_dir / "000001.jpg"
+    Image.new("RGB", (80, 45), "black").save(frame_path)
+    manifest_path = frames_dir.parent / "analysis-frames-manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["frames"][1]["sha256"] = sha256_file(frame_path)
+    write_json(manifest_path, payload)
+    new_hash = sha256_file(manifest_path)
+    for track_path in tracks:
+        track_payload = json.loads(track_path.read_text(encoding="utf-8"))
+        track_payload["analysis_frames_manifest_sha256"] = new_hash
+        track_path.write_text(json.dumps(track_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dimensions do not match"):
+        render_multi_segmentation_review(
+            track_json_paths=tracks,
+            labels=["Shared A", "Shared B"],
+            analysis_frames_dir=frames_dir,
+            output_dir=tmp_path / "review",
+        )
+
+
+def test_explicit_shared_analysis_frames_reject_paths_outside_directory(
+    tmp_path: Path,
+) -> None:
+    tracks = _fixture_tracks(tmp_path)
+    frames_dir = _shared_analysis_frames(tracks, tmp_path / "shared")
+    outside_path = tmp_path / "outside.jpg"
+    shutil.copyfile(frames_dir / "000001.jpg", outside_path)
+    manifest_path = frames_dir.parent / "analysis-frames-manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["frames"][1]["path"] = "../outside.jpg"
+    payload["frames"][1]["sha256"] = sha256_file(outside_path)
+    write_json(manifest_path, payload)
+    new_hash = sha256_file(manifest_path)
+    for track_path in tracks:
+        track_payload = json.loads(track_path.read_text(encoding="utf-8"))
+        track_payload["analysis_frames_manifest_sha256"] = new_hash
+        track_path.write_text(json.dumps(track_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside the explicit directory"):
+        render_multi_segmentation_review(
+            track_json_paths=tracks,
+            labels=["Shared A", "Shared B"],
+            analysis_frames_dir=frames_dir,
+            output_dir=tmp_path / "review",
+        )
+
+
 def test_multi_track_review_preserves_irregular_sample_timing(tmp_path: Path) -> None:
     left, right = _fixture_tracks(tmp_path)
     irregular_times = [0, 400, 1200, 1700]
@@ -288,6 +457,8 @@ def test_multi_track_cli_preserves_track_and_label_order() -> None:
             "Second",
             "--display-fps",
             "30",
+            "--analysis-frames-dir",
+            "shared/analysis-frames",
             "--output-dir",
             "review",
         ]
@@ -296,3 +467,118 @@ def test_multi_track_cli_preserves_track_and_label_order() -> None:
     assert args.track_json == [Path("first.json"), Path("second.json")]
     assert args.label == ["First", "Second"]
     assert args.display_fps == 30
+    assert args.analysis_frames_dir == Path("shared/analysis-frames")
+
+
+def test_shared_sam_cli_exposes_explicit_offload_policy() -> None:
+    defaults = build_parser().parse_args(
+        [
+            "track-shared-sam21",
+            "source.mp4",
+            "--checkpoint",
+            "tiny.pt",
+            "--targets-json",
+            "targets.json",
+            "--output-dir",
+            "shared",
+        ]
+    )
+    overridden = build_parser().parse_args(
+        [
+            "track-shared-sam21",
+            "source.mp4",
+            "--checkpoint",
+            "tiny.pt",
+            "--targets-json",
+            "targets.json",
+            "--no-offload-video-to-cpu",
+            "--offload-state-to-cpu",
+            "--output-dir",
+            "shared",
+        ]
+    )
+
+    assert defaults.offload_video_to_cpu is True
+    assert defaults.offload_state_to_cpu is False
+    assert overridden.offload_video_to_cpu is False
+    assert overridden.offload_state_to_cpu is True
+
+
+def test_aligned_segmentation_track_comparison_is_symmetric_agreement(
+    tmp_path: Path,
+) -> None:
+    left, right = _fixture_tracks(tmp_path)
+    output = tmp_path / "agreement.json"
+
+    report = compare_aligned_segmentation_tracks(left, right, output)
+
+    assert report.interpretation == "peer_agreement_not_accuracy"
+    assert report.total_samples == 4
+    assert report.mask_iou_samples == 4
+    assert report.mean_mask_iou == 0
+    assert report.mean_bbox_iou == 0
+    assert report.mean_center_distance_normalized == 500
+    assert report.state_agreement_rate == 1
+    assert "Neither track is ground truth" in report.warning
+    assert report.track_a_path == str(left.resolve())
+    assert report.track_b_path == str(right.resolve())
+    assert output.exists()
+
+    tampered = report.model_dump(mode="json")
+    tampered["mean_mask_iou"] = 0.99
+    with pytest.raises(ValueError, match="mean_mask_iou does not match samples"):
+        SegmentationTrackAgreementReport.model_validate(tampered)
+
+    duplicate_index = report.model_dump(mode="json")
+    duplicate_index["samples"][1]["sample_index"] = 0
+    with pytest.raises(ValueError, match="sample indexes must be contiguous"):
+        SegmentationTrackAgreementReport.model_validate(duplicate_index)
+
+    duplicate_pts = report.model_dump(mode="json")
+    duplicate_pts["samples"][1]["source_pts"] = duplicate_pts["samples"][0][
+        "source_pts"
+    ]
+    with pytest.raises(ValueError, match="source PTS values must be strictly increasing"):
+        SegmentationTrackAgreementReport.model_validate(duplicate_pts)
+
+
+def test_segmentation_track_comparison_fails_closed_on_mask_hash(
+    tmp_path: Path,
+) -> None:
+    left, right = _fixture_tracks(tmp_path)
+    (right.parent / "masks" / "000002.png").write_bytes(b"changed")
+
+    with pytest.raises(ValueError, match="mask hash mismatch"):
+        compare_aligned_segmentation_tracks(left, right, tmp_path / "agreement.json")
+    assert not (tmp_path / "agreement.json").exists()
+
+
+def test_compare_sam21_tracks_cli_is_ordered_ab() -> None:
+    args = build_parser().parse_args(
+        [
+            "compare-sam21-tracks",
+            "shared.json",
+            "independent.json",
+            "--output",
+            "agreement.json",
+        ]
+    )
+
+    assert args.track_a_json == Path("shared.json")
+    assert args.track_b_json == Path("independent.json")
+    assert args.output == Path("agreement.json")
+
+
+def test_segmentation_agreement_sample_schema_rejects_false_state_claim() -> None:
+    with pytest.raises(ValueError, match="state_agreement must reflect"):
+        SegmentationTrackAgreementSample(
+            sample_index=0,
+            analysis_sample_time_ms=0,
+            source_pts=100,
+            tracking_state_a=TrackingState.TRACKED,
+            tracking_state_b=TrackingState.LOST,
+            state_agreement=True,
+            mask_iou=0,
+            bbox_iou=None,
+            center_distance_normalized=None,
+        )

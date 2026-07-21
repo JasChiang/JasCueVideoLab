@@ -1408,7 +1408,7 @@ def run_full_event_geometry(
         )
         checkpoint_sha256 = sha256_file(checkpoint_path)
         seed_manifest = {
-            "contract_version": "bbox-seed-v1",
+            "contract_version": "bbox-seed-v2-exact-pts",
             "asset_id": proposal.asset_id,
             "event_id": proposal.event_id,
             "entity_id": proposal.entity_id,
@@ -1457,6 +1457,10 @@ def run_full_event_geometry(
                 output_dir=track_dir,
                 seed_source=str(seed_manifest_path),
                 asset_id=proposal.asset_id,
+                seed_frame_pts=proposal.frame_pts,
+                seed_frame_sha256=proposal.frame_hash,
+                seed_source_width=proposal.source_width,
+                seed_source_height=proposal.source_height,
                 analysis_fps=sam_analysis_fps,
                 max_side=tracking_max_side,
                 device=tracking_device,
@@ -1477,6 +1481,10 @@ def run_full_event_geometry(
             analysis_start_ms=expected_analysis_start_ms,
             analysis_end_ms=expected_analysis_end_ms,
             checkpoint_sha256=checkpoint_sha256,
+            seed_frame_pts=proposal.frame_pts,
+            seed_frame_sha256=proposal.frame_hash,
+            seed_source_width=proposal.source_width,
+            seed_source_height=proposal.source_height,
         )
     pricing = summarize_usage_and_list_price(geometry_dir)
     execution_pricing = summarize_usage_files(

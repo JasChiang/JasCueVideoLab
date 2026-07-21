@@ -28,7 +28,7 @@
   → 輸出 16:9／9:16 silent rough cuts 與 HTML review page
 ```
 
-這個設計刻意不把 Gemini timestamp 當 cut point。模型回傳的 frame ID 必須存在於 catalog，Pydantic contract 才會接受；實際 `source_in_ms`／`source_out_ms` 由本機資料生成並 clamp 在單一 shot。9:16 目前只有 `left`／`center`／`right` 三種固定構圖意圖，不是逐幀 crop tracking；要做可用的動態構圖，下一步才接 SAM 2.1／EdgeTAM mask propagation 與重新定位 gate。
+這個設計刻意不把 Gemini timestamp 當 cut point。模型回傳的 frame ID 必須存在於 catalog，Pydantic contract 才會接受；實際 `source_in_ms`／`source_out_ms` 由本機資料生成並 clamp 在單一 shot。舊版 rushes rough cut 的 9:16 仍只有 `left`／`center`／`right` 三種固定構圖意圖，不是逐幀 tracking；需要動態構圖時，應改走下方 exact-frame bbox → shot-local SAM 2.1 mask propagation 路徑。
 
 ## Full v1：完整逐片 Clip Card，按需才做 geometry
 
@@ -106,6 +106,7 @@ uv run jascue-video-lab full-library /path/to/rushes \
 2. **已完成核心 contract**：多候選不取最高 model confidence；自動 seed 只接受唯一 `matched` candidate，其餘必須人工指定。
 3. **部分完成**：exact-frame Grounding 與 bbox seed/SAM 有完整 fingerprint，仍要補齊較早的 proxy、shot 與 dense cache。
 4. **部分完成**：每個新 SAM sample 可回映原始 decoded source PTS，但 renderer 的 in/out、seed、track、crop 核准狀態與週期性 identity revalidation 尚未完成。
+5. **已完成效率／一致性 contract**：同一 shot 內的多個 bbox target 可共用一次 decoded-frame catalog、predictor 與 SAM inference state；每個 target 仍保存獨立 seed、mask、狀態與 provenance。共享與獨立執行可用逐格 mask agreement 自動比較，但 agreement 不是 ground truth。
 
 另外，silent source 不得生成 audio evidence、失敗但已有 usage 的 API response 仍必須計價、公開匯出需採 allowlist sanitizer。完整測試還要加入 non-zero PTS、VFR、B-frame、rotation/edit-list、快速 UI 命中，以及相似物件跨鏡 identity-switch 等 fixture。
 
@@ -227,7 +228,7 @@ App 的固定順序是：
 
 每個時刻提供兩個隔離模式：A 是預設且可驗證的「FFmpeg exact frame → image Grounding」；B 是實驗性的「完整影片 → 指定 `MM:SS` → bbox」。Google 官方明確文件化的是 image object detection bbox，而 File API 影片預設以 1 FPS 保存／處理；官方沒有提供 B 模式實際採用 frame 的 PTS 或 hash。因此 B 的 contract 永遠標記 `unknown_gemini_video_sample`，投影到 FFmpeg frame 的圖只供 A/B 診斷，不能成為 production geometry。兩種方法都經獨立盲審後，export 才會計算第一候選 bbox IoU 與 center distance。
 
-一個經授權、已去識別化的短片測例曾讓 A、B 兩種模式選中相同指定實例，但兩個 bbox 仍有明顯幾何差異。這是模型輔助視覺檢查，不是獨立 human ground truth；B 模式的 reference frame 仍不可知，因此不能用來建立正式 tracking seed。
+一個經授權的真實短片測例曾讓 A、B 兩種模式選中相同指定實例，但兩個 bbox 仍有明顯幾何差異。公開文字不揭露原始檔名與私人路徑；媒體本身仍可能含人物、品牌與活動場景，不能稱為已去識別化。這是模型輔助視覺檢查，不是獨立 human ground truth；B 模式的 reference frame 仍不可知，因此不能用來建立正式 tracking seed。
 
 持久資料位於被 Git 排除的 `artifacts/blind-review-app/<session-id>/`；跨 session 的 Gemini File API cache 依 analysis source SHA-256 位於 `artifacts/blind-review-file-cache/`。同一 upload identity 在官方 48 小時保存期內會重用。App 不會把 API key 傳到瀏覽器，也不以 browser storage 當實驗資料來源。
 
@@ -313,14 +314,65 @@ uv run jascue-video-lab track-sam21 VIDEO.mp4 \
   --target-description '審核者指定的前景實體；排除背景圖像與相似實例' \
   --analysis-fps 2 --output-dir ARTIFACT/sam21-selected-subject
 
-# 多個目標仍各自 Grounding 與追蹤，最後才合成一支人工審核影片
+# 同一 shot 的多個 bbox seed 共用一個 SAM predictor／inference state
+# targets.json 必須含兩個以上、target_id 唯一的 bbox-only targets
+uv run jascue-video-lab track-shared-sam21 VIDEO.mp4 \
+  --checkpoint artifacts/models/sam2.1_hiera_tiny.pt \
+  --targets-json ARTIFACT/targets.json \
+  --analysis-fps 15 --device cpu \
+  --output-dir ARTIFACT/sam21-shared
+```
+
+`targets.json` 必須把每個 bbox 鎖到 upstream exact-frame Grounding 所聲明的 decoded source PTS，而不是只給可被重新四捨五入的毫秒：
+
+```json
+{
+  "asset_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "targets": [
+    {
+      "target_id": "subject-a",
+      "target_description": "審核者選定的第一個前景實體",
+      "seed_source": "exact-frame Gemini bbox",
+      "seed_time_ms": 5739,
+      "seed_frame_pts": 344344,
+      "seed_frame_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seed_source_width": 3840,
+      "seed_source_height": 2160,
+      "seed_box_2d": [410, 370, 490, 570]
+    },
+    {
+      "target_id": "subject-b",
+      "target_description": "審核者選定的第二個前景實體",
+      "seed_source": "exact-frame Gemini bbox",
+      "seed_time_ms": 5739,
+      "seed_frame_pts": 344344,
+      "seed_frame_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seed_source_width": 3840,
+      "seed_source_height": 2160,
+      "seed_box_2d": [520, 330, 575, 505]
+    }
+  ]
+}
+```
+
+範例中的全零 hash 必須替換為實際值。原始 Grounding PNG 與 SAM 的 analysis JPEG 具有不同編碼，所以 hash 不同；dimensions 也可能因縮放而不同。追蹤器會把要求的 source PTS 強制加入固定間距抽樣序列，並以該 PTS 精確選 seed，不使用 nearest frame。此命令能驗證 PTS 與重解碼影格對齊；`seed_frame_sha256`、原始 dimensions 與 `seed_source` 則是呼叫端提供並保存的 upstream provenance，仍須由上游 Grounding bundle 驗證，不能由追蹤命令單獨證明 Gemini 看過該 PNG。
+
+```bash
+# 將共享 session 的 per-target tracks 合成一支正常播放速度的人工審核影片
 uv run jascue-video-lab render-multi-sam21 \
-  ARTIFACT/sam21-selected-subject/segmentation-track.json \
-  ARTIFACT/sam21-second-subject/segmentation-track.json \
+  ARTIFACT/sam21-shared/targets/subject-a/segmentation-track.json \
+  ARTIFACT/sam21-shared/targets/subject-b/segmentation-track.json \
   --label 'Selected subject A' \
   --label 'Selected subject B' \
+  --analysis-frames-dir ARTIFACT/sam21-shared/analysis-frames \
   --display-fps 30 \
   --output-dir ARTIFACT/multi-track-review
+
+# 比較兩條完全對齊的 SAM tracks；只量 agreement，不宣稱其中一條是真值
+uv run jascue-video-lab compare-sam21-tracks \
+  ARTIFACT/reference/segmentation-track.json \
+  ARTIFACT/candidate/segmentation-track.json \
+  --output ARTIFACT/sam-track-agreement.json
 
 # 與 CSRT 比較只稱為 agreement；兩者都不是 human ground truth
 uv run jascue-video-lab compare-trackers \
@@ -328,7 +380,19 @@ uv run jascue-video-lab compare-trackers \
   ARTIFACT/csrt/tracking.json --output ARTIFACT/tracker-agreement.json
 ```
 
-`render-multi-sam21` 只會合併來自同一 asset、同一區間與完全相同 decoded-source PTS 取樣序列的軌跡；任一對齊資料不同就拒絕輸出。`--display-fps 30` 只複製已有的 analysis frames 以便正常速度播放，不表示 tracker 已在 30 FPS 上推論。產出為含來源音軌的 H.264/yuv420p MP4 與可追溯 manifest，只供人工審核，不是準確率證明或 production SpatialTrack。
+`track-shared-sam21` 要求所有 seed 都落在同一個 FFmpeg shot，且不接受 Gemini polygon。它只共用重複的影片解碼、predictor 與 inference state；每個物件仍有自己的 object ID、bbox seed、mask 與 drift 狀態。每個 propagation output 會立即縮減成 binary mask 與小型統計並落盤，不會把 `影格數 × 物件數` 份 full-resolution float logits 全留在 RAM；缺格、重複格、越界格或缺物件則直接失敗，不會偽裝成 `lost`。`render-multi-sam21` 只會合併來自同一 asset、同一區間與完全相同 decoded-source PTS 取樣序列的軌跡；共享 session 必須顯式提供並驗證 immutable frame manifest，任一對齊資料不同就拒絕輸出。`--display-fps 30` 只控制審核影片播放時間，不表示 tracker 已在 30 FPS 上推論。產出為含來源音軌的 H.264/yuv420p MP4 與可追溯 manifest，只供人工審核，不是準確率證明或 production SpatialTrack。
+
+## macOS SAM 2.1 runtime 狀態
+
+目前可採用的 reference path 是 Meta 官方 SAM 2.1 PyTorch video predictor。它具備影片 memory、bbox prompt、多物件與雙向傳播；在 macOS 上可跑 CPU 或 MPS。實測顯示 MPS 能產生幾乎相同的 mask，但在目前的 Apple Silicon／PyTorch 組合上不一定更快，因此 `device=auto` 的結果不能取代目標機實測，正式預設仍以可重現 benchmark 決定。
+
+Apple 發布在 Hugging Face 的 `coreml-sam2.1-tiny` 與 `coreml-sam2.1-large` 都是**單張圖片 segmentation** package。它們沒有可直接取代 SAM video predictor 的 temporal memory pipeline；Large 仍然只是較大的 image-only 模型，不能因名稱含 SAM 2.1 就當成影片 tracker。
+
+EdgeTAM 的官方 PyTorch video predictor 同樣具備 temporal memory、bbox prompt、多物件與雙向 propagation。本機單一 fixture 的 MPS propagation 約為官方 SAM 2.1 Tiny MPS 的 2.87 倍速，但其中一個目標曾連續五格輸出空 mask，且目前依賴組合需要隔離的 tensor 相容修正；因此只列為需要人工 golden set 驗證的 experimental candidate，不取代 reference path。
+
+EfficientTAM-Ti 也以相同的兩個 bbox、一個共享 state 與雙向 propagation 跑通；速度介於 EdgeTAM 與官方 SAM 2.1 Tiny CPU 之間，而且不需修改 upstream source。不過 MPS 無法使用其 CUDA-only 小孔洞後處理，所以同樣必須以人工 mask fixture 驗證邊緣品質，不能只看 throughput 或 peer IoU。
+
+MLX 原生的完整 SAM 2.1 video predictor 也是值得繼續比較的 macOS 方向：它可保留 bbox、多物件與 memory propagation，且初步測速較 PyTorch 快。不過目前找到的社群實作仍很新，repository 的程式碼授權標示也尚未完整；因此只列為隔離的研究候選，不加入預設依賴。另一個僅支援 point、單向 propagation 或不能可靠共用多物件 state 的實作，不會用不等價條件加入 benchmark。詳細證據、MPS／CPU 實測、benchmark 限制與採用 gate 見 [MACOS-SAM21-EVALUATION.md](MACOS-SAM21-EVALUATION.md)。
 
 ## 產出
 
@@ -386,9 +450,9 @@ UV_CACHE_DIR=.uv-cache uv run pytest
 
 Contract tests 驗證 schema、entity reference、半開事件區間、禁止 `frame_accurate`、不可見目標空候選與 bbox 範圍；geometry tests 驗證 normalized-to-pixel、center distance、IoU、mask-derived bbox、碎片 gate 與跨 shot latch；media test 會實際呼叫 FFmpeg 產生短片並確認推薦毫秒與真實 PTS 分離。這些測試不會 mock 或宣稱 Gemini/SAM live call 成功；live 成功只能由 artifacts 中的 raw response、validated JSON、mask 與 debug overlay 證明。
 
-## 去識別化 Live 實驗結論
+## Live 實驗結論
 
-已使用多支經授權、去識別化的真實素材完成重複 live run。原始素材、可辨識檔名、活動資訊與逐次報告只保存在 Git 排除的本機 artifacts；公開 README 只記錄可泛化的方法學結論：
+已使用多支經授權的真實素材完成重複 live run。公開文件中的素材描述已去識別化，但媒體本身仍可能含可辨識人臉、品牌與活動場景。原始素材、可辨識檔名、活動資訊與逐次報告只保存在 Git 排除的本機 artifacts；公開 README 只記錄可泛化的方法學結論：
 
 - Content Map、Grounding Proposal 與 HTML timeline 的垂直資料流程可以完成，但 schema 合法不代表事件時間、物件身分或剪輯判斷正確。
 - 初版曾把 Gemini 官方 y-first bbox 當成專案 x-first bbox，造成正確物件被畫成錯誤形狀。現行 API boundary 固定使用明確命名的 `box_2d_yxyx`，再由本機 deterministic conversion 轉成 canonical x-first；不以長寬比例做 heuristic auto-swap。

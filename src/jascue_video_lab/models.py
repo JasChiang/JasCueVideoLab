@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
+from fractions import Fraction
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -20,6 +21,15 @@ class StrictModel(BaseModel):
 def _mmss_to_ms(value: str) -> int:
     minutes, seconds = (int(part) for part in value.split(":"))
     return (minutes * 60 + seconds) * 1000
+
+
+def _local_ms_from_pts(pts: int, start_pts: int, time_base: "Rational") -> int:
+    return round(
+        Fraction(
+            (pts - start_pts) * time_base.numerator * 1000,
+            time_base.denominator,
+        )
+    )
 
 
 def _proper_segments_intersect(
@@ -1169,6 +1179,12 @@ class SegmentationTrack(StrictModel):
     seed_source: str
     seed_time_ms: int = Field(ge=0)
     seed_sample_index: int = Field(ge=0)
+    seed_frame_pts: int | None = None
+    seed_frame_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    seed_source_width: int | None = Field(default=None, gt=0)
+    seed_source_height: int | None = Field(default=None, gt=0)
     semantic_seed_box: list[NormalizedCoordinate]
     seed_prompt_type: Literal["box", "mask_polygon"] = "box"
     sam_prompt_box: list[NormalizedCoordinate] | None
@@ -1192,6 +1208,13 @@ class SegmentationTrack(StrictModel):
     effective_fps: float = Field(ge=0)
     model_provenance: SegmentationModelProvenance
     samples: list[SegmentationSample]
+    target_id: str | None = Field(
+        default=None, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    shared_session_id: str | None = Field(default=None, min_length=1)
+    analysis_frames_manifest_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
     @model_validator(mode="after")
     def validate_track(self) -> "SegmentationTrack":
@@ -1222,6 +1245,66 @@ class SegmentationTrack(StrictModel):
             raise ValueError("state_counts must cover every sample")
         if self.seed_sample_index >= self.total_samples:
             raise ValueError("seed_sample_index is outside sampled frames")
+        if [sample.sample_index for sample in self.samples] != list(
+            range(len(self.samples))
+        ):
+            raise ValueError("sample indexes must be contiguous from zero")
+        sample_times = [sample.analysis_sample_time_ms for sample in self.samples]
+        if sample_times != sorted(set(sample_times)):
+            raise ValueError("sample times must be strictly increasing")
+        timing_bases = {sample.timing_basis for sample in self.samples}
+        if len(timing_bases) != 1:
+            raise ValueError("all samples in one track must use the same timing basis")
+        decoded_pts_timing = timing_bases == {"decoded_source_pts"}
+        if decoded_pts_timing:
+            if any(sample.source_pts is None for sample in self.samples):
+                raise ValueError("decoded-source-PTS samples require source_pts")
+            sample_pts = [sample.source_pts for sample in self.samples]
+            if sample_pts != sorted(set(sample_pts)):
+                raise ValueError("sample source PTS values must be strictly increasing")
+        seed_lineage = (
+            self.seed_frame_pts,
+            self.seed_frame_sha256,
+            self.seed_source_width,
+            self.seed_source_height,
+        )
+        if any(value is not None for value in seed_lineage) and not all(
+            value is not None for value in seed_lineage
+        ):
+            raise ValueError("seed frame lineage fields must be provided together")
+        shared_identity = (
+            self.target_id,
+            self.shared_session_id,
+            self.analysis_frames_manifest_sha256,
+        )
+        if any(value is not None for value in shared_identity) and not all(
+            value is not None for value in shared_identity
+        ):
+            raise ValueError("shared track identity fields must be provided together")
+        if self.seed_frame_pts is not None:
+            seed_sample = self.samples[self.seed_sample_index]
+            if seed_sample.source_pts != self.seed_frame_pts:
+                raise ValueError("seed frame source PTS must match the seed sample")
+        timing_lineage = (self.source_start_pts, self.source_time_base)
+        if any(value is not None for value in timing_lineage) and not all(
+            value is not None for value in timing_lineage
+        ):
+            raise ValueError("source timing lineage fields must be provided together")
+        if (
+            decoded_pts_timing
+            and self.source_start_pts is not None
+            and self.source_time_base is not None
+        ):
+            if any(
+                sample.analysis_sample_time_ms
+                != _local_ms_from_pts(
+                    sample.source_pts,  # type: ignore[arg-type]
+                    self.source_start_pts,
+                    self.source_time_base,
+                )
+                for sample in self.samples
+            ):
+                raise ValueError("sample times must be derived from source PTS lineage")
         if self.analysis_end_ms is not None:
             if self.analysis_end_ms <= self.analysis_start_ms:
                 raise ValueError("analysis interval must be non-empty and half-open")
@@ -1237,8 +1320,178 @@ class SegmentationTrack(StrictModel):
         return self
 
 
+class SharedSam21BBoxSeed(StrictModel):
+    """One semantic instance seed for a shared SAM 2.1 video session."""
+
+    target_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    target_description: str = Field(min_length=1)
+    seed_source: str = Field(min_length=1)
+    seed_time_ms: int = Field(ge=0)
+    seed_frame_pts: int
+    seed_frame_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    seed_source_width: int = Field(gt=0)
+    seed_source_height: int = Field(gt=0)
+    seed_box_2d: list[NormalizedCoordinate]
+
+    @model_validator(mode="after")
+    def validate_seed_box(self) -> "SharedSam21BBoxSeed":
+        if len(self.seed_box_2d) != 4:
+            raise ValueError("seed_box_2d must contain four coordinates")
+        x_min, y_min, x_max, y_max = self.seed_box_2d
+        if x_min >= x_max or y_min >= y_max:
+            raise ValueError("seed_box_2d must satisfy xmin < xmax and ymin < ymax")
+        return self
+
+
+class SharedSam21TrackingRequest(StrictModel):
+    """BBox-only request; every target must resolve to one shared shot interval."""
+
+    asset_id: str = Field(min_length=1)
+    targets: list[SharedSam21BBoxSeed] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> "SharedSam21TrackingRequest":
+        target_ids = [target.target_id for target in self.targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("shared SAM target_id values must be unique")
+        return self
+
+
+class SharedSam21AnalysisFrame(StrictModel):
+    sample_index: int = Field(ge=0)
+    analysis_sample_time_ms: int = Field(ge=0)
+    source_pts: int
+    path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SharedSam21AnalysisFramesManifest(StrictModel):
+    """Immutable decoded-frame lineage shared by every track in one session."""
+
+    timing_basis: Literal["decoded_source_pts"]
+    frames: list[SharedSam21AnalysisFrame] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_frames(self) -> "SharedSam21AnalysisFramesManifest":
+        expected_indexes = list(range(len(self.frames)))
+        if [frame.sample_index for frame in self.frames] != expected_indexes:
+            raise ValueError("analysis frame sample indexes must be contiguous from zero")
+        times = [frame.analysis_sample_time_ms for frame in self.frames]
+        if times != sorted(set(times)):
+            raise ValueError("analysis frame times must be strictly increasing")
+        source_pts = [frame.source_pts for frame in self.frames]
+        if source_pts != sorted(set(source_pts)):
+            raise ValueError("analysis frame source PTS values must be strictly increasing")
+        return self
+
+
+class SharedSam21SessionTiming(StrictModel):
+    shot_detection_seconds: float = Field(ge=0)
+    analysis_frame_extraction_seconds: float = Field(ge=0)
+    predictor_initialization_seconds: float = Field(ge=0)
+    prompt_seconds: float = Field(ge=0)
+    forward_propagation_seconds: float = Field(ge=0)
+    reverse_propagation_seconds: float = Field(ge=0)
+    target_artifact_seconds: float = Field(ge=0)
+    total_seconds: float = Field(ge=0)
+
+
+class SharedSam21SessionTarget(StrictModel):
+    target_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    target_description: str = Field(min_length=1)
+    seed_time_ms: int = Field(ge=0)
+    seed_sample_index: int = Field(ge=0)
+    seed_frame_pts: int
+    seed_frame_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    seed_source_width: int = Field(gt=0)
+    seed_source_height: int = Field(gt=0)
+    track_path: str = Field(min_length=1)
+    track_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state_counts: dict[TrackingState, int]
+
+
+class SharedSam21SessionManifest(StrictModel):
+    """Auditable batch record for tracks sharing decode, backbone, and state."""
+
+    artifact_type: Literal["shared_sam21_multi_object_tracking_session"]
+    method: Literal["bbox_seed_shared_sam2_video_mask_propagation"]
+    session_id: str = Field(min_length=1)
+    asset_id: str
+    video_path: str
+    shot_id: str = Field(min_length=1)
+    analysis_fps: float = Field(gt=0, le=60)
+    analysis_width: int = Field(gt=0)
+    analysis_height: int = Field(gt=0)
+    analysis_start_ms: int = Field(ge=0)
+    analysis_end_ms: int = Field(gt=0)
+    source_start_pts: int
+    source_time_base: Rational
+    analysis_frames_path: str = Field(min_length=1)
+    analysis_frames_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    analysis_frames: list[SharedSam21AnalysisFrame] = Field(min_length=1)
+    offload_video_to_cpu: bool
+    offload_state_to_cpu: bool
+    target_count: int = Field(ge=2)
+    targets: list[SharedSam21SessionTarget] = Field(min_length=2)
+    model_provenance: SegmentationModelProvenance
+    timing: SharedSam21SessionTiming
+    warning: str = Field(min_length=1)
+    generated_at: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_session(self) -> "SharedSam21SessionManifest":
+        if self.analysis_start_ms >= self.analysis_end_ms:
+            raise ValueError("analysis interval must be non-empty and half-open")
+        if self.target_count != len(self.targets):
+            raise ValueError("target_count must equal len(targets)")
+        target_ids = [target.target_id for target in self.targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("shared session target_id values must be unique")
+        expected_indexes = list(range(len(self.analysis_frames)))
+        if [frame.sample_index for frame in self.analysis_frames] != expected_indexes:
+            raise ValueError("analysis frame sample indexes must be contiguous from zero")
+        times = [frame.analysis_sample_time_ms for frame in self.analysis_frames]
+        if times != sorted(set(times)):
+            raise ValueError("analysis frame times must be strictly increasing")
+        source_pts = [frame.source_pts for frame in self.analysis_frames]
+        if source_pts != sorted(set(source_pts)):
+            raise ValueError("analysis frame source PTS values must be strictly increasing")
+        if any(
+            frame.analysis_sample_time_ms
+            != _local_ms_from_pts(
+                frame.source_pts,
+                self.source_start_pts,
+                self.source_time_base,
+            )
+            for frame in self.analysis_frames
+        ):
+            raise ValueError("analysis frame times must be derived from source PTS lineage")
+        if any(
+            not self.analysis_start_ms <= time_ms < self.analysis_end_ms
+            for time_ms in times
+        ):
+            raise ValueError("analysis frames must remain inside the shared interval")
+        if any(target.seed_sample_index >= len(self.analysis_frames) for target in self.targets):
+            raise ValueError("target seed_sample_index is outside analysis frames")
+        for target in self.targets:
+            seed_frame = self.analysis_frames[target.seed_sample_index]
+            if target.seed_frame_pts != seed_frame.source_pts:
+                raise ValueError("target seed frame PTS must match analysis frame lineage")
+            if target.seed_time_ms != seed_frame.analysis_sample_time_ms:
+                raise ValueError("target seed time must match analysis frame lineage")
+            if any(count < 0 for count in target.state_counts.values()):
+                raise ValueError("target state counts cannot be negative")
+            if sum(target.state_counts.values()) != len(self.analysis_frames):
+                raise ValueError("target state counts must cover every analysis frame")
+        return self
+
+
 class MultiSegmentationReviewMember(StrictModel):
-    """One independently produced track shown in a combined review video."""
+    """One per-target track shown in a synchronized review video."""
 
     label: str = Field(min_length=1)
     color_rgb: tuple[
@@ -1267,6 +1520,10 @@ class MultiSegmentationReviewManifest(StrictModel):
     analysis_start_ms: int = Field(ge=0)
     analysis_end_ms: int = Field(gt=0)
     total_samples: int = Field(gt=0)
+    analysis_frames_dir: str
+    analysis_frames_manifest_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     audio_muxed: bool
     output_video_path: str
     output_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -1290,6 +1547,138 @@ class MultiSegmentationReviewManifest(StrictModel):
         colors = [member.color_rgb for member in self.members]
         if len(colors) != len(set(colors)):
             raise ValueError("multi-track review colors must be unique")
+        return self
+
+
+class SegmentationTrackAgreementSample(StrictModel):
+    sample_index: int = Field(ge=0)
+    analysis_sample_time_ms: int = Field(ge=0)
+    source_pts: int
+    tracking_state_a: TrackingState
+    tracking_state_b: TrackingState
+    state_agreement: bool
+    mask_iou: float | None = Field(default=None, ge=0.0, le=1.0)
+    bbox_iou: float | None = Field(default=None, ge=0.0, le=1.0)
+    center_distance_normalized: float | None = Field(default=None, ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_agreement(self) -> "SegmentationTrackAgreementSample":
+        if self.state_agreement != (self.tracking_state_a == self.tracking_state_b):
+            raise ValueError("state_agreement must reflect the two tracking states")
+        if (self.bbox_iou is None) != (self.center_distance_normalized is None):
+            raise ValueError("bbox IoU and center distance must have identical coverage")
+        return self
+
+
+class SegmentationTrackAgreementReport(StrictModel):
+    """Symmetric agreement metrics for two exactly aligned segmentation tracks."""
+
+    artifact_type: Literal["segmentation_track_agreement_report"]
+    interpretation: Literal["peer_agreement_not_accuracy"]
+    asset_id: str
+    track_a_path: str
+    track_a_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    track_a_target_description: str = Field(min_length=1)
+    track_b_path: str
+    track_b_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    track_b_target_description: str = Field(min_length=1)
+    total_samples: int = Field(gt=0)
+    mask_iou_samples: int = Field(ge=0)
+    mean_mask_iou: float | None = Field(default=None, ge=0.0, le=1.0)
+    bbox_iou_samples: int = Field(ge=0)
+    mean_bbox_iou: float | None = Field(default=None, ge=0.0, le=1.0)
+    center_distance_samples: int = Field(ge=0)
+    mean_center_distance_normalized: float | None = Field(default=None, ge=0.0)
+    state_agreement_samples: int = Field(ge=0)
+    state_agreement_rate: float = Field(ge=0.0, le=1.0)
+    warning: str = Field(min_length=1)
+    generated_at: str = Field(min_length=1)
+    samples: list[SegmentationTrackAgreementSample] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_summary(self) -> "SegmentationTrackAgreementReport":
+        if self.track_a_path == self.track_b_path:
+            raise ValueError("track A and track B paths must be different")
+        if self.total_samples != len(self.samples):
+            raise ValueError("total_samples must equal len(samples)")
+        if [sample.sample_index for sample in self.samples] != list(
+            range(len(self.samples))
+        ):
+            raise ValueError("agreement sample indexes must be contiguous from zero")
+        sample_times = [sample.analysis_sample_time_ms for sample in self.samples]
+        if sample_times != sorted(set(sample_times)):
+            raise ValueError("agreement sample times must be strictly increasing")
+        sample_pts = [sample.source_pts for sample in self.samples]
+        if sample_pts != sorted(set(sample_pts)):
+            raise ValueError("agreement sample source PTS values must be strictly increasing")
+        mask_count = sum(sample.mask_iou is not None for sample in self.samples)
+        bbox_count = sum(sample.bbox_iou is not None for sample in self.samples)
+        center_count = sum(
+            sample.center_distance_normalized is not None for sample in self.samples
+        )
+        state_count = sum(sample.state_agreement for sample in self.samples)
+        if self.mask_iou_samples != mask_count:
+            raise ValueError("mask_iou_samples does not match sample coverage")
+        if self.bbox_iou_samples != bbox_count:
+            raise ValueError("bbox_iou_samples does not match sample coverage")
+        if self.center_distance_samples != center_count:
+            raise ValueError("center_distance_samples does not match sample coverage")
+        if self.state_agreement_samples != state_count:
+            raise ValueError("state_agreement_samples does not match samples")
+        if (self.mean_mask_iou is None) != (mask_count == 0):
+            raise ValueError("mean_mask_iou must reflect mask metric coverage")
+        if (self.mean_bbox_iou is None) != (bbox_count == 0):
+            raise ValueError("mean_bbox_iou must reflect bbox metric coverage")
+        if (self.mean_center_distance_normalized is None) != (center_count == 0):
+            raise ValueError("mean center distance must reflect metric coverage")
+        expected_mask_mean = (
+            round(
+                sum(
+                    sample.mask_iou
+                    for sample in self.samples
+                    if sample.mask_iou is not None
+                )
+                / mask_count,
+                6,
+            )
+            if mask_count
+            else None
+        )
+        expected_bbox_mean = (
+            round(
+                sum(
+                    sample.bbox_iou
+                    for sample in self.samples
+                    if sample.bbox_iou is not None
+                )
+                / bbox_count,
+                6,
+            )
+            if bbox_count
+            else None
+        )
+        expected_center_mean = (
+            round(
+                sum(
+                    sample.center_distance_normalized
+                    for sample in self.samples
+                    if sample.center_distance_normalized is not None
+                )
+                / center_count,
+                6,
+            )
+            if center_count
+            else None
+        )
+        expected_state_rate = round(state_count / len(self.samples), 6)
+        if self.mean_mask_iou != expected_mask_mean:
+            raise ValueError("mean_mask_iou does not match samples")
+        if self.mean_bbox_iou != expected_bbox_mean:
+            raise ValueError("mean_bbox_iou does not match samples")
+        if self.mean_center_distance_normalized != expected_center_mean:
+            raise ValueError("mean center distance does not match samples")
+        if self.state_agreement_rate != expected_state_rate:
+            raise ValueError("state_agreement_rate does not match samples")
         return self
 
 

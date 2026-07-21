@@ -35,13 +35,21 @@ from .models import (
     TemporalMap,
     RushesCatalog,
     RushesEditPlan,
+    SharedSam21TrackingRequest,
 )
-from .multi_tracking import render_multi_segmentation_review
+from .multi_tracking import (
+    compare_aligned_segmentation_tracks,
+    render_multi_segmentation_review,
+)
 from .overlay import draw_grounding_overlay
 from .review import render_manual_review
 from .repeat import run_repeated_grounding
 from .rushes import create_rushes_catalog, render_rushes_edit, run_rushes_experiment
-from .sam_tracking import compare_segmentation_to_bbox_track, track_bbox_sam21
+from .sam_tracking import (
+    compare_segmentation_to_bbox_track,
+    track_bbox_sam21,
+    track_bboxes_shared_sam21,
+)
 from .shots import detect_shots_ffmpeg
 from .storage import append_error, read_json, write_json
 from .timeline import render_direct_moment_timeline, render_temporal_timeline, render_timeline
@@ -450,6 +458,10 @@ def command_track_sam21(args: argparse.Namespace) -> int:
             f"selection:{selected_seed.selection_source}"
         )
         asset_id = grounding.asset_id
+        seed_frame_pts = grounding.frame_pts
+        seed_frame_sha256 = grounding.frame_hash
+        seed_source_width = grounding.source_width
+        seed_source_height = grounding.source_height
     else:
         if args.grounding_candidate_number is not None:
             raise ValueError("--grounding-candidate-number requires --grounding-json")
@@ -459,6 +471,10 @@ def command_track_sam21(args: argparse.Namespace) -> int:
         seed_box = args.seed_box
         seed_source = "manual canonical bbox"
         asset_id = None
+        seed_frame_pts = None
+        seed_frame_sha256 = None
+        seed_source_width = None
+        seed_source_height = None
     result = track_bbox_sam21(
         video_path=args.video,
         checkpoint_path=args.checkpoint,
@@ -468,6 +484,10 @@ def command_track_sam21(args: argparse.Namespace) -> int:
         output_dir=args.output_dir,
         seed_source=seed_source,
         asset_id=asset_id,
+        seed_frame_pts=seed_frame_pts,
+        seed_frame_sha256=seed_frame_sha256,
+        seed_source_width=seed_source_width,
+        seed_source_height=seed_source_height,
         analysis_fps=args.analysis_fps,
         max_side=args.max_side,
         device=args.device,
@@ -478,14 +498,45 @@ def command_track_sam21(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_track_shared_sam21(args: argparse.Namespace) -> int:
+    request = SharedSam21TrackingRequest.model_validate(read_json(args.targets_json))
+    result = track_bboxes_shared_sam21(
+        video_path=args.video,
+        checkpoint_path=args.checkpoint,
+        targets=request.targets,
+        output_dir=args.output_dir,
+        asset_id=request.asset_id,
+        analysis_fps=args.analysis_fps,
+        max_side=args.max_side,
+        device=args.device,
+        ffmpeg_scdet_threshold=args.ffmpeg_scdet_threshold,
+        seed_box_padding_ratio=args.seed_box_padding_ratio,
+        allowed_start_ms=args.allowed_start_ms,
+        allowed_end_ms=args.allowed_end_ms,
+        offload_video_to_cpu=args.offload_video_to_cpu,
+        offload_state_to_cpu=args.offload_state_to_cpu,
+    )
+    print(result.model_dump_json(indent=2, exclude={"analysis_frames"}))
+    return 0
+
+
 def command_render_multi_sam21(args: argparse.Namespace) -> int:
     result = render_multi_segmentation_review(
         track_json_paths=args.track_json,
         labels=args.label,
         output_dir=args.output_dir,
         display_fps=args.display_fps,
+        analysis_frames_dir=args.analysis_frames_dir,
     )
     print(result.model_dump_json(indent=2))
+    return 0
+
+
+def command_compare_sam21_tracks(args: argparse.Namespace) -> int:
+    result = compare_aligned_segmentation_tracks(
+        args.track_a_json, args.track_b_json, args.output
+    )
+    print(result.model_dump_json(indent=2, exclude={"samples"}))
     return 0
 
 
@@ -1471,6 +1522,45 @@ def build_parser() -> argparse.ArgumentParser:
     sam_tracking_parser.add_argument("--output-dir", type=Path, required=True)
     sam_tracking_parser.set_defaults(handler=command_track_sam21)
 
+    shared_sam_parser = subparsers.add_parser(
+        "track-shared-sam21",
+        help="Track multiple bbox-seeded objects in one SAM 2.1 inference state",
+    )
+    shared_sam_parser.add_argument("video", type=Path)
+    shared_sam_parser.add_argument("--checkpoint", type=Path, required=True)
+    shared_sam_parser.add_argument(
+        "--targets-json",
+        type=Path,
+        required=True,
+        help="SharedSam21TrackingRequest JSON containing two or more bbox targets",
+    )
+    shared_sam_parser.add_argument("--analysis-fps", type=float, default=2.0)
+    shared_sam_parser.add_argument("--max-side", type=int, default=960)
+    shared_sam_parser.add_argument(
+        "--device", choices=["auto", "cpu", "mps", "cuda"], default="auto"
+    )
+    shared_sam_parser.add_argument("--ffmpeg-scdet-threshold", type=float, default=4.0)
+    shared_sam_parser.add_argument("--seed-box-padding-ratio", type=float, default=0.0)
+    shared_sam_parser.add_argument("--allowed-start-ms", type=int)
+    shared_sam_parser.add_argument("--allowed-end-ms", type=int)
+    shared_sam_parser.add_argument(
+        "--offload-video-to-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep decoded video tensors on CPU by default; use "
+            "--no-offload-video-to-cpu only after measuring device memory"
+        ),
+    )
+    shared_sam_parser.add_argument(
+        "--offload-state-to-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Offload recurrent state to CPU; normally slower on MPS",
+    )
+    shared_sam_parser.add_argument("--output-dir", type=Path, required=True)
+    shared_sam_parser.set_defaults(handler=command_track_shared_sam21)
+
     multi_sam_parser = subparsers.add_parser(
         "render-multi-sam21",
         help="Combine aligned SAM tracks into a normal-duration manual-review MP4",
@@ -1483,8 +1573,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repeat once per track, in the same order as the track JSON arguments",
     )
     multi_sam_parser.add_argument("--display-fps", type=float, default=30.0)
+    multi_sam_parser.add_argument(
+        "--analysis-frames-dir",
+        type=Path,
+        help=(
+            "Explicit shared session analysis-frames directory; validates the "
+            "adjacent manifest, decoded PTS, dimensions, and frame hashes"
+        ),
+    )
     multi_sam_parser.add_argument("--output-dir", type=Path, required=True)
     multi_sam_parser.set_defaults(handler=command_render_multi_sam21)
+
+    segmentation_comparison_parser = subparsers.add_parser(
+        "compare-sam21-tracks",
+        help="Compare two aligned SAM mask tracks as symmetric agreement, not accuracy",
+    )
+    segmentation_comparison_parser.add_argument("track_a_json", type=Path)
+    segmentation_comparison_parser.add_argument("track_b_json", type=Path)
+    segmentation_comparison_parser.add_argument("--output", type=Path, required=True)
+    segmentation_comparison_parser.set_defaults(handler=command_compare_sam21_tracks)
 
     tracker_comparison_parser = subparsers.add_parser(
         "compare-trackers",
