@@ -36,6 +36,7 @@ from .models import (
     TargetCandidateMap,
     TemporalMap,
     TrimIntentProposal,
+    VideoTrimIntentProposal,
 )
 from .schema import gemini_response_schema
 from .storage import append_error, utc_now, write_json
@@ -1357,6 +1358,90 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "trim_intent", error)
+            raise
+
+    def analyze_video_trim_intent(
+        self,
+        *,
+        source_asset_id: str,
+        event: FullClipEvent,
+        uploaded: Any,
+        prompt_template: str,
+        editorial_intent: str,
+        allowed_start_mmss: str,
+        allowed_end_mmss: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> VideoTrimIntentProposal:
+        """Let Gemini watch the selected video and propose coarse MM:SS trim bounds."""
+        run_dir.mkdir(parents=True, exist_ok=True)
+        provenance = _provenance(run_id)
+        prompt = (
+            prompt_template
+            + "\n\n## 本次不可變 metadata\n"
+            + f"source_asset_id 必須原樣回傳：{source_asset_id}\n"
+            + f"event_id 必須原樣回傳：{event.event_id}\n"
+            + f"允許搜尋的半開區間：[ {allowed_start_mmss}, {allowed_end_mmss} )\n"
+            + "所有模型時間欄位只准使用 MM:SS；不得輸出毫秒、浮點秒、frame number 或 PTS。\n"
+            + "\n## 本次剪輯意圖（不是畫面證據）\n"
+            + editorial_intent
+            + "\n\n## Coarse Clip Card event\n"
+            + event.model_dump_json(indent=2)
+            + "\n\nmodel_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        request = {
+            "model": MODEL_ID,
+            "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+            "store": False,
+            "input": [
+                {"type": "text", "text": prompt},
+                {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
+            ],
+            "generation_config": {
+                "temperature": self.temperature,
+                "thinking_level": "low",
+                "max_output_tokens": 2048,
+            },
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(VideoTrimIntentProposal),
+            },
+        }
+        write_json(run_dir / "video_trim_intent.request.json", request)
+        try:
+            interaction = self.client.interactions.create(**request)
+            write_json(
+                run_dir / "video_trim_intent.raw_interaction.json",
+                _raw_dump(interaction),
+            )
+            write_json(
+                run_dir / "video_trim_intent.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = VideoTrimIntentProposal.model_validate_json(interaction.output_text)
+            if parsed.source_asset_id != source_asset_id or parsed.event_id != event.event_id:
+                raise GeminiContractError("Video trim intent changed immutable metadata")
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "video_trim_intent.json", final)
+            write_json(
+                run_dir / "video_trim_intent.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "video_trim_intent.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(run_dir, "video_trim_intent", error)
             raise
 
     def plan_rushes_edit(

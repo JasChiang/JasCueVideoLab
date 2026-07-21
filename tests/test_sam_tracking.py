@@ -21,6 +21,7 @@ from jascue_video_lab.sam_tracking import (
     _normalize_shot_manifest,
     _seed_shot,
     _timeline_ms_from_pts,
+    _timeline_ms_in_interval_from_pts,
     approximate_connected_components,
     binary_mask_geometry,
     classify_tracking_state,
@@ -159,6 +160,26 @@ def test_pts_to_local_timeline_uses_rational_time_base() -> None:
             time_base_denominator=12_288,
         )
         == 333
+    )
+    assert (
+        _timeline_ms_from_pts(
+            5_700_699,
+            source_start_pts=0,
+            time_base_numerator=1,
+            time_base_denominator=100_000,
+        )
+        == 57_007
+    )
+    assert (
+        _timeline_ms_in_interval_from_pts(
+            5_700_699,
+            source_start_pts=0,
+            time_base_numerator=1,
+            time_base_denominator=100_000,
+            start_time_ms=37_004,
+            end_time_ms=57_007,
+        )
+        == 57_006
     )
 
 

@@ -102,9 +102,9 @@ uv run jascue-video-lab review-trim \
   --output artifacts/trim-review/EVENT_ID/trim-decision.reviewed.json
 ```
 
-Trim Intent 不把「畫面變靜」直接等同廢尾或刻意留白。模型只能依畫面提出 `natural_pause`、`intentional_hold`、`title_safe_hold`、`clean_plate`、`reset_or_false_end` 或 `uncertain`，並保存可見證據與不確定性；它不能宣稱知道導演意圖。所有 phase 都只能引用輸入 contact sheet 的 exact DF ID，不能回傳自創時間碼。Gemini proposal 永遠是 `requires_human_review=true`，因此 schema 通過也不會直接改動成片。
+Trim Intent 不把「畫面變靜」直接等同廢尾或刻意留白。模型只能依畫面提出 `natural_pause`、`intentional_hold`、`title_safe_hold`、`clean_plate`、`reset_or_false_end` 或 `uncertain`，並保存可見證據與不確定性；它不能宣稱知道導演意圖。預設流程讓 Gemini 直接觀看完整 proxy，在指定 Clip Card event／shot 內回傳 coarse `MM:SS` 代表性 select；FFmpeg 只抽入點與 exclusive-out 邊界，將其解析到原始影片的 decoded PTS。Gemini proposal 永遠是 `requires_human_review=true`，因此 schema 通過也不會直接改動正式成片。
 
-一次經授權、去識別化的實片 trim 垂直切片使用 28 張 4 FPS 局部影格，在約 6.6 秒內完成 Structured Output；模型選出的本機 PTS 半開區間約為 3.003–8.759 秒，並標記後段為待審的穩定展示 hold。該次請求依當時公開 Standard list price 估算約 US$0.0146。這只證明 contract、成本記錄與實片輸出可運作，不代表剪點已獲真人核准或能泛化到所有素材。
+4／8 FPS dense DF contact sheet 現在是局部升級手段，不是預設 Trim Intent：只有快速手勢、短暫 UI 或真人對 coarse 邊界有疑義時，才在小視窗內讓模型從既有 exact frame ID 選擇。不得把整支毛片拆成大量圖片來取代影片理解。若 Gemini 只回傳 hold 的單側端點，系統不會推測另一端，而會捨棄不完整 hold interval 並把 contract normalization 寫入 uncertainties；若 exclusive out 位於片尾且沒有下一張 decoded frame，則保存明確的 end-of-stream time boundary，而不偽造 frame hash。
 
 `--audio-mode auto` 是預設值：有音軌就保留，無音軌也正常完成；`off` 明確移除音訊；`required` 只適合音訊證據不可缺少的實驗，來源沒有音軌時會保存錯誤並停止該片。artifact 會記錄 `source_has_audio` 與 `proxy_has_audio`，Clip Card 不得為 silent source 捏造 audio evidence。
 
@@ -181,7 +181,9 @@ uv run jascue-video-lab feature-cut \
   --output-dir artifacts/my-feature-cut
 ```
 
-若某章已有真人核准的 Trim Intent，可重複傳入 `--trim-decision PATH`。Renderer 只接受 `approval_status=approved` 且帶有人類 review record 的 decision，並再次驗證 source SHA-256、入選 RF frame、事件區間與目前 FFmpeg shot；proposed、rejected、跨鏡或多筆重疊 decision 會被拒絕。沒有匹配 decision 的章節仍使用原本「keyframe 中心 ± brief duration、限制在 shot」的粗剪方式，manifest 會分別標示 `human_approved_frame_id_pts` 或 `keyframe_centered_requested_duration`，不會把 fallback 冒充成精修結果。
+若某章已有真人核准的 Trim Intent，可重複傳入 `--trim-decision PATH`。Renderer 只接受 `approval_status=approved` 且帶有人類 review record 的 decision，並再次驗證 source SHA-256 與目前 FFmpeg shot；代表性 select 可以位於同一 source shot 中但不包含較早的 coarse RF anchor。proposed、rejected、跨鏡或同 source shot 多筆造成歧義的 decision 會被拒絕。沒有匹配 decision 的章節仍使用原本「keyframe 中心 ± brief duration、限制在 shot」的粗剪方式，manifest 會分別標示 `human_approved_frame_id_pts` 或 `keyframe_centered_requested_duration`，不會把 fallback 冒充成精修結果。
+
+若目的是先產生影片讓真人整體觀看，可明確加入 `--allow-proposed-trim-preview`。這只接受仍為 `proposed` 的可用 decision，輸出 manifest 會標記 `contains_unreviewed_trim_proposals=true`，每段也標成 `unreviewed_proposed_frame_id_pts`；它不能建立人工 review record、不能接受 rejected decision，也不能冒充正式核准 cut。
 
 ```bash
 uv run jascue-video-lab feature-cut \

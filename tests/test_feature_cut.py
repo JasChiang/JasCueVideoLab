@@ -10,12 +10,13 @@ from pydantic import ValidationError
 
 from jascue_video_lab.feature_cut import (
     _chapter_bounds_with_approved_trim,
-    _load_approved_trim_decisions,
+    _load_trim_decisions,
     _piecewise_expression,
     _concat_segments,
     _render_source_segment,
     _render_text_layer,
     _segment_variant_fingerprint,
+    _tracking_seed_request_ms,
     _usable_track_centers,
 )
 from jascue_video_lab.models import (
@@ -71,6 +72,18 @@ def test_segment_cache_key_changes_with_source_or_tracking_geometry() -> None:
     )
 
 
+def test_tracking_seed_moves_inside_a_trim_that_excludes_catalog_anchor() -> None:
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id="clip-1",
+        requested_time_ms=7500,
+        image_path="/tmp/frame.jpg",
+    )
+
+    assert _tracking_seed_request_ms(frame, 1000, 4000) == (2500, "trim_midpoint")
+    assert _tracking_seed_request_ms(frame, 7000, 8000) == (7500, "catalog_anchor")
+
+
 def test_feature_cut_refuses_unreviewed_trim_decision(tmp_path) -> None:
     path = tmp_path / "proposed.json"
     decision = TrimIntentDecision(
@@ -96,7 +109,35 @@ def test_feature_cut_refuses_unreviewed_trim_decision(tmp_path) -> None:
     write_json(path, decision)
 
     with pytest.raises(ValueError, match="human-approved"):
-        _load_approved_trim_decisions([path])
+        _load_trim_decisions([path])
+
+
+def test_feature_cut_preview_flag_still_refuses_unusable_proposal(tmp_path) -> None:
+    path = tmp_path / "proposed.json"
+    proposal = TrimIntentDecision(
+        source_asset_id="sha256:" + "a" * 64,
+        event_id="event-1",
+        shot_id="shot-0001",
+        usable=False,
+        first_included_frame=None,
+        last_included_frame=None,
+        exclusive_out_frame=None,
+        hold_start_frame=None,
+        hold_end_frame=None,
+        source_in_ms=None,
+        source_out_ms=None,
+        source_in_pts=None,
+        source_out_pts=None,
+        handle_in_ms=None,
+        handle_out_ms=None,
+        tail_intent="uncertain",
+        proposal_path="/tmp/proposal.json",
+        catalog_path="/tmp/catalog.json",
+    )
+    write_json(path, proposal)
+
+    with pytest.raises(ValueError, match="unreviewed proposed"):
+        _load_trim_decisions([path], allow_proposed_preview=True)
 
 
 def test_feature_cut_applies_only_matching_approved_trim_bounds(tmp_path) -> None:
@@ -158,6 +199,22 @@ def test_feature_cut_applies_only_matching_approved_trim_bounds(tmp_path) -> Non
             "catalog_path": "/tmp/catalog.json",
         }
     )
+    proposed = TrimIntentDecision.model_validate(
+        decision.model_copy(
+            update={
+                "approval_status": "proposed",
+                "requires_human_review": True,
+                "human_review": None,
+            }
+        ).model_dump(mode="json")
+    )
+    proposed_path = tmp_path / "usable-proposed.json"
+    write_json(proposed_path, proposed)
+    accepted = _load_trim_decisions(
+        [proposed_path],
+        allow_proposed_preview=True,
+    )
+    assert accepted[0][1].approval_status == "proposed"
     shot_cache = {
         clip.clip_id: ShotManifest(
             video_path=clip.path,
@@ -192,6 +249,100 @@ def test_feature_cut_applies_only_matching_approved_trim_bounds(tmp_path) -> Non
     assert (start_ms, end_ms, shot_id) == (3003, 7250, "shot-0001")
     assert audit["trim_method"] == "human_approved_frame_id_pts"
     assert audit["trim_event_id"] == "event-1"
+
+
+def test_trim_decision_can_select_a_better_range_away_from_catalog_anchor(tmp_path) -> None:
+    clip = RushClip(
+        clip_id="clip-1",
+        path="/tmp/source.mp4",
+        sha256="a" * 64,
+        duration_ms=10_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=1,
+    )
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id=clip.clip_id,
+        requested_time_ms=7500,
+        image_path="/tmp/frame.jpg",
+    )
+    evidence = {
+        "frame_id": "DF000001",
+        "requested_time_ms": 1000,
+        "frame_time_ms": 1001,
+        "frame_pts": 30,
+        "frame_hash": "b" * 64,
+    }
+    decision = TrimIntentDecision.model_validate(
+        {
+            "source_asset_id": "sha256:" + clip.sha256,
+            "event_id": "event-1",
+            "shot_id": "shot-0001",
+            "usable": True,
+            "first_included_frame": evidence,
+            "last_included_frame": None,
+            "exclusive_out_frame": {
+                **evidence,
+                "frame_id": "DF000002",
+                "requested_time_ms": 4000,
+                "frame_time_ms": 4004,
+                "frame_pts": 120,
+            },
+            "hold_start_frame": None,
+            "hold_end_frame": None,
+            "source_in_ms": 1001,
+            "source_out_ms": 4004,
+            "source_in_pts": 30,
+            "source_out_pts": 120,
+            "handle_in_ms": 0,
+            "handle_out_ms": 5000,
+            "tail_intent": "natural_pause",
+            "approval_status": "approved",
+            "requires_human_review": False,
+            "human_review": {
+                "reviewer": "reviewer",
+                "reviewed_at": "2026-07-21T00:00:00Z",
+                "decision": "approved",
+                "notes": "representative select precedes the coarse catalog anchor",
+            },
+            "proposal_path": "/tmp/proposal.json",
+            "catalog_path": "/tmp/catalog.json",
+        }
+    )
+    shot_cache = {
+        clip.clip_id: ShotManifest(
+            video_path=clip.path,
+            duration_ms=clip.duration_ms,
+            detector="test",
+            threshold=4,
+            generated_at="2026-07-21T00:00:00Z",
+            boundaries=[],
+            shots=[
+                ShotSegment(
+                    shot_id="shot-0001",
+                    start_time_ms=0,
+                    end_time_ms=10_000,
+                    start_frame_pts=0,
+                    boundary_source="video_start",
+                    boundary_score=None,
+                )
+            ],
+        )
+    }
+
+    start_ms, end_ms, _, _ = _chapter_bounds_with_approved_trim(
+        frame,
+        clip,
+        2.0,
+        shot_cache,
+        tmp_path,
+        4.0,
+        [(tmp_path / "approved.json", decision)],
+    )
+
+    assert (start_ms, end_ms) == (1001, 4004)
 
 
 def test_feature_brief_can_disable_titles_and_choose_primary_center_crop() -> None:

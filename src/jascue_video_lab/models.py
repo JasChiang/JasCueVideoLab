@@ -32,6 +32,18 @@ def _local_ms_from_pts(pts: int, start_pts: int, time_base: "Rational") -> int:
     )
 
 
+def _half_open_ms_matches_pts(
+    actual_ms: int,
+    expected_rounded_ms: int,
+    end_ms: int | None,
+) -> bool:
+    return actual_ms == expected_rounded_ms or (
+        end_ms is not None
+        and expected_rounded_ms == end_ms
+        and actual_ms == end_ms - 1
+    )
+
+
 def _proper_segments_intersect(
     a: tuple[int, int],
     b: tuple[int, int],
@@ -819,6 +831,84 @@ class TrimIntentProposal(StrictModel):
         return self
 
 
+class VideoTrimIntentProposal(StrictModel):
+    """Second-level direct-video trim proposal; local code resolves exact frame PTS."""
+
+    source_asset_id: str
+    event_id: str
+    usable: bool
+    recommended_in_mmss: MmSs | None
+    recommended_out_mmss: MmSs | None
+    hold_start_mmss: MmSs | None = None
+    hold_end_mmss: MmSs | None = None
+    reset_start_mmss: MmSs | None = None
+    tail_intent: TrimTailIntent
+    observed_phase_evidence: str = Field(max_length=800)
+    hold_evidence: str = Field(max_length=500)
+    trim_reason: str = Field(max_length=500)
+    quality_risks: list[str] = Field(max_length=8)
+    uncertainties: list[str] = Field(max_length=8)
+    requires_human_review: bool
+    confidence: Confidence
+    model_provenance: ModelProvenance
+
+    @model_validator(mode="before")
+    @classmethod
+    def preserve_incomplete_hold_as_uncertainty(cls, value: object) -> object:
+        """Omit an unusable half-interval explicitly instead of inventing its endpoint."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        start = normalized.get("hold_start_mmss")
+        end = normalized.get("hold_end_mmss")
+        if bool(start) == bool(end):
+            return normalized
+        warning = (
+            "contract_normalization: Gemini returned only one hold endpoint; "
+            "the incomplete hold interval was omitted without inferring a missing time"
+        )
+        uncertainties = list(normalized.get("uncertainties") or [])
+        if len(uncertainties) < 8:
+            uncertainties.append(warning)
+        else:
+            uncertainties[-1] = f"{uncertainties[-1]}; {warning}"
+        normalized["uncertainties"] = uncertainties
+        normalized["hold_start_mmss"] = None
+        normalized["hold_end_mmss"] = None
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_video_trim_fields(self) -> "VideoTrimIntentProposal":
+        if not self.requires_human_review:
+            raise ValueError("Gemini video trim proposals always require human review")
+        boundaries = [self.recommended_in_mmss, self.recommended_out_mmss]
+        if self.usable:
+            if any(value is None for value in boundaries):
+                raise ValueError("usable video trim proposals require in/out MM:SS")
+            assert self.recommended_in_mmss is not None
+            assert self.recommended_out_mmss is not None
+            if _mmss_to_ms(self.recommended_out_mmss) <= _mmss_to_ms(
+                self.recommended_in_mmss
+            ):
+                raise ValueError("video trim proposal must have in < exclusive out")
+        elif any(
+            value is not None
+            for value in [
+                *boundaries,
+                self.hold_start_mmss,
+                self.hold_end_mmss,
+                self.reset_start_mmss,
+            ]
+        ):
+            raise ValueError("unusable video trim proposals cannot reference MM:SS")
+        if bool(self.hold_start_mmss) != bool(self.hold_end_mmss):
+            raise ValueError("video hold start/end MM:SS must appear together")
+        if self.hold_start_mmss is not None and self.hold_end_mmss is not None:
+            if _mmss_to_ms(self.hold_end_mmss) < _mmss_to_ms(self.hold_start_mmss):
+                raise ValueError("video hold interval must be chronological")
+        return self
+
+
 class TrimFrameEvidence(StrictModel):
     frame_id: str = Field(pattern=r"^DF[0-9]{6}$")
     requested_time_ms: int = Field(ge=0)
@@ -863,7 +953,6 @@ class TrimIntentDecision(StrictModel):
     def validate_derived_bounds(self) -> "TrimIntentDecision":
         required = [
             self.first_included_frame,
-            self.last_included_frame,
             self.source_in_ms,
             self.source_out_ms,
             self.source_in_pts,
@@ -1440,11 +1529,14 @@ class SegmentationTrack(StrictModel):
             and self.source_time_base is not None
         ):
             if any(
-                sample.analysis_sample_time_ms
-                != _local_ms_from_pts(
-                    sample.source_pts,  # type: ignore[arg-type]
-                    self.source_start_pts,
-                    self.source_time_base,
+                not _half_open_ms_matches_pts(
+                    sample.analysis_sample_time_ms,
+                    _local_ms_from_pts(
+                        sample.source_pts,  # type: ignore[arg-type]
+                        self.source_start_pts,
+                        self.source_time_base,
+                    ),
+                    self.analysis_end_ms,
                 )
                 for sample in self.samples
             ):
@@ -1605,11 +1697,14 @@ class SharedSam21SessionManifest(StrictModel):
         if source_pts != sorted(set(source_pts)):
             raise ValueError("analysis frame source PTS values must be strictly increasing")
         if any(
-            frame.analysis_sample_time_ms
-            != _local_ms_from_pts(
-                frame.source_pts,
-                self.source_start_pts,
-                self.source_time_base,
+            not _half_open_ms_matches_pts(
+                frame.analysis_sample_time_ms,
+                _local_ms_from_pts(
+                    frame.source_pts,
+                    self.source_start_pts,
+                    self.source_time_base,
+                ),
+                self.analysis_end_ms,
             )
             for frame in self.analysis_frames
         ):

@@ -287,6 +287,27 @@ def _timeline_ms_from_pts(
     return round(relative_seconds * 1000)
 
 
+def _timeline_ms_in_interval_from_pts(
+    pts: int,
+    *,
+    source_start_pts: int,
+    time_base_numerator: int,
+    time_base_denominator: int,
+    start_time_ms: int,
+    end_time_ms: int,
+) -> int:
+    """Represent an exact in-range PTS in the same half-open integer-ms interval."""
+    relative_seconds = Fraction(
+        (pts - source_start_pts) * time_base_numerator,
+        time_base_denominator,
+    )
+    if not Fraction(start_time_ms, 1000) <= relative_seconds < Fraction(
+        end_time_ms, 1000
+    ):
+        raise ValueError("source PTS is outside the selected analysis interval")
+    return min(end_time_ms - 1, max(start_time_ms, round(relative_seconds * 1000)))
+
+
 def _normalize_shot_manifest(
     manifest: ShotManifest,
     *,
@@ -491,11 +512,13 @@ def _extract_analysis_frames(
                 "required source PTS is outside the exact selected analysis interval: "
                 f"{pts}"
             )
-        timeline_time_ms = _timeline_ms_from_pts(
+        timeline_time_ms = _timeline_ms_in_interval_from_pts(
             pts,
             source_start_pts=source_start_pts,
             time_base_numerator=time_base_numerator,
             time_base_denominator=time_base_denominator,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
         )
         if not start_time_ms <= timeline_time_ms < end_time_ms:
             raise ValueError(
@@ -580,17 +603,25 @@ def _extract_analysis_frames(
                 f"expected {expected_index}, got {showinfo_index}"
             )
         source_pts = int(match.group("pts"))
-        timeline_time_ms = _timeline_ms_from_pts(
+        relative_seconds = Fraction(
+            (source_pts - source_start_pts) * time_base_numerator,
+            time_base_denominator,
+        )
+        if not Fraction(start_time_ms, 1000) <= relative_seconds < Fraction(
+            end_time_ms, 1000
+        ):
+            raise RuntimeError(
+                "FFmpeg emitted an analysis frame outside the selected seed shot: "
+                f"PTS {source_pts} not in [{start_time_ms}, {end_time_ms}) ms"
+            )
+        timeline_time_ms = _timeline_ms_in_interval_from_pts(
             source_pts,
             source_start_pts=source_start_pts,
             time_base_numerator=time_base_numerator,
             time_base_denominator=time_base_denominator,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
         )
-        if not start_time_ms <= timeline_time_ms < end_time_ms:
-            raise RuntimeError(
-                "FFmpeg emitted an analysis frame outside the selected seed shot: "
-                f"{timeline_time_ms} ms not in [{start_time_ms}, {end_time_ms})"
-            )
         frames.append(
             _AnalysisFrame(
                 path=path,

@@ -150,24 +150,41 @@ def _chapter_bounds(
     return start_ms, end_ms, shot.shot_id
 
 
-def _load_approved_trim_decisions(
+def _load_trim_decisions(
     paths: Sequence[Path],
+    *,
+    allow_proposed_preview: bool = False,
 ) -> list[tuple[Path, TrimIntentDecision]]:
-    approved: list[tuple[Path, TrimIntentDecision]] = []
+    accepted: list[tuple[Path, TrimIntentDecision]] = []
     for path in paths:
         decision = TrimIntentDecision.model_validate(read_json(path))
+        is_approved = (
+            decision.usable
+            and decision.approval_status == "approved"
+            and not decision.requires_human_review
+            and decision.human_review is not None
+            and decision.human_review.decision == "approved"
+        )
+        is_proposed_preview = (
+            allow_proposed_preview
+            and decision.usable
+            and decision.approval_status == "proposed"
+            and decision.requires_human_review
+            and decision.human_review is None
+        )
+        if not is_approved and not is_proposed_preview:
+            qualifier = (
+                "human-approved or, with --allow-proposed-trim-preview, "
+                "an unreviewed proposed"
+            )
+            raise ValueError(f"feature cut only accepts {qualifier} trim decision: {path}")
         if (
             not decision.usable
-            or decision.approval_status != "approved"
-            or decision.requires_human_review
-            or decision.human_review is None
-            or decision.human_review.decision != "approved"
+            or decision.approval_status == "rejected"
         ):
-            raise ValueError(
-                f"feature cut only accepts explicitly human-approved trim decisions: {path}"
-            )
-        approved.append((path.resolve(), decision))
-    return approved
+            raise ValueError(f"feature cut refuses unusable or rejected trim decision: {path}")
+        accepted.append((path.resolve(), decision))
+    return accepted
 
 
 def _chapter_bounds_with_approved_trim(
@@ -192,9 +209,9 @@ def _chapter_bounds_with_approved_trim(
         (path, decision)
         for path, decision in approved_decisions
         if decision.source_asset_id == asset_id
+        and decision.shot_id == shot_id
         and decision.source_in_ms is not None
         and decision.source_out_ms is not None
-        and decision.source_in_ms <= frame.requested_time_ms < decision.source_out_ms
     ]
     if not matches:
         return fallback_start, fallback_end, shot_id, {
@@ -206,7 +223,8 @@ def _chapter_bounds_with_approved_trim(
         }
     if len(matches) > 1:
         raise ValueError(
-            f"multiple approved trim decisions match {frame.frame_id}; event mapping is ambiguous"
+            f"multiple trim decisions match the selected source shot for {frame.frame_id}; "
+            "event mapping is ambiguous"
         )
     path, decision = matches[0]
     assert decision.source_in_ms is not None and decision.source_out_ms is not None
@@ -222,12 +240,22 @@ def _chapter_bounds_with_approved_trim(
         <= shot.end_time_ms
     ):
         raise ValueError("approved trim decision crosses the selected shot boundary")
+    approved = decision.approval_status == "approved"
     return decision.source_in_ms, decision.source_out_ms, shot_id, {
-        "trim_method": "human_approved_frame_id_pts",
+        "trim_method": (
+            "human_approved_frame_id_pts"
+            if approved
+            else "unreviewed_proposed_frame_id_pts"
+        ),
         "trim_decision_path": str(path),
         "trim_event_id": decision.event_id,
         "trim_tail_intent": decision.tail_intent,
-        "trim_human_review": decision.human_review.model_dump(mode="json"),
+        "trim_requires_human_review": decision.requires_human_review,
+        "trim_human_review": (
+            decision.human_review.model_dump(mode="json")
+            if decision.human_review is not None
+            else None
+        ),
     }
 
 
@@ -784,6 +812,16 @@ def _vertical_center_crop_filter() -> str:
     )
 
 
+def _tracking_seed_request_ms(
+    frame: RushFrame,
+    start_ms: int,
+    end_ms: int,
+) -> tuple[int, str]:
+    if start_ms <= frame.requested_time_ms < end_ms:
+        return frame.requested_time_ms, "catalog_anchor"
+    return start_ms + (end_ms - start_ms) // 2, "trim_midpoint"
+
+
 def _build_track(
     *,
     client: GeminiLabClient,
@@ -803,7 +841,16 @@ def _build_track(
 ) -> tuple[GroundingProposal, SegmentationTrack]:
     track_root = output_dir / "sam21"
     exact_frame_path = output_dir / "evidence-frame.png"
-    exact_frame = extract_frame(Path(clip.path), frame.requested_time_ms, exact_frame_path)
+    seed_requested_time_ms, seed_anchor_source = _tracking_seed_request_ms(
+        frame,
+        start_ms,
+        end_ms,
+    )
+    exact_frame = extract_frame(
+        Path(clip.path),
+        seed_requested_time_ms,
+        exact_frame_path,
+    )
     media = probe_video(Path(clip.path))
     grounding_key = {
         "contract_version": "exact-frame-grounding-v2",
@@ -833,6 +880,15 @@ def _build_track(
         ).hexdigest(),
         "thinking_level": "low",
     }
+    if seed_anchor_source != "catalog_anchor":
+        grounding_key.update(
+            {
+                "catalog_frame_id": frame.frame_id,
+                "catalog_requested_time_ms": frame.requested_time_ms,
+                "seed_anchor_source": seed_anchor_source,
+                "seed_requested_time_ms": seed_requested_time_ms,
+            }
+        )
     grounding_fingerprint = hashlib.sha256(
         json.dumps(
             grounding_key,
@@ -1030,13 +1086,17 @@ def run_feature_cut_experiment(
     scdet_threshold: float = 4.0,
     sam_analysis_fps: float = 2.0,
     trim_decision_paths: Sequence[Path] = (),
+    allow_proposed_trim_preview: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     catalog = RushesCatalog.model_validate(read_json(catalog_path))
     brief = FeatureEditBrief.model_validate(read_json(brief_path))
     frames = {frame.frame_id: frame for frame in catalog.frames}
     clips = {clip.clip_id: clip for clip in catalog.clips}
-    approved_trim_decisions = _load_approved_trim_decisions(trim_decision_paths)
+    trim_decisions = _load_trim_decisions(
+        trim_decision_paths,
+        allow_proposed_preview=allow_proposed_trim_preview,
+    )
     brief_by_id = {chapter.feature_id: chapter for chapter in brief.chapters}
     timings: dict[str, float] = {}
     started = monotonic()
@@ -1084,13 +1144,14 @@ def run_feature_cut_experiment(
             "plan": plan.model_dump(mode="json"),
             "sam_analysis_fps": sam_analysis_fps,
             "scdet_threshold": scdet_threshold,
-            "approved_trim_decisions": [
+            "trim_decisions": [
                 {
                     "path": str(path),
                     "decision": decision.model_dump(mode="json"),
                 }
-                for path, decision in approved_trim_decisions
+                for path, decision in trim_decisions
             ],
+            "allow_proposed_trim_preview": allow_proposed_trim_preview,
         }
         render_key = hashlib.sha256(
             json.dumps(render_config, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -1106,7 +1167,15 @@ def run_feature_cut_experiment(
             "render_title_overlays": brief.render_title_overlays,
             "render_pipeline_version": _RENDER_PIPELINE_VERSION,
             "render_cache_key": render_key,
-            "approved_trim_decision_count": len(approved_trim_decisions),
+            "approved_trim_decision_count": sum(
+                decision.approval_status == "approved" for _, decision in trim_decisions
+            ),
+            "unreviewed_trim_proposal_count": sum(
+                decision.approval_status == "proposed" for _, decision in trim_decisions
+            ),
+            "contains_unreviewed_trim_proposals": any(
+                decision.approval_status == "proposed" for _, decision in trim_decisions
+            ),
             "horizontal": {"chapters": []},
             "vertical": {"chapters": []},
         }
@@ -1164,7 +1233,7 @@ def run_feature_cut_experiment(
                     shot_cache,
                     shots_dir,
                     scdet_threshold,
-                    approved_trim_decisions,
+                    trim_decisions,
                 )
                 vertical_frame = frames[selected.vertical_frame_id or ""]
                 vertical_clip = clips[vertical_frame.clip_id]
@@ -1182,7 +1251,7 @@ def run_feature_cut_experiment(
                     shot_cache,
                     shots_dir,
                     scdet_threshold,
-                    approved_trim_decisions,
+                    trim_decisions,
                 )
                 if brief.render_title_overlays:
                     _render_text_layer(

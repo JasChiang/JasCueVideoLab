@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from jascue_video_lab.models import (
     DenseFrame,
     DenseFrameCatalog,
     ModelProvenance,
     TrimIntentProposal,
+    VideoTrimIntentProposal,
 )
 from jascue_video_lab.storage import write_json
 from jascue_video_lab.trim_intent import derive_trim_decision, review_trim_decision
@@ -131,3 +135,64 @@ def test_human_review_is_required_before_trim_approval(tmp_path) -> None:
     assert reviewed.human_review is not None
     assert reviewed.human_review.reviewer == "human-reviewer"
     assert output_path.exists()
+
+
+def _video_proposal(**updates: object) -> VideoTrimIntentProposal:
+    values: dict[str, object] = {
+        "source_asset_id": "sha256:source",
+        "event_id": "event-1",
+        "usable": True,
+        "recommended_in_mmss": "00:03",
+        "recommended_out_mmss": "00:09",
+        "hold_start_mmss": "00:07",
+        "hold_end_mmss": "00:09",
+        "reset_start_mmss": None,
+        "tail_intent": "title_safe_hold",
+        "observed_phase_evidence": "setup, action, result, and hold are visible",
+        "hold_evidence": "subject remains stable near the end",
+        "trim_reason": "preserve the complete visible action",
+        "quality_risks": [],
+        "uncertainties": ["exact decoded boundaries require local resolution"],
+        "requires_human_review": True,
+        "confidence": 0.8,
+        "model_provenance": _provenance(),
+    }
+    values.update(updates)
+    return VideoTrimIntentProposal.model_validate(values)
+
+
+def test_direct_video_trim_proposal_is_coarse_and_requires_review() -> None:
+    proposal = _video_proposal()
+
+    assert proposal.recommended_in_mmss == "00:03"
+    assert proposal.recommended_out_mmss == "00:09"
+    assert proposal.requires_human_review is True
+
+
+def test_direct_video_trim_proposal_requires_chronological_bounds() -> None:
+    with pytest.raises(ValidationError, match="in < exclusive out"):
+        _video_proposal(
+            recommended_in_mmss="00:09",
+            recommended_out_mmss="00:03",
+            hold_start_mmss=None,
+            hold_end_mmss=None,
+        )
+
+
+def test_unusable_direct_video_proposal_cannot_invent_times() -> None:
+    with pytest.raises(ValidationError, match="cannot reference MM:SS"):
+        _video_proposal(
+            usable=False,
+            recommended_in_mmss="00:03",
+            recommended_out_mmss=None,
+            hold_start_mmss=None,
+            hold_end_mmss=None,
+        )
+
+
+def test_incomplete_video_hold_is_omitted_without_inventing_endpoint() -> None:
+    proposal = _video_proposal(hold_start_mmss="00:07", hold_end_mmss=None)
+
+    assert proposal.hold_start_mmss is None
+    assert proposal.hold_end_mmss is None
+    assert any("incomplete hold interval" in item for item in proposal.uncertainties)

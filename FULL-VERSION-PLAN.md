@@ -14,9 +14,9 @@
   → 每個 shot 的一張縮小稽核幀（不作 Grounding）
   → Gemini 根據 brief 從 Clip Cards 與代表幀找候選 shot
   → 人工鎖定 EvidenceQueryLock（target、排除條件、可選 predicate）
-  → 候選區間自動加密為 4–8 FPS frame-ID contact sheets
-  → Gemini 只選 immutable dense frame ID
-  → 回原片抽 exact frame，保存 PTS／hash
+  → 入圍影片由 Gemini 直接觀看並提出 coarse MM:SS representative select
+  → FFmpeg 對回原片 boundary PTS／hash
+  → 快速或有疑義的局部邊界才加密為 4–8 FPS immutable frame IDs
   → Gemini image Grounding 只提出 bbox；多候選需人工選擇
   → SAM 2.1 以 bbox seed，在允許區間 ∩ seed shot 內傳播 mask
   → 人工審核選帶、in/out、bbox 與 9:16 構圖
@@ -46,7 +46,7 @@
 - `first_1_5s_impact`、`narrative_priority` 與 `claim_source`，用來區分「代表畫面」和「適合吸引觀眾的開場」，並避免把模型觀察誤當產品規格來源。
 - `repetition_cluster`／`take_group` 候選，只負責召回相似拍攝，不直接替使用者淘汰 take。
 
-`ClipCard` 與 coarse Event Map 不要求 Gemini 產生毫秒。模型時間固定使用 `MM:SS` 字串作為 coarse 語意 anchor；本機必須驗證格式、事件順序、半開區間與 ffprobe 片長，再衍生毫秒。若模型時間非法，保存錯誤並停止，不得靜默 clamp。後續仍必須經 dense frame-ID 重定位才能取得 exact source PTS。
+`ClipCard` 與 coarse Event Map 不要求 Gemini 產生毫秒。模型時間固定使用 `MM:SS` 字串作為 coarse 語意 anchor；本機必須驗證格式、事件順序、半開區間與 ffprobe 片長，再衍生毫秒。若模型時間非法，保存錯誤並停止，不得靜默 clamp。入選片段的 coarse 邊界由 FFmpeg 解析到原始來源 PTS；只有快速或有疑義的局部狀態才要求 dense frame-ID refinement。
 
 Full v1 應分開保存兩層 schema：
 
@@ -82,7 +82,7 @@ Local derived schema
 - 位元完全相同可用 SHA-256 判斷；視覺近重複可用 perceptual hash／embedding 做候選召回；最終「哪個 take 較適合 brief」再交給 AI 與人工審核。
 - 所有 reject 都是可逆標記，不移除原檔；輸出 selects reel 前必須能查看相鄰 handles。
 
-目前已實作入選事件的 Trim Intent 垂直切片：在 `Clip Card event ∩ FFmpeg shot` 內建立 2／4／8 FPS DF IDs，Gemini 只選 setup/action/result/hold/reset 與建議 in／exclusive-out ID，本機映射 exact decoded PTS、半開區間與 handles，並輸出 preview。Proposal 永遠需要真人核准；feature renderer 只接受帶有 human review record 的 approved decision。尚未完成的是 10 分鐘等長毛片的自動 take segmentation、跨檔 take/variant grouping、近重複召回與全庫比較。
+目前已實作入選事件的 Trim Intent 垂直切片：Gemini 直接觀看完整 proxy，在 `Clip Card event ∩ FFmpeg shot` 內提出 coarse `MM:SS` 代表性 select；本機解析原始 boundary PTS、半開區間與 handles，並輸出 preview。2／4／8 FPS DF IDs 保留作局部疑義的升級路徑。Proposal 永遠需要真人核准；feature renderer 只接受帶有 human review record 的 approved decision，或以明確 flag 輸出仍標示未核准的 review cut。尚未完成的是 10 分鐘等長毛片的自動 take segmentation、跨檔 take/variant grouping、近重複召回與全庫比較。
 
 ### 4. Brief-driven evidence retrieval
 
@@ -166,7 +166,7 @@ Repository 現已有逐片完整 proxy → Structured Clip Card、模型只回 `
 
 2026-07-21 已將 geometry 主路徑收斂成 domain-neutral QueryLock → exact-frame Gemini bbox → reviewed candidate → SAM 2.1。SAM 在 predictor 初始化前即只抽取 `允許區間 ∩ seed shot` 的影格，並保存每張影格的 decoded source PTS；不再先跨鏡傳播後才標記風險。exact-frame Grounding 與 SAM seed 也改用包含 target、frame、prompt/schema、checkpoint、shot bounds 與處理參數的 variant fingerprint。舊 Gemini polygon A/B 只保留歷史報告，執行入口會拒絕使用 polygon seed。
 
-已新增單一入選事件的 Trim Intent：使用 compact phase-selection schema 避免模型在多個 nullable frame 欄位中自我重複，保留 raw failure、usage、成本與 prompt/schema fingerprint；成功 proposal 可產生 preview，人工核准後才會以 exact PTS bounds 取代 feature cut 的固定 duration 粗剪。尚未完成的是長毛片自動 take segmentation／重拍分組、brief-driven 全庫 selects、coarse/dense 統一 review UI、所有較早 pipeline 階段的完整 cache fingerprint、SAM 週期語意重驗、遮擋後 re-identification 與三次穩定度報告。本文件同時包含已實作與後續設計；任何未經人工審核的建議都不得當成 production cut 或 SpatialTrack。
+已新增直接看影片的入選事件 Trim Intent：模型回 coarse `MM:SS`，本機解析 source PTS，並保留 raw failure、usage、成本與 prompt/schema fingerprint；不完整 hold 不補猜，EOS 不偽造 decoded frame。成功 proposal 可產生 preview，人工核准後才會以 PTS bounds 取代 feature cut 的固定 duration 粗剪；另有顯式未核准 review-render 模式。尚未完成的是長毛片自動 take segmentation／重拍分組、Top-K 候選與可變鏡頭數的全片編排、coarse/dense 統一 review UI、所有較早 pipeline 階段的完整 cache fingerprint、SAM 週期語意重驗、遮擋後 re-identification 與三次穩定度報告。本文件同時包含已實作與後續設計；任何未經人工審核的建議都不得當成 production cut 或 SpatialTrack。
 
 ## 官方參考
 

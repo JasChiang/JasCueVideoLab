@@ -620,6 +620,7 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         scdet_threshold=args.scdet_threshold,
         sam_analysis_fps=args.sam_analysis_fps,
         trim_decision_paths=args.trim_decision,
+        allow_proposed_trim_preview=args.allow_proposed_trim_preview,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1684,6 +1685,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Explicitly human-approved trim decision JSON; repeat for multiple selected events. "
             "Proposed or rejected decisions are refused."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--allow-proposed-trim-preview",
+        action="store_true",
+        help=(
+            "Render an explicitly unreviewed proposal cut for human review. "
+            "The manifest remains marked as requiring review; rejected trims are never accepted."
         ),
     )
     feature_cut_parser.add_argument("--output-dir", type=Path, required=True)
