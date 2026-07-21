@@ -605,7 +605,7 @@ def main() -> None:
         "method": {
             "model": "EfficientTAM-Ti",
             "device": "mps",
-            "prompt": "manual bbox proposals; box-only",
+            "prompt": f"{fixture_config.get('seed_source', 'unspecified_bbox_source')}; box-only",
             "session_contract": "one predictor and one inference state per fixture; all targets added before propagation",
             "propagation": "forward and reverse from the exact seed frame",
             "model_load_seconds": model_load_seconds,
