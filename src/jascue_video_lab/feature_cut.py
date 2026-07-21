@@ -32,6 +32,7 @@ from .models import (
     RushesCatalog,
     SegmentationTrack,
     TrackingState,
+    TrimIntentDecision,
 )
 from .overlay import draw_grounding_overlay
 from .rushes import _segment_bounds
@@ -51,7 +52,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v3-explicit-vertical-fallback"
+_RENDER_PIPELINE_VERSION = "feature-cut-v4-approved-trim-intent"
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
 _TRACKING_SEED_BOX_PADDING_RATIO = 0.04
@@ -147,6 +148,87 @@ def _chapter_bounds(
         shot=shot,
     )
     return start_ms, end_ms, shot.shot_id
+
+
+def _load_approved_trim_decisions(
+    paths: Sequence[Path],
+) -> list[tuple[Path, TrimIntentDecision]]:
+    approved: list[tuple[Path, TrimIntentDecision]] = []
+    for path in paths:
+        decision = TrimIntentDecision.model_validate(read_json(path))
+        if (
+            not decision.usable
+            or decision.approval_status != "approved"
+            or decision.requires_human_review
+            or decision.human_review is None
+            or decision.human_review.decision != "approved"
+        ):
+            raise ValueError(
+                f"feature cut only accepts explicitly human-approved trim decisions: {path}"
+            )
+        approved.append((path.resolve(), decision))
+    return approved
+
+
+def _chapter_bounds_with_approved_trim(
+    frame: RushFrame,
+    clip: RushClip,
+    duration_seconds: float,
+    shot_cache: dict[str, ShotManifest],
+    shots_dir: Path,
+    scdet_threshold: float,
+    approved_decisions: Sequence[tuple[Path, TrimIntentDecision]],
+) -> tuple[int, int, str, dict[str, Any]]:
+    fallback_start, fallback_end, shot_id = _chapter_bounds(
+        frame,
+        clip,
+        duration_seconds,
+        shot_cache,
+        shots_dir,
+        scdet_threshold,
+    )
+    asset_id = f"sha256:{clip.sha256}"
+    matches = [
+        (path, decision)
+        for path, decision in approved_decisions
+        if decision.source_asset_id == asset_id
+        and decision.source_in_ms is not None
+        and decision.source_out_ms is not None
+        and decision.source_in_ms <= frame.requested_time_ms < decision.source_out_ms
+    ]
+    if not matches:
+        return fallback_start, fallback_end, shot_id, {
+            "trim_method": "keyframe_centered_requested_duration",
+            "trim_decision_path": None,
+            "trim_event_id": None,
+            "trim_tail_intent": None,
+            "trim_human_review": None,
+        }
+    if len(matches) > 1:
+        raise ValueError(
+            f"multiple approved trim decisions match {frame.frame_id}; event mapping is ambiguous"
+        )
+    path, decision = matches[0]
+    assert decision.source_in_ms is not None and decision.source_out_ms is not None
+    shot = next(item for item in shot_cache[clip.clip_id].shots if item.shot_id == shot_id)
+    if decision.shot_id != shot_id:
+        raise ValueError(
+            f"approved trim decision shot differs from current FFmpeg shot for {frame.frame_id}"
+        )
+    if not (
+        shot.start_time_ms
+        <= decision.source_in_ms
+        < decision.source_out_ms
+        <= shot.end_time_ms
+    ):
+        raise ValueError("approved trim decision crosses the selected shot boundary")
+    return decision.source_in_ms, decision.source_out_ms, shot_id, {
+        "trim_method": "human_approved_frame_id_pts",
+        "trim_decision_path": str(path),
+        "trim_event_id": decision.event_id,
+        "trim_tail_intent": decision.tail_intent,
+        "trim_human_review": decision.human_review.model_dump(mode="json"),
+    }
 
 
 def _run_ffmpeg(command: list[str]) -> None:
@@ -912,8 +994,10 @@ def _render_review_html(
             f"<td>{html.escape(selected.evidence_status)}</td>"
             f"<td>{html.escape(str(selected.horizontal_frame_id))}</td>"
             f"<td>{html.escape(str(horizontal.get('applied_zoom', 1.0)))}</td>"
+            f"<td>{html.escape(str(horizontal.get('trim_method', 'not_applicable')))}</td>"
             f"<td>{html.escape(str(selected.vertical_frame_id))}</td>"
             f"<td>{html.escape(vertical['applied_strategy'])}</td>"
+            f"<td>{html.escape(str(vertical.get('trim_method', 'not_applicable')))}</td>"
             f"<td>{debug_link}</td>"
             f"<td>{html.escape(selected.observed_visual_evidence)}</td>"
             f"<td>{html.escape('; '.join(selected.quality_risks) or 'none')}</td>"
@@ -927,7 +1011,7 @@ def _render_review_html(
         + " 畫面證據、frame ID、Gemini bbox、SAM tracking 與 fallback 分開保存。</p>"
         + f"<section><h2>16:9</h2><video controls src=\"{html.escape(str(Path(manifest['horizontal']['output_path']).relative_to(output_dir.resolve())))}\"></video></section>"
         + f"<section><h2>9:16</h2><video controls src=\"{html.escape(str(Path(manifest['vertical']['output_path']).relative_to(output_dir.resolve())))}\"></video></section>"
-        + "<table><thead><tr><th>chapter</th><th>evidence</th><th>16:9 frame</th><th>zoom</th><th>9:16 frame</th><th>vertical</th><th>debug</th><th>observed evidence</th><th>risks</th></tr></thead><tbody>"
+        + "<table><thead><tr><th>chapter</th><th>evidence</th><th>16:9 frame</th><th>zoom</th><th>16:9 trim</th><th>9:16 frame</th><th>vertical</th><th>9:16 trim</th><th>debug</th><th>observed evidence</th><th>risks</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table></html>",
         encoding="utf-8",
@@ -945,12 +1029,14 @@ def run_feature_cut_experiment(
     temperature: float = 0.2,
     scdet_threshold: float = 4.0,
     sam_analysis_fps: float = 2.0,
+    trim_decision_paths: Sequence[Path] = (),
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     catalog = RushesCatalog.model_validate(read_json(catalog_path))
     brief = FeatureEditBrief.model_validate(read_json(brief_path))
     frames = {frame.frame_id: frame for frame in catalog.frames}
     clips = {clip.clip_id: clip for clip in catalog.clips}
+    approved_trim_decisions = _load_approved_trim_decisions(trim_decision_paths)
     brief_by_id = {chapter.feature_id: chapter for chapter in brief.chapters}
     timings: dict[str, float] = {}
     started = monotonic()
@@ -998,6 +1084,13 @@ def run_feature_cut_experiment(
             "plan": plan.model_dump(mode="json"),
             "sam_analysis_fps": sam_analysis_fps,
             "scdet_threshold": scdet_threshold,
+            "approved_trim_decisions": [
+                {
+                    "path": str(path),
+                    "decision": decision.model_dump(mode="json"),
+                }
+                for path, decision in approved_trim_decisions
+            ],
         }
         render_key = hashlib.sha256(
             json.dumps(render_config, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -1013,6 +1106,7 @@ def run_feature_cut_experiment(
             "render_title_overlays": brief.render_title_overlays,
             "render_pipeline_version": _RENDER_PIPELINE_VERSION,
             "render_cache_key": render_key,
+            "approved_trim_decision_count": len(approved_trim_decisions),
             "horizontal": {"chapters": []},
             "vertical": {"chapters": []},
         }
@@ -1063,13 +1157,14 @@ def run_feature_cut_experiment(
             else:
                 horizontal_frame = frames[selected.horizontal_frame_id or ""]
                 horizontal_clip = clips[horizontal_frame.clip_id]
-                h_start, h_end, h_shot = _chapter_bounds(
+                h_start, h_end, h_shot, horizontal_trim = _chapter_bounds_with_approved_trim(
                     horizontal_frame,
                     horizontal_clip,
                     brief_chapter.target_duration_seconds,
                     shot_cache,
                     shots_dir,
                     scdet_threshold,
+                    approved_trim_decisions,
                 )
                 vertical_frame = frames[selected.vertical_frame_id or ""]
                 vertical_clip = clips[vertical_frame.clip_id]
@@ -1080,13 +1175,14 @@ def run_feature_cut_experiment(
                         )
                 horizontal_source_has_audio = source_audio_cache[horizontal_clip.sha256]
                 vertical_source_has_audio = source_audio_cache[vertical_clip.sha256]
-                v_start, v_end, v_shot = _chapter_bounds(
+                v_start, v_end, v_shot, vertical_trim = _chapter_bounds_with_approved_trim(
                     vertical_frame,
                     vertical_clip,
                     brief_chapter.target_duration_seconds,
                     shot_cache,
                     shots_dir,
                     scdet_threshold,
+                    approved_trim_decisions,
                 )
                 if brief.render_title_overlays:
                     _render_text_layer(
@@ -1274,6 +1370,7 @@ def run_feature_cut_experiment(
                         "source" if horizontal_source_has_audio else "synthetic_silence"
                     ),
                     "grounding_debug": str(horizontal_debug.resolve()) if horizontal_debug else None,
+                    **horizontal_trim,
                     **horizontal_geometry,
                 }
                 vertical_entry = {
@@ -1294,6 +1391,7 @@ def run_feature_cut_experiment(
                     ),
                     "primary_target_override": vertical_primary_override is not None,
                     "grounding_debug": str(vertical_debug.resolve()) if vertical_debug else None,
+                    **vertical_trim,
                     **vertical_geometry,
                 }
             horizontal_segments.append(horizontal_segment)

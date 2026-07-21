@@ -71,7 +71,7 @@ Local derived schema
 - 真正選中事件後，才回原始影片抽 1–3 張 exact frame，保存 PTS 與 hash 並做 Grounding。
 - 切鏡邊界是 tracker 的強制中止點；新 shot 必須建新 seed。
 
-### 3.5 待討論：長毛片 trimming、重拍與相似 take
+### 3.5 已完成單事件垂直切片：trimming；待續：長毛片重拍與相似 take
 
 這一層應在 Clip Card／Content Map 完成後另外執行，不得在媒體登錄時自動刪除素材：
 
@@ -81,6 +81,8 @@ Local derived schema
 - 同景多次拍攝先建立 `take_group`／`variant_group`，比較動作完整度、對焦、遮擋、運鏡、表演與留白，不直接判定檔案重複。
 - 位元完全相同可用 SHA-256 判斷；視覺近重複可用 perceptual hash／embedding 做候選召回；最終「哪個 take 較適合 brief」再交給 AI 與人工審核。
 - 所有 reject 都是可逆標記，不移除原檔；輸出 selects reel 前必須能查看相鄰 handles。
+
+目前已實作入選事件的 Trim Intent 垂直切片：在 `Clip Card event ∩ FFmpeg shot` 內建立 2／4／8 FPS DF IDs，Gemini 只選 setup/action/result/hold/reset 與建議 in／exclusive-out ID，本機映射 exact decoded PTS、半開區間與 handles，並輸出 preview。Proposal 永遠需要真人核准；feature renderer 只接受帶有 human review record 的 approved decision。尚未完成的是 10 分鐘等長毛片的自動 take segmentation、跨檔 take/variant grouping、近重複召回與全庫比較。
 
 ### 4. Brief-driven evidence retrieval
 
@@ -164,7 +166,7 @@ Repository 現已有逐片完整 proxy → Structured Clip Card、模型只回 `
 
 2026-07-21 已將 geometry 主路徑收斂成 domain-neutral QueryLock → exact-frame Gemini bbox → reviewed candidate → SAM 2.1。SAM 在 predictor 初始化前即只抽取 `允許區間 ∩ seed shot` 的影格，並保存每張影格的 decoded source PTS；不再先跨鏡傳播後才標記風險。exact-frame Grounding 與 SAM seed 也改用包含 target、frame、prompt/schema、checkpoint、shot bounds 與處理參數的 variant fingerprint。舊 Gemini polygon A/B 只保留歷史報告，執行入口會拒絕使用 polygon seed。
 
-尚未完成的是長毛片 take trimming／重拍分組、brief-driven 全庫 selects、coarse/dense 統一 review UI、所有較早 pipeline 階段的完整 cache fingerprint、SAM 週期語意重驗、遮擋後 re-identification 與三次穩定度報告。本文件同時包含已實作與後續設計；任何未經人工審核的建議都不得當成 production cut 或 SpatialTrack。
+已新增單一入選事件的 Trim Intent：使用 compact phase-selection schema 避免模型在多個 nullable frame 欄位中自我重複，保留 raw failure、usage、成本與 prompt/schema fingerprint；成功 proposal 可產生 preview，人工核准後才會以 exact PTS bounds 取代 feature cut 的固定 duration 粗剪。尚未完成的是長毛片自動 take segmentation／重拍分組、brief-driven 全庫 selects、coarse/dense 統一 review UI、所有較早 pipeline 階段的完整 cache fingerprint、SAM 週期語意重驗、遮擋後 re-identification 與三次穩定度報告。本文件同時包含已實作與後續設計；任何未經人工審核的建議都不得當成 production cut 或 SpatialTrack。
 
 ## 官方參考
 

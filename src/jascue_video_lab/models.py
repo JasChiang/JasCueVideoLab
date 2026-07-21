@@ -748,6 +748,150 @@ class DenseEventSelection(StrictModel):
         return self
 
 
+TrimTailIntent = Literal[
+    "none",
+    "natural_pause",
+    "intentional_hold",
+    "title_safe_hold",
+    "clean_plate",
+    "reset_or_false_end",
+    "uncertain",
+]
+
+
+TrimPhase = Literal[
+    "setup_start",
+    "action_start",
+    "result_start",
+    "hold_start",
+    "hold_end",
+    "reset_start",
+    "recommended_in",
+    "recommended_out",
+]
+
+
+class TrimPhaseSelection(StrictModel):
+    """One observable trim phase tied to one supplied dense-frame ID."""
+
+    phase: TrimPhase
+    frame_id: str = Field(min_length=8, max_length=8)
+
+
+class TrimIntentProposal(StrictModel):
+    """Evidence-bound trim phases selected from immutable dense frame IDs."""
+
+    source_asset_id: str
+    event_id: str
+    usable: bool
+    selections: list[TrimPhaseSelection] = Field(max_length=8)
+    tail_intent: TrimTailIntent
+    observed_phase_evidence: str = Field(max_length=800)
+    hold_evidence: str = Field(max_length=500)
+    trim_reason: str = Field(max_length=500)
+    quality_risks: list[str] = Field(max_length=8)
+    uncertainties: list[str] = Field(max_length=8)
+    requires_human_review: bool
+    confidence: Confidence
+    model_provenance: ModelProvenance
+
+    def frame_id_for(self, phase: TrimPhase) -> str | None:
+        selection = next((item for item in self.selections if item.phase == phase), None)
+        return selection.frame_id if selection is not None else None
+
+    @model_validator(mode="after")
+    def validate_usable_fields(self) -> "TrimIntentProposal":
+        if not self.requires_human_review:
+            raise ValueError("Gemini trim proposals always require human review")
+        phases = [selection.phase for selection in self.selections]
+        if len(phases) != len(set(phases)):
+            raise ValueError("trim phases must be unique")
+        required = [self.frame_id_for("recommended_in"), self.frame_id_for("recommended_out")]
+        if self.usable:
+            if any(frame_id is None for frame_id in required):
+                raise ValueError("usable trim proposals require recommended in/out frame IDs")
+            if required[0] == required[1]:
+                raise ValueError("trim proposal must include at least two sampled frames")
+        elif self.selections:
+            raise ValueError("unusable trim proposals cannot reference frame IDs")
+        if ("hold_start" in phases) != ("hold_end" in phases):
+            raise ValueError("hold start/end frame IDs must appear together")
+        return self
+
+
+class TrimFrameEvidence(StrictModel):
+    frame_id: str = Field(pattern=r"^DF[0-9]{6}$")
+    requested_time_ms: int = Field(ge=0)
+    frame_time_ms: int = Field(ge=0)
+    frame_pts: int
+    frame_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class TrimHumanReview(StrictModel):
+    reviewer: str = Field(min_length=1)
+    reviewed_at: str
+    decision: Literal["approved", "rejected"]
+    notes: str = ""
+
+
+class TrimIntentDecision(StrictModel):
+    """Local PTS derivation from a model proposal; never a human-approved cut by default."""
+
+    source_asset_id: str
+    event_id: str
+    shot_id: str
+    usable: bool
+    first_included_frame: TrimFrameEvidence | None
+    last_included_frame: TrimFrameEvidence | None
+    exclusive_out_frame: TrimFrameEvidence | None
+    hold_start_frame: TrimFrameEvidence | None
+    hold_end_frame: TrimFrameEvidence | None
+    source_in_ms: int | None = Field(default=None, ge=0)
+    source_out_ms: int | None = Field(default=None, gt=0)
+    source_in_pts: int | None = None
+    source_out_pts: int | None = None
+    handle_in_ms: int | None = Field(default=None, ge=0)
+    handle_out_ms: int | None = Field(default=None, gt=0)
+    tail_intent: TrimTailIntent
+    approval_status: Literal["proposed", "approved", "rejected"] = "proposed"
+    requires_human_review: bool = True
+    human_review: TrimHumanReview | None = None
+    proposal_path: str
+    catalog_path: str
+
+    @model_validator(mode="after")
+    def validate_derived_bounds(self) -> "TrimIntentDecision":
+        required = [
+            self.first_included_frame,
+            self.last_included_frame,
+            self.source_in_ms,
+            self.source_out_ms,
+            self.source_in_pts,
+            self.source_out_pts,
+        ]
+        if self.usable:
+            if any(value is None for value in required):
+                raise ValueError("usable trim decisions require derived in/out evidence")
+            assert self.source_in_ms is not None and self.source_out_ms is not None
+            if self.source_out_ms <= self.source_in_ms:
+                raise ValueError("trim decision must be a non-empty half-open interval")
+            if self.handle_in_ms is None or self.handle_out_ms is None:
+                raise ValueError("usable trim decisions require adjacent handles")
+            if not self.handle_in_ms <= self.source_in_ms < self.source_out_ms <= self.handle_out_ms:
+                raise ValueError("trim bounds must remain inside saved handles")
+        elif any(value is not None for value in required):
+            raise ValueError("unusable trim decisions cannot contain derived bounds")
+        if self.approval_status == "proposed":
+            if not self.requires_human_review or self.human_review is not None:
+                raise ValueError("proposed trim decisions must remain unreviewed")
+        else:
+            if self.requires_human_review or self.human_review is None:
+                raise ValueError("reviewed trim decisions require a human review record")
+            if self.human_review.decision != self.approval_status:
+                raise ValueError("human review decision must match approval status")
+        return self
+
+
 class DirectMoment(StrictModel):
     """A salient screenshot request using Gemini's documented MM:SS notation."""
 

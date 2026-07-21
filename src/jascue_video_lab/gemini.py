@@ -35,6 +35,7 @@ from .models import (
     RushesEditPlan,
     TargetCandidateMap,
     TemporalMap,
+    TrimIntentProposal,
 )
 from .schema import gemini_response_schema
 from .storage import append_error, utc_now, write_json
@@ -1221,6 +1222,141 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "dense_selection", error)
+            raise
+
+    def analyze_trim_intent(
+        self,
+        *,
+        event: FullClipEvent,
+        catalog: DenseFrameCatalog,
+        prompt_template: str,
+        editorial_intent: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> TrimIntentProposal:
+        """Select trim phases from immutable dense frame IDs; local code owns PTS."""
+        run_dir.mkdir(parents=True, exist_ok=True)
+        provenance = _provenance(run_id)
+        ordered_ids = [frame.frame_id for frame in catalog.frames]
+        prompt = (
+            prompt_template
+            + "\n\n## 本次不可變 metadata\n"
+            + f"source_asset_id 必須原樣回傳：{catalog.source_asset_id}\n"
+            + f"event_id 必須原樣回傳：{event.event_id}\n"
+            + "合法 DF frame IDs JSON（依時間順序）：\n"
+            + json.dumps(ordered_ids, ensure_ascii=False)
+            + "\nframe_id 必須逐字複製其中一個八字元字串；不得附註、改寫或引用清單外 ID；不得輸出或推算時間碼。\n"
+            + "\n## 本次剪輯意圖（不是畫面證據）\n"
+            + editorial_intent
+            + "\n\n## Coarse Clip Card event\n"
+            + event.model_dump_json(indent=2)
+            + "\n\nmodel_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        api_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        recorded_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for page_number, (page_path, page_hash) in enumerate(
+            zip(catalog.contact_sheet_paths, catalog.contact_sheet_hashes, strict=True),
+            start=1,
+        ):
+            label = f"CONTACT_SHEET_PAGE={page_number}"
+            data = base64.b64encode(Path(page_path).read_bytes()).decode("ascii")
+            mime_type = mimetypes.guess_type(page_path)[0] or "image/jpeg"
+            api_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {"type": "image", "data": data, "mime_type": mime_type},
+                ]
+            )
+            recorded_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {"type": "image", "mime_type": mime_type, "sha256": page_hash},
+                ]
+            )
+        api_request = {
+            "model": MODEL_ID,
+            "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+            "store": False,
+            "input": api_input,
+            "generation_config": {
+                "temperature": self.temperature,
+                "thinking_level": "minimal",
+                "max_output_tokens": 2048,
+            },
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(TrimIntentProposal),
+            },
+        }
+        write_json(
+            run_dir / "trim_intent.request.json",
+            {**api_request, "input": recorded_input, "frame_ids_in_order": ordered_ids},
+        )
+        try:
+            interaction = self.client.interactions.create(**api_request)
+            write_json(run_dir / "trim_intent.raw_interaction.json", _raw_dump(interaction))
+            write_json(
+                run_dir / "trim_intent.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = TrimIntentProposal.model_validate_json(interaction.output_text)
+            if (
+                parsed.source_asset_id != catalog.source_asset_id
+                or parsed.event_id != event.event_id
+            ):
+                raise GeminiContractError("Trim intent changed immutable metadata")
+            positions = {frame_id: index for index, frame_id in enumerate(ordered_ids)}
+            phase_order = [
+                "setup_start",
+                "action_start",
+                "result_start",
+                "hold_start",
+                "hold_end",
+                "reset_start",
+            ]
+            referenced = [(item.phase, item.frame_id) for item in parsed.selections]
+            unknown = [frame_id for _, frame_id in referenced if frame_id not in positions]
+            if unknown:
+                raise GeminiContractError(f"Trim intent referenced unknown frame IDs: {unknown}")
+            by_phase = {item.phase: item.frame_id for item in parsed.selections}
+            ordered_phases = [
+                positions[by_phase[name]]
+                for name in phase_order
+                if name in by_phase
+            ]
+            if ordered_phases != sorted(ordered_phases):
+                raise GeminiContractError("Trim phase frame IDs are not chronological")
+            if parsed.usable:
+                recommended_in = parsed.frame_id_for("recommended_in")
+                recommended_out = parsed.frame_id_for("recommended_out")
+                assert recommended_in is not None
+                assert recommended_out is not None
+                if not (
+                    positions[recommended_in]
+                    < positions[recommended_out]
+                ):
+                    raise GeminiContractError("Trim in/out frame IDs are not chronological")
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "trim_intent.json", final)
+            write_json(
+                run_dir / "trim_intent.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "trim_intent.schema_validation.json",
+                {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
+            )
+            append_error(run_dir, "trim_intent", error)
             raise
 
     def plan_rushes_edit(

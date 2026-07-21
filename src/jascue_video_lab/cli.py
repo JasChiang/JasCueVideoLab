@@ -54,6 +54,7 @@ from .shots import detect_shots_ffmpeg
 from .storage import append_error, read_json, write_json
 from .timeline import render_direct_moment_timeline, render_temporal_timeline, render_timeline
 from .tracking import track_bbox_csrt
+from .trim_intent import review_trim_decision, run_trim_intent_event
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -618,6 +619,7 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         temperature=args.temperature,
         scdet_threshold=args.scdet_threshold,
         sam_analysis_fps=args.sam_analysis_fps,
+        trim_decision_paths=args.trim_decision,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -641,6 +643,32 @@ def command_full_clip(args: argparse.Namespace) -> int:
         file_cache_root=args.file_cache_root,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_trim_event(args: argparse.Namespace) -> int:
+    result = run_trim_intent_event(
+        args.clip_run_dir,
+        args.event_id,
+        args.output_dir,
+        prompt_template=_load_prompt("trim_intent_frame_selection_zh-TW.txt"),
+        editorial_intent=args.editorial_intent,
+        sampling_fps=args.sampling_fps,
+        temperature=args.temperature,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_review_trim(args: argparse.Namespace) -> int:
+    decision = review_trim_decision(
+        args.decision_json,
+        args.output,
+        reviewer=args.reviewer,
+        decision=args.decision,
+        notes=args.notes,
+    )
+    print(json.dumps(decision.model_dump(mode="json"), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1648,6 +1676,16 @@ def build_parser() -> argparse.ArgumentParser:
     feature_cut_parser.add_argument("--sam-analysis-fps", type=float, default=2.0)
     feature_cut_parser.add_argument("--scdet-threshold", type=float, default=4.0)
     feature_cut_parser.add_argument("--temperature", type=float, default=0.2)
+    feature_cut_parser.add_argument(
+        "--trim-decision",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Explicitly human-approved trim decision JSON; repeat for multiple selected events. "
+            "Proposed or rejected decisions are refused."
+        ),
+    )
     feature_cut_parser.add_argument("--output-dir", type=Path, required=True)
     feature_cut_parser.set_defaults(handler=command_feature_cut)
 
@@ -1736,6 +1774,37 @@ def build_parser() -> argparse.ArgumentParser:
     full_selected_parser.add_argument("--file-cache-root", type=Path)
     full_selected_parser.add_argument("--output-dir", type=Path, required=True)
     full_selected_parser.set_defaults(handler=command_full_selected)
+
+    trim_event_parser = subparsers.add_parser(
+        "trim-event",
+        help="Refine one Clip Card event into frame-ID/PTS trim phases for human review",
+    )
+    trim_event_parser.add_argument("clip_run_dir", type=Path)
+    trim_event_parser.add_argument("event_id")
+    trim_event_parser.add_argument(
+        "--editorial-intent",
+        default=(
+            "保留可理解的完整動作與結果；若存在疑似刻意停留或適合文字的負空間，"
+            "保留為待人工確認的 hold proposal。"
+        ),
+    )
+    trim_event_parser.add_argument(
+        "--sampling-fps", type=float, choices=[2.0, 4.0, 8.0], default=4.0
+    )
+    trim_event_parser.add_argument("--temperature", type=float, default=0.1)
+    trim_event_parser.add_argument("--output-dir", type=Path, required=True)
+    trim_event_parser.set_defaults(handler=command_trim_event)
+
+    review_trim_parser = subparsers.add_parser(
+        "review-trim",
+        help="Approve or reject a saved trim proposal without another model call",
+    )
+    review_trim_parser.add_argument("decision_json", type=Path)
+    review_trim_parser.add_argument("--decision", choices=["approved", "rejected"], required=True)
+    review_trim_parser.add_argument("--reviewer", required=True)
+    review_trim_parser.add_argument("--notes", default="")
+    review_trim_parser.add_argument("--output", type=Path, required=True)
+    review_trim_parser.set_defaults(handler=command_review_trim)
 
     full_ground_parser = subparsers.add_parser(
         "full-ground-event",

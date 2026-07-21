@@ -111,6 +111,18 @@ FFmpeg 從 orientation-corrected 原始 source 抽幀後，以官方 Gemini imag
 
 SAM predictor 在初始化前先以 FFmpeg 找出 seed 所屬 shot，實際分析區間為 `使用者／事件允許範圍 ∩ seed shot`。每個 sample 保存原始 decoded `source_pts`、time base 衍生的時間與 mask-derived bbox；固定 FPS debug MP4 只是預覽，不是剪輯時間軸。tracker 有 mask 仍不等於語意身分已確認，因此 drift、lost 或遮擋後重現仍需重新 Grounding 或人工確認。
 
+### 7. 入選後才做 Trim Intent，且不能自動核准
+
+Clip Card 的 `MM:SS` event 只負責召回可能可用的區間。真正入選後，程式才在 `coarse event ∩ FFmpeg shot` 內建立 2／4／8 FPS 的 DF contact sheets，Gemini 只能從既有 ID 標記：
+
+- `setup_start`、`action_start`、`result_start`
+- `hold_start`、`hold_end`、`reset_start`
+- `recommended_in`、`recommended_out`
+
+本機再把兩個 DF ID 映射為 decoded-frame PTS 與半開 source interval；`recommended_in` 是第一張保留影格，`recommended_out` 是第一張不保留影格（exclusive out）。這能讓 in/out 都直接引用真實 decoded PTS，不必在 contact sheet 末端以抽樣間隔猜出點。相鄰 handles 另外保存供人檢查，不能因模型建議而丟棄原片。
+
+靜止片尾不自動視為廢尾。模型只能以可見證據提出 `natural_pause`、`intentional_hold`、`title_safe_hold`、`clean_plate`、`reset_or_false_end` 或 `uncertain`；「疑似刻意」仍不是導演意圖的 ground truth。每份 proposal 都固定 `requires_human_review=true`，並輸出可播放 preview。只有 `review-trim` 寫入明確真人核准紀錄後，`feature-cut --trim-decision` 才會套用；未核准、被拒絕、跨 shot、source hash 不符或多筆重疊都 fail closed。沒有 matching reviewed decision 的段落仍保留原本的 keyframe-centered rough trim，且 manifest 明確標成 fallback。
+
 ## 怎麼執行
 
 先準備 artifact；同一 artifact 再執行時會優先重用 File API 物件：
@@ -158,6 +170,8 @@ uv run jascue-video-lab full-ground-event ARTIFACT EVENT_ID \
 ```
 
 若 exact-frame Grounding 回傳多個合理 bbox，命令會 fail closed；人工看過 debug 圖後才能以 `--grounding-candidate-number` 指定候選。此編號從 1 開始，與 debug 圖上的 `1.`、`2.` 一致；artifact 同時保存 1-based number 與 0-based array index。QueryLock、Grounding request 與 bbox seed 都會各自保存 fingerprint。
+
+Trim Intent 採相同的 evidence-first 邊界：模型回 ID，本機回查 PTS，真人決定是否採用。它處理的是入選片段的動作完整度與可疑 hold，不取代全庫 take grouping 或「多次重拍中哪一個最好」的比較任務。
 
 ## 可以分享的結論
 

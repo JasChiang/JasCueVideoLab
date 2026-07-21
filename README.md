@@ -50,6 +50,13 @@ Full v1 不會把整支毛片切成數百張圖片送入模型。每支影片先
 只有快速 UI／短暫狀態不確定時：
   → 事件內 1–5 秒局部 4／8 FPS frame-ID contact sheet
   → Gemini 只選既有 ID；時間仍由本機映射
+
+只有入選片段需要精修頭尾時：
+  → Clip Card coarse event ∩ FFmpeg shot
+  → 局部 2／4／8 FPS immutable DF IDs
+  → Gemini 標記 setup／action／result／hold／reset 與建議 in／exclusive-out ID
+  → 本機將 ID 映射為 decoded-frame PTS、半開區間與安全 handles
+  → 產生 proposal preview，真人核准後才可套入 feature cut
 ```
 
 ```bash
@@ -79,7 +86,25 @@ uv run jascue-video-lab full-ground-event \
 uv run jascue-video-lab full-clip VIDEO.mp4 \
   --dense-event EVENT_ID --dense-fps 8 --dense-window-ms 4000 \
   --output-dir artifacts/full-v1-clip
+
+# 入選事件的 trim intent；只產生待審 proposal，不會自動核准
+uv run jascue-video-lab trim-event \
+  artifacts/full-v1-library/clips/ASSET_PREFIX EVENT_ID \
+  --sampling-fps 4 \
+  --editorial-intent '保留完整動作與結果；標記可疑 hold、reset 與品質風險。' \
+  --output-dir artifacts/trim-review/EVENT_ID
+
+# 真人看過 index.html／trim-preview.mp4 後，明確核准或拒絕
+uv run jascue-video-lab review-trim \
+  artifacts/trim-review/EVENT_ID/trim-decision.json \
+  --decision approved --reviewer REVIEWER_ID \
+  --notes '已確認動作完整，片尾停留可保留。' \
+  --output artifacts/trim-review/EVENT_ID/trim-decision.reviewed.json
 ```
+
+Trim Intent 不把「畫面變靜」直接等同廢尾或刻意留白。模型只能依畫面提出 `natural_pause`、`intentional_hold`、`title_safe_hold`、`clean_plate`、`reset_or_false_end` 或 `uncertain`，並保存可見證據與不確定性；它不能宣稱知道導演意圖。所有 phase 都只能引用輸入 contact sheet 的 exact DF ID，不能回傳自創時間碼。Gemini proposal 永遠是 `requires_human_review=true`，因此 schema 通過也不會直接改動成片。
+
+一次經授權、去識別化的實片 trim 垂直切片使用 28 張 4 FPS 局部影格，在約 6.6 秒內完成 Structured Output；模型選出的本機 PTS 半開區間約為 3.003–8.759 秒，並標記後段為待審的穩定展示 hold。該次請求依當時公開 Standard list price 估算約 US$0.0146。這只證明 contract、成本記錄與實片輸出可運作，不代表剪點已獲真人核准或能泛化到所有素材。
 
 `--audio-mode auto` 是預設值：有音軌就保留，無音軌也正常完成；`off` 明確移除音訊；`required` 只適合音訊證據不可缺少的實驗，來源沒有音軌時會保存錯誤並停止該片。artifact 會記錄 `source_has_audio` 與 `proxy_has_audio`，Clip Card 不得為 silent source 捏造 audio evidence。
 
@@ -154,6 +179,17 @@ uv run jascue-video-lab feature-cut \
   --sam-checkpoint artifacts/models/sam2.1_hiera_tiny.pt \
   --sam-analysis-fps 2 \
   --output-dir artifacts/my-feature-cut
+```
+
+若某章已有真人核准的 Trim Intent，可重複傳入 `--trim-decision PATH`。Renderer 只接受 `approval_status=approved` 且帶有人類 review record 的 decision，並再次驗證 source SHA-256、入選 RF frame、事件區間與目前 FFmpeg shot；proposed、rejected、跨鏡或多筆重疊 decision 會被拒絕。沒有匹配 decision 的章節仍使用原本「keyframe 中心 ± brief duration、限制在 shot」的粗剪方式，manifest 會分別標示 `human_approved_frame_id_pts` 或 `keyframe_centered_requested_duration`，不會把 fallback 冒充成精修結果。
+
+```bash
+uv run jascue-video-lab feature-cut \
+  artifacts/my-rushes-run/catalog.json BRIEF.json \
+  --sam-checkpoint artifacts/models/sam2.1_hiera_tiny.pt \
+  --trim-decision artifacts/trim-review/event-a/trim-decision.reviewed.json \
+  --trim-decision artifacts/trim-review/event-b/trim-decision.reviewed.json \
+  --output-dir artifacts/my-feature-cut-reviewed-trims
 ```
 
 經授權的多功能產品素材已完成 16:9 與 9:16 live review-cut 實驗：橫式版本只在通過 geometry gate 時套用有限 reframe，直式版本則以使用者明確指定的 `strict` 或 `primary_center` 規則處理動態 crop，不使用模糊背景掩蓋構圖失敗。Grounding schema 通過、bbox/contact sheet 經視覺檢查，仍只代表流程可稽核，不代表每個構圖或選片已獲獨立真人核准。
