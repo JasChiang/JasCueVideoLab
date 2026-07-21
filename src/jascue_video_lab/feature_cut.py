@@ -52,7 +52,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v4-approved-trim-intent"
+_RENDER_PIPELINE_VERSION = "feature-cut-v5-primary-target-no-clipping"
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
 _TRACKING_SEED_BOX_PADDING_RATIO = 0.04
@@ -691,6 +691,61 @@ def _piecewise_expression(times: Sequence[float], values: Sequence[float]) -> st
     return expression
 
 
+def _vertical_crop_geometry(
+    times: Sequence[float],
+    centers_x: Sequence[float],
+    boxes: Sequence[Sequence[int]],
+) -> tuple[list[float], dict[str, Any]]:
+    """Return the exact smoothed crop-x keyframes consumed by the renderer."""
+    if not times or len(times) != len(centers_x) or len(times) != len(boxes):
+        raise ValueError("vertical crop geometry needs aligned non-empty samples")
+    scaled_width = 3414
+    crop_width = 1080
+    crop_width_normalized = crop_width * 1000 / scaled_width
+    smooth_centers = _smooth(centers_x)
+    x_values = [
+        max(0.0, min(scaled_width - crop_width, center * scaled_width / 1000 - 540))
+        for center in smooth_centers
+    ]
+    max_target_width = max(box[2] - box[0] for box in boxes)
+    return x_values, {
+        "crop_width_normalized": round(crop_width_normalized, 4),
+        "max_target_width_normalized": max_target_width,
+        "crop_coordinate_space": {
+            "scaled_width": scaled_width,
+            "scaled_height": 1920,
+            "crop_width": crop_width,
+            "crop_height": 1920,
+            "origin": "top_left",
+        },
+        "crop_keyframes": [
+            {
+                "time_seconds": round(time, 6),
+                "tracked_center_x_normalized": round(center, 4),
+                "smoothed_center_x_normalized": round(smooth_center, 4),
+                "crop_x_pixels": round(crop_x, 3),
+            }
+            for time, center, smooth_center, crop_x in zip(
+                times, centers_x, smooth_centers, x_values, strict=True
+            )
+        ],
+    }
+
+
+def _vertical_target_fits_crop(
+    max_target_width_normalized: float,
+    crop_width_normalized: float,
+    *,
+    primary_center: bool,
+) -> tuple[bool, float]:
+    """Primary-center may relax outer margin, never clip the selected target."""
+    safety_multiplier = 1.0 if primary_center else 1.08
+    return (
+        max_target_width_normalized * safety_multiplier <= crop_width_normalized,
+        safety_multiplier,
+    )
+
+
 def _horizontal_filter_from_track(
     track: SegmentationTrack, zoom_intent: str
 ) -> tuple[str, dict[str, Any]]:
@@ -771,18 +826,23 @@ def _vertical_filter_from_track(
             "fallback_reason": "fewer_than_two_usable_tracking_samples",
         }
     scaled_width = 3414
-    crop_width_normalized = 1080 * 1000 / scaled_width
-    max_target_width = max(box[2] - box[0] for box in boxes)
-    if not allow_subject_clipping and max_target_width * 1.08 > crop_width_normalized:
+    x_values, crop_audit = _vertical_crop_geometry(times, centers_x, boxes)
+    crop_width_normalized = float(crop_audit["crop_width_normalized"])
+    max_target_width = int(crop_audit["max_target_width_normalized"])
+    target_fits, target_safety_multiplier = _vertical_target_fits_crop(
+        max_target_width,
+        crop_width_normalized,
+        primary_center=allow_subject_clipping,
+    )
+    if not target_fits:
         return fallback_filter, {
             "applied_strategy": fallback_strategy,
-            "fallback_reason": "tracked_subject_too_wide_for_safe_9x16_crop",
+            "fallback_reason": "tracked_primary_target_too_wide_for_safe_9x16_crop",
             "subject_clipping_allowed": False,
+            "secondary_context_clipping_allowed": allow_subject_clipping,
+            "target_safety_multiplier": target_safety_multiplier,
+            **crop_audit,
         }
-    x_values = [
-        max(0.0, min(scaled_width - 1080, center * scaled_width / 1000 - 540))
-        for center in _smooth(centers_x)
-    ]
     x_expression = _piecewise_expression(times, x_values)
     return (
         f"[0:v]fps=30,scale={scaled_width}:1920,"
@@ -790,7 +850,10 @@ def _vertical_filter_from_track(
         {
             "applied_strategy": "tracked_crop",
             "fallback_reason": None,
-            "subject_clipping_allowed": allow_subject_clipping,
+            "subject_clipping_allowed": False,
+            "secondary_context_clipping_allowed": allow_subject_clipping,
+            "target_safety_multiplier": target_safety_multiplier,
+            **crop_audit,
         },
     )
 

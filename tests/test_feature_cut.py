@@ -18,6 +18,8 @@ from jascue_video_lab.feature_cut import (
     _segment_variant_fingerprint,
     _tracking_seed_request_ms,
     _usable_track_centers,
+    _vertical_crop_geometry,
+    _vertical_target_fits_crop,
 )
 from jascue_video_lab.models import (
     FeatureChapterBrief,
@@ -70,6 +72,47 @@ def test_segment_cache_key_changes_with_source_or_tracking_geometry() -> None:
     assert original != _segment_variant_fingerprint(
         **{**base, "source_sha256": "d" * 64}
     )
+
+
+def test_vertical_crop_geometry_preserves_rendered_x_audit_keyframes() -> None:
+    x_values, audit = _vertical_crop_geometry(
+        [0.0, 1.0, 2.0],
+        [200.0, 500.0, 900.0],
+        [[100, 100, 300, 900], [400, 100, 600, 900], [800, 100, 1000, 900]],
+    )
+
+    assert len(x_values) == 3
+    assert [item["crop_x_pixels"] for item in audit["crop_keyframes"]] == [
+        round(value, 3) for value in x_values
+    ]
+    assert audit["crop_coordinate_space"] == {
+        "scaled_width": 3414,
+        "scaled_height": 1920,
+        "crop_width": 1080,
+        "crop_height": 1920,
+        "origin": "top_left",
+    }
+    assert audit["crop_width_normalized"] == pytest.approx(316.3445)
+    assert audit["max_target_width_normalized"] == 200
+    assert x_values == sorted(x_values)
+
+
+def test_primary_center_relaxes_margin_but_never_clips_primary_target() -> None:
+    strict_fits, strict_margin = _vertical_target_fits_crop(
+        310.0, 316.3445, primary_center=False
+    )
+    primary_fits, primary_margin = _vertical_target_fits_crop(
+        310.0, 316.3445, primary_center=True
+    )
+    too_wide, _ = _vertical_target_fits_crop(
+        320.0, 316.3445, primary_center=True
+    )
+
+    assert strict_fits is False
+    assert strict_margin == 1.08
+    assert primary_fits is True
+    assert primary_margin == 1.0
+    assert too_wide is False
 
 
 def test_tracking_seed_moves_inside_a_trim_that_excludes_catalog_anchor() -> None:
