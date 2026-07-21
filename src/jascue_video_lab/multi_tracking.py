@@ -1,0 +1,473 @@
+from __future__ import annotations
+
+import json
+import math
+import subprocess
+from fractions import Fraction
+from pathlib import Path
+from typing import Sequence
+
+from PIL import Image, ImageDraw
+
+from .media import has_audio_stream, probe_video, sha256_file
+from .models import (
+    MultiSegmentationReviewManifest,
+    MultiSegmentationReviewMember,
+    Rational,
+    SegmentationTrack,
+)
+from .overlay import _overlay_font
+from .storage import utc_now, write_json
+
+
+_REVIEW_COLORS: tuple[tuple[int, int, int], ...] = (
+    (0, 255, 170),
+    (255, 75, 166),
+    (255, 202, 58),
+    (64, 156, 255),
+    (255, 127, 39),
+    (166, 99, 255),
+    (76, 223, 255),
+    (255, 96, 96),
+)
+
+_REVIEW_WARNING = (
+    "This synchronized overlay is a manual-review visualization of independent "
+    "tracker proposals. It is not an accuracy measurement, independent ground truth, "
+    "or production SpatialTrack data."
+)
+
+
+def _load_track(path: Path) -> tuple[Path, SegmentationTrack]:
+    resolved = path.expanduser().resolve(strict=True)
+    return resolved, SegmentationTrack.model_validate_json(
+        resolved.read_text(encoding="utf-8")
+    )
+
+
+def _alignment_signature(track: SegmentationTrack) -> dict[str, object]:
+    return {
+        "asset_id": track.asset_id,
+        "video_path": str(Path(track.video_path).expanduser().resolve(strict=True)),
+        "analysis_fps": track.analysis_fps,
+        "analysis_start_ms": track.analysis_start_ms,
+        "analysis_end_ms": track.analysis_end_ms,
+        "analysis_width": track.analysis_width,
+        "analysis_height": track.analysis_height,
+        "source_start_pts": track.source_start_pts,
+        "source_time_base": (
+            track.source_time_base.model_dump(mode="json")
+            if track.source_time_base is not None
+            else None
+        ),
+        "samples": [
+            {
+                "sample_index": sample.sample_index,
+                "source_pts": sample.source_pts,
+                "analysis_sample_time_ms": sample.analysis_sample_time_ms,
+            }
+            for sample in track.samples
+        ],
+    }
+
+
+def validate_segmentation_track_alignment(
+    tracks: Sequence[SegmentationTrack],
+) -> None:
+    """Require exact source and decoded-sample lineage before combining tracks."""
+    if len(tracks) < 2:
+        raise ValueError("multi-track review requires at least two segmentation tracks")
+    for index, track in enumerate(tracks, start=1):
+        if track.analysis_end_ms is None:
+            raise ValueError(f"track {index} has no bounded analysis_end_ms")
+        if any(sample.source_pts is None for sample in track.samples):
+            raise ValueError(f"track {index} contains samples without decoded source PTS")
+        if [sample.sample_index for sample in track.samples] != list(
+            range(track.total_samples)
+        ):
+            raise ValueError(f"track {index} sample indices are not contiguous from zero")
+        sample_times = [sample.analysis_sample_time_ms for sample in track.samples]
+        if any(current >= following for current, following in zip(sample_times, sample_times[1:])):
+            raise ValueError(f"track {index} sample times are not strictly increasing")
+        source_pts = [sample.source_pts for sample in track.samples]
+        if any(current >= following for current, following in zip(source_pts, source_pts[1:])):
+            raise ValueError(f"track {index} source PTS values are not strictly increasing")
+    reference = _alignment_signature(tracks[0])
+    for index, track in enumerate(tracks[1:], start=2):
+        candidate = _alignment_signature(track)
+        mismatches = {
+            key: {"expected": reference[key], "actual": candidate[key]}
+            for key in reference
+            if candidate[key] != reference[key]
+        }
+        if mismatches:
+            raise ValueError(
+                f"segmentation track {index} is not exactly aligned: {mismatches}"
+            )
+
+
+def _contained_artifact_path(track_dir: Path, relative_path: str) -> Path:
+    resolved_root = track_dir.resolve(strict=True)
+    resolved = (resolved_root / relative_path).resolve(strict=True)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as error:
+        raise ValueError(f"track artifact escapes its directory: {relative_path}") from error
+    return resolved
+
+
+def _render_overlay_frame(
+    *,
+    frame_path: Path,
+    tracks: Sequence[SegmentationTrack],
+    track_dirs: Sequence[Path],
+    labels: Sequence[str],
+    colors: Sequence[tuple[int, int, int]],
+    sample_index: int,
+    output_path: Path,
+) -> None:
+    with Image.open(frame_path).convert("RGBA") as source:
+        image = source.copy()
+    font = _overlay_font(max(12, round(min(image.size) / 35)))
+    line_width = max(2, image.width // 400)
+
+    for track, track_dir, label, color in zip(
+        tracks, track_dirs, labels, colors, strict=True
+    ):
+        sample = track.samples[sample_index]
+        if sample.mask_path is not None:
+            mask_path = _contained_artifact_path(track_dir, sample.mask_path)
+            if sample.mask_sha256 is None or sha256_file(mask_path) != sample.mask_sha256:
+                raise ValueError(f"mask hash mismatch: {mask_path}")
+            with Image.open(mask_path).convert("L") as source_mask:
+                if source_mask.size != image.size:
+                    raise ValueError(
+                        f"mask dimensions do not match analysis frame: {mask_path}"
+                    )
+                alpha = source_mask.point(lambda value: 92 if value else 0)
+            color_layer = Image.new("RGBA", image.size, (*color, 0))
+            color_layer.putalpha(alpha)
+            image = Image.alpha_composite(image, color_layer)
+
+        box = sample.derived_tracking_box
+        if box is None:
+            continue
+        x_min, y_min, x_max, y_max = box
+        pixels = (
+            round(x_min * image.width / 1000),
+            round(y_min * image.height / 1000),
+            round(x_max * image.width / 1000),
+            round(y_max * image.height / 1000),
+        )
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(pixels, outline=color, width=line_width)
+        text = f"{label} | {sample.tracking_state.value}"
+        text_box = draw.textbbox((0, 0), text, font=font)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+        text_x = min(max(0, pixels[0]), max(0, image.width - text_width - 12))
+        text_y = max(0, pixels[1] - text_height - 12)
+        draw.rectangle(
+            (text_x, text_y, text_x + text_width + 10, text_y + text_height + 8),
+            fill=(*color, 220),
+        )
+        draw.text((text_x + 5, text_y + 3), text, fill="black", font=font)
+
+    draw = ImageDraw.Draw(image)
+    legend = "  ".join(f"{index + 1}. {label}" for index, label in enumerate(labels))
+    legend_box = draw.textbbox((0, 0), legend, font=font)
+    legend_height = legend_box[3] - legend_box[1]
+    draw.rectangle((0, 0, image.width, legend_height + 18), fill="#101820cc")
+    x = 12
+    for label, color in zip(labels, colors, strict=True):
+        item = f"■ {label}  "
+        draw.text((x, 7), item, fill=color, font=font)
+        item_box = draw.textbbox((0, 0), item, font=font)
+        x += item_box[2] - item_box[0]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.convert("RGB").save(output_path, quality=90)
+
+
+def _render_review_video(
+    *,
+    overlays_dir: Path,
+    source_video: Path,
+    output_path: Path,
+    sample_times_ms: Sequence[int],
+    display_fps: float,
+    start_ms: int,
+    end_ms: int,
+    source_has_audio: bool,
+) -> None:
+    duration_seconds = (end_ms - start_ms) / 1000
+    if not sample_times_ms:
+        raise ValueError("multi-track review requires at least one sampled frame")
+    if any(not start_ms <= value < end_ms for value in sample_times_ms):
+        raise ValueError("sample times must remain inside the review interval")
+    if any(
+        current >= following
+        for current, following in zip(sample_times_ms, sample_times_ms[1:])
+    ):
+        raise ValueError("sample times must be strictly increasing")
+
+    # FFmpeg's concat demuxer preserves each decoded sample's real timeline gap.
+    # The first selected frame is held back to the interval start; subsequent
+    # frames begin at their actual analysis_sample_time_ms. Repeating the last
+    # entry makes the final duration effective instead of silently truncating it.
+    timeline_path = output_path.parent / "overlay-timeline.ffconcat"
+    lines = ["ffconcat version 1.0"]
+    for index, sample_time_ms in enumerate(sample_times_ms):
+        frame_path = (overlays_dir / f"{index:06d}.jpg").resolve(strict=True)
+        if "\n" in str(frame_path) or "\r" in str(frame_path):
+            raise ValueError("overlay frame path contains a newline")
+        escaped_path = str(frame_path).replace("'", "'\\''")
+        next_time_ms = (
+            sample_times_ms[index + 1]
+            if index + 1 < len(sample_times_ms)
+            else end_ms
+        )
+        frame_start_ms = start_ms if index == 0 else sample_time_ms
+        frame_duration = (next_time_ms - frame_start_ms) / 1000
+        if frame_duration <= 0:
+            raise ValueError("overlay frame duration must be positive")
+        lines.extend(
+            [
+                f"file '{escaped_path}'",
+                "option framerate 1000",
+                f"duration {frame_duration:.9f}",
+            ]
+        )
+    last_path = (overlays_dir / f"{len(sample_times_ms) - 1:06d}.jpg").resolve(
+        strict=True
+    )
+    escaped_last_path = str(last_path).replace("'", "'\\''")
+    lines.extend([f"file '{escaped_last_path}'", "option framerate 1000"])
+    timeline_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # The output fps filter duplicates VFR review samples for broadly compatible
+    # playback; it does not claim that SAM inferred at display_fps.
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(timeline_path),
+        "-ss",
+        f"{start_ms / 1000:.6f}",
+        "-t",
+        f"{duration_seconds:.6f}",
+        "-i",
+        str(source_video),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-vf",
+        f"fps={display_fps},scale=in_range=pc:out_range=tv,format=yuv420p",
+        "-t",
+        f"{duration_seconds:.6f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-fps_mode",
+        "cfr",
+    ]
+    if source_has_audio:
+        command.extend(["-c:a", "aac", "-b:a", "192k"])
+    command.extend(["-movflags", "+faststart", str(output_path)])
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"multi-track review render failed ({completed.returncode}): "
+            f"{completed.stderr.strip()}"
+        )
+
+
+def _probe_review_video(path: Path) -> dict[str, object]:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            (
+                "format=duration:stream=codec_type,codec_name,pix_fmt,avg_frame_rate,"
+                "duration,nb_frames"
+            ),
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"could not inspect rendered review video: {completed.stderr.strip()}")
+    payload = json.loads(completed.stdout)
+    video_streams = [
+        stream for stream in payload.get("streams", []) if stream.get("codec_type") == "video"
+    ]
+    if len(video_streams) != 1:
+        raise RuntimeError("rendered review must contain exactly one video stream")
+    video = video_streams[0]
+    rate = Fraction(str(video["avg_frame_rate"]))
+    video_duration = video.get("duration")
+    frame_count = video.get("nb_frames")
+    if video_duration in {None, "N/A"} or frame_count in {None, "N/A"}:
+        raise RuntimeError("rendered review lacks video duration or frame-count metadata")
+    return {
+        "duration_ms": round(float(payload["format"]["duration"]) * 1000),
+        "video_duration_ms": round(float(video_duration) * 1000),
+        "frame_count": int(frame_count),
+        "codec_name": video.get("codec_name"),
+        "pixel_format": video.get("pix_fmt"),
+        "frame_rate": Rational(numerator=rate.numerator, denominator=rate.denominator),
+        "audio_muxed": any(
+            stream.get("codec_type") == "audio" for stream in payload.get("streams", [])
+        ),
+    }
+
+
+def render_multi_segmentation_review(
+    *,
+    track_json_paths: Sequence[Path],
+    labels: Sequence[str],
+    output_dir: Path,
+    display_fps: float = 30.0,
+) -> MultiSegmentationReviewManifest:
+    """Combine aligned independent SAM tracks into one manual-review MP4."""
+    if len(track_json_paths) < 2:
+        raise ValueError("multi-track review requires at least two track JSON files")
+    if len(labels) != len(track_json_paths):
+        raise ValueError("provide exactly one label for each segmentation track")
+    normalized_labels = [label.strip() for label in labels]
+    if any(not label for label in normalized_labels):
+        raise ValueError("multi-track review labels must be non-empty")
+    if len(normalized_labels) != len(set(normalized_labels)):
+        raise ValueError("multi-track review labels must be unique")
+    if len(track_json_paths) > len(_REVIEW_COLORS):
+        raise ValueError(f"multi-track review supports at most {len(_REVIEW_COLORS)} tracks")
+
+    loaded = [_load_track(path) for path in track_json_paths]
+    resolved_paths = [item[0] for item in loaded]
+    if len(resolved_paths) != len(set(resolved_paths)):
+        raise ValueError("segmentation track JSON paths must be unique")
+    tracks = [item[1] for item in loaded]
+    validate_segmentation_track_alignment(tracks)
+    reference = tracks[0]
+    if display_fps < reference.analysis_fps or display_fps > 60:
+        raise ValueError("display_fps must be within [analysis_fps, 60]")
+
+    source_video = Path(reference.video_path).expanduser().resolve(strict=True)
+    source_media = probe_video(source_video)
+    if source_media.asset_id != reference.asset_id:
+        raise ValueError("source video content no longer matches the track asset_id")
+    if reference.analysis_end_ms is None:
+        raise ValueError("reference track has no bounded analysis_end_ms")
+    if reference.analysis_end_ms > source_media.duration_ms:
+        raise ValueError("track analysis interval exceeds source video duration")
+
+    output_dir = output_dir.expanduser().resolve()
+    overlays_dir = output_dir / "overlays"
+    if overlays_dir.exists() and any(overlays_dir.iterdir()):
+        raise FileExistsError(f"combined overlay directory is not empty: {overlays_dir}")
+    overlays_dir.mkdir(parents=True, exist_ok=True)
+    reference_frames_dir = resolved_paths[0].parent / "analysis-frames"
+    colors = _REVIEW_COLORS[: len(tracks)]
+    track_dirs = [path.parent for path in resolved_paths]
+    for sample_index in range(reference.total_samples):
+        frame_path = reference_frames_dir / f"{sample_index:06d}.jpg"
+        if not frame_path.exists():
+            raise FileNotFoundError(frame_path)
+        with Image.open(frame_path) as frame:
+            if frame.size != (reference.analysis_width, reference.analysis_height):
+                raise ValueError(f"analysis frame dimensions do not match track: {frame_path}")
+        _render_overlay_frame(
+            frame_path=frame_path,
+            tracks=tracks,
+            track_dirs=track_dirs,
+            labels=normalized_labels,
+            colors=colors,
+            sample_index=sample_index,
+            output_path=overlays_dir / f"{sample_index:06d}.jpg",
+        )
+
+    output_video = output_dir / "multi-track-review.mp4"
+    source_has_audio = has_audio_stream(source_video)
+    _render_review_video(
+        overlays_dir=overlays_dir,
+        source_video=source_video,
+        output_path=output_video,
+        sample_times_ms=[sample.analysis_sample_time_ms for sample in reference.samples],
+        display_fps=display_fps,
+        start_ms=reference.analysis_start_ms,
+        end_ms=reference.analysis_end_ms,
+        source_has_audio=source_has_audio,
+    )
+    rendered = _probe_review_video(output_video)
+    if rendered["codec_name"] != "h264" or rendered["pixel_format"] != "yuv420p":
+        raise RuntimeError("review output is not H.264 yuv420p")
+    if rendered["audio_muxed"] != source_has_audio:
+        raise RuntimeError("review output audio presence does not match the source interval")
+    expected_duration_ms = reference.analysis_end_ms - reference.analysis_start_ms
+    duration_tolerance_ms = math.ceil(1000 / display_fps) + 5
+    if abs(int(rendered["video_duration_ms"]) - expected_duration_ms) > duration_tolerance_ms:
+        raise RuntimeError("review video stream does not cover the complete analysis interval")
+    minimum_frames = max(1, math.floor(expected_duration_ms * display_fps / 1000) - 1)
+    if int(rendered["frame_count"]) < minimum_frames:
+        raise RuntimeError("review video stream contains too few frames for its interval")
+
+    members = [
+        MultiSegmentationReviewMember(
+            label=label,
+            color_rgb=color,
+            target_description=track.target_description,
+            track_json_path=str(path),
+            track_json_sha256=sha256_file(path),
+            seed_time_ms=track.seed_time_ms,
+        )
+        for path, track, label, color in zip(
+            resolved_paths, tracks, normalized_labels, colors, strict=True
+        )
+    ]
+    manifest = MultiSegmentationReviewManifest(
+        artifact_type="multi_segmentation_track_review",
+        interpretation="manual_review_visualization_not_accuracy",
+        asset_id=reference.asset_id,
+        source_video_path=str(source_video),
+        source_video_sha256=source_media.sha256,
+        analysis_fps=reference.analysis_fps,
+        display_fps=display_fps,
+        analysis_width=reference.analysis_width,
+        analysis_height=reference.analysis_height,
+        analysis_start_ms=reference.analysis_start_ms,
+        analysis_end_ms=reference.analysis_end_ms,
+        total_samples=reference.total_samples,
+        audio_muxed=bool(rendered["audio_muxed"]),
+        output_video_path=str(output_video),
+        output_video_sha256=sha256_file(output_video),
+        output_duration_ms=int(rendered["duration_ms"]),
+        output_video_duration_ms=int(rendered["video_duration_ms"]),
+        output_frame_count=int(rendered["frame_count"]),
+        output_codec_name="h264",
+        output_pixel_format="yuv420p",
+        output_frame_rate=rendered["frame_rate"],
+        warning=_REVIEW_WARNING,
+        generated_at=utc_now(),
+        members=members,
+    )
+    write_json(output_dir / "multi-track-review.json", manifest)
+    return manifest

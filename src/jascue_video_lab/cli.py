@@ -36,6 +36,7 @@ from .models import (
     RushesCatalog,
     RushesEditPlan,
 )
+from .multi_tracking import render_multi_segmentation_review
 from .overlay import draw_grounding_overlay
 from .review import render_manual_review
 from .repeat import run_repeated_grounding
@@ -474,6 +475,17 @@ def command_track_sam21(args: argparse.Namespace) -> int:
         seed_box_padding_ratio=args.seed_box_padding_ratio,
     )
     print(result.model_dump_json(indent=2, exclude={"samples"}))
+    return 0
+
+
+def command_render_multi_sam21(args: argparse.Namespace) -> int:
+    result = render_multi_segmentation_review(
+        track_json_paths=args.track_json,
+        labels=args.label,
+        output_dir=args.output_dir,
+        display_fps=args.display_fps,
+    )
+    print(result.model_dump_json(indent=2))
     return 0
 
 
@@ -1458,6 +1470,21 @@ def build_parser() -> argparse.ArgumentParser:
     sam_tracking_parser.add_argument("--seed-box-padding-ratio", type=float, default=0.0)
     sam_tracking_parser.add_argument("--output-dir", type=Path, required=True)
     sam_tracking_parser.set_defaults(handler=command_track_sam21)
+
+    multi_sam_parser = subparsers.add_parser(
+        "render-multi-sam21",
+        help="Combine aligned SAM tracks into a normal-duration manual-review MP4",
+    )
+    multi_sam_parser.add_argument("track_json", type=Path, nargs="+")
+    multi_sam_parser.add_argument(
+        "--label",
+        action="append",
+        required=True,
+        help="Repeat once per track, in the same order as the track JSON arguments",
+    )
+    multi_sam_parser.add_argument("--display-fps", type=float, default=30.0)
+    multi_sam_parser.add_argument("--output-dir", type=Path, required=True)
+    multi_sam_parser.set_defaults(handler=command_render_multi_sam21)
 
     tracker_comparison_parser = subparsers.add_parser(
         "compare-trackers",

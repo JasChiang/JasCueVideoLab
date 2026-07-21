@@ -313,11 +313,22 @@ uv run jascue-video-lab track-sam21 VIDEO.mp4 \
   --target-description '審核者指定的前景實體；排除背景圖像與相似實例' \
   --analysis-fps 2 --output-dir ARTIFACT/sam21-selected-subject
 
+# 多個目標仍各自 Grounding 與追蹤，最後才合成一支人工審核影片
+uv run jascue-video-lab render-multi-sam21 \
+  ARTIFACT/sam21-selected-subject/segmentation-track.json \
+  ARTIFACT/sam21-second-subject/segmentation-track.json \
+  --label 'Selected subject A' \
+  --label 'Selected subject B' \
+  --display-fps 30 \
+  --output-dir ARTIFACT/multi-track-review
+
 # 與 CSRT 比較只稱為 agreement；兩者都不是 human ground truth
 uv run jascue-video-lab compare-trackers \
   ARTIFACT/sam21-selected-subject/segmentation-track.json \
   ARTIFACT/csrt/tracking.json --output ARTIFACT/tracker-agreement.json
 ```
+
+`render-multi-sam21` 只會合併來自同一 asset、同一區間與完全相同 decoded-source PTS 取樣序列的軌跡；任一對齊資料不同就拒絕輸出。`--display-fps 30` 只複製已有的 analysis frames 以便正常速度播放，不表示 tracker 已在 30 FPS 上推論。產出為含來源音軌的 H.264/yuv420p MP4 與可追溯 manifest，只供人工審核，不是準確率證明或 production SpatialTrack。
 
 ## 產出
 

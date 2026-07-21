@@ -1237,6 +1237,62 @@ class SegmentationTrack(StrictModel):
         return self
 
 
+class MultiSegmentationReviewMember(StrictModel):
+    """One independently produced track shown in a combined review video."""
+
+    label: str = Field(min_length=1)
+    color_rgb: tuple[
+        Annotated[int, Field(ge=0, le=255)],
+        Annotated[int, Field(ge=0, le=255)],
+        Annotated[int, Field(ge=0, le=255)],
+    ]
+    target_description: str = Field(min_length=1)
+    track_json_path: str
+    track_json_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    seed_time_ms: int = Field(ge=0)
+
+
+class MultiSegmentationReviewManifest(StrictModel):
+    """Provenance for a synchronized multi-track manual-review visualization."""
+
+    artifact_type: Literal["multi_segmentation_track_review"]
+    interpretation: Literal["manual_review_visualization_not_accuracy"]
+    asset_id: str
+    source_video_path: str
+    source_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    analysis_fps: float = Field(gt=0, le=60)
+    display_fps: float = Field(gt=0, le=60)
+    analysis_width: int = Field(gt=0)
+    analysis_height: int = Field(gt=0)
+    analysis_start_ms: int = Field(ge=0)
+    analysis_end_ms: int = Field(gt=0)
+    total_samples: int = Field(gt=0)
+    audio_muxed: bool
+    output_video_path: str
+    output_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_duration_ms: int = Field(gt=0)
+    output_video_duration_ms: int = Field(gt=0)
+    output_frame_count: int = Field(gt=0)
+    output_codec_name: Literal["h264"]
+    output_pixel_format: Literal["yuv420p"]
+    output_frame_rate: Rational
+    warning: str = Field(min_length=1)
+    generated_at: str = Field(min_length=1)
+    members: list[MultiSegmentationReviewMember] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def validate_review_manifest(self) -> "MultiSegmentationReviewManifest":
+        if self.analysis_start_ms >= self.analysis_end_ms:
+            raise ValueError("analysis interval must be non-empty and half-open")
+        labels = [member.label for member in self.members]
+        if len(labels) != len(set(labels)):
+            raise ValueError("multi-track review labels must be unique")
+        colors = [member.color_rgb for member in self.members]
+        if len(colors) != len(set(colors)):
+            raise ValueError("multi-track review colors must be unique")
+        return self
+
+
 class TrackerAgreementSample(StrictModel):
     analysis_sample_time_ms: int = Field(ge=0)
     reference_time_ms: float = Field(ge=0)
