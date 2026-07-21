@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import StrEnum
 from typing import Annotated, Literal
 
@@ -79,7 +81,10 @@ class EntityKind(StrEnum):
     PERSON = "person"
     FACE = "face"
     HAND = "hand"
+    ANIMAL = "animal"
+    OBJECT = "object"
     PRODUCT = "product"
+    DEVICE = "device"
     PHONE = "phone"
     PHONE_SCREEN = "phone_screen"
     SCREEN = "screen"
@@ -87,6 +92,7 @@ class EntityKind(StrEnum):
     LOGO = "logo"
     TEXT_REGION = "text_region"
     UI_ELEMENT = "ui_element"
+    VEHICLE = "vehicle"
     OTHER = "other"
 
 
@@ -95,6 +101,184 @@ class Occlusion(StrEnum):
     PARTIAL = "partial"
     HEAVY = "heavy"
     UNKNOWN = "unknown"
+
+
+class MatchStatus(StrEnum):
+    """Semantic target match result; intentionally separate from visibility."""
+
+    MATCHED = "matched"
+    AMBIGUOUS = "ambiguous"
+    NOT_VISIBLE = "not_visible"
+    TARGET_MISMATCH = "target_mismatch"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+class PredicateStatus(StrEnum):
+    """Whether an optional observable event predicate is supported by evidence."""
+
+    SATISFIED = "satisfied"
+    NOT_SATISFIED = "not_satisfied"
+    INDETERMINATE = "indeterminate"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class EvidenceClaimSource(StrEnum):
+    USER_BRIEF = "user_brief"
+    HUMAN_REVIEW = "human_review"
+    IMPORTED_METADATA = "imported_metadata"
+    MODEL_PROPOSAL = "model_proposal"
+
+
+class EvidenceQueryTargetRef(StrictModel):
+    """Stable, domain-neutral reference to a selected target instance."""
+
+    target_id: str = Field(min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    target_description: str = Field(min_length=1)
+    positive_attributes: list[str] = Field(default_factory=list)
+    negative_attributes: list[str] = Field(default_factory=list)
+    reference_frame_ids: list[str] = Field(default_factory=list)
+    reference_crop_hashes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_target_reference(self) -> "EvidenceQueryTargetRef":
+        for field_name in (
+            "positive_attributes",
+            "negative_attributes",
+            "reference_frame_ids",
+            "reference_crop_hashes",
+        ):
+            values = getattr(self, field_name)
+            if any(not value.strip() for value in values):
+                raise ValueError(f"{field_name} values must be non-empty")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} values must be unique")
+        for digest in self.reference_crop_hashes:
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("reference_crop_hashes must be lowercase SHA-256 digests")
+        positive = {value.casefold() for value in self.positive_attributes}
+        negative = {value.casefold() for value in self.negative_attributes}
+        if positive & negative:
+            raise ValueError("positive and negative target attributes must not overlap")
+        return self
+
+
+AspectRatio = Annotated[str, Field(pattern=r"^[1-9][0-9]*:[1-9][0-9]*$")]
+
+
+class AspectConstraint(StrictModel):
+    aspect_ratio: AspectRatio
+    required_target_ids: list[str] = Field(default_factory=list)
+    constraint: str = Field(min_length=1)
+
+
+class EvidenceQueryProvenance(StrictModel):
+    created_at: str = Field(min_length=1)
+    created_by: str = Field(min_length=1)
+    source_reference: str | None = None
+    parent_query_id: str | None = None
+
+
+class PredicatePhaseConditions(StrictModel):
+    """Observable before/apex/after evidence for a locked temporal predicate."""
+
+    precondition: str = Field(min_length=1)
+    apex: str = Field(min_length=1)
+    postcondition: str = Field(min_length=1)
+
+
+class EvidenceQueryLock(StrictModel):
+    """Immutable-by-convention editorial/evidence contract for downstream stages.
+
+    It intentionally describes neither a media domain nor a tracker. Consumers may
+    persist ``definition_sha256()`` with derived artifacts to prove which revision
+    governed a result.
+    """
+
+    query_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    revision: int = Field(ge=1)
+    editorial_goal: str = Field(min_length=1)
+    targets: list[EvidenceQueryTargetRef] = Field(default_factory=list)
+    observable_predicate: str | None = None
+    predicate_phases: PredicatePhaseConditions | None = None
+    required_evidence: list[str] = Field(default_factory=list)
+    negative_constraints: list[str] = Field(default_factory=list)
+    editing_uses: list[str] = Field(default_factory=list)
+    aspect_constraints: list[AspectConstraint] = Field(default_factory=list)
+    claim_source: EvidenceClaimSource
+    provenance: EvidenceQueryProvenance
+
+    @model_validator(mode="after")
+    def validate_query_lock(self) -> "EvidenceQueryLock":
+        target_ids = [target.target_id for target in self.targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("query lock target_id values must be unique")
+        known_targets = set(target_ids)
+        for aspect in self.aspect_constraints:
+            if len(aspect.required_target_ids) != len(set(aspect.required_target_ids)):
+                raise ValueError("aspect required_target_ids must be unique")
+            unknown = set(aspect.required_target_ids) - known_targets
+            if unknown:
+                raise ValueError(
+                    f"aspect constraint references unknown targets: {sorted(unknown)}"
+                )
+        for field_name in (
+            "required_evidence",
+            "negative_constraints",
+            "editing_uses",
+        ):
+            values = getattr(self, field_name)
+            if any(not value.strip() for value in values):
+                raise ValueError(f"{field_name} values must be non-empty")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} values must be unique")
+        if self.observable_predicate is not None and not self.observable_predicate.strip():
+            raise ValueError("observable_predicate must be non-empty when supplied")
+        if self.predicate_phases is not None and self.observable_predicate is None:
+            raise ValueError("predicate_phases require observable_predicate")
+        return self
+
+    def canonical_definition_json(self) -> str:
+        return json.dumps(
+            self.model_dump(mode="json", exclude_none=True),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def definition_sha256(self) -> str:
+        return hashlib.sha256(self.canonical_definition_json().encode("utf-8")).hexdigest()
+
+
+def _validated_grounding_match_status(
+    *, visible: bool, candidate_count: int, match_status: MatchStatus | None
+) -> MatchStatus:
+    status = match_status
+    if status is None:
+        if not visible:
+            status = MatchStatus.NOT_VISIBLE
+        elif candidate_count == 1:
+            status = MatchStatus.MATCHED
+        else:
+            status = MatchStatus.AMBIGUOUS
+    if status == MatchStatus.MATCHED:
+        if not visible or candidate_count != 1:
+            raise ValueError(
+                "match_status=matched requires visible=true and exactly one candidate"
+            )
+    elif status == MatchStatus.AMBIGUOUS:
+        if not visible or candidate_count == 0:
+            raise ValueError(
+                f"match_status={status.value} requires visible=true and candidates"
+            )
+    elif visible or candidate_count:
+        raise ValueError(
+            f"match_status={status.value} requires visible=false and no candidates"
+        )
+    return status
 
 
 class ModelProvenance(StrictModel):
@@ -471,8 +655,34 @@ class DenseFrameCatalog(StrictModel):
 
     @model_validator(mode="after")
     def validate_contact_sheets(self) -> "DenseFrameCatalog":
+        if self.source_end_ms <= self.source_start_ms:
+            raise ValueError("dense source window must be non-empty and half-open")
         if len(self.contact_sheet_paths) != len(self.contact_sheet_hashes):
             raise ValueError("contact sheet paths and hashes must align")
+        frame_ids = [frame.frame_id for frame in self.frames]
+        if len(frame_ids) != len(set(frame_ids)):
+            raise ValueError("dense frame IDs must be unique")
+        if frame_ids != sorted(frame_ids):
+            raise ValueError("dense frame IDs must be ordered")
+        requested_times = [frame.requested_time_ms for frame in self.frames]
+        if any(
+            current >= following
+            for current, following in zip(requested_times, requested_times[1:])
+        ):
+            raise ValueError("dense requested times must be strictly increasing")
+        frame_times = [frame.frame_time_ms for frame in self.frames]
+        if any(
+            current > following
+            for current, following in zip(frame_times, frame_times[1:])
+        ):
+            raise ValueError("dense source frame times must be ordered")
+        for frame in self.frames:
+            if frame.event_id != self.event_id:
+                raise ValueError("dense frame event_id must match its catalog")
+            if not self.source_start_ms <= frame.requested_time_ms < self.source_end_ms:
+                raise ValueError("dense requested time must be inside the source window")
+            if not self.source_start_ms <= frame.frame_time_ms < self.source_end_ms:
+                raise ValueError("dense source frame time must be inside the source window")
         return self
 
 
@@ -485,6 +695,8 @@ class DenseEventSelection(StrictModel):
     last_frame_id: str | None = Field(default=None, pattern=r"^DF[0-9]{6}$")
     target_entity_id: str | None = None
     target_description: str | None = None
+    match_status: MatchStatus | None = None
+    predicate_status: PredicateStatus = PredicateStatus.NOT_APPLICABLE
     observable_evidence: str
     selection_reason: str
     uncertainties: list[str]
@@ -494,13 +706,35 @@ class DenseEventSelection(StrictModel):
     @model_validator(mode="after")
     def validate_visibility(self) -> "DenseEventSelection":
         frame_ids = [self.first_frame_id, self.recommended_frame_id, self.last_frame_id]
+        target_fields = [self.target_entity_id, self.target_description]
+        self.match_status = self.match_status or (
+            MatchStatus.MATCHED if self.visible else MatchStatus.NOT_VISIBLE
+        )
         if self.visible:
             if any(frame_id is None for frame_id in frame_ids):
                 raise ValueError("visible dense selections require first/recommended/last IDs")
-            if bool(self.target_entity_id) != bool(self.target_description):
-                raise ValueError("dense selection target ID and description must appear together")
-        elif any(frame_id is not None for frame_id in frame_ids):
-            raise ValueError("invisible dense selections cannot reference frame IDs")
+            if self.match_status not in {MatchStatus.MATCHED, MatchStatus.AMBIGUOUS}:
+                raise ValueError("visible dense selections require matched or ambiguous status")
+            assert all(frame_id is not None for frame_id in frame_ids)
+            if not (
+                self.first_frame_id
+                <= self.recommended_frame_id
+                <= self.last_frame_id
+            ):
+                raise ValueError("dense selection frame IDs must be ordered")
+        else:
+            if any(value is not None for value in frame_ids + target_fields):
+                raise ValueError(
+                    "invisible dense selections cannot reference frame or target fields"
+                )
+            if self.match_status not in {
+                MatchStatus.NOT_VISIBLE,
+                MatchStatus.TARGET_MISMATCH,
+                MatchStatus.INSUFFICIENT_EVIDENCE,
+            }:
+                raise ValueError("invisible dense selection has incompatible match_status")
+        if bool(self.target_entity_id) != bool(self.target_description):
+            raise ValueError("dense selection target ID and description must appear together")
         return self
 
 
@@ -677,6 +911,8 @@ class GroundingProposal(StrictModel):
     source_width: int = Field(gt=0)
     source_height: int = Field(gt=0)
     visible: bool
+    match_status: MatchStatus | None = None
+    predicate_status: PredicateStatus = PredicateStatus.NOT_APPLICABLE
     occlusion: Occlusion
     visibility_reason: str
     candidates: list[GroundingCandidate]
@@ -684,10 +920,11 @@ class GroundingProposal(StrictModel):
 
     @model_validator(mode="after")
     def validate_visibility(self) -> "GroundingProposal":
-        if not self.visible and self.candidates:
-            raise ValueError("invisible targets must have an empty candidates array")
-        if self.visible and not self.candidates:
-            raise ValueError("visible targets must have at least one candidate")
+        self.match_status = _validated_grounding_match_status(
+            visible=self.visible,
+            candidate_count=len(self.candidates),
+            match_status=self.match_status,
+        )
         return self
 
 
@@ -703,6 +940,8 @@ class GeminiNativeGroundingProposal(StrictModel):
     source_width: int = Field(gt=0)
     source_height: int = Field(gt=0)
     visible: bool
+    match_status: MatchStatus | None = None
+    predicate_status: PredicateStatus = PredicateStatus.NOT_APPLICABLE
     occlusion: Occlusion
     visibility_reason: str
     candidates: list[GeminiNativeGroundingCandidate]
@@ -710,10 +949,11 @@ class GeminiNativeGroundingProposal(StrictModel):
 
     @model_validator(mode="after")
     def validate_visibility(self) -> "GeminiNativeGroundingProposal":
-        if not self.visible and self.candidates:
-            raise ValueError("invisible targets must have an empty candidates array")
-        if self.visible and not self.candidates:
-            raise ValueError("visible targets must have at least one candidate")
+        self.match_status = _validated_grounding_match_status(
+            visible=self.visible,
+            candidate_count=len(self.candidates),
+            match_status=self.match_status,
+        )
         return self
 
 
@@ -729,6 +969,8 @@ class GeminiNativeSegmentationProposal(StrictModel):
     source_width: int = Field(gt=0)
     source_height: int = Field(gt=0)
     visible: bool
+    match_status: MatchStatus | None = None
+    predicate_status: PredicateStatus = PredicateStatus.NOT_APPLICABLE
     occlusion: Occlusion
     visibility_reason: str
     candidates: list[GeminiNativeSegmentationCandidate]
@@ -736,10 +978,11 @@ class GeminiNativeSegmentationProposal(StrictModel):
 
     @model_validator(mode="after")
     def validate_visibility(self) -> "GeminiNativeSegmentationProposal":
-        if not self.visible and self.candidates:
-            raise ValueError("invisible targets must have an empty candidates array")
-        if self.visible and not self.candidates:
-            raise ValueError("visible targets must have at least one candidate")
+        self.match_status = _validated_grounding_match_status(
+            visible=self.visible,
+            candidate_count=len(self.candidates),
+            match_status=self.match_status,
+        )
         return self
 
 
@@ -753,6 +996,8 @@ class DirectVideoGroundingProposal(StrictModel):
     reference_frame_status: Literal["unknown_gemini_video_sample"]
     reference_frame_description: str
     visible: bool
+    match_status: MatchStatus | None = None
+    predicate_status: PredicateStatus = PredicateStatus.NOT_APPLICABLE
     occlusion: Occlusion
     visibility_reason: str
     candidates: list[GroundingCandidate]
@@ -760,10 +1005,11 @@ class DirectVideoGroundingProposal(StrictModel):
 
     @model_validator(mode="after")
     def validate_visibility(self) -> "DirectVideoGroundingProposal":
-        if not self.visible and self.candidates:
-            raise ValueError("invisible targets must have an empty candidates array")
-        if self.visible and not self.candidates:
-            raise ValueError("visible targets must have at least one candidate")
+        self.match_status = _validated_grounding_match_status(
+            visible=self.visible,
+            candidate_count=len(self.candidates),
+            match_status=self.match_status,
+        )
         return self
 
 
@@ -775,6 +1021,8 @@ class GeminiNativeDirectVideoGroundingProposal(StrictModel):
     reference_frame_status: Literal["unknown_gemini_video_sample"]
     reference_frame_description: str
     visible: bool
+    match_status: MatchStatus | None = None
+    predicate_status: PredicateStatus = PredicateStatus.NOT_APPLICABLE
     occlusion: Occlusion
     visibility_reason: str
     candidates: list[GeminiNativeGroundingCandidate]
@@ -782,10 +1030,11 @@ class GeminiNativeDirectVideoGroundingProposal(StrictModel):
 
     @model_validator(mode="after")
     def validate_visibility(self) -> "GeminiNativeDirectVideoGroundingProposal":
-        if not self.visible and self.candidates:
-            raise ValueError("invisible targets must have an empty candidates array")
-        if self.visible and not self.candidates:
-            raise ValueError("visible targets must have at least one candidate")
+        self.match_status = _validated_grounding_match_status(
+            visible=self.visible,
+            candidate_count=len(self.candidates),
+            match_status=self.match_status,
+        )
         return self
 
 
@@ -870,7 +1119,10 @@ class SegmentationSample(StrictModel):
     sample_index: int = Field(ge=0)
     analysis_sample_time_ms: int = Field(ge=0)
     source_pts: int | None = None
-    timing_basis: Literal["uniform_ffmpeg_analysis_sample"]
+    timing_basis: Literal[
+        "decoded_source_pts",
+        "uniform_ffmpeg_analysis_sample",
+    ]
     mask_path: str | None
     mask_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     mask_area_pixels: int = Field(ge=0)
@@ -907,6 +1159,7 @@ class SegmentationSample(StrictModel):
 
 class SegmentationTrack(StrictModel):
     method: Literal[
+        "bbox_seed_sam2_video_mask_propagation",
         "gemini_bbox_seed_sam2_video_mask_propagation",
         "gemini_polygon_seed_sam2_video_mask_propagation",
     ]
@@ -927,6 +1180,10 @@ class SegmentationTrack(StrictModel):
     analysis_fps: float = Field(gt=0, le=60)
     analysis_width: int = Field(gt=0)
     analysis_height: int = Field(gt=0)
+    analysis_start_ms: int = Field(default=0, ge=0)
+    analysis_end_ms: int | None = Field(default=None, gt=0)
+    source_start_pts: int | None = None
+    source_time_base: Rational | None = None
     timing_warning: str
     semantic_warning: str
     total_samples: int = Field(gt=0)
@@ -965,6 +1222,18 @@ class SegmentationTrack(StrictModel):
             raise ValueError("state_counts must cover every sample")
         if self.seed_sample_index >= self.total_samples:
             raise ValueError("seed_sample_index is outside sampled frames")
+        if self.analysis_end_ms is not None:
+            if self.analysis_end_ms <= self.analysis_start_ms:
+                raise ValueError("analysis interval must be non-empty and half-open")
+            if not self.analysis_start_ms <= self.seed_time_ms < self.analysis_end_ms:
+                raise ValueError("seed_time_ms must be inside the analysis interval")
+            if any(
+                not self.analysis_start_ms
+                <= sample.analysis_sample_time_ms
+                < self.analysis_end_ms
+                for sample in self.samples
+            ):
+                raise ValueError("tracking samples must remain inside the analysis interval")
         return self
 
 

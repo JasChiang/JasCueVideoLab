@@ -1,19 +1,30 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from jascue_video_lab.models import (
+    AspectConstraint,
     ContentMap,
     DirectVideoGroundingProposal,
     DirectMomentMap,
+    EvidenceClaimSource,
+    EvidenceQueryLock,
+    EvidenceQueryProvenance,
+    EvidenceQueryTargetRef,
+    EntityKind,
     FeatureEditPlan,
+    GeminiNativeDirectVideoGroundingProposal,
     GeminiNativeGroundingProposal,
     GeminiNativeSegmentationCandidate,
     GeminiNativeSegmentationProposal,
     GroundingCandidate,
     GroundingProposal,
+    MatchStatus,
     Occlusion,
+    PredicateStatus,
     RushesEditPlan,
     TargetCandidateMap,
     TemporalMap,
@@ -72,6 +83,183 @@ def test_invisible_grounding_requires_empty_candidates(provenance) -> None:
             ],
             model_provenance=provenance,
         )
+
+
+def _generic_grounding_payload(provenance) -> dict:
+    return {
+        "asset_id": "sha256:" + "a" * 64,
+        "event_id": "event-1",
+        "entity_id": "subject-1",
+        "frame_pts": 100,
+        "frame_time_ms": 4000,
+        "frame_hash": "b" * 64,
+        "source_width": 1280,
+        "source_height": 720,
+        "visible": True,
+        "occlusion": "none",
+        "visibility_reason": "the selected subject is directly visible",
+        "candidates": [
+            {
+                "box_2d": [100, 100, 200, 200],
+                "label": "selected subject",
+                "confidence": 0.8,
+                "disambiguation_reason": "matches the locked visual attributes",
+            }
+        ],
+        "model_provenance": provenance.model_dump(mode="json"),
+    }
+
+
+def test_legacy_grounding_derives_orthogonal_statuses(provenance) -> None:
+    proposal = GroundingProposal.model_validate(_generic_grounding_payload(provenance))
+    assert proposal.match_status == MatchStatus.MATCHED
+    assert proposal.predicate_status == PredicateStatus.NOT_APPLICABLE
+
+
+def test_legacy_multi_candidate_grounding_is_fail_closed_as_ambiguous(provenance) -> None:
+    payload = _generic_grounding_payload(provenance)
+    payload["candidates"].append(
+        {
+            "box_2d": [300, 100, 400, 200],
+            "label": "similar subject",
+            "confidence": 0.7,
+            "disambiguation_reason": "also satisfies the available visual attributes",
+        }
+    )
+    proposal = GroundingProposal.model_validate(payload)
+    assert proposal.match_status == MatchStatus.AMBIGUOUS
+
+    payload["match_status"] = "matched"
+    with pytest.raises(ValidationError, match="exactly one candidate"):
+        GroundingProposal.model_validate(payload)
+
+
+def test_ambiguous_grounding_is_not_promoted_to_matched(provenance) -> None:
+    payload = _generic_grounding_payload(provenance)
+    payload["match_status"] = "ambiguous"
+    payload["predicate_status"] = "indeterminate"
+    proposal = GroundingProposal.model_validate(payload)
+    assert proposal.match_status == MatchStatus.AMBIGUOUS
+    assert proposal.predicate_status == PredicateStatus.INDETERMINATE
+
+
+@pytest.mark.parametrize(
+    "match_status",
+    ["not_visible", "target_mismatch", "insufficient_evidence"],
+)
+def test_nonmatched_status_cannot_keep_visible_geometry(
+    provenance, match_status: str
+) -> None:
+    payload = _generic_grounding_payload(provenance)
+    payload["match_status"] = match_status
+    with pytest.raises(ValidationError, match="requires visible=false and no candidates"):
+        GroundingProposal.model_validate(payload)
+
+
+def test_predicate_result_does_not_change_target_match(provenance) -> None:
+    payload = _generic_grounding_payload(provenance)
+    payload["predicate_status"] = "not_satisfied"
+    proposal = GroundingProposal.model_validate(payload)
+    assert proposal.match_status == MatchStatus.MATCHED
+    assert proposal.predicate_status == PredicateStatus.NOT_SATISFIED
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        GroundingProposal,
+        GeminiNativeGroundingProposal,
+        GeminiNativeSegmentationProposal,
+        DirectVideoGroundingProposal,
+        GeminiNativeDirectVideoGroundingProposal,
+    ],
+)
+def test_all_grounding_contracts_expose_match_and_predicate_status(model) -> None:
+    assert "match_status" in model.model_fields
+    assert "predicate_status" in model.model_fields
+
+
+def _evidence_query_lock() -> EvidenceQueryLock:
+    return EvidenceQueryLock(
+        query_id="query:001",
+        revision=2,
+        editorial_goal="Show a complete observable interaction and its result.",
+        targets=[
+            EvidenceQueryTargetRef(
+                target_id="subject.primary",
+                target_description="the selected foreground subject",
+                positive_attributes=["foreground", "selected by reviewer"],
+                negative_attributes=["background depiction", "reflection"],
+                reference_frame_ids=["DF000123"],
+                reference_crop_hashes=["c" * 64],
+            )
+        ],
+        observable_predicate="the interaction reaches a directly visible result state",
+        required_evidence=["the selected subject is visible", "the result state is visible"],
+        negative_constraints=["do not substitute a visually similar instance"],
+        editing_uses=["demonstration", "portrait_reframe"],
+        aspect_constraints=[
+            AspectConstraint(
+                aspect_ratio="9:16",
+                required_target_ids=["subject.primary"],
+                constraint="keep the selected subject inside the visible frame",
+            )
+        ],
+        claim_source=EvidenceClaimSource.USER_BRIEF,
+        provenance=EvidenceQueryProvenance(
+            created_at="2026-07-21T00:00:00Z",
+            created_by="reviewer",
+            source_reference="brief:001",
+        ),
+    )
+
+
+def test_evidence_query_lock_is_domain_neutral_and_hash_stable() -> None:
+    lock = _evidence_query_lock()
+    reparsed = EvidenceQueryLock.model_validate_json(lock.model_dump_json())
+    assert reparsed == lock
+    assert reparsed.definition_sha256() == lock.definition_sha256()
+    assert len(lock.definition_sha256()) == 64
+
+
+def test_checked_in_query_lock_example_matches_contract() -> None:
+    path = Path(__file__).resolve().parents[1] / "examples" / "evidence-query-lock.json"
+    lock = EvidenceQueryLock.model_validate_json(path.read_text(encoding="utf-8"))
+    assert lock.targets[0].target_id == "subject.primary"
+    assert len(lock.definition_sha256()) == 64
+
+
+def test_entity_kinds_cover_generic_non_product_targets() -> None:
+    assert EntityKind("animal") is EntityKind.ANIMAL
+    assert EntityKind("object") is EntityKind.OBJECT
+    assert EntityKind("device") is EntityKind.DEVICE
+    assert EntityKind("vehicle") is EntityKind.VEHICLE
+
+
+def test_evidence_query_lock_rejects_unknown_aspect_target() -> None:
+    payload = _evidence_query_lock().model_dump(mode="json")
+    payload["aspect_constraints"][0]["required_target_ids"] = ["subject.unknown"]
+    with pytest.raises(ValidationError, match="unknown targets"):
+        EvidenceQueryLock.model_validate(payload)
+
+
+def test_evidence_query_lock_rejects_conflicting_target_attributes() -> None:
+    payload = _evidence_query_lock().model_dump(mode="json")
+    payload["targets"][0]["negative_attributes"].append("Foreground")
+    with pytest.raises(ValidationError, match="must not overlap"):
+        EvidenceQueryLock.model_validate(payload)
+
+
+def test_predicate_phases_require_a_locked_observable_predicate() -> None:
+    payload = _evidence_query_lock().model_dump(mode="json")
+    payload["observable_predicate"] = None
+    payload["predicate_phases"] = {
+        "precondition": "the state is absent",
+        "apex": "the requested change is directly visible",
+        "postcondition": "the resulting state remains visible",
+    }
+    with pytest.raises(ValidationError, match="require observable_predicate"):
+        EvidenceQueryLock.model_validate(payload)
 
 
 @pytest.mark.parametrize(

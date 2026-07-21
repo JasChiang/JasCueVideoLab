@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 from jascue_video_lab.media import create_analysis_proxy, extract_frame, probe_video
@@ -25,6 +26,49 @@ def test_probe_and_extract_preserve_semantic_request_vs_pts(tmp_path: Path) -> N
     assert frame.frame_time_ms == 600
     assert frame.frame_pts != frame.frame_time_ms
     assert (frame.width, frame.height) == (320, 180)
+
+
+def test_extract_frame_maps_nonzero_stream_pts_to_local_playback_time(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "nonzero-start.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x180:r=10:d=2",
+            "-vf",
+            "setpts=PTS+5/TB",
+            "-copyts",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(video),
+        ],
+        check=True,
+    )
+    media = probe_video(video)
+    assert media.video.start_pts is not None
+    assert media.video.start_pts > 0
+
+    frame = extract_frame(video, 555, tmp_path / "nonzero-frame.png")
+
+    source_time_base = Fraction(
+        media.video.time_base.numerator,
+        media.video.time_base.denominator,
+    )
+    local_time_ms = round(
+        Fraction(frame.frame_pts - media.video.start_pts) * source_time_base * 1000
+    )
+    assert frame.requested_time_ms == 555
+    assert frame.frame_time_ms == local_time_ms == 600
+    assert frame.frame_pts > media.video.start_pts
 
 
 def test_analysis_proxy_preserves_duration_and_has_independent_identity(tmp_path: Path) -> None:

@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
 from collections import Counter, deque
+from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from time import monotonic
 from typing import Any, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .media import sha256_file
 from .geometry import box_iou, center_distance
+from .media import probe_video, sha256_file
 from .models import (
+    Rational,
     SegmentationModelProvenance,
     SegmentationSample,
     SegmentationTrack,
@@ -21,13 +25,34 @@ from .models import (
     SemanticIdentityStatus,
     TrackingState,
 )
-from .shots import detect_shots_ffmpeg
+from .shots import ShotBoundary, ShotManifest, ShotSegment, detect_shots_ffmpeg
 from .storage import utc_now, write_json
 
 
 SAM21_TINY_MODEL_ID = "sam2.1_hiera_tiny"
 SAM21_CONFIG = "configs/sam2.1/sam2.1_hiera_t.yaml"
 SAM21_IMPLEMENTATION_REVISION = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
+
+
+@dataclass(frozen=True)
+class _AnalysisFrame:
+    path: Path
+    source_pts: int
+    timeline_time_ms: int
+
+
+@dataclass(frozen=True)
+class _SeedShot:
+    start_time_ms: int
+    end_time_ms: int
+    start_frame_pts: int | None
+    boundary_score: float | None
+
+
+_SHOWINFO_FRAME_RE = re.compile(
+    r"showinfo[^\n]*\bn:\s*(?P<index>\d+)\s+pts:\s*(?P<pts>-?\d+)\s+"
+    r"pts_time:(?P<pts_time>-?[0-9.]+)"
+)
 
 
 def _require_segmentation_dependencies() -> tuple[Any, Any, Any]:
@@ -228,54 +253,286 @@ def classify_tracking_state(
     return TrackingState.TRACKED, ["geometry_gates_passed"]
 
 
-def crossed_shot_boundary(
-    sample_index: int, seed_index: int, boundary_indices: Sequence[int]
-) -> bool:
-    if sample_index > seed_index:
-        return any(seed_index < boundary <= sample_index for boundary in boundary_indices)
-    if sample_index < seed_index:
-        return any(sample_index < boundary <= seed_index for boundary in boundary_indices)
-    return False
+def _timeline_ms_from_pts(
+    pts: int,
+    *,
+    source_start_pts: int,
+    time_base_numerator: int,
+    time_base_denominator: int,
+) -> int:
+    relative_seconds = Fraction(
+        (pts - source_start_pts) * time_base_numerator,
+        time_base_denominator,
+    )
+    return round(relative_seconds * 1000)
+
+
+def _normalize_shot_manifest(
+    manifest: ShotManifest,
+    *,
+    duration_ms: int,
+    source_start_pts: int,
+    time_base_numerator: int,
+    time_base_denominator: int,
+) -> ShotManifest:
+    """Map detector PTS to the video's zero-based playback timeline.
+
+    FFmpeg preserves non-zero stream PTS. Shot selection, however, receives the
+    same zero-based times used by the local player and grounding pipeline. Keep
+    the original frame PTS while deriving local milliseconds from the stream
+    time base instead of trusting rounded or container-relative timestamps.
+    """
+    by_time: dict[int, ShotBoundary] = {}
+    for boundary in manifest.boundaries:
+        local_ms = _timeline_ms_from_pts(
+            boundary.frame_pts,
+            source_start_pts=source_start_pts,
+            time_base_numerator=time_base_numerator,
+            time_base_denominator=time_base_denominator,
+        )
+        if not 0 < local_ms < duration_ms:
+            continue
+        normalized = boundary.model_copy(update={"frame_time_ms": local_ms})
+        existing = by_time.get(local_ms)
+        if existing is None or normalized.score > existing.score:
+            by_time[local_ms] = normalized
+    boundaries = [by_time[time_ms] for time_ms in sorted(by_time)]
+    starts: list[tuple[int, int | None, float | None]] = [
+        (0, source_start_pts, None)
+    ]
+    starts.extend(
+        (boundary.frame_time_ms, boundary.frame_pts, boundary.score)
+        for boundary in boundaries
+    )
+    shots = [
+        ShotSegment(
+            shot_id=f"shot-{index + 1:04d}",
+            start_time_ms=start_ms,
+            end_time_ms=(starts[index + 1][0] if index + 1 < len(starts) else duration_ms),
+            start_frame_pts=start_pts,
+            boundary_source="video_start" if index == 0 else "ffmpeg_scdet",
+            boundary_score=score,
+        )
+        for index, (start_ms, start_pts, score) in enumerate(starts)
+    ]
+    return manifest.model_copy(
+        update={
+            "duration_ms": duration_ms,
+            "detector": f"{manifest.detector}; local time derived from source PTS",
+            "timeline_basis": "local_ms_from_decoded_pts",
+            "source_start_pts": source_start_pts,
+            "source_time_base": Rational(
+                numerator=time_base_numerator,
+                denominator=time_base_denominator,
+            ),
+            "boundaries": boundaries,
+            "shots": shots,
+        }
+    )
+
+
+def _seed_shot(shots: Sequence[ShotSegment], seed_time_ms: int) -> _SeedShot:
+    for shot in shots:
+        if shot.start_time_ms <= seed_time_ms < shot.end_time_ms:
+            return _SeedShot(
+                start_time_ms=shot.start_time_ms,
+                end_time_ms=shot.end_time_ms,
+                start_frame_pts=shot.start_frame_pts,
+                boundary_score=shot.boundary_score,
+            )
+    raise ValueError("seed_time_ms is outside the decoded video timeline")
+
+
+def resolve_tracking_interval(
+    manifest: ShotManifest,
+    *,
+    seed_time_ms: int,
+    allowed_start_ms: int,
+    allowed_end_ms: int,
+) -> tuple[int, int]:
+    """Resolve the half-open, shot-local interval consumed by a tracker.
+
+    This pure helper is shared by cache-key construction and execution so a
+    cached SAM artifact cannot hide a change in shot boundaries.
+    """
+    if not 0 <= allowed_start_ms < allowed_end_ms <= manifest.duration_ms:
+        raise ValueError("allowed tracking interval must be inside the video duration")
+    shot = _seed_shot(manifest.shots, seed_time_ms)
+    start_ms = max(shot.start_time_ms, allowed_start_ms)
+    end_ms = min(shot.end_time_ms, allowed_end_ms)
+    if not start_ms <= seed_time_ms < end_ms:
+        raise ValueError(
+            "seed must lie inside the intersection of the allowed interval and seed shot"
+        )
+    return start_ms, end_ms
+
+
+def require_bbox_track_request_match(
+    track: SegmentationTrack,
+    *,
+    video_path: Path,
+    asset_id: str,
+    target_description: str,
+    seed_time_ms: int,
+    seed_box_2d: Sequence[int],
+    seed_box_padding_ratio: float,
+    analysis_fps: float,
+    analysis_start_ms: int,
+    analysis_end_ms: int,
+    checkpoint_sha256: str,
+) -> None:
+    """Fail closed if a cached SAM artifact is not this bbox-seed request."""
+    expected = {
+        "method": "bbox_seed_sam2_video_mask_propagation",
+        "asset_id": asset_id,
+        "video_path": str(video_path.expanduser().resolve()),
+        "target_description": target_description,
+        "seed_time_ms": seed_time_ms,
+        "semantic_seed_box": list(seed_box_2d),
+        "seed_prompt_type": "box",
+        "sam_prompt_box": pad_normalized_box(
+            seed_box_2d,
+            seed_box_padding_ratio,
+        ),
+        "seed_box_padding_ratio": seed_box_padding_ratio,
+        "analysis_fps": analysis_fps,
+        "analysis_start_ms": analysis_start_ms,
+        "analysis_end_ms": analysis_end_ms,
+    }
+    mismatches = {
+        field: {"expected": value, "actual": getattr(track, field)}
+        for field, value in expected.items()
+        if getattr(track, field) != value
+    }
+    provenance_expected = {
+        "model_id": SAM21_TINY_MODEL_ID,
+        "implementation": "facebookresearch/sam2",
+        "implementation_revision": SAM21_IMPLEMENTATION_REVISION,
+        "checkpoint_sha256": checkpoint_sha256,
+    }
+    for field, value in provenance_expected.items():
+        actual = getattr(track.model_provenance, field)
+        if actual != value:
+            mismatches[f"model_provenance.{field}"] = {
+                "expected": value,
+                "actual": actual,
+            }
+    if track.sam_prompt_mask_polygon_xy is not None:
+        mismatches["sam_prompt_mask_polygon_xy"] = {
+            "expected": None,
+            "actual": track.sam_prompt_mask_polygon_xy,
+        }
+    if mismatches:
+        raise ValueError(f"cached SAM track does not match bbox seed request: {mismatches}")
 
 
 def _extract_analysis_frames(
-    video_path: Path, frames_dir: Path, analysis_fps: float, max_side: int
-) -> tuple[list[Path], int, int]:
+    video_path: Path,
+    frames_dir: Path,
+    analysis_fps: float,
+    max_side: int,
+    *,
+    start_time_ms: int,
+    end_time_ms: int,
+    source_start_pts: int,
+    time_base_numerator: int,
+    time_base_denominator: int,
+) -> tuple[list[_AnalysisFrame], int, int]:
     if analysis_fps <= 0 or analysis_fps > 60:
         raise ValueError("analysis_fps must be in (0, 60]")
     if max_side < 320:
         raise ValueError("max_side must be at least 320")
+    if not 0 <= start_time_ms < end_time_ms:
+        raise ValueError("analysis frame interval must be a non-empty half-open interval")
     frames_dir.mkdir(parents=True, exist_ok=True)
     if any(frames_dir.iterdir()):
         raise FileExistsError(f"analysis frame directory is not empty: {frames_dir}")
-    filter_graph = (
-        f"fps={analysis_fps},"
-        f"scale={max_side}:{max_side}:force_original_aspect_ratio=decrease"
+    time_base = Fraction(time_base_numerator, time_base_denominator)
+    source_origin_seconds = Fraction(source_start_pts) * time_base
+    absolute_start_seconds = source_origin_seconds + Fraction(start_time_ms, 1000)
+    absolute_end_seconds = source_origin_seconds + Fraction(end_time_ms, 1000)
+    interval_seconds = Fraction(1, 1) / Fraction(str(analysis_fps))
+    select = (
+        f"gte(t\\,{float(absolute_start_seconds):.9f})*"
+        f"lt(t\\,{float(absolute_end_seconds):.9f})*"
+        "(isnan(prev_selected_t)+"
+        f"gte(t-prev_selected_t\\,{float(interval_seconds):.9f}))"
     )
-    subprocess.run(
+    filter_graph = (
+        f"select={select},"
+        f"scale={max_side}:{max_side}:force_original_aspect_ratio=decrease,"
+        "showinfo"
+    )
+    completed = subprocess.run(
         [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
-            "error",
+            "info",
+            "-copyts",
             "-i",
             str(video_path),
+            "-map",
+            "0:v:0",
             "-vf",
             filter_graph,
+            "-an",
+            "-fps_mode",
+            "vfr",
             "-q:v",
             "2",
             "-start_number",
             "0",
             str(frames_dir / "%06d.jpg"),
         ],
-        check=True,
+        check=False,
+        capture_output=True,
+        text=True,
     )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"FFmpeg analysis-frame extraction failed ({completed.returncode}): "
+            f"{completed.stderr.strip()}"
+        )
     paths = sorted(frames_dir.glob("*.jpg"), key=lambda path: int(path.stem))
     if not paths:
         raise RuntimeError("FFmpeg produced no analysis frames")
+    matches = list(_SHOWINFO_FRAME_RE.finditer(completed.stderr))
+    if len(matches) != len(paths):
+        raise RuntimeError(
+            "could not establish one-to-one source PTS lineage for analysis frames: "
+            f"{len(paths)} files but {len(matches)} showinfo records"
+        )
+    frames: list[_AnalysisFrame] = []
+    for expected_index, (path, match) in enumerate(zip(paths, matches, strict=True)):
+        showinfo_index = int(match.group("index"))
+        if showinfo_index != expected_index:
+            raise RuntimeError(
+                "FFmpeg showinfo frame indices are not contiguous from zero: "
+                f"expected {expected_index}, got {showinfo_index}"
+            )
+        source_pts = int(match.group("pts"))
+        timeline_time_ms = _timeline_ms_from_pts(
+            source_pts,
+            source_start_pts=source_start_pts,
+            time_base_numerator=time_base_numerator,
+            time_base_denominator=time_base_denominator,
+        )
+        if not start_time_ms <= timeline_time_ms < end_time_ms:
+            raise RuntimeError(
+                "FFmpeg emitted an analysis frame outside the selected seed shot: "
+                f"{timeline_time_ms} ms not in [{start_time_ms}, {end_time_ms})"
+            )
+        frames.append(
+            _AnalysisFrame(
+                path=path,
+                source_pts=source_pts,
+                timeline_time_ms=timeline_time_ms,
+            )
+        )
     with Image.open(paths[0]) as first:
         width, height = first.size
-    return paths, width, height
+    return frames, width, height
 
 
 def _scene_cut_scores(frame_paths: Sequence[Path]) -> list[float | None]:
@@ -376,28 +633,72 @@ def track_bbox_sam21(
     device: str = "auto",
     ffmpeg_scdet_threshold: float = 4.0,
     seed_box_padding_ratio: float = 0.0,
+    allowed_start_ms: int | None = None,
+    allowed_end_ms: int | None = None,
     seed_mask_polygon_xy: Sequence[Sequence[int]] | None = None,
 ) -> SegmentationTrack:
-    """Use a Gemini/manual bbox or polygon mask seed and propagate it in both directions."""
-    np, torch, build_sam2_video_predictor = _require_segmentation_dependencies()
+    """Refine a semantic bbox with SAM 2.1 and propagate only inside its seed shot."""
+    if seed_mask_polygon_xy is not None:
+        raise ValueError(
+            "polygon seeds are disabled for the primary SAM path; provide a bbox seed"
+        )
     if not 0 <= ffmpeg_scdet_threshold <= 100:
         raise ValueError("ffmpeg_scdet_threshold must be in [0, 100]")
     if not video_path.exists():
         raise FileNotFoundError(video_path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(checkpoint_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    frame_paths, width, height = _extract_analysis_frames(
-        video_path, output_dir / "analysis-frames", analysis_fps, max_side
-    )
-    shot_manifest = detect_shots_ffmpeg(
+    media = probe_video(video_path)
+    if asset_id is not None and asset_id != media.asset_id:
+        raise ValueError(
+            "bbox seed asset_id does not match the supplied tracking video"
+        )
+    if (allowed_start_ms is None) != (allowed_end_ms is None):
+        raise ValueError("allowed_start_ms and allowed_end_ms must be provided together")
+    if allowed_start_ms is not None and not (
+        0 <= allowed_start_ms < allowed_end_ms <= media.duration_ms
+    ):
+        raise ValueError("allowed tracking interval must be inside the video duration")
+    source_start_pts = media.video.start_pts or 0
+    time_base_numerator = media.video.time_base.numerator
+    time_base_denominator = media.video.time_base.denominator
+    detected_shots = detect_shots_ffmpeg(
         video_path,
         threshold=ffmpeg_scdet_threshold,
-        output_path=output_dir / "shots.json",
+    )
+    shot_manifest = _normalize_shot_manifest(
+        detected_shots,
+        duration_ms=media.duration_ms,
+        source_start_pts=source_start_pts,
+        time_base_numerator=time_base_numerator,
+        time_base_denominator=time_base_denominator,
+    )
+    seed_shot = _seed_shot(shot_manifest.shots, seed_time_ms)
+    analysis_start_ms, analysis_end_ms = resolve_tracking_interval(
+        shot_manifest,
+        seed_time_ms=seed_time_ms,
+        allowed_start_ms=allowed_start_ms or 0,
+        allowed_end_ms=(
+            allowed_end_ms if allowed_end_ms is not None else media.duration_ms
+        ),
+    )
+    np, torch, build_sam2_video_predictor = _require_segmentation_dependencies()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / "shots.json", shot_manifest)
+    analysis_frames, width, height = _extract_analysis_frames(
+        video_path,
+        output_dir / "analysis-frames",
+        analysis_fps,
+        max_side,
+        start_time_ms=analysis_start_ms,
+        end_time_ms=analysis_end_ms,
+        source_start_pts=source_start_pts,
+        time_base_numerator=time_base_numerator,
+        time_base_denominator=time_base_denominator,
     )
     seed_index = min(
-        range(len(frame_paths)),
-        key=lambda index: abs(round(index * 1000 / analysis_fps) - seed_time_ms),
+        range(len(analysis_frames)),
+        key=lambda index: abs(analysis_frames[index].timeline_time_ms - seed_time_ms),
     )
     resolved_device = resolve_device(device, torch)
     started = monotonic()
@@ -413,30 +714,14 @@ def track_bbox_sam21(
         offload_state_to_cpu=resolved_device != "cpu",
         async_loading_frames=False,
     )
-    if seed_mask_polygon_xy is not None:
-        if seed_box_padding_ratio != 0:
-            raise ValueError("seed_box_padding_ratio cannot be used with a polygon mask seed")
-        seed_mask = normalized_polygon_to_mask(seed_mask_polygon_xy, width, height)
-        _, _, seed_logits = predictor.add_new_mask(
-            inference_state=inference_state,
-            frame_idx=seed_index,
-            obj_id="target",
-            mask=seed_mask,
-        )
-        sam_prompt_box = None
-        method = "gemini_polygon_seed_sam2_video_mask_propagation"
-        seed_prompt_type = "mask_polygon"
-    else:
-        sam_prompt_box = pad_normalized_box(seed_box_2d, seed_box_padding_ratio)
-        seed_box_xyxy = normalized_box_to_xyxy(sam_prompt_box, width, height)
-        _, _, seed_logits = predictor.add_new_points_or_box(
-            inference_state=inference_state,
-            frame_idx=seed_index,
-            obj_id="target",
-            box=np.asarray(seed_box_xyxy, dtype=np.float32),
-        )
-        method = "gemini_bbox_seed_sam2_video_mask_propagation"
-        seed_prompt_type = "box"
+    sam_prompt_box = pad_normalized_box(seed_box_2d, seed_box_padding_ratio)
+    seed_box_xyxy = normalized_box_to_xyxy(sam_prompt_box, width, height)
+    _, _, seed_logits = predictor.add_new_points_or_box(
+        inference_state=inference_state,
+        frame_idx=seed_index,
+        obj_id="target",
+        box=np.asarray(seed_box_xyxy, dtype=np.float32),
+    )
     logits_by_index: dict[int, Any] = {
         seed_index: seed_logits[0, 0].detach().float().cpu().numpy()
     }
@@ -449,25 +734,26 @@ def track_bbox_sam21(
     ):
         logits_by_index[frame_idx] = mask_logits[0, 0].detach().float().cpu().numpy()
     elapsed = monotonic() - started
-    cut_scores: list[float | None] = [None] * len(frame_paths)
-    boundary_pts: dict[int, int] = {}
-    for boundary in shot_manifest.boundaries:
-        sample_index = min(
-            range(len(frame_paths)),
-            key=lambda index: abs(round(index * 1000 / analysis_fps) - boundary.frame_time_ms),
-        )
-        if cut_scores[sample_index] is None or boundary.score > cut_scores[sample_index]:
-            cut_scores[sample_index] = boundary.score
-            boundary_pts[sample_index] = boundary.frame_pts
-    boundary_indices = sorted(boundary_pts)
+    cut_scores: list[float | None] = [None] * len(analysis_frames)
+    begins_at_shot_boundary = (
+        seed_shot.start_time_ms > 0
+        and analysis_start_ms == seed_shot.start_time_ms
+    )
+    if begins_at_shot_boundary:
+        cut_scores[0] = seed_shot.boundary_score
     masks_dir = output_dir / "masks"
     overlays_dir = output_dir / "overlays"
     samples: list[SegmentationSample] = []
     previous_areas: list[float] = []
     previous_center: Sequence[float] | None = None
-    for index, frame_path in enumerate(frame_paths):
+    for index, analysis_frame in enumerate(analysis_frames):
+        frame_path = analysis_frame.path
         logits = logits_by_index.get(index)
-        binary = np.asarray(logits > 0, dtype=bool) if logits is not None else np.zeros((height, width), bool)
+        binary = (
+            np.asarray(logits > 0, dtype=bool)
+            if logits is not None
+            else np.zeros((height, width), bool)
+        )
         geometry = binary_mask_geometry(binary)
         components = approximate_connected_components(binary)
         if geometry["area_pixels"]:
@@ -481,7 +767,7 @@ def track_bbox_sam21(
             mask_hash = None
             mask_path = None
         cut_score = cut_scores[index]
-        shot_boundary = index in boundary_pts
+        shot_boundary = index == 0 and begins_at_shot_boundary
         comparison_areas = [] if index == seed_index else previous_areas
         comparison_center = None if index == seed_index else previous_center
         state, reasons = classify_tracking_state(
@@ -491,27 +777,24 @@ def track_bbox_sam21(
             previous_area_ratios=comparison_areas,
             center_2d=geometry["center_2d"],
             previous_center_2d=comparison_center,
-            shot_boundary=shot_boundary,
+            # The predictor was initialized after the cut, so the first frame is
+            # evidence of a reset rather than a cross-shot drift condition.
+            shot_boundary=False,
         )
-        outside_seed_shot = crossed_shot_boundary(index, seed_index, boundary_indices)
-        if outside_seed_shot and state != TrackingState.LOST:
-            state = TrackingState.DRIFT_SUSPECTED
-            if "outside_seed_shot_reacquisition_required" not in reasons:
-                reasons.append("outside_seed_shot_reacquisition_required")
+        if shot_boundary:
+            reasons.append("tracker_initialized_inside_new_shot")
         semantic_status = (
             SemanticIdentityStatus.SEED_GROUNDED
             if index == seed_index
             else SemanticIdentityStatus.REVALIDATION_REQUIRED
-            if outside_seed_shot
-            or shot_boundary
-            or state in {TrackingState.DRIFT_SUSPECTED, TrackingState.LOST}
+            if state in {TrackingState.DRIFT_SUSPECTED, TrackingState.LOST}
             else SemanticIdentityStatus.NOT_REVALIDATED
         )
         sample = SegmentationSample(
             sample_index=index,
-            analysis_sample_time_ms=round(index * 1000 / analysis_fps),
-            source_pts=boundary_pts.get(index),
-            timing_basis="uniform_ffmpeg_analysis_sample",
+            analysis_sample_time_ms=analysis_frame.timeline_time_ms,
+            source_pts=analysis_frame.source_pts,
+            timing_basis="decoded_source_pts",
             mask_path=mask_path,
             mask_sha256=mask_hash,
             mask_area_pixels=geometry["area_pixels"],
@@ -519,7 +802,9 @@ def track_bbox_sam21(
             connected_components=components,
             derived_tracking_box=geometry["box_2d"],
             center_2d=geometry["center_2d"],
-            mean_positive_probability=(round(mean_probability, 6) if mean_probability is not None else None),
+            mean_positive_probability=(
+                round(mean_probability, 6) if mean_probability is not None else None
+            ),
             scene_cut_score=round(cut_score, 6) if cut_score is not None else None,
             shot_boundary=shot_boundary,
             tracking_state=state,
@@ -542,29 +827,33 @@ def track_bbox_sam21(
             previous_center = geometry["center_2d"]
     state_counts = Counter(sample.tracking_state for sample in samples)
     track = SegmentationTrack(
-        method=method,
-        asset_id=asset_id or f"sha256:{sha256_file(video_path)}",
+        method="bbox_seed_sam2_video_mask_propagation",
+        asset_id=asset_id or media.asset_id,
         video_path=str(video_path.resolve()),
         target_description=target_description,
         seed_source=seed_source,
         seed_time_ms=seed_time_ms,
         seed_sample_index=seed_index,
         semantic_seed_box=list(seed_box_2d),
-        seed_prompt_type=seed_prompt_type,
+        seed_prompt_type="box",
         sam_prompt_box=sam_prompt_box,
-        sam_prompt_mask_polygon_xy=(
-            [tuple(point) for point in seed_mask_polygon_xy]
-            if seed_mask_polygon_xy is not None
-            else None
-        ),
+        sam_prompt_mask_polygon_xy=None,
         seed_box_padding_ratio=seed_box_padding_ratio,
         refined_seed_mask_path=str(Path("masks") / f"{seed_index:06d}.png"),
         analysis_fps=analysis_fps,
         analysis_width=width,
         analysis_height=height,
+        analysis_start_ms=analysis_start_ms,
+        analysis_end_ms=analysis_end_ms,
+        source_start_pts=source_start_pts,
+        source_time_base={
+            "numerator": time_base_numerator,
+            "denominator": time_base_denominator,
+        },
         timing_warning=(
-            "analysis_sample_time_ms is a uniform FFmpeg sampling clock, not original frame PTS "
-            "and not a frame-accurate edit point"
+            "analysis_sample_time_ms is derived from each selected decoded frame's source PTS "
+            "relative to stream start_pts; source_pts preserves the decoded source timestamp. "
+            "The constant-rate debug video is not an edit timeline."
         ),
         semantic_warning=(
             "SAM propagates geometry from one semantic seed. Non-seed samples are not semantic "

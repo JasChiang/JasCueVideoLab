@@ -7,7 +7,7 @@ from typing import Sequence
 
 from .gemini import GeminiLabClient
 from .geometry import box_iou, center_distance
-from .models import ExtractedFrame, GroundingProposal, MediaInfo
+from .models import ExtractedFrame, GroundingProposal, MatchStatus, MediaInfo
 from .overlay import draw_grounding_overlay
 from .storage import append_error, read_json, write_json
 
@@ -54,12 +54,20 @@ def run_repeated_grounding(
                 )
                 draw_grounding_overlay(Path(frame.path), proposal, run_dir / "debug.png")
                 proposals.append((label, proposal))
-                candidate = proposal.candidates[0] if proposal.candidates else None
+                candidate = (
+                    proposal.candidates[0]
+                    if proposal.match_status == MatchStatus.MATCHED
+                    and len(proposal.candidates) == 1
+                    else None
+                )
                 row: dict[str, object] = {
                     "run": label,
                     "schema_valid": True,
                     "visible": proposal.visible,
                     "candidate_count": len(proposal.candidates),
+                    "match_status": proposal.match_status,
+                    "predicate_status": proposal.predicate_status,
+                    "geometry_comparable": candidate is not None,
                     "box_2d": list(candidate.box_2d) if candidate else None,
                     "confidence": candidate.confidence if candidate else None,
                 }
@@ -85,8 +93,16 @@ def run_repeated_grounding(
 
     pairwise: list[dict[str, object]] = []
     for (left_label, left), (right_label, right) in itertools.combinations(proposals, 2):
-        left_candidate = left.candidates[0] if left.candidates else None
-        right_candidate = right.candidates[0] if right.candidates else None
+        left_candidate = (
+            left.candidates[0]
+            if left.match_status == MatchStatus.MATCHED and len(left.candidates) == 1
+            else None
+        )
+        right_candidate = (
+            right.candidates[0]
+            if right.match_status == MatchStatus.MATCHED and len(right.candidates) == 1
+            else None
+        )
         comparable = left_candidate is not None and right_candidate is not None
         pairwise.append(
             {

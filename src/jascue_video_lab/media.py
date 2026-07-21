@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image
@@ -135,6 +136,35 @@ def has_audio_stream(path: Path) -> bool:
 _SHOWINFO_RE = re.compile(r"pts:\s*(?P<pts>-?\d+)\s+pts_time:(?P<time>-?[0-9.]+)")
 
 
+@lru_cache(maxsize=128)
+def _cached_video_stream_timing(
+    resolved_path: str,
+    size_bytes: int,
+    mtime_ns: int,
+) -> tuple[int, Fraction]:
+    """Read stream origin/time base without re-probing unchanged files per frame."""
+    del size_bytes, mtime_ns
+    result = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=start_pts,time_base",
+            "-of",
+            "json",
+            resolved_path,
+        ]
+    )
+    streams = json.loads(result.stdout).get("streams", [])
+    if not streams:
+        raise MediaCommandError(f"no video stream found: {resolved_path}")
+    stream = streams[0]
+    return int(stream.get("start_pts") or 0), Fraction(stream["time_base"])
+
+
 def extract_frame(
     source: Path,
     requested_time_ms: int,
@@ -144,13 +174,23 @@ def extract_frame(
 ) -> ExtractedFrame:
     if requested_time_ms < 0:
         raise ValueError("requested_time_ms must be non-negative")
+    resolved_source = source.expanduser().resolve(strict=True)
+    stat = resolved_source.stat()
+    source_start_pts, source_time_base = _cached_video_stream_timing(
+        str(resolved_source),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
-    seconds = requested_time_ms / 1000
+    absolute_seconds = (
+        Fraction(source_start_pts) * source_time_base
+        + Fraction(requested_time_ms, 1000)
+    )
     # select runs after FFmpeg's default orientation correction. showinfo records
     # the exact chosen source PTS rather than pretending the semantic time is exact.
     if max_width is not None and max_width < 64:
         raise ValueError("max_width must be at least 64 when provided")
-    filters = [f"select=gte(t\\,{seconds:.6f})"]
+    filters = [f"select=gte(t\\,{float(absolute_seconds):.9f})"]
     if max_width is not None:
         filters.append(f"scale='min({max_width},iw)':-2")
     filters.append("showinfo")
@@ -161,8 +201,9 @@ def extract_frame(
             "-hide_banner",
             "-loglevel",
             "info",
+            "-copyts",
             "-i",
-            str(source.expanduser().resolve(strict=True)),
+            str(resolved_source),
             "-map",
             "0:v:0",
             "-vf",
@@ -178,14 +219,20 @@ def extract_frame(
     match = _SHOWINFO_RE.search(completed.stderr)
     if not match:
         raise MediaCommandError("could not parse selected frame PTS from ffmpeg showinfo")
+    frame_pts = int(match.group("pts"))
+    frame_time_ms = round(
+        Fraction(frame_pts - source_start_pts) * source_time_base * 1000
+    )
+    if frame_time_ms < 0:
+        raise MediaCommandError("selected frame precedes the video stream start PTS")
     with Image.open(output) as image:
         width, height = image.size
     frame_hash = sha256_file(output)
     return ExtractedFrame(
         path=str(output.resolve()),
         requested_time_ms=requested_time_ms,
-        frame_time_ms=round(float(match.group("time")) * 1000),
-        frame_pts=int(match.group("pts")),
+        frame_time_ms=frame_time_ms,
+        frame_pts=frame_pts,
         frame_hash=frame_hash,
         width=width,
         height=height,

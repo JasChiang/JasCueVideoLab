@@ -8,8 +8,12 @@ import pytest
 from pydantic import ValidationError
 
 from jascue_video_lab.full_v1 import (
+    _matching_dense_seed_frame,
+    _query_lock_event_description,
+    _query_lock_target_description,
     _render_dense_contact_sheets,
     _revalidate_saved_clip_card,
+    _select_query_lock_target,
     _shared_upload_dir,
     create_dense_event_catalog,
     create_shot_catalog,
@@ -27,6 +31,11 @@ from jascue_video_lab.media import create_analysis_proxy, has_audio_stream, prob
 from jascue_video_lab.models import (
     DenseEventSelection,
     DenseFrame,
+    DenseFrameCatalog,
+    EvidenceClaimSource,
+    EvidenceQueryLock,
+    EvidenceQueryProvenance,
+    EvidenceQueryTargetRef,
     Entity,
     EntityKind,
     FullClipCard,
@@ -48,6 +57,59 @@ def _provenance() -> ModelProvenance:
         run_id="test",
         generated_at="now",
     )
+
+
+def _query_lock(*targets: EvidenceQueryTargetRef) -> EvidenceQueryLock:
+    return EvidenceQueryLock(
+        query_id="query-demo",
+        revision=1,
+        editorial_goal="Show directly observable evidence for the selected subject.",
+        targets=list(targets),
+        observable_predicate="the selected subject reaches the requested visible state",
+        required_evidence=["the selected subject is directly visible"],
+        negative_constraints=["do not substitute another similar instance"],
+        editing_uses=["review"],
+        claim_source=EvidenceClaimSource.HUMAN_REVIEW,
+        provenance=EvidenceQueryProvenance(
+            created_at="2026-07-21T00:00:00Z",
+            created_by="reviewer",
+        ),
+    )
+
+
+def test_query_lock_requires_explicit_target_when_multiple() -> None:
+    first = EvidenceQueryTargetRef(
+        target_id="subject-a",
+        target_description="the foreground subject selected by the reviewer",
+        positive_attributes=["marked reference instance"],
+        negative_attributes=["background depiction"],
+    )
+    second = EvidenceQueryTargetRef(
+        target_id="subject-b",
+        target_description="the second selected subject",
+    )
+    lock = _query_lock(first, second)
+    with pytest.raises(ValueError, match="multiple targets"):
+        _select_query_lock_target(lock, None)
+    assert _select_query_lock_target(lock, "subject-b") == second
+
+
+def test_query_lock_prompt_material_is_generic_and_keeps_exclusions() -> None:
+    target = EvidenceQueryTargetRef(
+        target_id="subject-a",
+        target_description="the foreground subject selected by the reviewer",
+        positive_attributes=["marked reference instance"],
+        negative_attributes=["background depiction", "reflection"],
+        reference_frame_ids=["DF000010"],
+    )
+    lock = _query_lock(target)
+    target_text = _query_lock_target_description(target)
+    event_text = _query_lock_event_description(_event(), lock)
+    assert "marked reference instance" in target_text
+    assert "background depiction" in target_text
+    assert lock.observable_predicate in event_text
+    assert lock.negative_constraints[0] in event_text
+    assert not any(term in (target_text + event_text).lower() for term in ("oppo", "reno"))
 
 
 def _event(**updates) -> FullClipEvent:
@@ -446,6 +508,158 @@ def test_invisible_dense_selection_has_no_ids_or_target() -> None:
         model_provenance=_provenance(),
     )
     assert selection.visible is False
+
+
+def test_invisible_dense_selection_rejects_stale_target_identity() -> None:
+    with pytest.raises(ValidationError, match="frame or target fields"):
+        DenseEventSelection(
+            source_asset_id="sha256:" + "1" * 64,
+            event_id="event-demo",
+            visible=False,
+            target_entity_id="subject-primary",
+            target_description="selected foreground subject",
+            observable_evidence="the selected subject cannot be confirmed",
+            selection_reason="all supplied evidence frames are inconclusive",
+            uncertainties=["the subject may be outside the sampled window"],
+            confidence=0.2,
+            model_provenance=_provenance(),
+        )
+
+
+def _dense_catalog_payload() -> dict:
+    def frame(index: int, requested_time_ms: int, frame_time_ms: int) -> dict:
+        return {
+            "frame_id": f"DF{index:06d}",
+            "event_id": "event-demo",
+            "requested_time_ms": requested_time_ms,
+            "frame_time_ms": frame_time_ms,
+            "frame_pts": index * 100,
+            "frame_hash": f"{index:x}" * 64,
+            "width": 640,
+            "height": 360,
+            "image_path": f"/evidence/source-{index}.jpg",
+            "transport_image_path": f"/evidence/transport-{index}.jpg",
+            "transport_image_hash": f"{index + 4:x}" * 64,
+        }
+
+    return {
+        "source_asset_id": "sha256:" + "1" * 64,
+        "event_id": "event-demo",
+        "sampling_fps": 4,
+        "source_start_ms": 1000,
+        "source_end_ms": 2000,
+        "frames": [frame(1, 1000, 1000), frame(2, 1250, 1267)],
+        "contact_sheet_paths": ["/evidence/contact-sheet.jpg"],
+        "contact_sheet_hashes": ["f" * 64],
+        "generated_at": "now",
+    }
+
+
+def test_dense_catalog_accepts_ordered_event_local_frames() -> None:
+    catalog = DenseFrameCatalog.model_validate(_dense_catalog_payload())
+    assert [frame.frame_id for frame in catalog.frames] == ["DF000001", "DF000002"]
+
+
+def test_dense_seed_is_reused_only_for_the_same_locked_target() -> None:
+    catalog = DenseFrameCatalog.model_validate(_dense_catalog_payload())
+    selection = DenseEventSelection(
+        source_asset_id=catalog.source_asset_id,
+        event_id=catalog.event_id,
+        visible=True,
+        first_frame_id="DF000001",
+        recommended_frame_id="DF000002",
+        last_frame_id="DF000002",
+        target_entity_id="subject-a",
+        target_description="the selected foreground subject",
+        match_status="matched",
+        observable_evidence="the selected subject is visible",
+        selection_reason="clear boundary and low blur",
+        uncertainties=[],
+        confidence=0.8,
+        model_provenance=_provenance(),
+    )
+    matched = _matching_dense_seed_frame(
+        selection,
+        catalog,
+        target_entity_id="subject-a",
+        target_description="the selected foreground subject",
+    )
+    assert matched is not None
+    assert matched.frame_pts == catalog.frames[1].frame_pts
+    assert (
+        _matching_dense_seed_frame(
+            selection,
+            catalog,
+            target_entity_id="subject-b",
+            target_description="the selected foreground subject",
+        )
+        is None
+    )
+    assert (
+        _matching_dense_seed_frame(
+            selection,
+            catalog,
+            target_entity_id="subject-a",
+            target_description="the selected foreground subject with a changed constraint",
+        )
+        is None
+    )
+
+
+def test_ambiguous_dense_selection_is_not_a_tracking_seed() -> None:
+    catalog = DenseFrameCatalog.model_validate(_dense_catalog_payload())
+    selection = DenseEventSelection(
+        source_asset_id=catalog.source_asset_id,
+        event_id=catalog.event_id,
+        visible=True,
+        first_frame_id="DF000001",
+        recommended_frame_id="DF000002",
+        last_frame_id="DF000002",
+        target_entity_id="subject-a",
+        target_description="one of two similar foreground subjects",
+        match_status="ambiguous",
+        observable_evidence="two plausible instances are visible",
+        selection_reason="identity is not distinguishable",
+        uncertainties=["operator selection required"],
+        confidence=0.4,
+        model_provenance=_provenance(),
+    )
+    assert (
+        _matching_dense_seed_frame(
+            selection,
+            catalog,
+            target_entity_id="subject-a",
+            target_description="one of two similar foreground subjects",
+        )
+        is None
+    )
+
+
+def test_dense_catalog_rejects_mixed_event_frames() -> None:
+    payload = _dense_catalog_payload()
+    payload["frames"][1]["event_id"] = "event-other"
+    with pytest.raises(ValidationError, match="event_id must match"):
+        DenseFrameCatalog.model_validate(payload)
+
+
+def test_dense_catalog_rejects_duplicate_or_out_of_order_ids() -> None:
+    duplicate = _dense_catalog_payload()
+    duplicate["frames"][1]["frame_id"] = "DF000001"
+    with pytest.raises(ValidationError, match="IDs must be unique"):
+        DenseFrameCatalog.model_validate(duplicate)
+
+    out_of_order = _dense_catalog_payload()
+    out_of_order["frames"].reverse()
+    with pytest.raises(ValidationError, match="IDs must be ordered"):
+        DenseFrameCatalog.model_validate(out_of_order)
+
+
+@pytest.mark.parametrize("time_field", ["requested_time_ms", "frame_time_ms"])
+def test_dense_catalog_rejects_times_outside_window(time_field: str) -> None:
+    payload = _dense_catalog_payload()
+    payload["frames"][1][time_field] = 2000
+    with pytest.raises(ValidationError, match="inside the source window"):
+        DenseFrameCatalog.model_validate(payload)
 
 
 def test_saved_raw_clip_card_can_be_revalidated_without_another_api_call(

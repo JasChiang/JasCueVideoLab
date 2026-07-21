@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
 
+from jascue_video_lab.media import probe_video
 from jascue_video_lab.models import RushesEditPlan
 from jascue_video_lab.rushes import _crop_filter, _segment_bounds, create_rushes_catalog
+from jascue_video_lab.sam_tracking import _normalize_shot_manifest
 from jascue_video_lab.shots import ShotSegment, detect_shots_ffmpeg
 
 
@@ -65,6 +68,74 @@ def test_ffmpeg_scdet_preserves_exact_boundary_pts(tmp_path: Path) -> None:
     assert [boundary.frame_time_ms for boundary in manifest.boundaries] == [2000, 4000]
     assert all(boundary.frame_pts > 0 for boundary in manifest.boundaries)
     assert [(shot.start_time_ms, shot.end_time_ms) for shot in manifest.shots] == [
+        (0, 2000),
+        (2000, 4000),
+        (4000, 6000),
+    ]
+
+
+def test_ffmpeg_scdet_uses_local_time_with_nonzero_stream_start_pts(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "nonzero-start-cuts.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=320x180:r=10:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x180:r=10:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:s=320x180:r=10:d=2",
+            "-filter_complex",
+            "[0:v][1:v][2:v]concat=n=3:v=1:a=0,setpts=PTS+5/TB[v]",
+            "-map",
+            "[v]",
+            "-copyts",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(video),
+        ],
+        check=True,
+    )
+    media = probe_video(video)
+    assert media.video.start_pts is not None
+    assert media.video.start_pts > 0
+
+    detected = detect_shots_ffmpeg(video, threshold=4)
+    assert [boundary.frame_time_ms for boundary in detected.boundaries] == [2000, 4000]
+    time_base = Fraction(
+        media.video.time_base.numerator,
+        media.video.time_base.denominator,
+    )
+    assert [boundary.frame_pts for boundary in detected.boundaries] == [
+        media.video.start_pts + round(Fraction(2, 1) / time_base),
+        media.video.start_pts + round(Fraction(4, 1) / time_base),
+    ]
+
+    normalized = _normalize_shot_manifest(
+        detected,
+        duration_ms=media.duration_ms,
+        source_start_pts=media.video.start_pts,
+        time_base_numerator=media.video.time_base.numerator,
+        time_base_denominator=media.video.time_base.denominator,
+    )
+    assert normalized.timeline_basis == "local_ms_from_decoded_pts"
+    assert normalized.source_start_pts == media.video.start_pts
+    assert normalized.source_time_base == media.video.time_base
+    assert normalized.shots[0].start_frame_pts == media.video.start_pts
+    assert [(shot.start_time_ms, shot.end_time_ms) for shot in normalized.shots] == [
         (0, 2000),
         (2000, 4000),
         (4000, 6000),

@@ -14,6 +14,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .billing import summarize_usage_and_list_price, summarize_usage_files
 from .gemini import GeminiLabClient, MODEL_ID, VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
+from .grounding_selection import (
+    require_grounding_request_match,
+    require_tracking_seed_candidate,
+)
 from .media import create_analysis_proxy, extract_frame, has_audio_stream, probe_video, sha256_file
 from .models import (
     ClipShotCatalog,
@@ -22,16 +26,26 @@ from .models import (
     DenseFrameCatalog,
     DerivedClipEvent,
     DerivedClipTimeline,
+    EvidenceQueryLock,
+    EvidenceQueryTargetRef,
     FullClipCard,
     FullClipEvent,
     FeatureEditPlan,
+    GeminiNativeGroundingProposal,
     GroundingProposal,
+    MatchStatus,
     RushesCatalog,
     SegmentationTrack,
     ShotRepresentativeFrame,
 )
 from .overlay import draw_grounding_overlay
-from .sam_tracking import track_bbox_sam21
+from .sam_tracking import (
+    SAM21_CONFIG,
+    SAM21_IMPLEMENTATION_REVISION,
+    require_bbox_track_request_match,
+    resolve_tracking_interval,
+    track_bbox_sam21,
+)
 from .schema import gemini_response_schema
 from .shots import ShotManifest, detect_shots_ffmpeg
 from .storage import append_error, read_json, utc_now, write_json
@@ -1065,47 +1079,89 @@ def run_full_library(
     return result
 
 
-def _extract_tracking_source(
-    source_path: Path,
-    start_ms: int,
-    end_ms: int,
-    output_path: Path,
-) -> None:
-    if end_ms <= start_ms:
-        raise ValueError("tracking source interval must be non-empty")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            f"{start_ms / 1000:.3f}",
-            "-i",
-            str(source_path),
-            "-t",
-            f"{(end_ms - start_ms) / 1000:.3f}",
-            "-map",
-            "0:v:0",
-            "-vf",
-            "scale=1920:1920:force_original_aspect_ratio=decrease:force_divisible_by=2",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ],
-        check=True,
-    )
+def _query_lock_target_description(target: EvidenceQueryTargetRef) -> str:
+    """Render a locked target without adding domain assumptions."""
+    parts = [target.target_description]
+    if target.positive_attributes:
+        parts.append("必須可由畫面確認的特徵：" + "；".join(target.positive_attributes))
+    if target.negative_attributes:
+        parts.append("不得混淆為：" + "；".join(target.negative_attributes))
+    return "\n".join(parts)
+
+
+def _select_query_lock_target(
+    query_lock: EvidenceQueryLock,
+    query_target_id: str | None,
+) -> EvidenceQueryTargetRef:
+    if not query_lock.targets:
+        raise ValueError("query lock has no target suitable for geometry")
+    if query_target_id is None:
+        if len(query_lock.targets) != 1:
+            raise ValueError(
+                "query lock contains multiple targets; select one with --query-target-id"
+            )
+        return query_lock.targets[0]
+    try:
+        return next(
+            target for target in query_lock.targets if target.target_id == query_target_id
+        )
+    except StopIteration as error:
+        raise ValueError(
+            f"query lock does not contain target: {query_target_id}"
+        ) from error
+
+
+def _query_lock_event_description(
+    event: FullClipEvent,
+    query_lock: EvidenceQueryLock,
+) -> str:
+    """Combine observed event context with an immutable, generic evidence contract."""
+    parts = [f"coarse event（僅供情境，不是空間證據）：{event.description}"]
+    if query_lock.observable_predicate:
+        parts.append("要驗證的可觀察條件：" + query_lock.observable_predicate)
+    if query_lock.predicate_phases is not None:
+        parts.extend(
+            [
+                "條件前證據：" + query_lock.predicate_phases.precondition,
+                "條件頂點證據：" + query_lock.predicate_phases.apex,
+                "條件後證據：" + query_lock.predicate_phases.postcondition,
+            ]
+        )
+    if query_lock.required_evidence:
+        parts.append("必要證據：" + "；".join(query_lock.required_evidence))
+    if query_lock.negative_constraints:
+        parts.append("排除條件：" + "；".join(query_lock.negative_constraints))
+    return "\n".join(parts)
+
+
+def _matching_dense_seed_frame(
+    selection: DenseEventSelection,
+    catalog: DenseFrameCatalog,
+    *,
+    target_entity_id: str,
+    target_description: str,
+) -> DenseFrame | None:
+    """Return a dense seed only when its semantic target and lineage still match."""
+    if selection.source_asset_id != catalog.source_asset_id:
+        raise ValueError("dense selection and catalog source assets differ")
+    if selection.event_id != catalog.event_id:
+        raise ValueError("dense selection and catalog event IDs differ")
+    if (
+        not selection.visible
+        or selection.match_status != MatchStatus.MATCHED
+        or selection.recommended_frame_id is None
+        or selection.target_entity_id != target_entity_id
+        or selection.target_description != target_description
+    ):
+        return None
+    try:
+        return next(
+            frame
+            for frame in catalog.frames
+            if frame.frame_id == selection.recommended_frame_id
+        )
+    except StopIteration as error:
+        raise ValueError("dense selection references a frame absent from its catalog") from error
 
 
 def run_full_event_geometry(
@@ -1116,12 +1172,33 @@ def run_full_event_geometry(
     checkpoint_path: Path | None = None,
     target_entity_id: str | None = None,
     target_description: str | None = None,
+    accept_proposed_target: bool = False,
+    grounding_candidate_number: int | None = None,
+    query_lock_path: Path | None = None,
+    query_target_id: str | None = None,
     sam_analysis_fps: float = 2.0,
     temperature: float = 0.2,
 ) -> dict[str, Any]:
     """Ground one selected Clip Card event and optionally propagate SAM inside its interval."""
     if bool(target_entity_id) != bool(target_description):
         raise ValueError("target entity ID and description must be provided together")
+    if target_entity_id is not None and accept_proposed_target:
+        raise ValueError(
+            "explicit target fields cannot be combined with --accept-proposed-target"
+        )
+    if checkpoint_path is None and grounding_candidate_number is not None:
+        raise ValueError(
+            "--grounding-candidate-number is only consumed when --sam-checkpoint is provided"
+        )
+    if query_target_id is not None and query_lock_path is None:
+        raise ValueError("--query-target-id requires --query-lock")
+    if query_lock_path is not None and (
+        target_entity_id is not None or accept_proposed_target
+    ):
+        raise ValueError(
+            "a query lock is the immutable target source and cannot be combined with "
+            "explicit/proposed target flags"
+        )
     card = FullClipCard.model_validate(
         read_json(clip_run_dir / "gemini" / "clip-card" / "clip_card.json")
     )
@@ -1138,37 +1215,124 @@ def run_full_event_geometry(
         derived = next(item for item in timeline.events if item.event_id == event_id)
     except StopIteration as error:
         raise ValueError(f"unknown Clip Card event: {event_id}") from error
-    if target_entity_id is None:
-        if not event.grounding_targets:
-            raise ValueError(f"event {event_id} has no proposed Grounding target")
+    query_lock: EvidenceQueryLock | None = None
+    query_lock_sha256: str | None = None
+    grounding_event_description = event.description
+    target_lock_source = "explicit_target"
+    if query_lock_path is not None:
+        query_lock = EvidenceQueryLock.model_validate(read_json(query_lock_path))
+        locked_target = _select_query_lock_target(query_lock, query_target_id)
+        target_entity_id = locked_target.target_id
+        target_description = _query_lock_target_description(locked_target)
+        query_lock_sha256 = query_lock.definition_sha256()
+        target_lock_source = (
+            f"query_lock:{query_lock.query_id}:revision:{query_lock.revision}"
+        )
+        grounding_event_description = _query_lock_event_description(event, query_lock)
+    elif target_entity_id is None:
+        if not accept_proposed_target:
+            proposed = [target.entity_id for target in event.grounding_targets]
+            raise ValueError(
+                "an explicit Grounding target is required; provide target entity ID and "
+                f"description, or explicitly accept the sole proposal. Proposed IDs: {proposed}"
+            )
+        if len(event.grounding_targets) != 1:
+            raise ValueError(
+                "--accept-proposed-target requires exactly one proposed Grounding target; "
+                "multiple or absent proposals require explicit user selection"
+            )
         selected_target = event.grounding_targets[0]
         target_entity_id = selected_target.entity_id
         target_description = selected_target.target_description
+        target_lock_source = "explicit_acceptance_of_single_clip_card_proposal"
 
     dense_selection_path = clip_run_dir / "dense" / event_id / "gemini" / "dense_selection.json"
     seed_source = "clip_card_recommended_mmss"
     requested_time_ms = derived.recommended_keyframe_ms
-    if dense_selection_path.exists():
+    expected_dense_frame_pts: int | None = None
+    # Existing dense selections were generated under the Clip Card target, not
+    # under an EvidenceQueryLock. Until dense artifacts carry a lock hash, never
+    # reuse them for a lock-governed request, even if an entity ID happens to match.
+    if dense_selection_path.exists() and query_lock is None:
         dense_selection = DenseEventSelection.model_validate(read_json(dense_selection_path))
-        if dense_selection.visible and dense_selection.recommended_frame_id:
-            dense_catalog = DenseFrameCatalog.model_validate(
-                read_json(clip_run_dir / "dense" / event_id / "dense-catalog.json")
-            )
-            dense_frame = next(
-                frame
-                for frame in dense_catalog.frames
-                if frame.frame_id == dense_selection.recommended_frame_id
-            )
+        dense_catalog = DenseFrameCatalog.model_validate(
+            read_json(clip_run_dir / "dense" / event_id / "dense-catalog.json")
+        )
+        dense_frame = _matching_dense_seed_frame(
+            dense_selection,
+            dense_catalog,
+            target_entity_id=str(target_entity_id),
+            target_description=str(target_description),
+        )
+        if dense_frame is not None:
             requested_time_ms = dense_frame.requested_time_ms
-            seed_source = f"dense_frame_id:{dense_frame.frame_id}"
+            expected_dense_frame_pts = dense_frame.frame_pts
+            seed_source = f"dense_frame_id:{dense_frame.frame_id}:target_matched"
     if requested_time_ms is None:
         requested_time_ms = (derived.start_ms + derived.end_ms) // 2
         seed_source = "local_event_midpoint_no_model_keyframe"
 
     geometry_dir = clip_run_dir / "geometry" / event_id
-    grounding_dir = geometry_dir / "grounding"
-    frame_path = grounding_dir / "frame.png"
+    if query_lock is not None:
+        write_json(
+            geometry_dir / "query-lock.json",
+            {
+                "definition_sha256": query_lock_sha256,
+                "query_lock": query_lock.model_dump(mode="json"),
+            },
+        )
+    frame_path = geometry_dir / "evidence-frames" / f"requested-{requested_time_ms}.png"
     frame = extract_frame(source_path, requested_time_ms, frame_path)
+    if expected_dense_frame_pts is not None and frame.frame_pts != expected_dense_frame_pts:
+        raise ValueError(
+            "dense frame lineage mismatch: the original-resolution extraction did not "
+            f"resolve to the selected frame PTS ({frame.frame_pts} != "
+            f"{expected_dense_frame_pts})"
+        )
+    grounding_request_key = {
+        "contract_version": "exact-frame-grounding-v2",
+        "model_id": MODEL_ID,
+        "source_asset_id": media.asset_id,
+        "event_id": event.event_id,
+        "frame_hash": frame.frame_hash,
+        "frame_pts": frame.frame_pts,
+        "frame_time_ms": frame.frame_time_ms,
+        "source_width": frame.width,
+        "source_height": frame.height,
+        "dense_frame_expected_pts": expected_dense_frame_pts,
+        "target_entity_id": target_entity_id,
+        "target_description": target_description,
+        "target_lock_source": target_lock_source,
+        "query_lock_sha256": query_lock_sha256,
+        "event_description": grounding_event_description,
+        "prompt_sha256": hashlib.sha256(grounding_prompt.encode("utf-8")).hexdigest(),
+        "system_instruction_sha256": hashlib.sha256(
+            VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
+        ).hexdigest(),
+        "response_schema_sha256": hashlib.sha256(
+            json.dumps(
+                gemini_response_schema(GeminiNativeGroundingProposal),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "temperature": temperature,
+        "thinking_level": "low",
+    }
+    grounding_fingerprint = hashlib.sha256(
+        json.dumps(
+            grounding_request_key,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    grounding_dir = geometry_dir / "grounding" / f"bbox-{grounding_fingerprint[:16]}"
+    write_json(
+        grounding_dir / "request-key.json",
+        {**grounding_request_key, "request_fingerprint": grounding_fingerprint},
+    )
     write_json(
         grounding_dir / "frame.json",
         {
@@ -1182,6 +1346,18 @@ def run_full_event_geometry(
     grounding_path = grounding_dir / "grounding.json"
     if grounding_path.exists():
         proposal = GroundingProposal.model_validate(read_json(grounding_path))
+        require_grounding_request_match(
+            proposal,
+            asset_id=media.asset_id,
+            event_id=event.event_id,
+            entity_id=str(target_entity_id),
+            frame_pts=frame.frame_pts,
+            frame_time_ms=frame.frame_time_ms,
+            frame_hash=frame.frame_hash,
+            source_width=frame.width,
+            source_height=frame.height,
+            model_id=MODEL_ID,
+        )
         grounding_reused = True
     else:
         client = GeminiLabClient(temperature=temperature)
@@ -1190,7 +1366,7 @@ def run_full_event_geometry(
                 media=media,
                 frame=frame,
                 event_id=event.event_id,
-                event_description=event.description,
+                event_description=grounding_event_description,
                 entity_id=str(target_entity_id),
                 target_description=str(target_description),
                 prompt_template=grounding_prompt,
@@ -1204,38 +1380,104 @@ def run_full_event_geometry(
     draw_grounding_overlay(frame_path, proposal, grounding_dir / "debug.png")
 
     track: SegmentationTrack | None = None
+    selected_seed = None
+    track_path: Path | None = None
     if checkpoint_path is not None:
         if not proposal.visible or not proposal.candidates:
             raise ValueError(f"Gemini Grounding target is not visible for {event_id}")
-        track_dir = geometry_dir / "sam21"
+        selected_seed = require_tracking_seed_candidate(
+            proposal,
+            candidate_number=grounding_candidate_number,
+            require_predicate_satisfied=bool(
+                query_lock is not None and query_lock.observable_predicate
+            ),
+        )
+        tracking_scdet_threshold = 4.0
+        tracking_seed_box_padding_ratio = 0.04
+        tracking_max_side = 960
+        tracking_device = "auto"
+        tracking_shots = detect_shots_ffmpeg(
+            source_path,
+            threshold=tracking_scdet_threshold,
+        )
+        expected_analysis_start_ms, expected_analysis_end_ms = resolve_tracking_interval(
+            tracking_shots,
+            seed_time_ms=frame.frame_time_ms,
+            allowed_start_ms=derived.start_ms,
+            allowed_end_ms=derived.end_ms,
+        )
+        checkpoint_sha256 = sha256_file(checkpoint_path)
+        seed_manifest = {
+            "contract_version": "bbox-seed-v1",
+            "asset_id": proposal.asset_id,
+            "event_id": proposal.event_id,
+            "entity_id": proposal.entity_id,
+            "target_description": target_description,
+            "target_lock_source": target_lock_source,
+            "query_lock_sha256": query_lock_sha256,
+            "frame_hash": proposal.frame_hash,
+            "frame_pts": proposal.frame_pts,
+            "candidate_number": selected_seed.candidate_number,
+            "candidate_index": selected_seed.candidate_index,
+            "candidate_selection_source": selected_seed.selection_source,
+            "box_2d": list(selected_seed.candidate.box_2d),
+            "seed_type": "gemini_bbox",
+            "source_start_ms": derived.start_ms,
+            "source_end_ms": derived.end_ms,
+            "normalized_seed_shot_start_ms": expected_analysis_start_ms,
+            "normalized_seed_shot_end_ms": expected_analysis_end_ms,
+            "analysis_fps": sam_analysis_fps,
+            "analysis_max_side": tracking_max_side,
+            "ffmpeg_scdet_threshold": tracking_scdet_threshold,
+            "seed_box_padding_ratio": tracking_seed_box_padding_ratio,
+            "device_request": tracking_device,
+            "sam_config": SAM21_CONFIG,
+            "sam_implementation_revision": SAM21_IMPLEMENTATION_REVISION,
+            "checkpoint_sha256": checkpoint_sha256,
+        }
+        seed_fingerprint = hashlib.sha256(
+            json.dumps(seed_manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        track_dir = geometry_dir / "sam21" / f"bbox-{seed_fingerprint[:16]}"
+        seed_manifest_path = track_dir / "seed-selection.json"
+        write_json(
+            seed_manifest_path,
+            {**seed_manifest, "seed_fingerprint": seed_fingerprint},
+        )
         track_path = track_dir / "segmentation-track.json"
         if track_path.exists():
             track = SegmentationTrack.model_validate(read_json(track_path))
         else:
-            tracking_source = geometry_dir / "tracking-source.mp4"
-            if not tracking_source.exists():
-                _extract_tracking_source(
-                    source_path,
-                    derived.start_ms,
-                    derived.end_ms,
-                    tracking_source,
-                )
-            candidate = max(proposal.candidates, key=lambda item: item.confidence)
             track = track_bbox_sam21(
-                video_path=tracking_source,
+                video_path=source_path,
                 checkpoint_path=checkpoint_path,
-                seed_time_ms=max(0, frame.frame_time_ms - derived.start_ms),
-                seed_box_2d=candidate.box_2d,
+                seed_time_ms=frame.frame_time_ms,
+                seed_box_2d=selected_seed.candidate.box_2d,
                 target_description=str(target_description),
                 output_dir=track_dir,
-                seed_source=str(grounding_path),
+                seed_source=str(seed_manifest_path),
                 asset_id=proposal.asset_id,
                 analysis_fps=sam_analysis_fps,
-                max_side=960,
-                device="auto",
-                ffmpeg_scdet_threshold=4.0,
-                seed_box_padding_ratio=0.04,
+                max_side=tracking_max_side,
+                device=tracking_device,
+                ffmpeg_scdet_threshold=tracking_scdet_threshold,
+                seed_box_padding_ratio=tracking_seed_box_padding_ratio,
+                allowed_start_ms=derived.start_ms,
+                allowed_end_ms=derived.end_ms,
             )
+        require_bbox_track_request_match(
+            track,
+            video_path=source_path,
+            asset_id=proposal.asset_id,
+            target_description=str(target_description),
+            seed_time_ms=frame.frame_time_ms,
+            seed_box_2d=selected_seed.candidate.box_2d,
+            seed_box_padding_ratio=tracking_seed_box_padding_ratio,
+            analysis_fps=sam_analysis_fps,
+            analysis_start_ms=expected_analysis_start_ms,
+            analysis_end_ms=expected_analysis_end_ms,
+            checkpoint_sha256=checkpoint_sha256,
+        )
     pricing = summarize_usage_and_list_price(geometry_dir)
     execution_pricing = summarize_usage_files(
         [grounding_dir / "grounding.raw_interaction.json"] if not grounding_reused else [],
@@ -1245,6 +1487,21 @@ def run_full_event_geometry(
         "event_id": event_id,
         "target_entity_id": target_entity_id,
         "target_description": target_description,
+        "target_lock_source": target_lock_source,
+        "query_lock_sha256": query_lock_sha256,
+        "grounding_request_fingerprint": grounding_fingerprint,
+        "grounding_path": str(grounding_path.resolve()),
+        "grounding_debug_path": str((grounding_dir / "debug.png").resolve()),
+        "grounding_candidate_number": (
+            selected_seed.candidate_number if selected_seed is not None else None
+        ),
+        "grounding_candidate_index": (
+            selected_seed.candidate_index if selected_seed is not None else None
+        ),
+        "grounding_candidate_selection_source": (
+            selected_seed.selection_source if selected_seed is not None else None
+        ),
+        "sam_seed_type": "bbox" if checkpoint_path is not None else None,
         "seed_source": seed_source,
         "frame_pts": frame.frame_pts,
         "frame_time_ms": frame.frame_time_ms,
@@ -1254,9 +1511,7 @@ def run_full_event_geometry(
         "grounding_reused": grounding_reused,
         "grounding_seconds": grounding_seconds,
         "sam_track_path": (
-            str((geometry_dir / "sam21" / "segmentation-track.json").resolve())
-            if track is not None
-            else None
+            str(track_path.resolve()) if track is not None and track_path is not None else None
         ),
         "sam_total_samples": track.total_samples if track is not None else 0,
         "pricing": pricing,

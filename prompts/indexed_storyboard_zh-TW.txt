@@ -10,7 +10,7 @@
 - frame ID 必須依輸入順序滿足 `first_frame_id <= recommended_frame_id <= last_frame_id`。
 - 不同事件不得共用 frame ID，且必須依輸入順序排列。
 - `observable_evidence` 只描述所提供圖片中直接可見的內容。
-- 每個事件指定一個適合單幀 bbox 的可見主要物件，提供穩定的 `grounding_target_id` 與能區分相似實例的 `grounding_target_description`。目標可以是手機、手機螢幕、Mac 螢幕、手或人物臉部，但必須在 recommended frame 清楚可見。
+- 每個事件指定一個適合單幀 bbox 的可見主要實例或局部，提供穩定的 `grounding_target_id` 與能區分相似實例的 `grounding_target_description`。目標可屬任何 schema 支援的 entity kind，但必須在 recommended frame 清楚可見，且描述不得依賴特定品牌或物件類別的預設知識。
 - 若取樣間隔漏掉短暫狀態，寫入 uncertainties，不得補造未提供的 frame ID。
 - 不要建立逐字稿、字幕、bbox、crop 或 tracking。
 

@@ -25,12 +25,16 @@
 
 若有多個合理候選，全部回傳，依 confidence 由高至低排序，並各自說明辨識理由。沒有足夠證據時不要任選。
 
+`match_status` 必須描述指定實例的語意配對結果，而不是框的幾何品質：只有唯一且可由本張影格確認的指定目標可用 `matched`；多個合理實例或身分無法區分時用 `ambiguous`；目標不在畫面用 `not_visible`；畫面中的物件與指定條件衝突用 `target_mismatch`；證據不足以判斷時用 `insufficient_evidence`。後三種狀態必須 `visible=false` 且 `candidates=[]`。
+
+若相關事件描述包含明確、可觀察的動作或狀態條件，才判斷 `predicate_status`；直接支持時用 `satisfied`、直接反證時用 `not_satisfied`、本張影格不足以判斷時用 `indeterminate`。未提供這類條件時用 `not_applicable`。可見性、語意配對、事件條件與遮擋是不同欄位，不得互相代替。
+
 ## 遮擋與不可見
 
 完全不可見時 visible=false、candidates=[]，並在 visibility_reason 說明原因，不得猜測座標。部分遮擋時 visible=true、occlusion=partial；若 bbox 含推定的完整範圍，須在 disambiguation_reason 明說並降低 confidence。
 
 ## 目標層級
 
-嚴格遵守指定層級：手機螢幕不可框整支手機；手機不可框整條手臂；人物臉部不可框整個人；正在操作的手機不可選桌上另一支手機。
+嚴格遵守指定實例、層級與關係：局部不可框成整體，整體不可擴大到持有人或周邊；實體不可改成背景圖像或反射；帶有持有、操作、位置或狀態條件的 target 不可改選另一個同類實例。
 
 只回傳符合所提供 Structured Output schema 的資料。

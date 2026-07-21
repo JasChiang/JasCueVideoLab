@@ -1,4 +1,4 @@
-# 先選對物件，再談 Grounding：JasCueVideoLab 方法論
+# 先鎖定證據，再談 Geometry：JasCueVideoLab 方法論
 
 這份文件說明一個看似簡單、實際上很容易做錯的影片 AI 流程：如何讓 Gemini 從影片理解內容、找到適合截圖的時間，再對原始影格框出「使用者真正想要的那一個物件」。
 
@@ -6,14 +6,14 @@
 
 ## 給一般人的版本
 
-如果一個畫面同時有三支手機、產品背板和招牌，只問 AI「幫我框重要物件」，AI 可能每次選到不同東西。它也許都框得很準，但框的不是你想要的那一個。
+如果畫面同時有多個相似實例、背景描繪、反射或物件局部，只問 AI「幫我框重要物件」，AI 可能每次選到不同東西。它也許都框得很準，但框的不是你想要的那一個。這個問題和物件是人、產品、動物、工具、螢幕或文件無關。
 
 因此流程改成四步：
 
-1. **AI 先提候選**：列出「左邊白色手機」「中央紫色手機」「右邊白色手機」等可辨識實例。
-2. **人選目標**：使用者選擇真正關心的物件；如果一開始已指定，就跳過候選步驟。
+1. **AI 先提候選**：列出畫面中可區分的實例，不產生座標。
+2. **人選目標並鎖定條件**：使用者選擇真正關心的實例、必要特徵、排除特徵與可選的事件條件；如果一開始已指定，就跳過候選步驟。
 3. **AI 找代表時間**：Gemini 只用 `MM:SS` 建議幾個物件清楚可見的時刻。
-4. **本機抽原始幀再框選**：FFmpeg 找到真正的 frame PTS，Gemini 對那張原始影格輸出 bbox，最後產生 debug overlay 供人檢查。
+4. **本機抽原始幀再框選**：FFmpeg 找到真正的 frame PTS，Gemini 對那張原始影格只輸出 bbox，最後產生 debug overlay 供人檢查。需要連續幾何時，才把人工核准的 bbox 交給 SAM。
 
 簡化成一句話：
 
@@ -24,11 +24,13 @@
 Gemini 建議 MM:SS → 本機驗證片長 → FFmpeg 抽原始幀／保存 PTS
                  ↓
       Gemini 單幀 bbox → debug overlay → 人工確認
+                                      ↓
+                    選配：SAM 在同一 shot 內傳播 mask
 ```
 
 這個順序把兩個不同問題拆開：
 
-- **Selection**：到底要追哪個實例？這是使用者意圖。
+- **Query Lock**：到底要找哪個實例、驗證哪個可觀察條件？這是使用者意圖。
 - **Geometry**：該實例在這張圖的哪裡？這才是 Grounding。
 
 「bbox 很準」不代表「target 選對」。把 selection 留給使用者，是目前最重要的可靠性改進。
@@ -70,12 +72,12 @@ Gemini File API 的檔案會保存 48 小時，期間可重複用同一個 file 
 
 官方說明：[Files API](https://ai.google.dev/gemini-api/docs/files)、[File input methods](https://ai.google.dev/gemini-api/docs/file-input-methods)。
 
-### 3. Target Candidate Map
+### 3. Target Candidate Map 與 EvidenceQueryLock
 
 沒有 target 時，不再讓 Content Map 或時間模型順便替使用者挑物件。獨立的 `TargetCandidateMap` 至少保存：
 
 - `candidate_id`：穩定、可重複引用的 ID。
-- `entity_kind`：phone、phone_screen、face、hand、product 等物件層級。
+- `entity_kind`：person、face、hand、product、device、screen、document、UI element 或 other 等 schema 層級。
 - `target_description`：可直接交給單幀 Grounding，並明確排除相似物件。
 - `distinguishing_features`：顏色、位置、持有人、朝向或操作狀態。
 - `representative_timestamp_mmss`：只用於候選預覽與人工判斷。
@@ -83,25 +85,31 @@ Gemini File API 的檔案會保存 48 小時，期間可重複用同一個 file 
 
 候選階段禁止 bbox、crop、mask 與 tracking data。它只回答「可以選什麼」，不回答「框在哪裡」。
 
+候選由使用者選定後會形成 domain-neutral `EvidenceQueryLock`，至少保存穩定 target ID、正向／排除特徵、可選的 observable predicate、必要證據、負面限制、版本與 hash。後續 Grounding 和 tracking artifact 都保存同一份 lock hash；變更條件會建立新 cache variant，不會沿用舊框。
+
+既有 dense frame selection 若是在 QueryLock 建立前產生，即使剛好使用相同 target ID 也不會重用，因為它沒有 lock hash，無法證明採用了新的排除條件或 predicate。現階段會退回事件的 coarse keyframe／本機中點並讓 exact-frame gate 決定是否有足夠證據；未來的 lock-aware dense refinement 必須把完整 lock hash 寫入 artifact 才能重用。
+
 ### 4. 鎖定 target 後才找時間
 
 選定候選後，`candidate_id` 與 `target_description` 會成為不可變輸入。每個 Direct Moment 都必須逐字回傳同一 target；模型若改選背板或其他手機，本機 contract 直接判定失敗。
 
 若使用者一開始已提供 target ID 與精確描述，可以直接跳過候選階段。描述應包含：
 
-- 物件層級，例如「手機螢幕」而不是「手機」。
-- 實例特徵，例如中央、紫色、背面朝鏡頭。
-- 排除條件，例如不可框大型 Reno 16 背板，也不可框左右白色手機。
+- 目標層級，例如局部、整體或持有人，不可互相擴張。
+- 可直接看見的實例特徵，例如位置、顏色、朝向、持有關係或狀態。
+- 排除條件，例如另一個同類實例、背景圖像、反射或支撐物。
 
 ### 5. 單幀 Grounding
 
 FFmpeg 從 orientation-corrected 原始 source 抽幀後，以官方 Gemini image bbox convention 接收 `[y_min, x_min, y_max, x_max]`。API boundary schema 明確命名為 `box_2d_yxyx`，再由本機做純軸序轉換，輸出專案 canonical `[x_min, y_min, x_max, y_max]`。
 
-如果 target 不可見，模型必須回傳 `visible=false`、`candidates=[]`，不得利用前後時刻猜位置。Debug overlay 必須畫在原始影格上供人工檢查。
+如果 target 不可見，模型必須回傳 `visible=false`、`candidates=[]`，不得利用前後時刻猜位置。`match_status` 另外區分 `matched`、`ambiguous`、`not_visible`、`target_mismatch` 與 `insufficient_evidence`；可選的 `predicate_status` 只回答指定動作／狀態是否有證據，不能取代物件身分或可見性。多候選不得依最高 confidence 自動選框，必須由人指定 candidate。Debug overlay 必須畫在原始影格上供人工檢查。
 
-### 6. Tracking 仍是另一層問題
+### 6. Gemini bbox → SAM；不使用 Gemini polygon 當主路徑
 
-正確的單幀 seed 可以初始化外部 tracker，但 tracker 回報 success 不代表幾何正確。本實驗曾出現 CSRT 221/221 accepted，bbox 卻逐漸縮到招牌上半部的反例。因此追蹤至少需要週期性 re-grounding、幾何／語意 gate 與真人 ground truth；單幀 Gemini bbox 不能直接當 production tracking data。
+正確的單幀 bbox seed 可以初始化 SAM 2.1，由 SAM 將矩形精煉為 mask 並向前／向後傳播。主路徑明確拒絕 Gemini polygon seed：在目前最具辨識難度的 A/B 反例中，bbox seed 保住了指定實例而 polygon seed 跟錯區域；polygon artifacts 只保留為唯讀歷史實驗，不會進入 Full v1 或剪輯 renderer。這是風險導向的架構決策，不是宣稱 bbox 在所有物件上都有較高 pixel accuracy。
+
+SAM predictor 在初始化前先以 FFmpeg 找出 seed 所屬 shot，實際分析區間為 `使用者／事件允許範圍 ∩ seed shot`。每個 sample 保存原始 decoded `source_pts`、time base 衍生的時間與 mask-derived bbox；固定 FPS debug MP4 只是預覽，不是剪輯時間軸。tracker 有 mask 仍不等於語意身分已確認，因此 drift、lost 或遮擋後重現仍需重新 Grounding 或人工確認。
 
 ## 怎麼執行
 
@@ -123,26 +131,37 @@ uv run jascue-video-lab suggest-targets ARTIFACT \
 ```bash
 uv run jascue-video-lab direct-moment-repeat ARTIFACT \
   --candidate-map ARTIFACT/target-candidates/run-01/target_candidates.json \
-  --candidate-id phone_purple_center \
+  --candidate-id selected-subject \
   --runs 3 --ground-runs 1 \
-  --output-dir ARTIFACT/purple-phone
+  --output-dir ARTIFACT/selected-subject
 ```
 
 也可直接提供 target：
 
 ```bash
 uv run jascue-video-lab direct-moment-repeat ARTIFACT \
-  --target-id center-purple-phone \
-  --target-description '中央偏左、背面朝向鏡頭的紫色實體手機；排除大型背板與兩支白色手機。' \
+  --target-id selected-subject \
+  --target-description '中央偏左、具有指定標記的前景實體；排除背景描繪、反射與其他相似實例。' \
   --runs 3 --ground-runs 1 \
-  --output-dir ARTIFACT/purple-phone
+  --output-dir ARTIFACT/selected-subject
 ```
 
 若直接執行 `direct-moment-repeat` 卻沒有任何 target，CLI 會只產生候選並停止，不會偷偷挑一個物件進行 bbox。
 
+Full v1 的 selected event 也可以直接使用版本化 QueryLock；若 lock 有多個 targets，必須另外明選一個 ID：
+
+```bash
+uv run jascue-video-lab full-ground-event ARTIFACT EVENT_ID \
+  --query-lock query-lock.json \
+  --query-target-id selected-subject \
+  --sam-checkpoint artifacts/models/sam2.1_hiera_tiny.pt
+```
+
+若 exact-frame Grounding 回傳多個合理 bbox，命令會 fail closed；人工看過 debug 圖後才能以 `--grounding-candidate-number` 指定候選。此編號從 1 開始，與 debug 圖上的 `1.`、`2.` 一致；artifact 同時保存 1-based number 與 0-based array index。QueryLock、Grounding request 與 bbox seed 都會各自保存 fingerprint。
+
 ## 可以分享的結論
 
-> 影片 AI Grounding 最容易被忽略的問題，不是「框得準不準」，而是「它框的是不是使用者要的那一個」。我的實驗把流程拆成 Target Candidates → User Selection → MM:SS Moment → Exact Frame PTS → Single-frame Grounding。沒有指定目標時，AI 只提候選，不替人做最後選擇；指定後才找時間與 bbox。同一影片在 Gemini File API 的 48 小時保存期內會重用，只有確認過期才重傳。這讓錯誤更容易被看見，也讓每一步都能獨立驗證。
+> 影片 AI Grounding 最容易被忽略的問題，不是「框得準不準」，而是「它框的是不是使用者要的那一個」。我的實驗把流程拆成 Target Candidates → Human Query Lock → MM:SS Moment → Exact Frame PTS → Gemini bbox → 選配的 shot-local SAM。沒有指定目標時，AI 只提候選，不替人做最後選擇；多個 bbox 也不靠 confidence 偷選。同一影片在 Gemini File API 的有效期內會重用，只有確認過期才重傳。這讓錯誤更容易被看見，也讓每一步都能獨立驗證。
 
 ## 尚未證明的事
 
@@ -173,4 +192,4 @@ App 另提供隔離的 B 模式，直接把完整影片、target 與 `MM:SS` 交
 
 B 的 normalized bbox 可以投影到相同 `MM:SS` 所抽到的 FFmpeg 原始幀供人觀察，但投影圖必須標示 sample unknown。只有 A 與 B 都完成獨立盲審後，系統才計算 bbox IoU 與 center distance；這些數字量測的是兩個 proposal 的幾何差，不證明它們來自同一影格。
 
-首次匿名化產品展示測例的 live A/B 使用相同的中央紫色手機 target 與 `00:02`：原始 2.002 秒單幀方法為 `[412, 684, 467, 871]`，direct-video 方法為 `[413, 664, 466, 842]`，IoU 0.738123、normalized center distance 24.5。Direct-video 確實選中正確紫色手機，牌價估算 US$0.007224；但框較短且實際影片取樣幀未知，所以這項結果只能說「值得繼續 A/B」，不能取代原始單幀 Grounding。視覺檢查由 Codex 執行，尚未成為獨立 human annotation。
+首次匿名化展示測例的 live A/B 使用相同前景實體 target 與 `00:02`：原始 2.002 秒單幀方法為 `[412, 684, 467, 871]`，direct-video 方法為 `[413, 664, 466, 842]`，IoU 0.738123、normalized center distance 24.5。Direct-video 選中相同實例，但框較短且實際影片取樣幀未知，所以這項結果只能說「值得繼續 A/B」，不能取代原始單幀 Grounding。視覺檢查由 Codex 執行，尚未成為獨立 human annotation。

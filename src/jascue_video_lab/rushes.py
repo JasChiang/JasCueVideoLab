@@ -444,7 +444,7 @@ def run_rushes_experiment(
             catalog=catalog,
             uploaded=uploaded,
             prompt_template=prompt_template,
-            project_id="public-rushes-selects",
+            project_id="rushes-selects",
             run_id=f"rushes-{uuid.uuid4().hex[:8]}",
             run_dir=output_dir / "gemini",
         )

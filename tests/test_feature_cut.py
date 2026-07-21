@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +13,8 @@ from jascue_video_lab.feature_cut import (
     _concat_segments,
     _render_source_segment,
     _render_text_layer,
+    _segment_variant_fingerprint,
+    _usable_track_centers,
 )
 from jascue_video_lab.models import FeatureChapterBrief, FeatureChapterSelect, FeatureEditBrief
 
@@ -39,6 +42,24 @@ def test_feature_brief_requires_unique_chapter_ids() -> None:
         )
 
 
+def test_segment_cache_key_changes_with_source_or_tracking_geometry() -> None:
+    base = {
+        "source_sha256": "a" * 64,
+        "start_ms": 1000,
+        "end_ms": 3000,
+        "filter_graph": "crop=1080:1920:x=100:y=0",
+        "geometry": {"applied_strategy": "tracked_crop"},
+        "track_fingerprint": "b" * 64,
+    }
+    original = _segment_variant_fingerprint(**base)
+    assert original != _segment_variant_fingerprint(
+        **{**base, "track_fingerprint": "c" * 64}
+    )
+    assert original != _segment_variant_fingerprint(
+        **{**base, "source_sha256": "d" * 64}
+    )
+
+
 def test_feature_brief_can_disable_titles_and_choose_primary_center_crop() -> None:
     brief = FeatureEditBrief(
         project_id="clean-cut",
@@ -51,7 +72,7 @@ def test_feature_brief_can_disable_titles_and_choose_primary_center_crop() -> No
                 title="hero",
                 detail_lines=[],
                 target_duration_seconds=6,
-                vertical_primary_target_description="presenter holding the white phone",
+                vertical_primary_target_description="reviewer-selected foreground subject",
                 vertical_crop_mode="primary_center",
             )
         ],
@@ -66,7 +87,7 @@ def test_tracked_reframe_requires_target_and_nonzero_intent() -> None:
         "evidence_status": "supported",
         "horizontal_frame_id": "RF000001",
         "vertical_frame_id": "RF000002",
-        "observed_visual_evidence": "phone screen",
+        "observed_visual_evidence": "selected subject remains visible",
         "selection_reason": "clear",
         "horizontal_strategy": "tracked_reframe",
         "horizontal_zoom_intent": "none",
@@ -84,6 +105,30 @@ def test_piecewise_expression_is_ffmpeg_escaped() -> None:
     expression = _piecewise_expression([0.0, 0.5, 1.0], [100.0, 150.0, 130.0])
     assert "lt(t\\,0.500)" in expression
     assert "if(" in expression
+
+
+def test_track_centers_are_rebased_to_render_segment_time() -> None:
+    track = SimpleNamespace(
+        analysis_start_ms=5000,
+        samples=[
+            SimpleNamespace(
+                analysis_sample_time_ms=5100,
+                tracking_state="tracked",
+                center_2d=[300.0, 500.0],
+                derived_tracking_box=[200, 200, 400, 800],
+            ),
+            SimpleNamespace(
+                analysis_sample_time_ms=6100,
+                tracking_state="low_confidence",
+                center_2d=[500.0, 500.0],
+                derived_tracking_box=[400, 200, 600, 800],
+            ),
+        ],
+    )
+    times, centers, boxes = _usable_track_centers(track)  # type: ignore[arg-type]
+    assert times == pytest.approx([0.1, 1.1])
+    assert centers == [300.0, 500.0]
+    assert boxes == [[200, 200, 400, 800], [400, 200, 600, 800]]
 
 
 def test_dynamic_crop_filter_renders_video_and_audio(tmp_path: Path) -> None:
@@ -216,3 +261,52 @@ def test_concat_decodes_each_mp4_instead_of_stream_copy(tmp_path: Path) -> None:
         text=True,
     )
     assert float(completed.stdout) == pytest.approx(2.0, abs=0.08)
+
+
+def test_video_only_source_gets_explicit_synthetic_silence(tmp_path: Path) -> None:
+    source = tmp_path / "video-only.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x180:r=30:d=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+    output = tmp_path / "review-segment.mp4"
+    audio_origin = _render_source_segment(
+        source_path=source,
+        start_ms=0,
+        end_ms=1000,
+        overlay_path=None,
+        base_filter="[0:v]fps=30,scale=320:180,setsar=1[base]",
+        output_path=output,
+    )
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stream_types = {stream["codec_type"] for stream in json.loads(completed.stdout)["streams"]}
+    assert audio_origin == "synthetic_silence"
+    assert stream_types == {"video", "audio"}

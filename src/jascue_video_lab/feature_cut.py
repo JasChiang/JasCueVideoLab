@@ -4,6 +4,7 @@ import hashlib
 import html
 import json
 import math
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -13,13 +14,18 @@ from typing import Any, Sequence
 from PIL import Image, ImageDraw, ImageFont
 
 from .billing import summarize_usage_and_list_price
-from .gemini import GeminiLabClient
-from .media import extract_frame, probe_video, sha256_file
+from .gemini import GeminiLabClient, MODEL_ID, VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
+from .grounding_selection import (
+    require_grounding_request_match,
+    require_tracking_seed_candidate,
+)
+from .media import extract_frame, has_audio_stream, probe_video, sha256_file
 from .models import (
     FeatureChapterBrief,
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
+    GeminiNativeGroundingProposal,
     GroundingProposal,
     RushClip,
     RushFrame,
@@ -29,7 +35,13 @@ from .models import (
 )
 from .overlay import draw_grounding_overlay
 from .rushes import _segment_bounds
-from .sam_tracking import track_bbox_sam21
+from .sam_tracking import (
+    SAM21_CONFIG,
+    SAM21_IMPLEMENTATION_REVISION,
+    require_bbox_track_request_match,
+    track_bbox_sam21,
+)
+from .schema import gemini_response_schema
 from .shots import ShotManifest, detect_shots_ffmpeg
 from .storage import read_json, utc_now, write_json
 
@@ -40,6 +52,9 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
 _RENDER_PIPELINE_VERSION = "feature-cut-v2-primary-center-atomic"
+_TRACKING_MAX_SIDE = 960
+_TRACKING_DEVICE = "cpu"
+_TRACKING_SEED_BOX_PADDING_RATIO = 0.04
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -156,9 +171,12 @@ def _render_source_segment(
     overlay_path: Path | None,
     base_filter: str,
     output_path: Path,
-) -> None:
+    source_has_audio: bool | None = None,
+) -> str:
     duration = (end_ms - start_ms) / 1000
     audio_fade_out = max(0.0, duration - 0.12)
+    if source_has_audio is None:
+        source_has_audio = has_audio_stream(source_path)
     if overlay_path is None:
         filter_graph = base_filter + ";[base]null[v]"
         overlay_input: list[str] = []
@@ -169,6 +187,15 @@ def _render_source_segment(
             + "[base][card]overlay=0:0:shortest=1[v]"
         )
         overlay_input = ["-loop", "1", "-i", str(overlay_path)]
+    if source_has_audio:
+        audio_input: list[str] = []
+        audio_map = "0:a:0"
+        audio_origin = "source"
+    else:
+        silence_input_index = 2 if overlay_path is not None else 1
+        audio_input = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+        audio_map = f"{silence_input_index}:a:0"
+        audio_origin = "synthetic_silence"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f".{output_path.stem}.partial.mp4")
     _run_segment_encoder(
@@ -183,6 +210,7 @@ def _render_source_segment(
             "-i",
             str(source_path),
             *overlay_input,
+            *audio_input,
             "-t",
             f"{duration:.3f}",
             "-filter_complex",
@@ -190,7 +218,7 @@ def _render_source_segment(
             "-map",
             "[v]",
             "-map",
-            "0:a:0",
+            audio_map,
             "-af",
             (
                 "volume=0.58,afade=t=in:st=0:d=0.08,"
@@ -235,6 +263,7 @@ def _render_source_segment(
         ]
     )
     temporary_path.replace(output_path)
+    return audio_origin
 
 
 def _render_missing_segment(
@@ -379,7 +408,10 @@ def _output_media_metadata(path: Path) -> dict[str, Any]:
     )
     payload = json.loads(completed.stdout)
     video = next(stream for stream in payload["streams"] if stream["codec_type"] == "video")
-    audio = next(stream for stream in payload["streams"] if stream["codec_type"] == "audio")
+    audio = next(
+        (stream for stream in payload["streams"] if stream["codec_type"] == "audio"),
+        None,
+    )
     return {
         "sha256": sha256_file(path),
         "duration_seconds": float(payload["format"]["duration"]),
@@ -389,7 +421,8 @@ def _output_media_metadata(path: Path) -> dict[str, Any]:
         "height": int(video["height"]),
         "frame_rate": video["r_frame_rate"],
         "video_frames": int(video["nb_frames"]),
-        "audio_codec": audio["codec_name"],
+        "has_audio": audio is not None,
+        "audio_codec": audio["codec_name"] if audio is not None else None,
     }
 
 
@@ -466,36 +499,41 @@ def _segment_is_valid(
     return decode.returncode == 0
 
 
-def _extract_tracking_source(
-    source_path: Path, start_ms: int, end_ms: int, output_path: Path
-) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    _run_ffmpeg(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            f"{start_ms / 1000:.3f}",
-            "-i",
-            str(source_path),
-            "-t",
-            f"{(end_ms - start_ms) / 1000:.3f}",
-            "-vf",
-            "scale=1920:-2",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            str(output_path),
-        ]
+def _stable_fingerprint(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _track_geometry_fingerprint(track: SegmentationTrack) -> str:
+    """Fingerprint every consumed tracking sample and its model/source provenance."""
+    return _stable_fingerprint(track.model_dump(mode="json"))
+
+
+def _segment_variant_fingerprint(
+    *,
+    source_sha256: str,
+    start_ms: int,
+    end_ms: int,
+    filter_graph: str,
+    geometry: dict[str, Any],
+    track_fingerprint: str | None,
+) -> str:
+    return _stable_fingerprint(
+        {
+            "contract_version": "feature-segment-render-v2",
+            "source_sha256": source_sha256,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "filter_graph": filter_graph,
+            "geometry": geometry,
+            "track_fingerprint": track_fingerprint,
+        }
     )
 
 
@@ -510,7 +548,7 @@ def _usable_track_centers(track: SegmentationTrack) -> tuple[list[float], list[f
             and sample.center_2d is not None
             and sample.derived_tracking_box is not None
         ):
-            times.append(sample.analysis_sample_time_ms / 1000)
+            times.append((sample.analysis_sample_time_ms - track.analysis_start_ms) / 1000)
             centers.append(float(sample.center_2d[0]))
             boxes.append([int(value) for value in sample.derived_tracking_box])
     return times, centers, boxes
@@ -664,17 +702,70 @@ def _build_track(
     output_dir: Path,
     run_id: str,
     analysis_fps: float,
+    scdet_threshold: float,
 ) -> tuple[GroundingProposal, SegmentationTrack]:
-    grounding_dir = output_dir / "grounding"
-    track_dir = output_dir / "sam21"
+    track_root = output_dir / "sam21"
+    exact_frame_path = output_dir / "evidence-frame.png"
+    exact_frame = extract_frame(Path(clip.path), frame.requested_time_ms, exact_frame_path)
+    media = probe_video(Path(clip.path))
+    grounding_key = {
+        "contract_version": "exact-frame-grounding-v2",
+        "model_id": MODEL_ID,
+        "source_asset_id": media.asset_id,
+        "temperature": client.temperature,
+        "feature_id": feature_id,
+        "frame_hash": exact_frame.frame_hash,
+        "frame_pts": exact_frame.frame_pts,
+        "frame_time_ms": exact_frame.frame_time_ms,
+        "source_width": exact_frame.width,
+        "source_height": exact_frame.height,
+        "entity_id": "reframe_subject",
+        "event_description": event_description,
+        "target_description": target_description,
+        "prompt_sha256": hashlib.sha256(grounding_prompt.encode("utf-8")).hexdigest(),
+        "system_instruction_sha256": hashlib.sha256(
+            VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
+        ).hexdigest(),
+        "response_schema_sha256": hashlib.sha256(
+            json.dumps(
+                gemini_response_schema(GeminiNativeGroundingProposal),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "thinking_level": "low",
+    }
+    grounding_fingerprint = hashlib.sha256(
+        json.dumps(
+            grounding_key,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    grounding_dir = output_dir / "grounding" / f"bbox-{grounding_fingerprint[:16]}"
+    write_json(
+        grounding_dir / "request-key.json",
+        {**grounding_key, "request_fingerprint": grounding_fingerprint},
+    )
     grounding_path = grounding_dir / "grounding.json"
-    exact_frame_path = grounding_dir / "frame.png"
     if grounding_path.exists():
         proposal = GroundingProposal.model_validate(read_json(grounding_path))
+        require_grounding_request_match(
+            proposal,
+            asset_id=media.asset_id,
+            event_id=feature_id,
+            entity_id="reframe_subject",
+            frame_pts=exact_frame.frame_pts,
+            frame_time_ms=exact_frame.frame_time_ms,
+            frame_hash=exact_frame.frame_hash,
+            source_width=exact_frame.width,
+            source_height=exact_frame.height,
+            model_id=MODEL_ID,
+        )
         frame_time_ms = proposal.frame_time_ms
     else:
-        exact_frame = extract_frame(Path(clip.path), frame.requested_time_ms, exact_frame_path)
-        media = probe_video(Path(clip.path))
         proposal = client.ground_frame(
             media=media,
             frame=exact_frame,
@@ -686,33 +777,82 @@ def _build_track(
             run_id=run_id,
             output_dir=grounding_dir,
         )
-        draw_grounding_overlay(exact_frame_path, proposal, grounding_dir / "debug.png")
         frame_time_ms = exact_frame.frame_time_ms
+    debug_path = grounding_dir / "debug.png"
+    if not debug_path.exists():
+        draw_grounding_overlay(exact_frame_path, proposal, debug_path)
+    if debug_path.exists():
+        shutil.copy2(debug_path, output_dir / "grounding-debug.png")
     if not proposal.visible or not proposal.candidates:
         raise ValueError(f"Gemini could not ground reframe subject for {feature_id}")
+    selected_seed = require_tracking_seed_candidate(proposal)
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+    seed_manifest = {
+        "contract_version": "bbox-seed-v1",
+        "asset_id": proposal.asset_id,
+        "event_id": proposal.event_id,
+        "entity_id": proposal.entity_id,
+        "target_description": target_description,
+        "frame_hash": proposal.frame_hash,
+        "frame_pts": proposal.frame_pts,
+        "candidate_number": selected_seed.candidate_number,
+        "candidate_index": selected_seed.candidate_index,
+        "candidate_selection_source": selected_seed.selection_source,
+        "box_2d": list(selected_seed.candidate.box_2d),
+        "seed_type": "gemini_bbox",
+        "source_start_ms": start_ms,
+        "source_end_ms": end_ms,
+        "normalized_seed_shot_start_ms": start_ms,
+        "normalized_seed_shot_end_ms": end_ms,
+        "analysis_fps": analysis_fps,
+        "analysis_max_side": _TRACKING_MAX_SIDE,
+        "ffmpeg_scdet_threshold": scdet_threshold,
+        "seed_box_padding_ratio": _TRACKING_SEED_BOX_PADDING_RATIO,
+        "device_request": _TRACKING_DEVICE,
+        "sam_config": SAM21_CONFIG,
+        "sam_implementation_revision": SAM21_IMPLEMENTATION_REVISION,
+        "checkpoint_sha256": checkpoint_sha256,
+    }
+    seed_fingerprint = hashlib.sha256(
+        json.dumps(seed_manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    track_dir = track_root / f"bbox-{seed_fingerprint[:16]}"
+    seed_manifest_path = track_dir / "seed-selection.json"
+    write_json(seed_manifest_path, {**seed_manifest, "seed_fingerprint": seed_fingerprint})
     track_path = track_dir / "segmentation-track.json"
     if track_path.exists():
         track = SegmentationTrack.model_validate(read_json(track_path))
     else:
-        tracking_source = output_dir / "tracking-source.mp4"
-        if not tracking_source.exists():
-            _extract_tracking_source(Path(clip.path), start_ms, end_ms, tracking_source)
-        candidate = max(proposal.candidates, key=lambda item: item.confidence)
         track = track_bbox_sam21(
-            video_path=tracking_source,
+            video_path=Path(clip.path),
             checkpoint_path=checkpoint_path,
-            seed_time_ms=max(0, frame_time_ms - start_ms),
-            seed_box_2d=candidate.box_2d,
+            seed_time_ms=frame_time_ms,
+            seed_box_2d=selected_seed.candidate.box_2d,
             target_description=target_description,
             output_dir=track_dir,
-            seed_source=str(grounding_path),
+            seed_source=str(seed_manifest_path),
             asset_id=proposal.asset_id,
             analysis_fps=analysis_fps,
-            max_side=960,
-            device="cpu",
-            ffmpeg_scdet_threshold=4.0,
-            seed_box_padding_ratio=0.04,
+            max_side=_TRACKING_MAX_SIDE,
+            device=_TRACKING_DEVICE,
+            ffmpeg_scdet_threshold=scdet_threshold,
+            seed_box_padding_ratio=_TRACKING_SEED_BOX_PADDING_RATIO,
+            allowed_start_ms=start_ms,
+            allowed_end_ms=end_ms,
         )
+    require_bbox_track_request_match(
+        track,
+        video_path=Path(clip.path),
+        asset_id=proposal.asset_id,
+        target_description=target_description,
+        seed_time_ms=frame_time_ms,
+        seed_box_2d=selected_seed.candidate.box_2d,
+        seed_box_padding_ratio=_TRACKING_SEED_BOX_PADDING_RATIO,
+        analysis_fps=analysis_fps,
+        analysis_start_ms=start_ms,
+        analysis_end_ms=end_ms,
+        checkpoint_sha256=checkpoint_sha256,
+    )
     return proposal, track
 
 
@@ -757,9 +897,9 @@ def _render_review_html(
             "</tr>"
         )
     (output_dir / "index.html").write_text(
-        """<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><title>OPPO Reno16 feature cut review</title>
+        """<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><title>Feature cut review</title>
 <style>body{font:15px system-ui;background:#101214;color:#eee;max-width:1500px;margin:24px auto;padding:0 20px}section{background:#1b1f24;padding:20px;margin:20px 0;border-radius:12px}video{width:min(100%,960px);max-height:76vh;background:#000}table{border-collapse:collapse;width:100%}th,td{border:1px solid #3b424a;padding:8px;text-align:left;vertical-align:top}a{color:#71e59c}</style>
-<h1>OPPO Reno16 feature cut review</h1><p>"""
+<h1>Feature cut review</h1><p>"""
         + html.escape(overlay_note)
         + " 畫面證據、frame ID、Gemini bbox、SAM tracking 與 fallback 分開保存。</p>"
         + f"<section><h2>16:9</h2><video controls src=\"{html.escape(str(Path(manifest['horizontal']['output_path']).relative_to(output_dir.resolve())))}\"></video></section>"
@@ -854,6 +994,7 @@ def run_feature_cut_experiment(
             "vertical": {"chapters": []},
         }
         track_cache: dict[tuple[str, str, int, int], tuple[GroundingProposal, SegmentationTrack, Path]] = {}
+        source_audio_cache: dict[str, bool] = {}
         stage = monotonic()
         for index, selected in enumerate(plan.chapters):
             brief_chapter = brief_by_id[selected.feature_id]
@@ -887,12 +1028,14 @@ def run_feature_cut_experiment(
                     "source_frame_id": None,
                     "applied_zoom": 1.0,
                     "fallback_reason": "catalog_evidence_not_found",
+                    "audio_origin": "synthetic_silence",
                 }
                 vertical_entry = {
                     "feature_id": selected.feature_id,
                     "source_frame_id": None,
                     "applied_strategy": "graphic_missing_evidence_card",
                     "fallback_reason": "catalog_evidence_not_found",
+                    "audio_origin": "synthetic_silence",
                 }
             else:
                 horizontal_frame = frames[selected.horizontal_frame_id or ""]
@@ -907,6 +1050,13 @@ def run_feature_cut_experiment(
                 )
                 vertical_frame = frames[selected.vertical_frame_id or ""]
                 vertical_clip = clips[vertical_frame.clip_id]
+                for source_clip in (horizontal_clip, vertical_clip):
+                    if source_clip.sha256 not in source_audio_cache:
+                        source_audio_cache[source_clip.sha256] = has_audio_stream(
+                            Path(source_clip.path)
+                        )
+                horizontal_source_has_audio = source_audio_cache[horizontal_clip.sha256]
+                vertical_source_has_audio = source_audio_cache[vertical_clip.sha256]
                 v_start, v_end, v_shot = _chapter_bounds(
                     vertical_frame,
                     vertical_clip,
@@ -930,6 +1080,7 @@ def run_feature_cut_experiment(
                     "fallback_reason": None,
                 }
                 horizontal_debug: Path | None = None
+                horizontal_track_fingerprint: str | None = None
                 if selected.horizontal_strategy == "tracked_reframe":
                     target = selected.horizontal_target_description or ""
                     cache_key = (horizontal_frame.frame_id, target, h_start, h_end)
@@ -952,13 +1103,15 @@ def run_feature_cut_experiment(
                                 output_dir=track_root,
                                 run_id=f"feature-h-{uuid.uuid4().hex[:8]}",
                                 analysis_fps=sam_analysis_fps,
+                                scdet_threshold=scdet_threshold,
                             )
                             track_cache[cache_key] = (proposal, track, track_root)
                         _, track, track_root = track_cache[cache_key]
+                        horizontal_track_fingerprint = _track_geometry_fingerprint(track)
                         horizontal_filter, horizontal_geometry = _horizontal_filter_from_track(
                             track, selected.horizontal_zoom_intent
                         )
-                        horizontal_debug = track_root / "grounding" / "debug.png"
+                        horizontal_debug = track_root / "grounding-debug.png"
                     except Exception as error:
                         horizontal_geometry = {
                             "requested_zoom": (
@@ -970,6 +1123,21 @@ def run_feature_cut_experiment(
                                 f"tracking_or_grounding_failed:{type(error).__name__}:{error}"
                             ),
                         }
+                horizontal_segment_fingerprint = _segment_variant_fingerprint(
+                    source_sha256=horizontal_clip.sha256,
+                    start_ms=h_start,
+                    end_ms=h_end,
+                    filter_graph=horizontal_filter,
+                    geometry=horizontal_geometry,
+                    track_fingerprint=horizontal_track_fingerprint,
+                )
+                horizontal_segment = (
+                    output_dir
+                    / "segments"
+                    / render_variant
+                    / "16x9"
+                    / f"{index:02d}-{horizontal_segment_fingerprint[:12]}.mp4"
+                )
                 if not _segment_is_valid(
                     horizontal_segment,
                     expected_duration=(h_end - h_start) / 1000,
@@ -982,6 +1150,7 @@ def run_feature_cut_experiment(
                         overlay_path=(horizontal_overlay if brief.render_title_overlays else None),
                         base_filter=horizontal_filter,
                         output_path=horizontal_segment,
+                        source_has_audio=horizontal_source_has_audio,
                     )
                 vertical_filter = _vertical_fit_filter()
                 vertical_geometry: dict[str, Any] = {
@@ -989,6 +1158,7 @@ def run_feature_cut_experiment(
                     "fallback_reason": None,
                 }
                 vertical_debug: Path | None = None
+                vertical_track_fingerprint: str | None = None
                 vertical_primary_override = brief_chapter.vertical_primary_target_description
                 if selected.vertical_strategy == "tracked_crop" or vertical_primary_override:
                     target = vertical_primary_override or selected.vertical_target_description or ""
@@ -1015,21 +1185,38 @@ def run_feature_cut_experiment(
                                 output_dir=track_root,
                                 run_id=f"feature-v-{uuid.uuid4().hex[:8]}",
                                 analysis_fps=sam_analysis_fps,
+                                scdet_threshold=scdet_threshold,
                             )
                             track_cache[cache_key] = (proposal, track, track_root)
                         _, track, track_root = track_cache[cache_key]
+                        vertical_track_fingerprint = _track_geometry_fingerprint(track)
                         vertical_filter, vertical_geometry = _vertical_filter_from_track(
                             track,
                             allow_subject_clipping=(
                                 brief_chapter.vertical_crop_mode == "primary_center"
                             ),
                         )
-                        vertical_debug = track_root / "grounding" / "debug.png"
+                        vertical_debug = track_root / "grounding-debug.png"
                     except Exception as error:
                         vertical_geometry = {
                             "applied_strategy": "fit_with_background",
                             "fallback_reason": f"tracking_or_grounding_failed:{type(error).__name__}:{error}",
                         }
+                vertical_segment_fingerprint = _segment_variant_fingerprint(
+                    source_sha256=vertical_clip.sha256,
+                    start_ms=v_start,
+                    end_ms=v_end,
+                    filter_graph=vertical_filter,
+                    geometry=vertical_geometry,
+                    track_fingerprint=vertical_track_fingerprint,
+                )
+                vertical_segment = (
+                    output_dir
+                    / "segments"
+                    / render_variant
+                    / "9x16"
+                    / f"{index:02d}-{vertical_segment_fingerprint[:12]}.mp4"
+                )
                 if not _segment_is_valid(
                     vertical_segment,
                     expected_duration=(v_end - v_start) / 1000,
@@ -1042,6 +1229,7 @@ def run_feature_cut_experiment(
                         overlay_path=(vertical_overlay if brief.render_title_overlays else None),
                         base_filter=vertical_filter,
                         output_path=vertical_segment,
+                        source_has_audio=vertical_source_has_audio,
                     )
                 horizontal_entry = {
                     "feature_id": selected.feature_id,
@@ -1050,6 +1238,12 @@ def run_feature_cut_experiment(
                     "source_in_ms": h_start,
                     "source_out_ms": h_end,
                     "source_shot_id": h_shot,
+                    "segment_render_fingerprint": horizontal_segment_fingerprint,
+                    "track_geometry_fingerprint": horizontal_track_fingerprint,
+                    "segment_path": str(horizontal_segment.resolve()),
+                    "audio_origin": (
+                        "source" if horizontal_source_has_audio else "synthetic_silence"
+                    ),
                     "grounding_debug": str(horizontal_debug.resolve()) if horizontal_debug else None,
                     **horizontal_geometry,
                 }
@@ -1060,6 +1254,12 @@ def run_feature_cut_experiment(
                     "source_in_ms": v_start,
                     "source_out_ms": v_end,
                     "source_shot_id": v_shot,
+                    "segment_render_fingerprint": vertical_segment_fingerprint,
+                    "track_geometry_fingerprint": vertical_track_fingerprint,
+                    "segment_path": str(vertical_segment.resolve()),
+                    "audio_origin": (
+                        "source" if vertical_source_has_audio else "synthetic_silence"
+                    ),
                     "target_description": (
                         vertical_primary_override or selected.vertical_target_description
                     ),
@@ -1076,10 +1276,10 @@ def run_feature_cut_experiment(
         client.close()
     output_suffix = "" if brief.render_title_overlays else "-clean"
     horizontal_output = (
-        output_dir / "renders" / f"oppo-reno16-feature-16x9{output_suffix}.mp4"
+        output_dir / "renders" / f"feature-cut-16x9{output_suffix}.mp4"
     )
     vertical_output = (
-        output_dir / "renders" / f"oppo-reno16-feature-9x16{output_suffix}.mp4"
+        output_dir / "renders" / f"feature-cut-9x16{output_suffix}.mp4"
     )
     horizontal_output.parent.mkdir(parents=True, exist_ok=True)
     stage = monotonic()

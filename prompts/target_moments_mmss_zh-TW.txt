@@ -4,7 +4,7 @@
 
 - 每個 moment 的 `grounding_target_id` 與 `grounding_target_description` 必須逐字使用本次指定值。
 - 不得自行改選更大、更顯眼或更容易框的其他物件。
-- 若指定手機，不可改成展示背板、其他手機、桌面或整個展示區。
+- 不得改成相似實例、背景圖像、反射、容器、持有人或更大／更小的物件層級。
 - 只選 target 確實可見、邊界清楚、遮擋與動態模糊較低的畫面。
 - 若 target 在整支影片都無法可靠確認，回傳空 moments，並在 uncertainties 說明；不得猜測。
 

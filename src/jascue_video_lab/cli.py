@@ -23,6 +23,7 @@ from .full_v1 import (
     run_selected_full_clips,
 )
 from .gemini import GeminiLabClient
+from .grounding_selection import require_tracking_seed_candidate
 from .media import extract_frame, probe_video, sha256_file
 from .models import (
     ContentMap,
@@ -383,12 +384,25 @@ def command_ground_repeat(args: argparse.Namespace) -> int:
 def command_track_csrt(args: argparse.Namespace) -> int:
     if args.grounding_json:
         grounding = GroundingProposal.model_validate(read_json(args.grounding_json))
-        if not grounding.visible or not grounding.candidates:
-            raise ValueError("grounding seed must be visible and contain at least one candidate")
+        tracking_media = probe_video(args.video)
+        if grounding.asset_id != tracking_media.asset_id:
+            raise ValueError(
+                "GroundingProposal asset_id does not match the supplied tracking video"
+            )
+        selected_seed = require_tracking_seed_candidate(
+            grounding,
+            candidate_number=args.grounding_candidate_number,
+        )
         seed_time_ms = grounding.frame_time_ms
-        seed_box = grounding.candidates[0].box_2d
-        seed_source = f"Gemini GroundingProposal:{args.grounding_json}"
+        seed_box = selected_seed.candidate.box_2d
+        seed_source = (
+            f"GroundingProposal:{args.grounding_json}:"
+            f"candidate-number:{selected_seed.candidate_number}:"
+            f"selection:{selected_seed.selection_source}"
+        )
     else:
+        if args.grounding_candidate_number is not None:
+            raise ValueError("--grounding-candidate-number requires --grounding-json")
         if args.seed_time_ms is None or args.seed_box is None:
             raise ValueError("provide --grounding-json or both --seed-time-ms and --seed-box")
         seed_time_ms = args.seed_time_ms
@@ -418,13 +432,26 @@ def command_track_csrt(args: argparse.Namespace) -> int:
 def command_track_sam21(args: argparse.Namespace) -> int:
     if args.grounding_json:
         grounding = GroundingProposal.model_validate(read_json(args.grounding_json))
-        if not grounding.visible or not grounding.candidates:
-            raise ValueError("grounding seed must be visible and contain at least one candidate")
+        tracking_media = probe_video(args.video)
+        if grounding.asset_id != tracking_media.asset_id:
+            raise ValueError(
+                "GroundingProposal asset_id does not match the supplied tracking video"
+            )
+        selected_seed = require_tracking_seed_candidate(
+            grounding,
+            candidate_number=args.grounding_candidate_number,
+        )
         seed_time_ms = grounding.frame_time_ms
-        seed_box = grounding.candidates[0].box_2d
-        seed_source = f"Gemini GroundingProposal:{args.grounding_json}"
+        seed_box = selected_seed.candidate.box_2d
+        seed_source = (
+            f"GroundingProposal:{args.grounding_json}:"
+            f"candidate-number:{selected_seed.candidate_number}:"
+            f"selection:{selected_seed.selection_source}"
+        )
         asset_id = grounding.asset_id
     else:
+        if args.grounding_candidate_number is not None:
+            raise ValueError("--grounding-candidate-number requires --grounding-json")
         if args.seed_time_ms is None or args.seed_box is None:
             raise ValueError("provide --grounding-json or both --seed-time-ms and --seed-box")
         seed_time_ms = args.seed_time_ms
@@ -600,6 +627,10 @@ def command_full_ground_event(args: argparse.Namespace) -> int:
         checkpoint_path=args.sam_checkpoint,
         target_entity_id=args.target_entity_id,
         target_description=args.target_description,
+        accept_proposed_target=args.accept_proposed_target,
+        grounding_candidate_number=args.grounding_candidate_number,
+        query_lock_path=args.query_lock,
+        query_target_id=args.query_target_id,
         sam_analysis_fps=args.sam_analysis_fps,
         temperature=args.temperature,
     )
@@ -1389,6 +1420,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tracking_parser.add_argument("video", type=Path)
     tracking_parser.add_argument("--grounding-json", type=Path)
+    tracking_parser.add_argument(
+        "--grounding-candidate-number",
+        type=int,
+        help="1-based operator selection matching the number drawn on the debug overlay",
+    )
     tracking_parser.add_argument("--seed-time-ms", type=int)
     tracking_parser.add_argument("--seed-box", type=int, nargs=4)
     tracking_parser.add_argument("--target-description", required=True)
@@ -1405,6 +1441,11 @@ def build_parser() -> argparse.ArgumentParser:
     sam_tracking_parser.add_argument("video", type=Path)
     sam_tracking_parser.add_argument("--checkpoint", type=Path, required=True)
     sam_tracking_parser.add_argument("--grounding-json", type=Path)
+    sam_tracking_parser.add_argument(
+        "--grounding-candidate-number",
+        type=int,
+        help="1-based operator selection matching the number drawn on the debug overlay",
+    )
     sam_tracking_parser.add_argument("--seed-time-ms", type=int)
     sam_tracking_parser.add_argument("--seed-box", type=int, nargs=4)
     sam_tracking_parser.add_argument("--target-description", required=True)
@@ -1570,6 +1611,25 @@ def build_parser() -> argparse.ArgumentParser:
     full_ground_parser.add_argument("event_id")
     full_ground_parser.add_argument("--target-entity-id")
     full_ground_parser.add_argument("--target-description")
+    full_ground_parser.add_argument(
+        "--query-lock",
+        type=Path,
+        help="Immutable, domain-neutral evidence query contract used instead of target flags",
+    )
+    full_ground_parser.add_argument(
+        "--query-target-id",
+        help="Select one target when the query lock contains multiple target references",
+    )
+    full_ground_parser.add_argument(
+        "--accept-proposed-target",
+        action="store_true",
+        help="Explicitly accept the Clip Card target only when exactly one proposal exists",
+    )
+    full_ground_parser.add_argument(
+        "--grounding-candidate-number",
+        type=int,
+        help="1-based human/operator selection matching the number drawn on the debug overlay",
+    )
     full_ground_parser.add_argument("--sam-checkpoint", type=Path)
     full_ground_parser.add_argument("--sam-analysis-fps", type=float, default=2.0)
     full_ground_parser.add_argument("--temperature", type=float, default=0.2)

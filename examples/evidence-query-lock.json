@@ -1,0 +1,56 @@
+{
+  "query_id": "query:review-001",
+  "revision": 1,
+  "editorial_goal": "Show directly observable evidence for the reviewer-selected subject.",
+  "targets": [
+    {
+      "target_id": "subject.primary",
+      "target_description": "the foreground subject selected by the reviewer",
+      "positive_attributes": [
+        "matches the marked reference instance",
+        "is directly visible in the source frame"
+      ],
+      "negative_attributes": [
+        "background depiction",
+        "reflection",
+        "another visually similar instance"
+      ],
+      "reference_frame_ids": [],
+      "reference_crop_hashes": []
+    }
+  ],
+  "observable_predicate": "the selected subject reaches the requested directly visible state",
+  "predicate_phases": {
+    "precondition": "the requested state has not yet occurred",
+    "apex": "the requested state is directly visible",
+    "postcondition": "the visible result of the state change can be confirmed"
+  },
+  "required_evidence": [
+    "the selected subject is visible",
+    "the requested state is directly observable"
+  ],
+  "negative_constraints": [
+    "do not substitute a similar instance",
+    "do not infer content outside the supplied frame"
+  ],
+  "editing_uses": [
+    "review",
+    "portrait_reframe"
+  ],
+  "aspect_constraints": [
+    {
+      "aspect_ratio": "9:16",
+      "required_target_ids": [
+        "subject.primary"
+      ],
+      "constraint": "keep the selected subject inside the visible frame"
+    }
+  ],
+  "claim_source": "human_review",
+  "provenance": {
+    "created_at": "2026-07-21T00:00:00Z",
+    "created_by": "reviewer",
+    "source_reference": null,
+    "parent_query_id": null
+  }
+}

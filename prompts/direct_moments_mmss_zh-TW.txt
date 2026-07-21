@@ -15,7 +15,7 @@
 每個 moment 指定一個該畫面中清楚可見、適合 bbox 的主要物件：
 
 - `grounding_target_id` 使用簡短穩定 ID。
-- `grounding_target_description` 必須說明物件層級與可區分特徵；例如只框手機螢幕時不得描述為整支手機。
+- `grounding_target_description` 必須說明物件層級、可區分特徵與排除條件；指定局部時不得描述成整體，指定實體時不得改成其影像或反射。
 - 若有多個相似物件，描述其左右位置、顏色、內容或與手的關係。
 
 只回傳符合所提供 Structured Output schema 的資料。

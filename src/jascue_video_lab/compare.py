@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .geometry import box_iou, center_distance
-from .models import ContentMap, Event, GroundingProposal
+from .models import ContentMap, Event, GroundingCandidate, GroundingProposal, MatchStatus
 from .storage import read_json, write_json
 
 
@@ -52,9 +52,18 @@ def _schema_results(run_dir: Path) -> list[dict[str, Any]]:
 def _grounding_label(content: ContentMap, proposal: GroundingProposal) -> str:
     entity = next((item for item in content.entities if item.entity_id == proposal.entity_id), None)
     parts = [entity.label if entity else proposal.entity_id]
-    if proposal.candidates:
-        parts.append(proposal.candidates[0].label)
+    candidate = _single_matched_candidate(proposal)
+    if candidate is not None:
+        parts.append(candidate.label)
     return " / ".join(parts)
+
+
+def _single_matched_candidate(
+    proposal: GroundingProposal,
+) -> GroundingCandidate | None:
+    if proposal.match_status != MatchStatus.MATCHED or len(proposal.candidates) != 1:
+        return None
+    return proposal.candidates[0]
 
 
 def _grounding_kind(content: ContentMap, proposal: GroundingProposal) -> str:
@@ -153,7 +162,9 @@ def compare_runs(run_dirs: list[Path], output_path: Path, human_annotations: Pat
                 left_map,
                 right_map,
             ):
-                if not left_proposal.candidates or not right_proposal.candidates:
+                left_candidate = _single_matched_candidate(left_proposal)
+                right_candidate = _single_matched_candidate(right_proposal)
+                if left_candidate is None or right_candidate is None:
                     bbox_metrics.append(
                         {
                             "left_entity_id": left_proposal.entity_id,
@@ -166,12 +177,15 @@ def compare_runs(run_dirs: list[Path], output_path: Path, human_annotations: Pat
                             "left_event_id": left_event.event_id,
                             "right_event_id": right_event.event_id,
                             "comparable": False,
-                            "reason": "one or both proposals have no candidates",
+                            "reason": (
+                                "one or both proposals are not a unique semantic match; "
+                                "ambiguous candidates require human selection"
+                            ),
                         }
                     )
                     continue
-                left_box = left_proposal.candidates[0].box_2d
-                right_box = right_proposal.candidates[0].box_2d
+                left_box = left_candidate.box_2d
+                right_box = right_candidate.box_2d
                 bbox_metrics.append(
                     {
                         "left_entity_id": left_proposal.entity_id,
@@ -262,7 +276,11 @@ def compare_human(runs: list[dict[str, Any]], annotation_path: Path) -> list[dic
         box_matches = []
         for reference in annotations.get("boxes", []):
             proposals: list[GroundingProposal] = run.get("groundings", [])
-            visible = [proposal for proposal in proposals if proposal.candidates]
+            visible = [
+                proposal
+                for proposal in proposals
+                if _single_matched_candidate(proposal) is not None
+            ]
             if not visible:
                 box_matches.append(
                     {
@@ -274,7 +292,9 @@ def compare_human(runs: list[dict[str, Any]], annotation_path: Path) -> list[dic
                 continue
             def proposal_similarity(proposal: GroundingProposal) -> float:
                 entity_label = entities.get(proposal.entity_id).label if proposal.entity_id in entities else proposal.entity_id
-                candidate_label = proposal.candidates[0].label
+                candidate = _single_matched_candidate(proposal)
+                assert candidate is not None
+                candidate_label = candidate.label
                 return max(
                     label_similarity(reference["entity_label"], entity_label),
                     label_similarity(reference["entity_label"], candidate_label),
@@ -287,7 +307,9 @@ def compare_human(runs: list[dict[str, Any]], annotation_path: Path) -> list[dic
                     -abs(reference["frame_time_ms"] - proposal.frame_time_ms),
                 ),
             )
-            predicted_box = predicted.candidates[0].box_2d
+            predicted_candidate = _single_matched_candidate(predicted)
+            assert predicted_candidate is not None
+            predicted_box = predicted_candidate.box_2d
             reference_box = reference["box_2d"]
             similarity = proposal_similarity(predicted)
             frame_delta = abs(reference["frame_time_ms"] - predicted.frame_time_ms)
