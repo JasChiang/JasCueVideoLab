@@ -273,14 +273,14 @@ class BlindReviewService:
         return uploaded, reused, upload_media
 
     def suggest_targets(
-        self, session_id: str, *, runs: int = 1, temperature: float = 0.2
+        self, session_id: str, *, runs: int = 1
     ) -> dict[str, Any]:
         if not 1 <= runs <= 5:
             raise ValueError("runs must be between 1 and 5")
         session = self._session(session_id)
         media = self._media(session)
         batch_dir = self._session_dir(session_id) / "candidates" / f"batch-{uuid.uuid4().hex[:8]}"
-        client = self.client_factory(temperature=temperature)
+        client = self.client_factory()
         started = monotonic()
         maps: list[TargetCandidateMap] = []
         try:
@@ -366,7 +366,7 @@ class BlindReviewService:
         return selection
 
     def analyze_moments(
-        self, session_id: str, *, runs: int = 1, temperature: float = 0.2
+        self, session_id: str, *, runs: int = 1
     ) -> dict[str, Any]:
         if not 1 <= runs <= 5:
             raise ValueError("runs must be between 1 and 5")
@@ -378,7 +378,7 @@ class BlindReviewService:
         )
         media = self._media(session)
         batch_dir = self._session_dir(session_id) / "moments" / f"batch-{uuid.uuid4().hex[:8]}"
-        client = self.client_factory(temperature=temperature)
+        client = self.client_factory()
         started = monotonic()
         maps: list[DirectMomentMap] = []
         try:
@@ -418,7 +418,6 @@ class BlindReviewService:
         session_id: str,
         *,
         moment_id: str,
-        temperature: float = 0.2,
         mode: Literal["exact_frame", "direct_video"] = "exact_frame",
     ) -> dict[str, Any]:
         session = self._session(session_id)
@@ -439,7 +438,7 @@ class BlindReviewService:
         frame = extract_frame(Path(session["source_path"]), requested_ms, review_dir / "frame.png")
         write_json(review_dir / "frame.json", frame)
         media = self._media(session)
-        client = self.client_factory(temperature=temperature)
+        client = self.client_factory()
         started = monotonic()
         try:
             if mode == "exact_frame":

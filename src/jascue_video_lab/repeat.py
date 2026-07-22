@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Sequence
 
-from .gemini import GeminiLabClient
+from .gemini import GeminiLabClient, MODEL_ID
 from .geometry import box_iou, center_distance
 from .models import ExtractedFrame, GroundingProposal, MatchStatus, MediaInfo
 from .overlay import draw_grounding_overlay
@@ -23,7 +23,6 @@ def run_repeated_grounding(
     target_description: str,
     output_dir: Path,
     runs: int,
-    temperature: float,
     reference_box: Sequence[int] | None = None,
 ) -> dict[str, object]:
     if runs < 1:
@@ -34,7 +33,7 @@ def run_repeated_grounding(
     proposals: list[tuple[str, GroundingProposal]] = []
     rows: list[dict[str, object]] = []
     failures = 0
-    client = GeminiLabClient(temperature=temperature)
+    client = GeminiLabClient()
     try:
         for number in range(1, runs + 1):
             label = f"repeat-{number:02d}"
@@ -123,7 +122,7 @@ def run_repeated_grounding(
         )
 
     summary: dict[str, object] = {
-        "model": "gemini-3.5-flash",
+        "model": MODEL_ID,
         "frame_hash": frame.frame_hash,
         "frame_pts": frame.frame_pts,
         "frame_time_ms": frame.frame_time_ms,

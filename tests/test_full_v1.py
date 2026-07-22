@@ -26,7 +26,7 @@ from jascue_video_lab.full_v1 import (
     run_selected_full_clips,
     selected_clip_ids_from_feature_plan,
 )
-from jascue_video_lab.gemini import VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
+from jascue_video_lab.gemini import MODEL_ID, VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
 from jascue_video_lab.media import create_analysis_proxy, has_audio_stream, probe_video
 from jascue_video_lab.models import (
     DenseEventSelection,
@@ -47,9 +47,9 @@ from jascue_video_lab.models import (
 from jascue_video_lab.shots import ShotManifest, ShotSegment
 
 
-def _provenance() -> ModelProvenance:
+def _provenance(model_id: str = "gemini-3.5-flash") -> ModelProvenance:
     return ModelProvenance(
-        model_id="gemini-3.5-flash",
+        model_id=model_id,
         api="gemini_interactions",
         sdk="google-genai",
         sdk_version="test",
@@ -665,7 +665,7 @@ def test_dense_catalog_rejects_times_outside_window(time_field: str) -> None:
 def test_saved_raw_clip_card_can_be_revalidated_without_another_api_call(
     tmp_path: Path,
 ) -> None:
-    card = _card()
+    card = _card(model_provenance=_provenance(MODEL_ID))
     prompt = "clip card prompt"
     run_dir = tmp_path / "gemini"
     run_dir.mkdir()
@@ -674,13 +674,13 @@ def test_saved_raw_clip_card_can_be_revalidated_without_another_api_call(
         encoding="utf-8",
     )
     (run_dir / "clip_card.raw_interaction.json").write_text(
-        json.dumps({"id": "interaction-1"}),
+        json.dumps({"id": "interaction-1", "model": MODEL_ID}),
         encoding="utf-8",
     )
     (run_dir / "clip_card.request.json").write_text(
         json.dumps(
             {
-                "model": "gemini-3.5-flash",
+                "model": MODEL_ID,
                 "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
                 "input": [{"type": "text", "text": prompt + "\nmetadata"}],
             }
@@ -700,7 +700,7 @@ def test_saved_raw_clip_card_can_be_revalidated_without_another_api_call(
 
 
 def test_saved_raw_clip_card_is_not_reused_after_prompt_change(tmp_path: Path) -> None:
-    card = _card()
+    card = _card(model_provenance=_provenance(MODEL_ID))
     run_dir = tmp_path / "gemini"
     run_dir.mkdir()
     (run_dir / "clip_card.raw_output.json").write_text(
@@ -709,7 +709,7 @@ def test_saved_raw_clip_card_is_not_reused_after_prompt_change(tmp_path: Path) -
     (run_dir / "clip_card.request.json").write_text(
         json.dumps(
             {
-                "model": "gemini-3.5-flash",
+                "model": MODEL_ID,
                 "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
                 "input": [{"type": "text", "text": "old prompt\nmetadata"}],
             }
@@ -729,7 +729,7 @@ def test_saved_raw_clip_card_is_not_reused_after_prompt_change(tmp_path: Path) -
 def test_saved_raw_clip_card_is_not_reused_without_current_system_instruction(
     tmp_path: Path,
 ) -> None:
-    card = _card()
+    card = _card(model_provenance=_provenance(MODEL_ID))
     prompt = "clip card prompt"
     run_dir = tmp_path / "gemini"
     run_dir.mkdir()
@@ -739,7 +739,7 @@ def test_saved_raw_clip_card_is_not_reused_without_current_system_instruction(
     (run_dir / "clip_card.request.json").write_text(
         json.dumps(
             {
-                "model": "gemini-3.5-flash",
+                "model": MODEL_ID,
                 "input": [{"type": "text", "text": prompt + "\nmetadata"}],
             }
         ),
@@ -753,6 +753,41 @@ def test_saved_raw_clip_card_is_not_reused_without_current_system_instruction(
         prompt,
     )
     assert recovered is None
+
+
+def test_saved_raw_clip_card_from_previous_model_is_not_reused(tmp_path: Path) -> None:
+    card = _card(model_provenance=_provenance("gemini-3.5-flash"))
+    prompt = "clip card prompt"
+    run_dir = tmp_path / "gemini"
+    run_dir.mkdir()
+    (run_dir / "clip_card.raw_output.json").write_text(
+        json.dumps({"output_text": card.model_dump_json()}), encoding="utf-8"
+    )
+    (run_dir / "clip_card.raw_interaction.json").write_text(
+        json.dumps({"id": "old-interaction", "model": "gemini-3.5-flash"}),
+        encoding="utf-8",
+    )
+    (run_dir / "clip_card.request.json").write_text(
+        json.dumps(
+            {
+                "model": "gemini-3.5-flash",
+                "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+                "input": [{"type": "text", "text": prompt + "\nmetadata"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        _revalidate_saved_clip_card(
+            run_dir,
+            card.source_asset_id,
+            card.proxy_asset_id,
+            card.duration_ms,
+            prompt,
+        )
+        is None
+    )
 
 
 def test_full_clip_prompt_evidence_rule_is_domain_neutral() -> None:

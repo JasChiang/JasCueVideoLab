@@ -466,7 +466,6 @@ def main() -> int:
     parser.add_argument("prepared_library", type=Path)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--project-id", default="open-edit-no-brief")
-    parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument(
         "--reuse-raw-output",
         action="store_true",
@@ -474,7 +473,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--thinking-level",
-        choices=["minimal", "low", "medium", "high"],
+        choices=["low", "high"],
         default="high",
     )
     args = parser.parse_args()
@@ -564,7 +563,6 @@ model_provenance 必須先原樣回傳：
         "store": False,
         "input": [{"type": "text", "text": prompt}],
         "generation_config": {
-            "temperature": args.temperature,
             "thinking_level": args.thinking_level,
         },
         "response_format": {
@@ -588,6 +586,24 @@ model_provenance 必須先原樣回傳：
                 raise FileNotFoundError(
                     f"--reuse-raw-output requires original artifact: {required_path}"
                 )
+        original_request = read_json(original_request_path)
+        raw_interaction = read_json(raw_interaction_path)
+        artifact_models = {
+            "original_request": str(original_request.get("model") or ""),
+            "raw_interaction": str(raw_interaction.get("model") or ""),
+        }
+        mismatched_models = {
+            source: model
+            for source, model in artifact_models.items()
+            if model != MODEL_ID
+        }
+        if mismatched_models:
+            raise ValueError(
+                "--reuse-raw-output model mismatch: "
+                f"expected {MODEL_ID!r}, got {mismatched_models}. "
+                "Reuse the File API upload cache instead, or explicitly run with the "
+                "artifact's original JASCUE_GEMINI_MODEL."
+            )
         reprojection_request_path = (
             args.output_dir / "open-edit.reprojection-request.json"
         )
@@ -613,7 +629,6 @@ model_provenance 必須先原樣回傳：
         )
         raw_output = read_json(raw_output_path)
         output_text = str(raw_output["output_text"])
-        raw_interaction = read_json(raw_interaction_path)
         interaction_id = str(raw_interaction.get("id") or "")
     else:
         write_json(args.output_dir / "open-edit.request.json", request)

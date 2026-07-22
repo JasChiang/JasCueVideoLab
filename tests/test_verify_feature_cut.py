@@ -69,7 +69,7 @@ def test_cache_key_is_deterministic_and_covers_every_contract_input() -> None:
 
     assert compute_cache_key(
         **base,
-        generation_config={"temperature": 0, "thinking_level": "low"},
+        generation_config={"thinking_level": "high"},
     ) != first
     assert compute_cache_key(
         **base,
@@ -90,6 +90,7 @@ def test_qa_attempts_are_immutable_and_pricing_aggregates_retries(
         first / "raw_interaction.json",
         {
             "id": "first-billed-attempt",
+            "model": MODEL_ID,
             "usage": {"total_input_tokens": 100, "total_output_tokens": 10},
         },
     )
@@ -97,6 +98,7 @@ def test_qa_attempts_are_immutable_and_pricing_aggregates_retries(
         second / "raw_interaction.json",
         {
             "id": "second-billed-attempt",
+            "model": MODEL_ID,
             "usage": {"total_input_tokens": 200, "total_output_tokens": 20},
         },
     )
@@ -119,6 +121,7 @@ def test_legacy_canonical_response_is_snapshotted_only_once(tmp_path: Path) -> N
         run_dir / "raw_interaction.json",
         {
             "id": "legacy-billed-attempt",
+            "model": MODEL_ID,
             "usage": {"total_input_tokens": 50, "total_output_tokens": 5},
         },
     )
@@ -485,7 +488,10 @@ def _write_valid_cache_fixture(run_dir: Path) -> dict[str, Any]:
     }
     write_json(run_dir / "cache-key.json", expected_cache_record)
     write_json(run_dir / "request.json", request)
-    write_json(run_dir / "raw_interaction.json", {"id": "interaction-cached"})
+    write_json(
+        run_dir / "raw_interaction.json",
+        {"id": "interaction-cached", "model": MODEL_ID},
+    )
     write_json(run_dir / "raw_output.json", {"output_text": raw_result.model_dump_json()})
     write_json(run_dir / "validated.json", raw_result)
     write_json(

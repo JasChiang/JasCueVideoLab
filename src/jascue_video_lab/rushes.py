@@ -414,7 +414,6 @@ def run_rushes_experiment(
     *,
     prompt_template: str,
     sample_interval_ms: int = 2000,
-    temperature: float = 0.2,
     scdet_threshold: float = 4.0,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -434,7 +433,7 @@ def run_rushes_experiment(
     reel_path = Path(catalog.analysis_reel_path)
     reel_media = probe_video(reel_path)
     upload_dir = output_dir / "file-cache" / reel_media.sha256 / "upload"
-    client = GeminiLabClient(temperature=temperature)
+    client = GeminiLabClient()
     try:
         stage = monotonic()
         uploaded, reused = client.ensure_video_upload(reel_path, upload_dir)

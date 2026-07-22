@@ -2697,7 +2697,6 @@ def _ground_tracking_seed(
         ),
         "model_id": MODEL_ID,
         "source_asset_id": media.asset_id,
-        "temperature": client.temperature,
         "feature_id": feature_id,
         "frame_hash": exact_frame.frame_hash,
         "frame_pts": exact_frame.frame_pts,
@@ -3305,7 +3304,6 @@ def run_feature_cut_experiment(
     output_dir: Path,
     plan_prompt: str,
     grounding_prompt: str,
-    temperature: float = 0.2,
     scdet_threshold: float = 4.0,
     sam_analysis_fps: float = 2.0,
     trim_decision_paths: Sequence[Path] = (),
@@ -3374,7 +3372,7 @@ def run_feature_cut_experiment(
     reel_path = Path(catalog.analysis_reel_path)
     reel_media = probe_video(reel_path)
     upload_dir = catalog_path.parent / "file-cache" / reel_media.sha256 / "upload"
-    client = GeminiLabClient(temperature=temperature)
+    client = GeminiLabClient()
     plan_reuse_record_path: Path | None = None
     gemini_geometry_block_reason: str | None = None
     write_json(

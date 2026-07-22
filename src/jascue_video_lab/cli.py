@@ -22,7 +22,7 @@ from .full_v1 import (
     run_full_library,
     run_selected_full_clips,
 )
-from .gemini import GeminiLabClient
+from .gemini import GeminiLabClient, MODEL_ID
 from .grounding_selection import require_tracking_seed_candidate
 from .media import extract_frame, probe_video, sha256_file
 from .models import (
@@ -183,7 +183,7 @@ def command_upload(args: argparse.Namespace) -> int:
     if proxy_record is not None:
         write_json(artifact_root / "analysis_proxy.json", proxy_record)
     upload_started = monotonic()
-    client = GeminiLabClient(temperature=args.temperature)
+    client = GeminiLabClient()
     try:
         uploaded, reused = client.ensure_video_upload(
             upload_source,
@@ -226,12 +226,11 @@ def _run_target_suggestions(
     artifact_root: Path,
     output_dir: Path,
     runs: int,
-    temperature: float,
 ) -> int:
     started = monotonic()
     media = MediaInfo.model_validate(read_json(artifact_root / "media.json"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    client = GeminiLabClient(temperature=temperature)
+    client = GeminiLabClient()
     summaries: list[dict[str, object]] = []
     failures = 0
     try:
@@ -287,7 +286,7 @@ def _run_target_suggestions(
         client.close()
     pricing = summarize_usage_and_list_price(output_dir)
     result = {
-        "model": "gemini-3.5-flash",
+        "model": MODEL_ID,
         "method": "user-selectable target candidates before timing or Grounding",
         "file_api_object_reused": reused,
         "runs_requested": runs,
@@ -312,7 +311,6 @@ def command_suggest_targets(args: argparse.Namespace) -> int:
         artifact_root=args.artifact_root,
         output_dir=args.output_dir,
         runs=args.runs,
-        temperature=args.temperature,
     )
 
 
@@ -384,7 +382,6 @@ def command_ground_repeat(args: argparse.Namespace) -> int:
         target_description=args.target_description,
         output_dir=args.output_dir,
         runs=args.runs,
-        temperature=args.temperature,
         reference_box=args.reference_box,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -586,7 +583,6 @@ def command_rushes_run(args: argparse.Namespace) -> int:
         args.output_dir,
         prompt_template=_load_prompt("rushes_selects_zh-TW.txt"),
         sample_interval_ms=args.sample_interval_ms,
-        temperature=args.temperature,
         scdet_threshold=args.scdet_threshold,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -616,7 +612,6 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         output_dir=args.output_dir,
         plan_prompt=_load_prompt("feature_cut_selects_zh-TW.txt"),
         grounding_prompt=_load_prompt("grounding_native_yxyx_zh-TW.txt"),
-        temperature=args.temperature,
         scdet_threshold=args.scdet_threshold,
         sam_analysis_fps=args.sam_analysis_fps,
         trim_decision_paths=args.trim_decision,
@@ -637,7 +632,6 @@ def command_full_clip(args: argparse.Namespace) -> int:
         proxy_fps=args.proxy_fps,
         audio_mode=args.audio_mode,
         scdet_threshold=args.scdet_threshold,
-        temperature=args.temperature,
         dense_mode=args.dense_mode,
         dense_event_ids=set(args.dense_event),
         dense_window_ms=args.dense_window_ms,
@@ -656,7 +650,6 @@ def command_trim_event(args: argparse.Namespace) -> int:
         prompt_template=_load_prompt("trim_intent_frame_selection_zh-TW.txt"),
         editorial_intent=args.editorial_intent,
         sampling_fps=args.sampling_fps,
-        temperature=args.temperature,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -686,7 +679,6 @@ def command_full_library(args: argparse.Namespace) -> int:
         proxy_fps=args.proxy_fps,
         audio_mode=args.audio_mode,
         scdet_threshold=args.scdet_threshold,
-        temperature=args.temperature,
         prepare_only=args.prepare_only,
         file_cache_root=args.file_cache_root,
     )
@@ -703,7 +695,6 @@ def command_full_selected(args: argparse.Namespace) -> int:
         clip_card_prompt=_load_prompt("full_clip_card_mmss_zh-TW.txt"),
         dense_prompt=_load_prompt("dense_event_frame_selection_zh-TW.txt"),
         max_clips=args.max_clips,
-        temperature=args.temperature,
         audio_mode=args.audio_mode,
         prepare_only=args.prepare_only,
         file_cache_root=args.file_cache_root,
@@ -725,7 +716,6 @@ def command_full_ground_event(args: argparse.Namespace) -> int:
         query_lock_path=args.query_lock,
         query_target_id=args.query_target_id,
         sam_analysis_fps=args.sam_analysis_fps,
-        temperature=args.temperature,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -745,7 +735,7 @@ def command_temporal_repeat(args: argparse.Namespace) -> int:
     media = MediaInfo.model_validate(read_json(args.artifact_root / "media.json"))
     source = args.artifact_root / "source.mp4"
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    client = GeminiLabClient(temperature=args.temperature)
+    client = GeminiLabClient()
     summaries: list[dict[str, object]] = []
     failures = 0
     try:
@@ -798,7 +788,7 @@ def command_temporal_repeat(args: argparse.Namespace) -> int:
     finally:
         client.close()
     result = {
-        "model": "gemini-3.5-flash",
+        "model": MODEL_ID,
         "method": "temporal-first reduced schema; no entity/layout/card fields",
         "runs_requested": args.runs,
         "runs_succeeded": args.runs - failures,
@@ -837,7 +827,7 @@ def command_storyboard_temporal(args: argparse.Namespace) -> int:
         write_json(frame_dir / "frame.json", frame)
     write_json(args.output_dir / "frame_index.json", frames)
 
-    client = GeminiLabClient(temperature=args.temperature)
+    client = GeminiLabClient()
     try:
         indexed = client.analyze_indexed_storyboard(
             media=media,
@@ -885,7 +875,7 @@ def command_storyboard_temporal(args: argparse.Namespace) -> int:
     write_json(args.output_dir / "temporal_map.derived_from_pts.json", temporal)
     event_images: dict[str, Path] = {}
     grounding_results: list[dict[str, object]] = []
-    ground_client = GeminiLabClient(temperature=args.temperature)
+    ground_client = GeminiLabClient()
     try:
         for event, indexed_event in zip(temporal.events, indexed.events, strict=True):
             frame_index = positions[indexed_event.recommended_frame_id]
@@ -933,7 +923,7 @@ def command_storyboard_temporal(args: argparse.Namespace) -> int:
     )
     result = {
         "ok": True,
-        "model": "gemini-3.5-flash",
+        "model": MODEL_ID,
         "method": "Gemini selects immutable frame IDs; local FFmpeg PTS supplies all times",
         "interval_ms": args.interval_ms,
         "frame_count": len(frames),
@@ -1009,9 +999,8 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
             artifact_root=args.artifact_root,
             output_dir=args.output_dir,
             runs=args.runs,
-            temperature=args.temperature,
         )
-    client = GeminiLabClient(temperature=args.temperature)
+    client = GeminiLabClient()
     summaries: list[dict[str, object]] = []
     analysis_failures = 0
     grounding_failures = 0
@@ -1161,7 +1150,7 @@ def command_direct_moment_repeat(args: argparse.Namespace) -> int:
     pricing = summarize_usage_and_list_price(args.output_dir)
     write_json(args.output_dir / "pricing.json", pricing)
     result = {
-        "model": "gemini-3.5-flash",
+        "model": MODEL_ID,
         "method": "direct Gemini MM:SS salient moments",
         "runs_requested": args.runs,
         "runs_succeeded": args.runs - analysis_failures,
@@ -1193,7 +1182,7 @@ def command_run(args: argparse.Namespace) -> int:
     client: GeminiLabClient | None = None
     run_dirs: list[Path] = []
     try:
-        client = GeminiLabClient(temperature=args.temperature)
+        client = GeminiLabClient()
         uploaded, _ = client.ensure_video_upload(
             source_link,
             artifact_root / "upload",
@@ -1208,8 +1197,7 @@ def command_run(args: argparse.Namespace) -> int:
                 run_dir / "run.json",
                 {
                     "run_id": run_id,
-                    "model": "gemini-3.5-flash",
-                    "temperature": args.temperature,
+                    "model": MODEL_ID,
                     "asset_id": media.asset_id,
                     "semantic_time_is_frame_accurate": False,
                 },
@@ -1337,7 +1325,7 @@ def command_run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jascue-video-lab",
-        description="Gemini 3.5 Flash video understanding and single-frame grounding lab",
+        description=f"{MODEL_ID} video understanding and single-frame grounding lab",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1352,7 +1340,6 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser.add_argument("video", type=Path)
     upload_parser.add_argument("--analysis-proxy", type=Path)
     upload_parser.add_argument("--max-proxy-duration-delta-ms", type=int, default=100)
-    upload_parser.add_argument("--temperature", type=float, default=0.2)
     upload_parser.add_argument(
         "--force-reupload",
         action="store_true",
@@ -1395,7 +1382,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("video", type=Path)
     run_parser.add_argument("--runs", type=int, default=3)
     run_parser.add_argument("--ground-per-event", type=int, default=1)
-    run_parser.add_argument("--temperature", type=float, default=0.2)
     run_parser.add_argument(
         "--content-repair-attempts",
         type=int,
@@ -1446,7 +1432,6 @@ def build_parser() -> argparse.ArgumentParser:
     repeat_parser.add_argument("--entity-id", required=True)
     repeat_parser.add_argument("--target-description", required=True)
     repeat_parser.add_argument("--runs", type=int, default=5)
-    repeat_parser.add_argument("--temperature", type=float, default=0.2)
     repeat_parser.add_argument("--reference-box", type=int, nargs=4)
     repeat_parser.add_argument("--output-dir", type=Path, required=True)
     repeat_parser.set_defaults(handler=command_ground_repeat)
@@ -1465,7 +1450,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     temporal_parser.add_argument("artifact_root", type=Path)
     temporal_parser.add_argument("--runs", type=int, default=3)
-    temporal_parser.add_argument("--temperature", type=float, default=0.2)
     temporal_parser.add_argument("--output-dir", type=Path, required=True)
     temporal_parser.set_defaults(handler=command_temporal_repeat)
 
@@ -1476,7 +1460,6 @@ def build_parser() -> argparse.ArgumentParser:
     storyboard_parser.add_argument("artifact_root", type=Path)
     storyboard_parser.add_argument("--interval-ms", type=int, default=4000)
     storyboard_parser.add_argument("--max-width", type=int, default=768)
-    storyboard_parser.add_argument("--temperature", type=float, default=0.2)
     storyboard_parser.add_argument("--output-dir", type=Path, required=True)
     storyboard_parser.set_defaults(handler=command_storyboard_temporal)
 
@@ -1486,7 +1469,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     candidates_parser.add_argument("artifact_root", type=Path)
     candidates_parser.add_argument("--runs", type=int, default=1)
-    candidates_parser.add_argument("--temperature", type=float, default=0.2)
     candidates_parser.add_argument("--output-dir", type=Path, required=True)
     candidates_parser.set_defaults(handler=command_suggest_targets)
 
@@ -1503,7 +1485,6 @@ def build_parser() -> argparse.ArgumentParser:
     direct_parser.add_argument("--target-description")
     direct_parser.add_argument("--candidate-map", type=Path)
     direct_parser.add_argument("--candidate-id")
-    direct_parser.add_argument("--temperature", type=float, default=0.2)
     direct_parser.add_argument("--output-dir", type=Path, required=True)
     direct_parser.set_defaults(handler=command_direct_moment_repeat)
 
@@ -1655,7 +1636,6 @@ def build_parser() -> argparse.ArgumentParser:
     rushes_parser.add_argument("source_directory", type=Path)
     rushes_parser.add_argument("--sample-interval-ms", type=int, default=2000)
     rushes_parser.add_argument("--scdet-threshold", type=float, default=4.0)
-    rushes_parser.add_argument("--temperature", type=float, default=0.2)
     rushes_parser.add_argument("--output-dir", type=Path, required=True)
     rushes_parser.set_defaults(handler=command_rushes_run)
 
@@ -1677,7 +1657,6 @@ def build_parser() -> argparse.ArgumentParser:
     feature_cut_parser.add_argument("--sam-checkpoint", type=Path, required=True)
     feature_cut_parser.add_argument("--sam-analysis-fps", type=float, default=2.0)
     feature_cut_parser.add_argument("--scdet-threshold", type=float, default=4.0)
-    feature_cut_parser.add_argument("--temperature", type=float, default=0.2)
     feature_cut_parser.add_argument(
         "--trim-decision",
         type=Path,
@@ -1721,7 +1700,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="auto preserves audio when present; off strips it; required rejects silent sources",
     )
     full_clip_parser.add_argument("--scdet-threshold", type=float, default=4.0)
-    full_clip_parser.add_argument("--temperature", type=float, default=0.2)
     full_clip_parser.add_argument(
         "--dense-mode",
         choices=["none", "required", "flagged", "all"],
@@ -1760,7 +1738,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="auto preserves audio when present; off strips it; required rejects silent sources",
     )
     full_library_parser.add_argument("--scdet-threshold", type=float, default=4.0)
-    full_library_parser.add_argument("--temperature", type=float, default=0.2)
     full_library_parser.add_argument(
         "--prepare-only",
         action="store_true",
@@ -1778,7 +1755,6 @@ def build_parser() -> argparse.ArgumentParser:
     full_selected_parser.add_argument("plan_json", type=Path)
     full_selected_parser.add_argument("--prepared-library", type=Path, required=True)
     full_selected_parser.add_argument("--max-clips", type=int)
-    full_selected_parser.add_argument("--temperature", type=float, default=0.2)
     full_selected_parser.add_argument(
         "--audio-mode",
         choices=["auto", "off", "required"],
@@ -1809,7 +1785,6 @@ def build_parser() -> argparse.ArgumentParser:
     trim_event_parser.add_argument(
         "--sampling-fps", type=float, choices=[2.0, 4.0, 8.0], default=4.0
     )
-    trim_event_parser.add_argument("--temperature", type=float, default=0.1)
     trim_event_parser.add_argument("--output-dir", type=Path, required=True)
     trim_event_parser.set_defaults(handler=command_trim_event)
 
@@ -1853,7 +1828,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     full_ground_parser.add_argument("--sam-checkpoint", type=Path)
     full_ground_parser.add_argument("--sam-analysis-fps", type=float, default=2.0)
-    full_ground_parser.add_argument("--temperature", type=float, default=0.2)
     full_ground_parser.set_defaults(handler=command_full_ground_event)
     return parser
 

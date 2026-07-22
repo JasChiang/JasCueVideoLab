@@ -42,7 +42,7 @@ from .schema import gemini_response_schema
 from .storage import append_error, utc_now, write_json
 
 
-MODEL_ID = "gemini-3.5-flash"
+MODEL_ID = os.environ.get("JASCUE_GEMINI_MODEL", "gemini-3.6-flash")
 API_NAME = "gemini_interactions"
 SDK_NAME = "google-genai"
 
@@ -63,9 +63,14 @@ class GeminiContractError(RuntimeError):
     pass
 
 
-def _provenance(run_id: str, interaction_id: str | None = None) -> ModelProvenance:
+def _provenance(
+    run_id: str,
+    interaction_id: str | None = None,
+    *,
+    model_id: str = MODEL_ID,
+) -> ModelProvenance:
     return ModelProvenance(
-        model_id=MODEL_ID,
+        model_id=model_id,
         api=API_NAME,
         sdk=SDK_NAME,
         sdk_version=importlib.metadata.version("google-genai"),
@@ -92,12 +97,12 @@ def _is_file_api_not_found(error: BaseException) -> bool:
 
 
 class GeminiLabClient:
-    def __init__(self, *, api_key: str | None = None, temperature: float = 0.2) -> None:
+    def __init__(self, *, api_key: str | None = None, model_id: str = MODEL_ID) -> None:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not resolved_key:
             raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required for live Gemini calls")
         self.client = genai.Client(api_key=resolved_key)
-        self.temperature = temperature
+        self.model_id = model_id
 
     def close(self) -> None:
         self.client.close()
@@ -199,7 +204,7 @@ class GeminiLabClient:
         run_dir: Path,
     ) -> TargetCandidateMap:
         """Propose user-selectable targets without producing any boxes or tracking data."""
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         last_valid_mmss = max(0, (media.duration_ms - 1) // 1000)
         prompt = (
             prompt_template
@@ -211,14 +216,14 @@ class GeminiLabClient:
             + provenance.model_dump_json()
         )
         request_record = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -264,7 +269,7 @@ class GeminiLabClient:
         run_dir: Path,
         repair_attempts: int = 1,
     ) -> ContentMap:
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         base_prompt = (
             prompt_template
             + "\n\n## 本次不可變輸入 metadata\n"
@@ -292,14 +297,14 @@ class GeminiLabClient:
                     + (previous_output or "<前次呼叫沒有可用 output_text>")
                 )
             request_record = {
-                "model": MODEL_ID,
+                "model": self.model_id,
                 "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
                 "store": False,
                 "input": [
                     {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
                     {"type": "text", "text": prompt},
                 ],
-                "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+                "generation_config": {"thinking_level": "low"},
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",
@@ -380,7 +385,7 @@ class GeminiLabClient:
         run_id: str,
         output_dir: Path,
     ) -> GroundingProposal:
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         replacements = {
             "target_description": target_description,
             "event_description": event_description,
@@ -409,14 +414,14 @@ class GeminiLabClient:
         image_data = base64.b64encode(Path(frame.path).read_bytes()).decode("ascii")
         mime_type = mimetypes.guess_type(frame.path)[0] or "image/png"
         api_request = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "text", "text": prompt},
                 {"type": "image", "data": image_data, "mime_type": mime_type},
             ],
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -526,7 +531,7 @@ class GeminiLabClient:
     ) -> GeminiNativeSegmentationProposal:
         """Request a target-specific bbox and single polygon mask from one exact frame."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         prompt = f"""You are a single-frame object Grounding and segmentation system.
 
 Find only this requested target in the provided exact source frame:
@@ -566,7 +571,7 @@ model_provenance (return it unchanged with interaction_id=null):
         image_data = base64.b64encode(Path(frame.path).read_bytes()).decode("ascii")
         mime_type = mimetypes.guess_type(frame.path)[0] or "image/png"
         api_request = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
@@ -574,8 +579,7 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"type": "image", "data": image_data, "mime_type": mime_type},
             ],
             "generation_config": {
-                "temperature": self.temperature,
-                "thinking_level": "minimal",
+                "thinking_level": "low",
             },
             "response_format": {
                 "type": "text",
@@ -656,7 +660,7 @@ model_provenance (return it unchanged with interaction_id=null):
         output_dir: Path,
     ) -> DirectVideoGroundingProposal:
         """Experimental video-input bbox; the Gemini-sampled reference frame stays unknown."""
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         prompt = (
             prompt_template
             + "\n\n## 本次不可變輸入\n"
@@ -671,14 +675,14 @@ model_provenance (return it unchanged with interaction_id=null):
             + provenance.model_dump_json()
         )
         request_record = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -761,7 +765,7 @@ model_provenance (return it unchanged with interaction_id=null):
         run_dir: Path,
     ) -> TemporalMap:
         """Run a deliberately small timing-only pass for prompt-complexity A/B testing."""
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         prompt = (
             prompt_template
             + "\n\n## 本次不可變輸入 metadata\n"
@@ -771,14 +775,14 @@ model_provenance (return it unchanged with interaction_id=null):
             + provenance.model_dump_json()
         )
         request_record = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -823,7 +827,7 @@ model_provenance (return it unchanged with interaction_id=null):
         run_dir: Path,
     ) -> IndexedStoryboardMap:
         """Let Gemini select immutable frame IDs instead of generating timestamps."""
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         prompt = (
             prompt_template
             + "\n\n## 本次不可變輸入 metadata\n"
@@ -861,11 +865,11 @@ model_provenance (return it unchanged with interaction_id=null):
                 ]
             )
         api_request = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": api_input,
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -935,7 +939,7 @@ model_provenance (return it unchanged with interaction_id=null):
         locked_target_description: str | None = None,
     ) -> DirectMomentMap:
         """Ask directly for a few MM:SS screenshot moments, without event boundaries."""
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         last_valid_mmss = max(0, (media.duration_ms - 1) // 1000)
         prompt = (
             prompt_template
@@ -957,14 +961,14 @@ model_provenance (return it unchanged with interaction_id=null):
                 + "\n不得改選任何相似實例、背景中的描繪或反射，也不得改成其他物件。"
             )
         request_record = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -1023,7 +1027,7 @@ model_provenance (return it unchanged with interaction_id=null):
     ) -> FullClipCard:
         """Analyze one complete proxy while keeping model event time in MM:SS."""
         run_dir.mkdir(parents=True, exist_ok=True)
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         last_start_second = max(0, (source_media.duration_ms - 1) // 1000)
         last_end_second = source_media.duration_ms // 1000
         prompt = (
@@ -1041,14 +1045,14 @@ model_provenance (return it unchanged with interaction_id=null):
             + provenance.model_dump_json()
         )
         request_record = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "text", "text": prompt},
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
             ],
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -1105,7 +1109,7 @@ model_provenance (return it unchanged with interaction_id=null):
     ) -> DenseEventSelection:
         """Select immutable dense frame IDs; the model never emits source time."""
         run_dir.mkdir(parents=True, exist_ok=True)
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         prompt = (
             prompt_template
             + "\n\n## 本次不可變 metadata\n"
@@ -1150,11 +1154,11 @@ model_provenance (return it unchanged with interaction_id=null):
                 ]
             )
         api_request = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
             "input": api_input,
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -1237,7 +1241,7 @@ model_provenance (return it unchanged with interaction_id=null):
     ) -> TrimIntentProposal:
         """Select trim phases from immutable dense frame IDs; local code owns PTS."""
         run_dir.mkdir(parents=True, exist_ok=True)
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         ordered_ids = [frame.frame_id for frame in catalog.frames]
         prompt = (
             prompt_template
@@ -1276,13 +1280,12 @@ model_provenance (return it unchanged with interaction_id=null):
                 ]
             )
         api_request = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
             "store": False,
             "input": api_input,
             "generation_config": {
-                "temperature": self.temperature,
-                "thinking_level": "minimal",
+                "thinking_level": "low",
                 "max_output_tokens": 2048,
             },
             "response_format": {
@@ -1375,7 +1378,7 @@ model_provenance (return it unchanged with interaction_id=null):
     ) -> VideoTrimIntentProposal:
         """Let Gemini watch the selected video and propose coarse MM:SS trim bounds."""
         run_dir.mkdir(parents=True, exist_ok=True)
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         prompt = (
             prompt_template
             + "\n\n## 本次不可變 metadata\n"
@@ -1391,7 +1394,7 @@ model_provenance (return it unchanged with interaction_id=null):
             + provenance.model_dump_json()
         )
         request = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
@@ -1399,7 +1402,6 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
             ],
             "generation_config": {
-                "temperature": self.temperature,
                 "thinking_level": "low",
                 "max_output_tokens": 2048,
             },
@@ -1455,7 +1457,7 @@ model_provenance (return it unchanged with interaction_id=null):
         run_dir: Path,
     ) -> RushesEditPlan:
         """Select immutable catalog frame IDs; Gemini never emits source cut timestamps."""
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         prompt = (
             prompt_template
             + "\n\n## 本次不可變 catalog metadata\n"
@@ -1467,14 +1469,14 @@ model_provenance (return it unchanged with interaction_id=null):
             + provenance.model_dump_json()
         )
         request_record = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",
@@ -1535,7 +1537,7 @@ model_provenance (return it unchanged with interaction_id=null):
         run_dir: Path,
     ) -> FeatureEditPlan:
         """Select evidence-backed frame IDs for a user-authored feature brief."""
-        provenance = _provenance(run_id)
+        provenance = _provenance(run_id, model_id=self.model_id)
         prompt = (
             prompt_template
             + "\n\n## 本次不可變 metadata\n"
@@ -1549,14 +1551,14 @@ model_provenance (return it unchanged with interaction_id=null):
             + provenance.model_dump_json()
         )
         request_record = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
             "store": False,
             "input": [
                 {"type": "video", "uri": uploaded.uri, "mime_type": uploaded.mime_type},
                 {"type": "text", "text": prompt},
             ],
-            "generation_config": {"temperature": self.temperature, "thinking_level": "low"},
+            "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
                 "mime_type": "application/json",

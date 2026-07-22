@@ -244,7 +244,6 @@ def run_trim_intent_event(
     prompt_template: str,
     editorial_intent: str,
     sampling_fps: float = 4.0,
-    temperature: float = 0.1,
 ) -> dict[str, Any]:
     started = monotonic()
     card_path = clip_run_dir / "gemini" / "clip-card" / "clip_card.json"
@@ -308,7 +307,6 @@ def run_trim_intent_event(
     request_identity = {
         "contract_version": TRIM_INTENT_CONTRACT_VERSION,
         "model": MODEL_ID,
-        "temperature": temperature,
         "source_asset_id": card.source_asset_id,
         "event": event.model_dump(mode="json"),
         "editorial_intent": editorial_intent,
@@ -329,7 +327,7 @@ def run_trim_intent_event(
         attempt_number = len(list(variant_dir.glob("attempt-*"))) + 1
         attempt_dir = variant_dir / f"attempt-{attempt_number:02d}"
         write_json(variant_dir / "request-identity.json", request_identity)
-        client = GeminiLabClient(temperature=temperature)
+        client = GeminiLabClient()
         execution_interaction = attempt_dir / "trim_intent.raw_interaction.json"
         try:
             proposal = client.analyze_trim_intent(
@@ -428,7 +426,6 @@ def run_video_trim_intent_event(
     *,
     prompt_template: str,
     editorial_intent: str,
-    temperature: float = 0.1,
 ) -> dict[str, Any]:
     """Watch the complete proxy, then resolve its coarse MM:SS bounds to source PTS."""
     started = monotonic()
@@ -474,7 +471,6 @@ def run_video_trim_intent_event(
     request_identity = {
         "contract_version": "video-trim-mmss-to-source-pts-v1",
         "model": MODEL_ID,
-        "temperature": temperature,
         "source_asset_id": card.source_asset_id,
         "proxy_asset_id": card.proxy_asset_id,
         "event": event.model_dump(mode="json"),
@@ -519,7 +515,7 @@ def run_video_trim_intent_event(
             raw_response_reparsed = True
             break
     if not reused:
-        client = GeminiLabClient(temperature=temperature)
+        client = GeminiLabClient()
         attempt_number = len(list(variant_dir.glob("attempt-*"))) + 1
         attempt_dir = variant_dir / f"attempt-{attempt_number:02d}"
         execution_interaction = attempt_dir / "video_trim_intent.raw_interaction.json"

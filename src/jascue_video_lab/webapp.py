@@ -22,7 +22,6 @@ MAX_UPLOAD_BYTES = int(os.environ.get("JCVL_MAX_UPLOAD_BYTES", str(2 * 1024**3))
 
 class CandidateRequest(StrictModel):
     runs: int = Field(default=1, ge=1, le=5)
-    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
 
 
 class TargetRequest(StrictModel):
@@ -43,13 +42,11 @@ class TargetRequest(StrictModel):
 
 class MomentRequest(StrictModel):
     runs: int = Field(default=1, ge=1, le=5)
-    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
 
 
 class GroundRequest(StrictModel):
     moment_id: str = Field(min_length=1)
     mode: Literal["exact_frame", "direct_video"] = "exact_frame"
-    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
 
 
 class ReviewRequest(StrictModel):
@@ -155,9 +152,7 @@ def create_app(service: BlindReviewService | None = None) -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/candidates")
     def candidates(session_id: str, body: CandidateRequest) -> dict[str, object]:
-        return workflow.suggest_targets(
-            session_id, runs=body.runs, temperature=body.temperature
-        )
+        return workflow.suggest_targets(session_id, runs=body.runs)
 
     @app.post("/api/sessions/{session_id}/target")
     def select_target(session_id: str, body: TargetRequest) -> dict[str, object]:
@@ -171,16 +166,13 @@ def create_app(service: BlindReviewService | None = None) -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/moments")
     def moments(session_id: str, body: MomentRequest) -> dict[str, object]:
-        return workflow.analyze_moments(
-            session_id, runs=body.runs, temperature=body.temperature
-        )
+        return workflow.analyze_moments(session_id, runs=body.runs)
 
     @app.post("/api/sessions/{session_id}/ground")
     def ground(session_id: str, body: GroundRequest) -> dict[str, object]:
         return workflow.ground_moment(
             session_id,
             moment_id=body.moment_id,
-            temperature=body.temperature,
             mode=body.mode,
         )
 

@@ -429,6 +429,7 @@ def test_incremental_pricing_names_changed_error_artifacts_honestly(
     write_json(
         tmp_path / "grounding" / "grounding.raw_interaction.json",
         {
+            "model": MODEL_ID,
             "usage": {
                 "total_input_tokens": 100,
                 "total_output_tokens": 10,

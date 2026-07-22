@@ -196,7 +196,7 @@ frame_time_ms={record['frame_time_ms']}
                         "resolution": args.resolution,
                     },
                 ],
-                "generation_config": {"temperature": 0, "thinking_level": "low"},
+                "generation_config": {"thinking_level": "low"},
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",
@@ -276,7 +276,7 @@ frame_time_ms={record['frame_time_ms']}
                         for path in crop_paths
                     ],
                 ],
-                "generation_config": {"temperature": 0, "thinking_level": "low"},
+                "generation_config": {"thinking_level": "low"},
                 "response_format": {
                     "type": "text",
                     "mime_type": "application/json",

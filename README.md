@@ -241,7 +241,7 @@ Clip Card plan 轉成 renderer plan 時會另寫不可變的 external-projection
 
 當 9:16 audit 證明 required union 不可容納或 tracking coverage 不足時，處理順序是先換同一 editorial role 的候選 take，而不是立刻套模糊背景。`scripts/apply_open_edit_candidate_overrides.py` 接受人工審查過的 `feature_id + aspect + candidate_id + reason` patch，保留原始 OpenEditPlan 與兩邊 hash，再重新投影 brief／feature plan／trim plan；候選不存在或同一 aspect 重複覆寫會 fail closed。這仍是 human-in-the-loop 工具，尚未宣稱能自動把所有替代 take 做完 geometry 排名。
 
-成片 Gemini QA 採成本分級，不是每次 render 都重看全部。所有片段先跑零 API 成本的本機 geometry／coverage／media gate；只有文字／UI、多 required targets、controlled clip、tracking risk 或 fallback 段落需要語意複核。`scripts/verify_feature_cut.py` 可把完成版 9:16 壓成 720×1280 proxy，以一次 `gemini-3.5-flash`、`thinking_level=minimal` Structured Output call 檢查主體身分、重要文字、語意是否符合與重複／突兀問題；它不回時間戳、不驗證 frame-accurate geometry，也不會自行改剪。相同 render／manifest／prompt／schema 會重用結果，最終仍由真人核准。若 schema 驗證失敗或重試，每一次 request、raw response、錯誤、timing 與 pricing 都保存於不可覆寫的 attempt 目錄，總成本會聚合所有實際有 usage 的請求。
+成片 Gemini QA 採成本分級，不是每次 render 都重看全部。所有片段先跑零 API 成本的本機 geometry／coverage／media gate；只有文字／UI、多 required targets、controlled clip、tracking risk 或 fallback 段落需要語意複核。`scripts/verify_feature_cut.py` 可把完成版 9:16 壓成 720×1280 proxy，以一次 `gemini-3.6-flash`、`thinking_level=low` Structured Output call 檢查主體身分、重要文字、語意是否符合與重複／突兀問題；它不回時間戳、不驗證 frame-accurate geometry，也不會自行改剪。相同 render／manifest／prompt／schema／model 會重用結果，最終仍由真人核准。若 schema 驗證失敗或重試，每一次 request、raw response、錯誤、timing 與 pricing 都保存於不可覆寫的 attempt 目錄，總成本會聚合所有實際有 usage 的請求。
 
 Gemini 的成片 `pass` 不可覆蓋本機幾何證據。QA validator 會把 required-region coverage、完整 containment、controlled clip、fallback 與 source-edge 診斷一起納入本機最終狀態；只要其中一項需要複核，即使模型認為主體「看得見」，validated status 仍固定為 `review`。feature-cut 另把本次新增或改變的 raw interactions 記在 `pricing.incremental.json`，與包含歷史快取的 `pricing.json` 分開，避免把舊請求重複算成本輪花費。
 
@@ -282,7 +282,7 @@ export GEMINI_API_KEY='...'
 
 若執行環境不會繼承 terminal export，可在專案根目錄建立已被 `.gitignore` 排除的 `.env.local`，內容只放 `GEMINI_API_KEY=...`，執行前先 `source .env.local`。不要把 key 貼進 issue、artifact 或 commit。
 
-只使用官方 `google-genai` SDK；模型 ID 固定為穩定版 `gemini-3.5-flash`。程式不依賴已淘汰的 `google-generativeai`，也沒有舊 Gemini model ID。
+只使用官方 `google-genai` SDK；預設模型是穩定版 `gemini-3.6-flash`，需要可重現歷史 A/B 時才以 `JASCUE_GEMINI_MODEL` 明確覆寫。3.6 請求不送出已淘汰的 `temperature`、`top_p` 或 `top_k`，thinking level 只使用目前 Interactions endpoint 驗證過的 `low`／`high`。模型 ID 會進入 request、cache identity、provenance 與逐模型計價；切換模型不會誤用舊 response cache，但仍可重用相同 File API 上傳。程式不依賴已淘汰的 `google-generativeai`，也沒有舊 Gemini 1.5／2.0 model ID。
 
 ## 本機 Blind Review Web App
 

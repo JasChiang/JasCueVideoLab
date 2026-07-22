@@ -21,7 +21,6 @@ def main() -> int:
     parser.add_argument("catalog_json", type=Path)
     parser.add_argument("prepared_library", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--temperature", type=float, default=0.1)
     args = parser.parse_args()
 
     started = monotonic()
@@ -98,7 +97,6 @@ def main() -> int:
                     output,
                     prompt_template=prompt,
                     editorial_intent=editorial_intent,
-                    temperature=args.temperature,
                 )
                 results.append(
                     {
@@ -129,7 +127,6 @@ def main() -> int:
         "catalog_id": catalog.catalog_id,
         "status": "ok" if not failures else "partial_failure",
         "mode": "direct_video_mmss_to_source_pts",
-        "temperature": args.temperature,
         "results": results,
         "failures": failures,
         "pricing": pricing,

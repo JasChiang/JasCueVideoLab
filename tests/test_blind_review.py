@@ -37,8 +37,8 @@ def _provenance(run_id: str) -> ModelProvenance:
 
 
 class FakeGeminiClient:
-    def __init__(self, *, temperature: float = 0.2) -> None:
-        self.temperature = temperature
+    def __init__(self) -> None:
+        pass
 
     def close(self) -> None:
         pass

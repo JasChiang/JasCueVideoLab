@@ -38,8 +38,7 @@ PROMPT_VERSION = "feature-cut-semantic-qa-v2-required-regions"
 VALIDATOR_VERSION = "feature-cut-semantic-qa-validator-v3-fail-closed-risk-gate"
 DEFAULT_PROMPT_RESOURCE = "feature_cut_qa_zh-TW.txt"
 QA_GENERATION_CONFIG = {
-    "temperature": 0,
-    "thinking_level": "minimal",
+    "thinking_level": "low",
     "max_output_tokens": 4096,
 }
 PROXY_CONTRACT = {
@@ -702,6 +701,7 @@ def _validate_cached_run(
     raw_interaction = read_json(run_dir / "raw_interaction.json")
     if not isinstance(raw_interaction, dict) or not raw_interaction:
         raise ValueError("cached raw interaction is empty or invalid")
+    _require_equal("raw_interaction.model", raw_interaction.get("model"), MODEL_ID)
     raw_output = read_json(run_dir / "raw_output.json")
     if not isinstance(raw_output, dict) or not isinstance(
         raw_output.get("output_text"), str
@@ -913,7 +913,7 @@ def main() -> None:
     upload_reused: bool | None = None
     interaction_seconds: float | None = None
     try:
-        client = GeminiLabClient(temperature=0.0)
+        client = GeminiLabClient()
         upload_started = time.monotonic()
         uploaded, upload_reused = client.ensure_video_upload(
             proxy_path,

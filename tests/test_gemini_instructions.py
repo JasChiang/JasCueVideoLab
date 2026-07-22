@@ -9,6 +9,7 @@ import pytest
 
 from jascue_video_lab.gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
+    MODEL_ID,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
     GeminiLabClient,
 )
@@ -31,7 +32,7 @@ def _client() -> tuple[GeminiLabClient, _RejectingInteractions]:
     interactions = _RejectingInteractions()
     client = object.__new__(GeminiLabClient)
     client.client = SimpleNamespace(interactions=interactions)
-    client.temperature = 0.2
+    client.model_id = MODEL_ID
     return client, interactions
 
 
@@ -134,6 +135,11 @@ def test_all_candidate_and_frame_observation_calls_use_visual_evidence_instructi
         )
         assert api_request["system_instruction"] == VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
         assert saved_request["system_instruction"] == VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
+        assert api_request["model"] == MODEL_ID
+        assert not {"temperature", "top_p", "top_k"}.intersection(
+            api_request["generation_config"]
+        )
+        assert api_request["generation_config"]["thinking_level"] in {"low", "high"}
 
 
 def test_edit_planning_calls_separate_intent_from_media_evidence(tmp_path: Path) -> None:
@@ -180,8 +186,23 @@ def test_edit_planning_calls_separate_intent_from_media_evidence(tmp_path: Path)
         )
         assert api_request["system_instruction"] == EDITORIAL_SYSTEM_INSTRUCTION
         assert saved_request["system_instruction"] == EDITORIAL_SYSTEM_INSTRUCTION
+        assert api_request["model"] == MODEL_ID
+        assert not {"temperature", "top_p", "top_k"}.intersection(
+            api_request["generation_config"]
+        )
+        assert api_request["generation_config"]["thinking_level"] in {"low", "high"}
 
     assert "不證明素材中存在相符畫面" in EDITORIAL_SYSTEM_INSTRUCTION
     assert "不得選擇不相符素材補位" in EDITORIAL_SYSTEM_INSTRUCTION
     assert "OPPO" not in EDITORIAL_SYSTEM_INSTRUCTION
     assert "Reno" not in EDITORIAL_SYSTEM_INSTRUCTION
+
+
+def test_live_request_sources_do_not_use_deprecated_sampling_parameters() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for directory in (root / "src", root / "scripts"):
+        for path in directory.rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            assert '"temperature"' not in source, path
+            assert '"top_p"' not in source, path
+            assert '"top_k"' not in source, path

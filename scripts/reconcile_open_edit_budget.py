@@ -95,7 +95,6 @@ def main() -> int:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--target-min", type=float, default=60.0)
     parser.add_argument("--target-max", type=float, default=90.0)
-    parser.add_argument("--temperature", type=float, default=0.1)
     args = parser.parse_args()
     if not 0 < args.target_min <= args.target_max:
         raise ValueError("invalid duration range")
@@ -191,7 +190,7 @@ model_provenance 必須原樣回傳：
         ),
         "store": False,
         "input": [{"type": "text", "text": prompt}],
-        "generation_config": {"temperature": args.temperature, "thinking_level": "high"},
+        "generation_config": {"thinking_level": "high"},
         "response_format": {
             "type": "text",
             "mime_type": "application/json",

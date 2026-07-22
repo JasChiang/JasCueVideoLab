@@ -83,7 +83,7 @@ h1,h2,p{{margin-top:0}}.lead{{max-width:1000px;color:var(--muted)}}.conclusion{{
 .samples{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}}.sample{{background:var(--panel);border:2px solid var(--line);border-radius:12px;overflow:hidden}}.sample.pass{{border-color:#167a50}}.sample.fail{{border-color:#a92d43}}.sample header{{display:flex;justify-content:space-between;padding:10px 12px}}.sample.pass header b{{color:var(--pass)}}.sample.fail header b{{color:var(--fail)}}.sample img{{width:100%;height:auto;display:block}}.sample p{{padding:10px 12px;margin:0;color:var(--muted)}}
 @media(max-width:650px){{main{{padding:18px}}.group-head{{display:block}}.score{{text-align:left;margin-bottom:12px}}}}
 </style></head><body><main><h1>同一影格 Grounding A/B</h1>
-<p class="lead">固定 frame hash、PTS、時間、模型、temperature 與 Structured Output schema，只改 target description。每組五次真實 Gemini API 呼叫；暫定 PASS 門檻為 Codex reviewer reference IoU ≥ 0.8。Reference 是 Codex 視覺檢查後手動輸入，未經獨立真人確認，不是 human ground truth。</p>
+<p class="lead">固定 frame hash、PTS、時間、模型、thinking level 與 Structured Output schema，只改 target description。每組五次真實 Gemini API 呼叫；暫定 PASS 門檻為 Codex reviewer reference IoU ≥ 0.8。Reference 是 Codex 視覺檢查後手動輸入，未經獨立真人確認，不是 human ground truth。</p>
 <p class="conclusion"><strong>結論：</strong>{html.escape(conclusion)}</p>
 {explicit_section}{generic_section}
 </main></body></html>"""

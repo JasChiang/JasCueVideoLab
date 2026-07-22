@@ -249,11 +249,10 @@ def main() -> int:
     parser.add_argument("brief_json", type=Path)
     parser.add_argument("prepared_library", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--repair-attempts", type=int, default=2)
     parser.add_argument(
         "--thinking-level",
-        choices=["minimal", "low", "medium", "high"],
+        choices=["low", "high"],
         default="high",
     )
     args = parser.parse_args()
@@ -347,7 +346,6 @@ model_provenance 必須先原樣回傳：
         "store": False,
         "input": [{"type": "text", "text": prompt}],
         "generation_config": {
-            "temperature": args.temperature,
             "thinking_level": args.thinking_level,
         },
         "response_format": {

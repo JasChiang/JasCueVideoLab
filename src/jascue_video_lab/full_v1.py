@@ -352,12 +352,16 @@ def _revalidate_saved_clip_card(
             card.source_asset_id != source_asset_id
             or card.proxy_asset_id != proxy_asset_id
             or card.duration_ms != duration_ms
+            or card.model_provenance.model_id != MODEL_ID
         ):
             return None
         raw_interaction_path = run_dir / "clip_card.raw_interaction.json"
         interaction_id = None
         if raw_interaction_path.exists():
-            interaction_id = read_json(raw_interaction_path).get("id") or None
+            raw_interaction = read_json(raw_interaction_path)
+            if raw_interaction.get("model") != MODEL_ID:
+                return None
+            interaction_id = raw_interaction.get("id") or None
         card = card.model_copy(
             update={
                 "model_provenance": card.model_provenance.model_copy(
@@ -443,7 +447,6 @@ def run_full_clip(
     proxy_fps: int = 30,
     audio_mode: str = "auto",
     scdet_threshold: float = 4.0,
-    temperature: float = 0.2,
     dense_mode: str = "none",
     dense_event_ids: set[str] | None = None,
     dense_window_ms: int = 4000,
@@ -548,7 +551,7 @@ def run_full_clip(
         )
         return result
 
-    client = GeminiLabClient(temperature=temperature)
+    client = GeminiLabClient()
     selections: dict[str, DenseEventSelection] = {}
     execution_interactions: list[Path] = []
     try:
@@ -756,7 +759,6 @@ def run_selected_full_clips(
     clip_card_prompt: str,
     dense_prompt: str,
     max_clips: int | None = None,
-    temperature: float = 0.2,
     audio_mode: str = "auto",
     prepare_only: bool = False,
     file_cache_root: Path | None = None,
@@ -809,7 +811,6 @@ def run_selected_full_clips(
                     clip_dir,
                     clip_card_prompt=clip_card_prompt,
                     dense_prompt=dense_prompt,
-                    temperature=temperature,
                     audio_mode=audio_mode,
                     dense_mode="none",
                     prepare_only=False,
@@ -916,7 +917,6 @@ def run_full_library(
     proxy_fps: int = 30,
     audio_mode: str = "auto",
     scdet_threshold: float = 4.0,
-    temperature: float = 0.2,
     prepare_only: bool = False,
     file_cache_root: Path | None = None,
 ) -> dict[str, Any]:
@@ -990,7 +990,6 @@ def run_full_library(
                 proxy_fps=proxy_fps,
                 audio_mode=audio_mode,
                 scdet_threshold=scdet_threshold,
-                temperature=temperature,
                 dense_mode="none",
                 prepare_only=prepare_only,
                 file_cache_root=file_cache_root,
@@ -1177,7 +1176,6 @@ def run_full_event_geometry(
     query_lock_path: Path | None = None,
     query_target_id: str | None = None,
     sam_analysis_fps: float = 2.0,
-    temperature: float = 0.2,
 ) -> dict[str, Any]:
     """Ground one selected Clip Card event and optionally propagate SAM inside its interval."""
     if bool(target_entity_id) != bool(target_description):
@@ -1317,7 +1315,6 @@ def run_full_event_geometry(
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest(),
-        "temperature": temperature,
         "thinking_level": "low",
     }
     grounding_fingerprint = hashlib.sha256(
@@ -1360,7 +1357,7 @@ def run_full_event_geometry(
         )
         grounding_reused = True
     else:
-        client = GeminiLabClient(temperature=temperature)
+        client = GeminiLabClient()
         try:
             proposal = client.ground_frame(
                 media=media,
