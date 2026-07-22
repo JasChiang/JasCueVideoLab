@@ -621,6 +621,7 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         sam_analysis_fps=args.sam_analysis_fps,
         trim_decision_paths=args.trim_decision,
         allow_proposed_trim_preview=args.allow_proposed_trim_preview,
+        reuse_feature_plan=args.reuse_feature_plan,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1685,6 +1686,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Explicitly human-approved trim decision JSON; repeat for multiple selected events. "
             "Proposed or rejected decisions are refused."
+        ),
+    )
+    feature_cut_parser.add_argument(
+        "--reuse-feature-plan",
+        action="store_true",
+        help=(
+            "Explicitly reuse the saved editorial feature plan in output-dir; "
+            "geometry and rendered segments are still recomputed and provenance is recorded."
         ),
     )
     feature_cut_parser.add_argument(

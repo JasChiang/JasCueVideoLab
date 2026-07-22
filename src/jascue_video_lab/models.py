@@ -1294,6 +1294,12 @@ class VideoStreamInfo(StrictModel):
     display_width: int
     display_height: int
     rotation_degrees: int
+    sample_aspect_ratio: Rational = Field(
+        default_factory=lambda: Rational(numerator=1, denominator=1)
+    )
+    display_sample_aspect_ratio: Rational = Field(
+        default_factory=lambda: Rational(numerator=1, denominator=1)
+    )
     average_frame_rate: Rational | None
     real_frame_rate: Rational | None
     time_base: Rational
@@ -1476,6 +1482,16 @@ class SegmentationTrack(StrictModel):
             raise ValueError("total_samples must equal len(samples)")
         if sum(self.state_counts.values()) != self.total_samples:
             raise ValueError("state_counts must cover every sample")
+        observed_state_counts: dict[TrackingState, int] = {}
+        for sample in self.samples:
+            observed_state_counts[sample.tracking_state] = (
+                observed_state_counts.get(sample.tracking_state, 0) + 1
+            )
+        declared_state_counts = {
+            state: count for state, count in self.state_counts.items() if count != 0
+        }
+        if declared_state_counts != observed_state_counts:
+            raise ValueError("state_counts must match sample tracking_state values")
         if self.seed_sample_index >= self.total_samples:
             raise ValueError("seed_sample_index is outside sampled frames")
         if [sample.sample_index for sample in self.samples] != list(
@@ -2012,6 +2028,47 @@ class RushesEditPlan(StrictModel):
         return self
 
 
+class FramingRegionIntent(StrictModel):
+    """One domain-neutral visual region used to constrain a reframe.
+
+    A region may describe a person, animal, product, document, sign, UI area,
+    or any other directly visible subject.  The vocabulary intentionally does
+    not encode fixture-specific brands or object classes.
+    """
+
+    region_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    target_description: str = Field(min_length=1)
+    kind: Literal["subject", "text_region", "ui_region", "graphic", "other"] = (
+        "subject"
+    )
+    role: Literal["required", "preferred", "avoid_overlay"] = "required"
+
+
+class ReframePolicyBinding(StrictModel):
+    """Immutable human-policy provenance embedded in a revised edit brief.
+
+    The sidecar is content addressed and binds the policy decision to the
+    exact source brief, catalog, saved feature plan, and plan binding.  It is
+    intentionally domain-neutral: the chapter overrides carry the visible
+    region descriptions, while this record only establishes provenance.
+    """
+
+    binding_version: Literal["human-reframe-policy-binding-v1"]
+    policy_id: str = Field(min_length=1)
+    reviewer: str = Field(min_length=1)
+    sidecar_path: str = Field(min_length=1)
+    sidecar_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_brief_path: str = Field(min_length=1)
+    source_brief_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_feature_plan_path: str = Field(min_length=1)
+    source_feature_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_plan_binding_path: str = Field(min_length=1)
+    source_plan_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_path: str = Field(min_length=1)
+    catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    selection_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class FeatureChapterBrief(StrictModel):
     feature_id: str = Field(pattern=r"^[a-z0-9_-]+$")
     title: str
@@ -2019,6 +2076,31 @@ class FeatureChapterBrief(StrictModel):
     target_duration_seconds: float = Field(ge=3.0, le=10.0)
     vertical_primary_target_description: str | None = None
     vertical_crop_mode: Literal["strict", "primary_center"] = "strict"
+    vertical_regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=4)
+    vertical_overflow_policy: Literal["preserve_all", "controlled_clip"] = (
+        "preserve_all"
+    )
+    vertical_edge_priority: Literal[
+        "balanced", "preserve_start", "preserve_end"
+    ] = "balanced"
+
+    @model_validator(mode="after")
+    def validate_vertical_regions(self) -> "FeatureChapterBrief":
+        ids = [region.region_id for region in self.vertical_regions]
+        if len(ids) != len(set(ids)):
+            raise ValueError("vertical region IDs must be unique within a chapter")
+        if self.vertical_regions and not any(
+            region.role == "required" for region in self.vertical_regions
+        ):
+            raise ValueError("vertical regions must include at least one required region")
+        if (
+            self.vertical_edge_priority != "balanced"
+            and self.vertical_overflow_policy != "controlled_clip"
+        ):
+            raise ValueError(
+                "edge priority only applies when vertical_overflow_policy is controlled_clip"
+            )
+        return self
 
 
 class FeatureEditBrief(StrictModel):
@@ -2029,6 +2111,7 @@ class FeatureEditBrief(StrictModel):
     vertical_fallback_strategy: Literal["fit_with_background", "center_crop"] = (
         "fit_with_background"
     )
+    reframe_policy_binding: ReframePolicyBinding | None = None
     chapters: list[FeatureChapterBrief] = Field(min_length=1, max_length=16)
 
     @model_validator(mode="after")

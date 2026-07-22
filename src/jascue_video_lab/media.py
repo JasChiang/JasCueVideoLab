@@ -35,9 +35,14 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def _rational(value: str | None) -> Rational | None:
-    if not value or value == "0/0":
+    if not value or value in {"0/0", "0:0", "N/A"}:
         return None
-    fraction = Fraction(value)
+    try:
+        fraction = Fraction(value.replace(":", "/"))
+    except (ValueError, ZeroDivisionError):
+        return None
+    if fraction <= 0:
+        return None
     return Rational(numerator=fraction.numerator, denominator=fraction.denominator)
 
 
@@ -76,6 +81,18 @@ def probe_video(path: Path) -> MediaInfo:
     rotation = _rotation(stream)
     coded_width = int(stream["width"])
     coded_height = int(stream["height"])
+    sample_aspect_ratio = _rational(stream.get("sample_aspect_ratio")) or Rational(
+        numerator=1,
+        denominator=1,
+    )
+    display_sample_aspect_ratio = (
+        Rational(
+            numerator=sample_aspect_ratio.denominator,
+            denominator=sample_aspect_ratio.numerator,
+        )
+        if rotation in {90, 270}
+        else sample_aspect_ratio
+    )
     display_width, display_height = (
         (coded_height, coded_width) if rotation in {90, 270} else (coded_width, coded_height)
     )
@@ -103,6 +120,8 @@ def probe_video(path: Path) -> MediaInfo:
             display_width=display_width,
             display_height=display_height,
             rotation_degrees=rotation,
+            sample_aspect_ratio=sample_aspect_ratio,
+            display_sample_aspect_ratio=display_sample_aspect_ratio,
             average_frame_rate=_rational(stream.get("avg_frame_rate")),
             real_frame_rate=_rational(stream.get("r_frame_rate")),
             time_base=time_base,

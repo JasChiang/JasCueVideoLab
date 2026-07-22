@@ -28,6 +28,36 @@ def test_probe_and_extract_preserve_semantic_request_vs_pts(tmp_path: Path) -> N
     assert (frame.width, frame.height) == (320, 180)
 
 
+def test_probe_preserves_non_square_sample_aspect_ratio(tmp_path: Path) -> None:
+    video = tmp_path / "anamorphic.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=720x576:r=10:d=0.2",
+            "-vf",
+            "setsar=16/15",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(video),
+        ],
+        check=True,
+    )
+
+    media = probe_video(video)
+
+    assert media.video.sample_aspect_ratio.numerator == 16
+    assert media.video.sample_aspect_ratio.denominator == 15
+    assert media.video.display_sample_aspect_ratio == media.video.sample_aspect_ratio
+
+
 def test_extract_frame_maps_nonzero_stream_pts_to_local_playback_time(
     tmp_path: Path,
 ) -> None:

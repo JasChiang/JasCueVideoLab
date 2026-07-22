@@ -21,12 +21,15 @@ from google import genai
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from jascue_video_lab.billing import summarize_usage_files
+from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
+from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
     FeatureChapterBrief,
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
+    FramingRegionIntent,
     FullClipCard,
     ModelProvenance,
     RushesCatalog,
@@ -37,6 +40,16 @@ from jascue_video_lab.storage import read_json, utc_now, write_json
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class VerticalOverflowProposal(StrictModel):
+    """Non-executable model suggestion for a later human framing decision."""
+
+    proposed_policy: Literal["controlled_clip"]
+    proposed_edge_priority: Literal[
+        "balanced", "preserve_start", "preserve_end"
+    ] = "balanced"
+    rationale: str = Field(min_length=1)
 
 
 class OpenEditCandidate(StrictModel):
@@ -53,6 +66,12 @@ class OpenEditCandidate(StrictModel):
     vertical_strategy: Literal["tracked_crop", "fit_with_background"]
     vertical_target_description: str | None
     vertical_crop_mode: Literal["strict", "primary_center"]
+    vertical_regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=4)
+    # Model output is never an execution authorization.  A human-reviewed,
+    # hash-bound policy sidecar is the only path to controlled_clip.
+    vertical_overflow_policy: Literal["preserve_all"] = "preserve_all"
+    vertical_edge_priority: Literal["balanced"] = "balanced"
+    vertical_overflow_proposal: VerticalOverflowProposal | None = None
     confidence: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
@@ -62,8 +81,22 @@ class OpenEditCandidate(StrictModel):
                 raise ValueError("tracked_reframe requires zoom intent and target")
         elif self.horizontal_zoom_intent != "none":
             raise ValueError("original horizontal strategy must use zoom intent none")
-        if self.vertical_strategy == "tracked_crop" and not self.vertical_target_description:
-            raise ValueError("tracked_crop requires a target description")
+        required_regions = [
+            region for region in self.vertical_regions if region.role == "required"
+        ]
+        if self.vertical_strategy == "tracked_crop" and not (
+            self.vertical_target_description or required_regions
+        ):
+            raise ValueError("tracked_crop requires a target description or required region")
+        if self.vertical_regions and not required_regions:
+            raise ValueError("vertical regions must include at least one required region")
+        if self.vertical_regions and self.vertical_strategy != "tracked_crop":
+            raise ValueError("vertical regions are crop constraints and require tracked_crop")
+        if (
+            self.vertical_overflow_proposal is not None
+            and self.vertical_strategy != "tracked_crop"
+        ):
+            raise ValueError("overflow proposals only apply to tracked_crop candidates")
         return self
 
 
@@ -150,6 +183,16 @@ def compact_card(card: FullClipCard) -> dict[str, object]:
         "clip_uses": card.clip_uses,
         "portrait_reframe_feasibility": card.portrait_reframe_feasibility,
         "uncertainties": card.uncertainties,
+        "entities": [
+            {
+                "entity_id": entity.entity_id,
+                "kind": entity.kind,
+                "label": entity.label,
+                "distinguishing_features": entity.distinguishing_features,
+                "evidence": entity.evidence,
+            }
+            for entity in card.entities
+        ],
         "events": [
             {
                 "event_id": event.event_id,
@@ -163,6 +206,10 @@ def compact_card(card: FullClipCard) -> dict[str, object]:
                 "editing_uses": event.editing_uses,
                 "quality_risks": event.quality_risks,
                 "framing_intent": event.framing_intent,
+                "primary_entity_ids": event.primary_entity_ids,
+                "required_entity_ids": event.required_entity_ids,
+                "optional_entity_ids": event.optional_entity_ids,
+                "avoid_overlay_entity_ids": event.avoid_overlay_entity_ids,
                 "grounding_targets": [
                     {
                         "entity_id": target.entity_id,
@@ -224,6 +271,7 @@ def project_feature_contracts(
     for shot in plan.shots:
         horizontal = shot.candidate(shot.horizontal_candidate_id)
         vertical = shot.candidate(shot.vertical_candidate_id)
+        vertical_target_description = _projected_vertical_target_description(vertical)
         brief_chapters.append(
             FeatureChapterBrief(
                 feature_id=shot.feature_id,
@@ -234,11 +282,14 @@ def project_feature_contracts(
                 ],
                 target_duration_seconds=shot.target_duration_seconds,
                 vertical_primary_target_description=(
-                    vertical.vertical_target_description
+                    vertical_target_description
                     if vertical.vertical_strategy == "tracked_crop"
                     else None
                 ),
                 vertical_crop_mode=vertical.vertical_crop_mode,
+                vertical_regions=vertical.vertical_regions,
+                vertical_overflow_policy="preserve_all",
+                vertical_edge_priority="balanced",
             )
         )
         selected_chapters.append(
@@ -258,9 +309,17 @@ def project_feature_contracts(
                 horizontal_zoom_intent=horizontal.horizontal_zoom_intent,
                 horizontal_target_description=horizontal.horizontal_target_description,
                 vertical_strategy=vertical.vertical_strategy,
-                vertical_target_description=vertical.vertical_target_description,
+                vertical_target_description=vertical_target_description,
                 quality_risks=sorted(
-                    set(horizontal.quality_risks + vertical.quality_risks)
+                    set(
+                        horizontal.quality_risks
+                        + vertical.quality_risks
+                        + (
+                            ["model_proposed_controlled_clip_requires_human_policy"]
+                            if vertical.vertical_overflow_proposal is not None
+                            else []
+                        )
+                    )
                 ),
                 confidence=min(horizontal.confidence, vertical.confidence),
             )
@@ -275,6 +334,12 @@ def project_feature_contracts(
                 "vertical_source_asset_id": vertical.source_asset_id,
                 "vertical_event_id": vertical.event_id,
                 "vertical_frame_id": vertical.frame_id,
+                "execution_vertical_overflow_policy": "preserve_all",
+                "model_vertical_overflow_proposal": (
+                    vertical.vertical_overflow_proposal.model_dump(mode="json")
+                    if vertical.vertical_overflow_proposal is not None
+                    else None
+                ),
             }
         )
     brief = FeatureEditBrief(
@@ -300,6 +365,54 @@ def project_feature_contracts(
         "chapters": audit_chapters,
     }
     return brief, feature_plan, trim_plan
+
+
+def reproject_external_feature_plan(
+    *,
+    source_plan: OpenEditPlan,
+    catalog: RushesCatalog,
+    brief: FeatureEditBrief,
+    source_artifacts: dict[str, Path],
+) -> tuple[FeatureEditBrief, FeatureEditPlan]:
+    """Registered deterministic projector used by provenance validation."""
+
+    del brief, source_artifacts
+    if source_plan.catalog_id != catalog.catalog_id:
+        raise ValueError("open-edit source plan differs from projection catalog")
+    projected_brief, projected_plan, _ = project_feature_contracts(source_plan)
+    return projected_brief, projected_plan
+
+
+def _projected_vertical_target_description(candidate: OpenEditCandidate) -> str | None:
+    """Project region-only framing intent into the legacy single-target contract.
+
+    ``FeatureChapterSelect`` still requires a non-empty target description for
+    ``tracked_crop``.  Open-edit candidates may instead express the stronger,
+    multi-region contract.  Keep those regions intact on the brief and derive a
+    deterministic, domain-neutral union description for consumers that still
+    read the single-target field.
+    """
+
+    if candidate.vertical_target_description:
+        return candidate.vertical_target_description
+    required_regions = sorted(
+        (
+            region
+            for region in candidate.vertical_regions
+            if region.role == "required"
+        ),
+        key=lambda region: region.region_id,
+    )
+    if not required_regions:
+        return None
+    members = "; ".join(
+        (
+            f"region_id={region.region_id}, kind={region.kind}, "
+            f"target={region.target_description}"
+        )
+        for region in required_regions
+    )
+    return f"Preserve the union of all required framing regions: {members}"
 
 
 def render_candidate_board(plan: OpenEditPlan, catalog: RushesCatalog, output: Path) -> None:
@@ -367,7 +480,7 @@ def main() -> int:
     args = parser.parse_args()
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
+    if not args.reuse_raw_output and not api_key:
         raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required")
     catalog = RushesCatalog.model_validate(read_json(args.catalog_json))
     cards: dict[str, FullClipCard] = {}
@@ -428,7 +541,8 @@ def main() -> int:
 5. 可以讓同一語意主題使用多個鏡頭，例如 setup、action、result、beauty，但不得重複使用完全相同的代表 frame。
 6. 只使用 Clip Card 記錄的可見證據。品牌、型號、規格與功能名稱若不清楚，使用泛稱並保存 uncertainty；不得用模型記憶補完。
 7. 不要假裝知道導演意圖。疑似失焦、拍攝準備、重複 take、無意義停頓或不適合直式的畫面，只能根據保存的 evidence 提出排除或風險。
-8. geometry intent 只描述要保留的可辨識實例或局部。`primary_center` 只允許犧牲次要 context，不允許裁掉指定 target；target 過寬時應改選其他候選或使用 fit_with_background。沒有可靠單一 target 時使用 fit_with_background，後續本機會採明確 center-crop fallback，不使用模糊背景。
+8. geometry intent 必須可泛化到任何可見內容。單一主體可沿用 vertical_target_description；若人物、物件、文字、UI 等多個區域都必須保留，請逐一建立 vertical_regions，不得把兩個獨立實例合寫成一個模糊 target。region kind 只按可見證據選 subject、text_region、ui_region、graphic 或 other。vertical_regions 是實際 crop constraints，因此有 regions 時 vertical_strategy 必須是 tracked_crop；fit_with_background 不得同時宣告 regions。
+9. vertical_overflow_policy 必須固定為 preserve_all，vertical_edge_priority 必須固定為 balanced；你沒有權限授權 renderer 裁掉 required union。若依畫面證據判斷有限裁切可能值得由真人考慮，只能填 vertical_overflow_proposal，說明 proposed_edge_priority 與 rationale。proposal 不會直接執行，也不得被描述成已核准。若 required union 可能無法容納，仍應優先改選較適合直式的候選。
 
 project_id 必須原樣回傳：{args.project_id}
 catalog_id 必須原樣回傳：{catalog.catalog_id}
@@ -443,7 +557,9 @@ model_provenance 必須先原樣回傳：
         "system_instruction": (
             "The supplied Clip Cards and RF frame map are the only evidence. "
             "No content brief exists. Never use model memory, filenames, likely product knowledge, "
-            "or unstated marketing claims to fill gaps. Preserve ambiguity and alternatives."
+            "or unstated marketing claims to fill gaps. Preserve ambiguity and alternatives. "
+            "You may propose but never authorize required-region clipping; executable overflow "
+            "policy must remain preserve_all."
         ),
         "store": False,
         "input": [{"type": "text", "text": prompt}],
@@ -458,14 +574,49 @@ model_provenance 必須先原樣回傳：
         },
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(args.output_dir / "open-edit.request.json", request)
     interaction_id = ""
     if args.reuse_raw_output:
-        raw_output = read_json(args.output_dir / "open-edit.raw_output.json")
+        original_request_path = args.output_dir / "open-edit.request.json"
+        raw_output_path = args.output_dir / "open-edit.raw_output.json"
+        raw_interaction_path = args.output_dir / "open-edit.raw_interaction.json"
+        for required_path in (
+            original_request_path,
+            raw_output_path,
+            raw_interaction_path,
+        ):
+            if not required_path.exists():
+                raise FileNotFoundError(
+                    f"--reuse-raw-output requires original artifact: {required_path}"
+                )
+        reprojection_request_path = (
+            args.output_dir / "open-edit.reprojection-request.json"
+        )
+        write_json(reprojection_request_path, request)
+        write_json(
+            args.output_dir / "open-edit.raw-output-reuse.json",
+            {
+                "interpretation": (
+                    "saved_model_response_revalidated_and_projected_no_new_model_call"
+                ),
+                "original_request_path": str(original_request_path.resolve()),
+                "original_request_sha256": sha256_file(original_request_path),
+                "raw_output_path": str(raw_output_path.resolve()),
+                "raw_output_sha256": sha256_file(raw_output_path),
+                "current_reprojection_request_path": str(
+                    reprojection_request_path.resolve()
+                ),
+                "current_reprojection_request_sha256": sha256_file(
+                    reprojection_request_path
+                ),
+                "reused_at": utc_now(),
+            },
+        )
+        raw_output = read_json(raw_output_path)
         output_text = str(raw_output["output_text"])
-        raw_interaction = read_json(args.output_dir / "open-edit.raw_interaction.json")
+        raw_interaction = read_json(raw_interaction_path)
         interaction_id = str(raw_interaction.get("id") or "")
     else:
+        write_json(args.output_dir / "open-edit.request.json", request)
         client = genai.Client(api_key=api_key)
         try:
             interaction = client.interactions.create(**request)
@@ -505,6 +656,41 @@ model_provenance 必須先原樣回傳：
             "selected_shot_count": len(plan.shots),
             "target_duration_seconds": brief.target_duration_seconds,
         },
+    )
+    projection_artifacts = {
+        "source_raw_interaction": args.output_dir / "open-edit.raw_interaction.json",
+        "source_raw_output": args.output_dir / "open-edit.raw_output.json",
+    }
+    for role, path in (
+        (
+            "original_request",
+            args.output_dir / "open-edit.request.json",
+        ),
+        (
+            "raw_output_reuse_record",
+            args.output_dir / "open-edit.raw-output-reuse.json",
+        ),
+        (
+            "current_reprojection_request",
+            args.output_dir / "open-edit.reprojection-request.json",
+        ),
+    ):
+        if args.reuse_raw_output and path.exists():
+            projection_artifacts[role] = path
+    projection_request_path = (
+        args.output_dir / "open-edit.reprojection-request.json"
+        if args.reuse_raw_output
+        else args.output_dir / "open-edit.request.json"
+    )
+    write_external_feature_plan_projection(
+        plan_dir=plan_dir,
+        projection_contract_id="clip-card-open-edit-v1",
+        catalog_path=args.catalog_json,
+        brief_path=args.output_dir / "brief.json",
+        feature_plan_path=plan_dir / "feature_edit_plan.json",
+        source_plan_path=args.output_dir / "open-edit-plan.json",
+        source_request_path=projection_request_path,
+        source_artifacts=projection_artifacts,
     )
     write_json(
         args.output_dir / "pricing.json",

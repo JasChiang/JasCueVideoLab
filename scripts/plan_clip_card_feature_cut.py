@@ -20,6 +20,7 @@ from google import genai
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from jascue_video_lab.billing import summarize_usage_files
+from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
 from jascue_video_lab.models import (
     FeatureChapterSelect,
@@ -189,6 +190,57 @@ def validate_plan_contract(
             frame_mmss = mmss(frame.requested_time_ms)
             if not event.start_mmss <= frame_mmss < event.end_mmss:
                 raise ValueError(f"frame lies outside selected event: {frame_id}")
+
+
+def project_feature_contracts(
+    plan: ClipCardFeaturePlan,
+    *,
+    brief: FeatureEditBrief,
+    catalog: RushesCatalog,
+) -> FeatureEditPlan:
+    """Deterministically project the richer Clip Card plan for the renderer."""
+
+    if plan.project_id != brief.project_id or plan.catalog_id != catalog.catalog_id:
+        raise ValueError("source plan differs from projection catalog/brief")
+    projected = [
+        FeatureChapterSelect(
+            feature_id=chapter.feature_id,
+            evidence_status=chapter.evidence_status,
+            horizontal_frame_id=chapter.horizontal_frame_id,
+            vertical_frame_id=chapter.vertical_frame_id,
+            observed_visual_evidence=chapter.observed_visual_evidence,
+            selection_reason=chapter.selection_reason,
+            horizontal_strategy=chapter.horizontal_strategy,
+            horizontal_zoom_intent=chapter.horizontal_zoom_intent,
+            horizontal_target_description=chapter.horizontal_target_description,
+            vertical_strategy=chapter.vertical_strategy,
+            vertical_target_description=chapter.vertical_target_description,
+            quality_risks=chapter.quality_risks,
+            confidence=chapter.confidence,
+        )
+        for chapter in plan.chapters
+    ]
+    return FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id=catalog.catalog_id,
+        title=plan.title,
+        chapters=projected,
+        uncertainties=plan.uncertainties,
+        model_provenance=plan.model_provenance,
+    )
+
+
+def reproject_external_feature_plan(
+    *,
+    source_plan: ClipCardFeaturePlan,
+    catalog: RushesCatalog,
+    brief: FeatureEditBrief,
+    source_artifacts: dict[str, Path],
+) -> tuple[FeatureEditBrief, FeatureEditPlan]:
+    """Registered deterministic projector used by provenance validation."""
+
+    del source_artifacts
+    return brief, project_feature_contracts(source_plan, brief=brief, catalog=catalog)
 
 
 def main() -> int:
@@ -370,26 +422,6 @@ model_provenance 必須先原樣回傳：
             )
     finally:
         client.close()
-    projected: list[FeatureChapterSelect] = []
-    for chapter in plan.chapters:
-        projected.append(
-            FeatureChapterSelect(
-                feature_id=chapter.feature_id,
-                evidence_status=chapter.evidence_status,
-                horizontal_frame_id=chapter.horizontal_frame_id,
-                vertical_frame_id=chapter.vertical_frame_id,
-                observed_visual_evidence=chapter.observed_visual_evidence,
-                selection_reason=chapter.selection_reason,
-                horizontal_strategy=chapter.horizontal_strategy,
-                horizontal_zoom_intent=chapter.horizontal_zoom_intent,
-                horizontal_target_description=chapter.horizontal_target_description,
-                vertical_strategy=chapter.vertical_strategy,
-                vertical_target_description=chapter.vertical_target_description,
-                quality_risks=chapter.quality_risks,
-                confidence=chapter.confidence,
-            )
-        )
-
     final_audit = plan.model_copy(
         update={
             "model_provenance": plan.model_provenance.model_copy(
@@ -397,19 +429,33 @@ model_provenance 必須先原樣回傳：
             )
         }
     )
-    final_plan = FeatureEditPlan(
-        project_id=brief.project_id,
-        catalog_id=catalog.catalog_id,
-        title=plan.title,
-        chapters=projected,
-        uncertainties=plan.uncertainties,
-        model_provenance=final_audit.model_provenance,
+    final_plan = project_feature_contracts(
+        final_audit,
+        brief=brief,
+        catalog=catalog,
     )
     write_json(args.output_dir / "clip-card-feature-plan.json", final_audit)
     write_json(args.output_dir / "feature_edit_plan.json", final_plan)
     write_json(
         args.output_dir / "clip-card-feature-plan.schema-validation.json",
         {"ok": True, "clip_card_count": len(cards), "frame_count": len(frames)},
+    )
+    write_external_feature_plan_projection(
+        plan_dir=args.output_dir,
+        projection_contract_id="clip-card-feature-cut-v1",
+        catalog_path=args.catalog_json,
+        brief_path=args.brief_json,
+        feature_plan_path=args.output_dir / "feature_edit_plan.json",
+        source_plan_path=args.output_dir / "clip-card-feature-plan.json",
+        source_request_path=args.output_dir / "clip-card-feature-plan.request.json",
+        source_artifacts={
+            "source_raw_interaction": (
+                args.output_dir / "clip-card-feature-plan.raw_interaction.json"
+            ),
+            "source_raw_output": (
+                args.output_dir / "clip-card-feature-plan.raw_output.json"
+            ),
+        },
     )
     pricing = summarize_usage_files(
         sorted(args.output_dir.glob("clip-card-feature-plan.attempt-*.raw_interaction.json")),
@@ -420,7 +466,7 @@ model_provenance 必須先原樣回傳：
         json.dumps(
             {
                 "clip_card_count": len(cards),
-                "chapter_count": len(projected),
+                "chapter_count": len(final_plan.chapters),
                 "pricing": pricing,
             },
             ensure_ascii=False,

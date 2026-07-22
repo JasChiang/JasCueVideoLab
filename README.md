@@ -159,7 +159,34 @@ uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
 
 固定 `left`／`center`／`right` crop 已被實驗性 9:16 輸出證明不可靠：人物或指定物件移動後仍可能被裁掉。`feature-cut` 改以使用者提供的章節 brief 控制敘事順序，Gemini 分別選橫式／直式 take 與明確 reframe target，再以 exact-frame image Grounding + SAM 2.1 mask propagation 約束 16:9 punch-in 與 9:16 crop。
 
-每個 tracked 9:16 segment 現在也保存 renderer 實際使用的 crop keyframes：相對片段時間、原始追蹤中心、平滑後中心、scaled coordinate space 與 `crop_x_pixels`。`primary_center` 只會放寬 target 外圍的 8% 安全 margin，允許犧牲次要 context；它不再允許指定 primary target 本身超出直式 crop。target 仍過寬時必須 fail closed、換候選或使用明確 fallback。`scripts/build_vertical_crop_audit.py` 可把候選素材、target、fallback、Grounding debug 與 crop 軌跡合成逐段人工審核頁。
+每個 tracked 9:16 segment 現在保存 renderer 真正使用的 crop keyframes、required-region union、逐時刻合法 crop interval、containment、可見寬度比例、首尾／中段 tracking coverage、crop speed 與 acceleration。裁切器不再先平滑 target 中心後直接裁切，而是先由每一個 required bbox 算出合法範圍，再把平滑路徑投影回該範圍；這可避免平滑延遲把快速移動主體推出畫面。`primary_center` 只會放寬 target 外圍的 8% safety margin，不暗中授權裁掉 target。
+
+Reframe geometry 使用 FFmpeg 自動旋轉後的 display dimensions 做 aspect-preserving cover，不再假設來源一定是 16:9。4:3、直式、超寬與相同比例素材都共用二維 x／y crop solver；manifest 保存來源／縮放／輸出座標空間、兩軸合法區間與實際 crop keyframes。非方形像素來源會先依 FFmpeg frame SAR 還原顯示比例；在 tracking 尚未建立同一顯示座標系前，只能 fail closed 到已正規化 SAR 的靜態 reframe 並標記人工複核。track seed 尺寸、analysis aspect 或多 track lineage 與來源不一致時同樣不能把 normalized 座標硬套進 renderer。
+
+一個構圖可用 `vertical_regions` 分開表達多個 required、preferred 或 avoid-overlay 區域；kind 只使用泛用的 `subject`、`text_region`、`ui_region`、`graphic`、`other`。多個 required 區域會各自取得 exact-frame Gemini bbox，再共用一個 SAM 2.1 video session，逐 sample 合併 union，避免把兩個人物或「人物＋螢幕」寫成一個模糊 target。文字也沒有品牌特例：brief 應指定「必須完整可讀的語意核心」為 required text region，裝飾或整塊容器則可列 preferred。
+
+預設 `vertical_overflow_policy=preserve_all`；required union 太寬、任一 required track 遺失、首尾 coverage 不足或逐 sample containment 失敗時都 fail closed。Gemini plan 的 schema 也只能輸出 `preserve_all`；模型若認為有限裁切值得考慮，只能留下 `vertical_overflow_proposal`，proposal 不具執行權限。
+
+人工若明確接受有限裁切，才可透過 `scripts/apply_reframe_policy.py` 選 `controlled_clip`，並以 `preserve_start`、`preserve_end` 或 `balanced` 指定優先側。腳本不會重跑選片，而會把原始 catalog、preserve-all brief、feature plan、plan binding、選定 frame IDs 與人工 policy 寫入 content-addressed sidecar；修改其中任一輸入，renderer 都會 fail closed。產生的 revised bundle 必須搭配 `--reuse-feature-plan` 使用，manifest 仍保存可見比例與 review requirement，不能把受控裁切冒充完整保留。
+
+```bash
+uv run python scripts/apply_reframe_policy.py \
+  SOURCE_BRIEF.json HUMAN_POLICY.json REVIEWED_OUTPUT_DIR \
+  --catalog CATALOG.json \
+  --feature-plan SOURCE_OUTPUT/gemini-plan/feature_edit_plan.json \
+  --reviewer "human-reviewer" \
+  --review-note "reviewed required-region tradeoffs"
+
+uv run jascue-video-lab feature-cut \
+  CATALOG.json REVIEWED_OUTPUT_DIR/brief.json \
+  --sam-checkpoint SAM_CHECKPOINT.pt \
+  --output-dir REVIEWED_OUTPUT_DIR \
+  --reuse-feature-plan
+```
+
+`scripts/build_vertical_crop_audit.py` 可把候選、fallback、風險碼、Grounding debug 與實際 crop 軌跡合成審核頁。
+
+若使用者明示不要背景補邊，而 SAM propagation 又不完整，renderer 可把已驗證的 Gemini seed union 當成靜態 anchor，依同一套 edge policy 產生 `seed_anchor_crop`；它比盲目裁來源正中央更接近指定主體，但不代表已驗證 seed 前後的移動，因此固定標記 `motion_outside_seed_unverified` 並要求人工複核。若 required union 本來就比 9:16 寬，仍應優先換 take、調整 required／preferred、拆鏡或選擇 contain／split／PiP；靜態 anchor 不能把幾何上放不下的內容變成完整可見。
 
 ```text
 使用者功能 brief（文案事實來源）
@@ -172,7 +199,7 @@ uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
   → 可選字卡 + 原始現場音 + H.264/AAC review cuts
 ```
 
-SAM 只提供幾何，不自行決定剪輯美學。16:9 的 `none`／`subtle`／`detail` 由 feature plan 表示 editorial intent，實際倍率不得超過 mask 安全值。9:16 的 `strict` 要求完整保留指定物件；人工 `primary_center` 則允許犧牲次要人物或 context，集中呈現指定主視覺。這個 sacrifice 必須寫入 brief／manifest，不能由 tracker 默默決定。使用者 brief 的規格文字與模型觀察到的畫面證據分開保存，沒有 ASR 或 transcript。
+SAM 只提供幾何，不自行決定剪輯美學。16:9 的 `none`／`subtle`／`detail` 由 feature plan 表示 editorial intent，實際倍率不得超過 mask 安全值。9:16 的 `strict` 要求完整保留 required regions；`primary_center` 只表示可犧牲未列為 required 的次要 context。真正允許裁掉 required union 時，必須另以 `controlled_clip` 明示並接受語意複核。使用者 brief 的規格文字與模型觀察到的畫面證據分開保存，沒有 ASR 或 transcript。
 
 ```bash
 uv run jascue-video-lab feature-cut \
@@ -182,6 +209,8 @@ uv run jascue-video-lab feature-cut \
   --sam-analysis-fps 2 \
   --output-dir artifacts/my-feature-cut
 ```
+
+若同一個 output directory 已保存 feature plan，renderer 不會再因檔案存在就自動假設它仍符合目前 prompt／brief。要做只比較裁切器的 controlled A/B，必須明示 `--reuse-feature-plan`；程式會保存舊 plan、目前 catalog／brief／prompt 的 hash，並只重算 geometry 與成片。想重新選片時則使用新的 output directory，不加此旗標。
 
 若某章已有真人核准的 Trim Intent，可重複傳入 `--trim-decision PATH`。Renderer 只接受 `approval_status=approved` 且帶有人類 review record 的 decision，並再次驗證 source SHA-256 與目前 FFmpeg shot；代表性 select 可以位於同一 source shot 中但不包含較早的 coarse RF anchor。proposed、rejected、跨鏡或同 source shot 多筆造成歧義的 decision 會被拒絕。沒有匹配 decision 的章節仍使用原本「keyframe 中心 ± brief duration、限制在 shot」的粗剪方式，manifest 會分別標示 `human_approved_frame_id_pts` 或 `keyframe_centered_requested_duration`，不會把 fallback 冒充成精修結果。
 
@@ -206,7 +235,15 @@ Feature renderer 同樣接受無音軌來源：有原音時保留並淡入淡出
 
 `scripts/plan_clip_card_feature_cut.py` 將這個方法延伸到完整 feature cut：模型可閱讀整個已驗證 Clip Card library，但只能選 catalog 中既有的 asset／event／RF frame ID；本機會再次驗證影格確實屬於該素材且位在事件區間，才投影成 `feature-cut` 可使用的 plan。選片階段不產生 bbox 或剪點，只有真正入選、需要動態構圖的區間才執行 exact-frame Grounding 與 SAM。實務上的幾何降級順序應保留多個候選：先允許 brief 明示的少量主體裁切，再嘗試同事件的另一 seed／更明確 target，其次換用候選素材，最後才採本機 fallback。`vertical_fallback_strategy=center_crop` 可明確禁止模糊背景；所有 fallback 原因仍寫入 render manifest，不能冒充成功追蹤。
 
-`scripts/plan_clip_card_open_edit.py` 是沒有內容 brief 的對照實驗：只給 60–90 秒與雙比例等操作限制，讓 Gemini 從完整 Clip Card library 自行推論主題、時間軸位置與每格 2–4 個候選。局部 Trim Intent 可能為保留完整動作而使成片超過模型原先配置的秒數，因此 `scripts/reconcile_open_edit_budget.py` 另讀實際 segment durations，只以 keep／drop／reorder 完整片段把全片拉回 duration contract；它不會在動作中間靜默截短。
+Clip Card plan 轉成 renderer plan 時會另寫不可變的 external-projection sidecar，保存來源 catalog、brief、模型 request／raw response、projection contract 與輸出 plan 的 hash。candidate override 也必須接續並驗證這條 provenance；任一上游內容改變就 fail closed。早於此 contract 的舊 artifact 不可手動複製 plan 冒充可重用結果，必須從仍保存的原始 artifact 重新投影。
+
+`scripts/plan_clip_card_open_edit.py` 是沒有內容 brief 的對照實驗：只給 60–90 秒與雙比例等操作限制，讓 Gemini 從完整 Clip Card library 自行推論主題、時間軸位置與每格 2–4 個候選。新版 evidence payload 也保留 Entity kind、required／optional／avoid-overlay 關係，讓模型可產生泛用 `vertical_regions`，而不是把多個獨立主體合寫成一個 bbox target。局部 Trim Intent 可能為保留完整動作而使成片超過模型原先配置的秒數，因此 `scripts/reconcile_open_edit_budget.py` 另讀實際 segment durations，只以 keep／drop／reorder 完整片段把全片拉回 duration contract；它不會在動作中間靜默截短。
+
+當 9:16 audit 證明 required union 不可容納或 tracking coverage 不足時，處理順序是先換同一 editorial role 的候選 take，而不是立刻套模糊背景。`scripts/apply_open_edit_candidate_overrides.py` 接受人工審查過的 `feature_id + aspect + candidate_id + reason` patch，保留原始 OpenEditPlan 與兩邊 hash，再重新投影 brief／feature plan／trim plan；候選不存在或同一 aspect 重複覆寫會 fail closed。這仍是 human-in-the-loop 工具，尚未宣稱能自動把所有替代 take 做完 geometry 排名。
+
+成片 Gemini QA 採成本分級，不是每次 render 都重看全部。所有片段先跑零 API 成本的本機 geometry／coverage／media gate；只有文字／UI、多 required targets、controlled clip、tracking risk 或 fallback 段落需要語意複核。`scripts/verify_feature_cut.py` 可把完成版 9:16 壓成 720×1280 proxy，以一次 `gemini-3.5-flash`、`thinking_level=minimal` Structured Output call 檢查主體身分、重要文字、語意是否符合與重複／突兀問題；它不回時間戳、不驗證 frame-accurate geometry，也不會自行改剪。相同 render／manifest／prompt／schema 會重用結果，最終仍由真人核准。若 schema 驗證失敗或重試，每一次 request、raw response、錯誤、timing 與 pricing 都保存於不可覆寫的 attempt 目錄，總成本會聚合所有實際有 usage 的請求。
+
+Gemini 的成片 `pass` 不可覆蓋本機幾何證據。QA validator 會把 required-region coverage、完整 containment、controlled clip、fallback 與 source-edge 診斷一起納入本機最終狀態；只要其中一項需要複核，即使模型認為主體「看得見」，validated status 仍固定為 `review`。feature-cut 另把本次新增或改變的 raw interactions 記在 `pricing.incremental.json`，與包含歷史快取的 `pricing.json` 分開，避免把舊請求重複算成本輪花費。
 
 主要影片／圖片辨識請求另使用 Interactions API `system_instruction` 建立 evidence-only 邊界：本次媒體與明確 metadata 是唯一證據，禁止以模型記憶、常見名稱、相似外觀或「最可能答案」補完品牌、型號、數字與 UI 文字。Full Clip Card prompt 也要求任一關鍵字元不清楚時改用泛稱並保存 uncertainty。控制 A/B 曾觀察到舊 prompt 以先驗補完一個相似但錯誤的型號；改用 domain-neutral 規則後該欄位在重跑中恢復正確，模型卻又把另一處模糊小字補成畫面不存在的規格。這證明 prompt guardrail 不是 ground truth：單一正確 claim 不代表整張 Clip Card 都正確，衝突與重要文字仍需 exact-frame 驗證及人工核准。
 

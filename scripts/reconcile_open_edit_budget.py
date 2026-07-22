@@ -116,12 +116,16 @@ def main() -> int:
         feature_id = shot["feature_id"]
         horizontal_item = horizontal[feature_id]
         vertical_item = vertical[feature_id]
-        duration_ms = int(horizontal_item["source_out_ms"]) - int(
-            horizontal_item["source_in_ms"]
-        )
-        vertical_duration_ms = int(vertical_item["source_out_ms"]) - int(
-            vertical_item["source_in_ms"]
-        )
+        duration_ms = horizontal_item.get("duration_ms")
+        if not isinstance(duration_ms, int) or duration_ms <= 0:
+            duration_ms = int(horizontal_item["source_out_ms"]) - int(
+                horizontal_item["source_in_ms"]
+            )
+        vertical_duration_ms = vertical_item.get("duration_ms")
+        if not isinstance(vertical_duration_ms, int) or vertical_duration_ms <= 0:
+            vertical_duration_ms = int(vertical_item["source_out_ms"]) - int(
+                vertical_item["source_in_ms"]
+            )
         if duration_ms != vertical_duration_ms:
             raise ValueError(f"aspect durations differ for {feature_id}")
         segments.append(
