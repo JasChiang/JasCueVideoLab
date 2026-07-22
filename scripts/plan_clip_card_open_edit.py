@@ -29,6 +29,8 @@ from jascue_video_lab.models import (
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
+    FeatureHorizontalCandidate,
+    FeatureVerticalCandidate,
     FramingRegionIntent,
     FullClipCard,
     ModelProvenance,
@@ -264,6 +266,8 @@ def validate_evidence(
 
 def project_feature_contracts(
     plan: OpenEditPlan,
+    *,
+    preserve_runtime_candidates: bool = True,
 ) -> tuple[FeatureEditBrief, FeatureEditPlan, dict[str, object]]:
     brief_chapters: list[FeatureChapterBrief] = []
     selected_chapters: list[FeatureChapterSelect] = []
@@ -271,6 +275,16 @@ def project_feature_contracts(
     for shot in plan.shots:
         horizontal = shot.candidate(shot.horizontal_candidate_id)
         vertical = shot.candidate(shot.vertical_candidate_id)
+        horizontal_ranked = [horizontal] + [
+            candidate
+            for candidate in shot.candidates
+            if candidate.candidate_id != horizontal.candidate_id
+        ]
+        vertical_ranked = [vertical] + [
+            candidate
+            for candidate in shot.candidates
+            if candidate.candidate_id != vertical.candidate_id
+        ]
         vertical_target_description = _projected_vertical_target_description(vertical)
         brief_chapters.append(
             FeatureChapterBrief(
@@ -322,6 +336,41 @@ def project_feature_contracts(
                     )
                 ),
                 confidence=min(horizontal.confidence, vertical.confidence),
+                horizontal_candidates=[
+                    FeatureHorizontalCandidate(
+                        candidate_id=candidate.candidate_id,
+                        rank=rank,
+                        source_asset_id=candidate.source_asset_id,
+                        event_id=candidate.event_id,
+                        frame_id=candidate.frame_id,
+                        observed_visual_evidence=candidate.observed_visual_evidence,
+                        selection_reason=candidate.selection_reason,
+                        strategy=candidate.horizontal_strategy,
+                        zoom_intent=candidate.horizontal_zoom_intent,
+                        target_description=candidate.horizontal_target_description,
+                        quality_risks=candidate.quality_risks,
+                        confidence=candidate.confidence,
+                    )
+                    for rank, candidate in enumerate(horizontal_ranked, start=1)
+                ] if preserve_runtime_candidates else [],
+                vertical_candidates=[
+                    FeatureVerticalCandidate(
+                        candidate_id=candidate.candidate_id,
+                        rank=rank,
+                        source_asset_id=candidate.source_asset_id,
+                        event_id=candidate.event_id,
+                        frame_id=candidate.frame_id,
+                        observed_visual_evidence=candidate.observed_visual_evidence,
+                        selection_reason=candidate.selection_reason,
+                        strategy=candidate.vertical_strategy,
+                        crop_mode=candidate.vertical_crop_mode,
+                        target_description=_projected_vertical_target_description(candidate),
+                        regions=candidate.vertical_regions,
+                        quality_risks=candidate.quality_risks,
+                        confidence=candidate.confidence,
+                    )
+                    for rank, candidate in enumerate(vertical_ranked, start=1)
+                ] if preserve_runtime_candidates else [],
             )
         )
         audit_chapters.append(
@@ -379,7 +428,29 @@ def reproject_external_feature_plan(
     del brief, source_artifacts
     if source_plan.catalog_id != catalog.catalog_id:
         raise ValueError("open-edit source plan differs from projection catalog")
-    projected_brief, projected_plan, _ = project_feature_contracts(source_plan)
+    projected_brief, projected_plan, _ = project_feature_contracts(
+        source_plan,
+        preserve_runtime_candidates=False,
+    )
+    return projected_brief, projected_plan
+
+
+def reproject_external_feature_plan_v2(
+    *,
+    source_plan: OpenEditPlan,
+    catalog: RushesCatalog,
+    brief: FeatureEditBrief,
+    source_artifacts: dict[str, Path],
+) -> tuple[FeatureEditBrief, FeatureEditPlan]:
+    """Reproduce the Top-K runtime-candidate projection contract."""
+
+    del brief, source_artifacts
+    if source_plan.catalog_id != catalog.catalog_id:
+        raise ValueError("source plan differs from projection catalog")
+    projected_brief, projected_plan, _ = project_feature_contracts(
+        source_plan,
+        preserve_runtime_candidates=True,
+    )
     return projected_brief, projected_plan
 
 
@@ -699,7 +770,7 @@ model_provenance 必須先原樣回傳：
     )
     write_external_feature_plan_projection(
         plan_dir=plan_dir,
-        projection_contract_id="clip-card-open-edit-v1",
+        projection_contract_id="clip-card-open-edit-v2",
         catalog_path=args.catalog_json,
         brief_path=args.output_dir / "brief.json",
         feature_plan_path=plan_dir / "feature_edit_plan.json",

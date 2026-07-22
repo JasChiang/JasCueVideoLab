@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from scripts.apply_open_edit_candidate_overrides import (
     CandidateOverride,
     CandidateOverridePatch,
     apply_candidate_overrides,
+    reproject_external_feature_plan as reproject_override_v1,
+    reproject_external_feature_plan_v2 as reproject_override_v2,
 )
 from scripts.plan_clip_card_open_edit import (
     OpenEditCandidate,
@@ -11,6 +15,8 @@ from scripts.plan_clip_card_open_edit import (
     OpenEditShot,
     VerticalOverflowProposal,
     project_feature_contracts,
+    reproject_external_feature_plan,
+    reproject_external_feature_plan_v2,
 )
 import pytest
 from jascue_video_lab.models import FramingRegionIntent, ModelProvenance
@@ -89,6 +95,81 @@ def test_candidate_override_changes_only_requested_aspect() -> None:
     assert revised.shots[1].horizontal_candidate_id == "a1"
     assert revised.shots[1].vertical_candidate_id == "b1"
     assert plan.shots[1].vertical_candidate_id == "a1"
+
+    mismatch = SimpleNamespace(catalog_id="another-catalog")
+    for projector in (reproject_override_v1, reproject_override_v2):
+        with pytest.raises(ValueError, match="differs from projection catalog"):
+            projector(
+                source_plan=revised,
+                catalog=mismatch,
+                brief=object(),
+                source_artifacts={},
+            )
+
+
+def test_open_edit_projection_entrypoints_keep_v1_and_v2_semantics() -> None:
+    shots = []
+    for index in range(10):
+        role = "hook" if index == 0 else "closing" if index == 9 else "action"
+        shots.append(
+            OpenEditShot(
+                feature_id=f"scene_{index}",
+                title="scene",
+                editorial_role=role,
+                intended_effect="progress",
+                target_duration_seconds=6,
+                candidates=[
+                    candidate(f"a{index}", f"RF{index * 2 + 1:06d}"),
+                    candidate(f"b{index}", f"RF{index * 2 + 2:06d}"),
+                ],
+                horizontal_candidate_id=f"a{index}",
+                vertical_candidate_id=f"b{index}",
+            )
+        )
+    plan = OpenEditPlan(
+        project_id="project",
+        catalog_id="catalog",
+        inferred_title="title",
+        inferred_theme="theme",
+        intended_audience_hypothesis="audience",
+        story_arc="arc",
+        shots=shots,
+        excluded_patterns=[],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id="gemini-3.6-flash",
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    catalog = SimpleNamespace(catalog_id="catalog")
+
+    _, legacy = reproject_external_feature_plan(
+        source_plan=plan,
+        catalog=catalog,  # type: ignore[arg-type]
+        brief=object(),  # type: ignore[arg-type]
+        source_artifacts={},
+    )
+    _, current = reproject_external_feature_plan_v2(
+        source_plan=plan,
+        catalog=catalog,  # type: ignore[arg-type]
+        brief=object(),  # type: ignore[arg-type]
+        source_artifacts={},
+    )
+
+    assert legacy.chapters[0].horizontal_candidates == []
+    assert legacy.chapters[0].vertical_candidates == []
+    assert [item.candidate_id for item in current.chapters[0].horizontal_candidates] == [
+        "a0",
+        "b0",
+    ]
+    assert [item.candidate_id for item in current.chapters[0].vertical_candidates] == [
+        "b0",
+        "a0",
+    ]
 
 
 def test_region_only_candidate_projects_deterministic_composite_target() -> None:

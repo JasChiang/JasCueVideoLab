@@ -91,7 +91,9 @@ def reproject_external_feature_plan(
 ) -> tuple[object, object]:
     """Recompute a reviewed override and its renderer contracts from evidence."""
 
-    del catalog, brief
+    del brief
+    if getattr(catalog, "catalog_id", None) != source_plan.catalog_id:
+        raise ValueError("override source plan differs from projection catalog")
     input_plan_path = source_artifacts["input_open_edit_plan"]
     patch_path = source_artifacts["candidate_override_patch"]
     audit_path = source_artifacts["candidate_override_audit"]
@@ -115,7 +117,32 @@ def reproject_external_feature_plan(
         != [item.model_dump(mode="json") for item in patch.overrides]
     ):
         raise ValueError("candidate override audit differs from validated patch inputs")
-    projected_brief, projected_plan, _ = project_feature_contracts(source_plan)
+    projected_brief, projected_plan, _ = project_feature_contracts(
+        source_plan,
+        preserve_runtime_candidates=False,
+    )
+    return projected_brief, projected_plan
+
+
+def reproject_external_feature_plan_v2(
+    *,
+    source_plan: OpenEditPlan,
+    catalog: object,
+    brief: object,
+    source_artifacts: dict[str, Path],
+) -> tuple[object, object]:
+    """Validate the same override chain and retain runtime Top-K candidates."""
+
+    reproject_external_feature_plan(
+        source_plan=source_plan,
+        catalog=catalog,
+        brief=brief,
+        source_artifacts=source_artifacts,
+    )
+    projected_brief, projected_plan, _ = project_feature_contracts(
+        source_plan,
+        preserve_runtime_candidates=True,
+    )
     return projected_brief, projected_plan
 
 
@@ -168,7 +195,7 @@ def main() -> int:
     )
     write_external_feature_plan_projection(
         plan_dir=plan_dir,
-        projection_contract_id="open-edit-candidate-overrides-v1",
+        projection_contract_id="open-edit-candidate-overrides-v2",
         catalog_path=Path(upstream_catalog_path),
         brief_path=output_dir / "brief.json",
         feature_plan_path=plan_dir / "feature_edit_plan.json",

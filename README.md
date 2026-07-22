@@ -1,8 +1,20 @@
 # JasCueVideoLab
 
-這是一個**完全獨立、實驗性**的 Gemini 3.5 Flash 影片理解與單幀 Grounding 驗證專案。它不是 JasCue 正式產品，不引用也不修改任何 JasCue 程式碼；實驗未通過前，不應將這裡的程式合併回 JasCue。
+這是一個**完全獨立、實驗性**的 Gemini 3.6 Flash 影片理解與單幀 Grounding 驗證專案。它不是 JasCue 正式產品，不引用也不修改任何 JasCue 程式碼；實驗未通過前，不應將這裡的程式合併回 JasCue。
 
-最新方法採用「未指定 target 就先提出候選，使用者以 QueryLock 鎖定實例與可選事件條件後才找時間與 bbox」，完整說明見 [METHODOLOGY.md](METHODOLOGY.md)。毛片 coarse-to-fine 全量流程見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)，目前已完成 per-clip Full v1 垂直切片與批次入口。Gemini polygon 與 bbox seed 的舊 A/B 僅保留為唯讀歷史資料；目前支援路徑只使用 Gemini／人工 bbox → SAM。
+最新方法採用「先鎖定證據，再驗證 geometry」：未指定 target 時先提出候選，使用者以 QueryLock 鎖定實例與可選事件條件後才找時間與 bbox；自動直式構圖則保留 Top-K 素材候選，逐一通過 exact-frame geometry preflight 才可採用。完整說明見 [METHODOLOGY.md](METHODOLOGY.md)，毛片 coarse-to-fine 全量流程見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)。Gemini polygon 與 bbox seed 的舊 A/B 僅保留為唯讀歷史資料；目前支援路徑只使用 Gemini／人工 bbox → SAM。
+
+## 這個專案要驗證什麼
+
+JasCueVideoLab 是可重跑、可計價、可人工稽核的研究工具，目的是分開量測以下能力，而不是用一次模型回答宣稱「AI 已經會自動剪片」：
+
+- Gemini 是否能完整觀看逐支 proxy，產生可重用的 Clip Cards 與 coarse semantic events。
+- 有 brief 或無 brief 時，Gemini 是否能從整批 Clip Cards 選出合適 take、敘事順序、時間段，以及針對 16:9／9:16 應保留或可犧牲的內容。
+- 從原片 exact frame 取得的 Gemini bbox，是否能正確指定語意實例並成為 SAM shot-local tracking seed。
+- 本機 crop solver 是否能利用整段 track 做雙比例構圖，保存每次候選切換、失敗、fallback、成本與處理時間，供真人決定是否採用。
+- 同一素材重跑時，選片、事件、時間與 geometry 是否穩定；模型錯誤、429、不可見與不確定狀態是否能 fail closed，而非靜默補值。
+
+Gemini 負責語意選擇，FFmpeg 負責可回映的媒體時間，Gemini image Grounding 負責單張 seed，SAM 負責同一 shot 內的時序 geometry，本機規則負責驗證與裁切，真人負責最終內容和畫面品質。任何模型 confidence、schema 通過、bbox 或 SAM mask 都不是 production ground truth，也不得直接當成 JasCue 正式 SpatialTrack。
 
 目前的最小垂直切片是：
 
@@ -159,6 +171,33 @@ uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
 
 固定 `left`／`center`／`right` crop 已被實驗性 9:16 輸出證明不可靠：人物或指定物件移動後仍可能被裁掉。`feature-cut` 改以使用者提供的章節 brief 控制敘事順序，Gemini 分別選橫式／直式 take 與明確 reframe target，再以 exact-frame image Grounding + SAM 2.1 mask propagation 約束 16:9 punch-in 與 9:16 crop。
 
+#### Full Auto v2 executor＋selection planner v3
+
+單一模型首選可能在語意上合理，卻在目標比例下無法安全構圖。Full Auto v2 executor 因此要求每個 `supported`／`partial` chapter 保存 2–4 個不同 evidence frame 的候選，而不是只留下 rank 1。selection planner v3 仍由 Gemini 依 brief 決定 source asset、Clip Card event、immutable RF frame、可見證據、品質風險、橫／直策略、簡短 framing intent，以及有序且互斥的 `required_entity_ids`、`preferred_entity_ids`、`sacrificable_entity_ids`。因此模型沒有失去「要剪哪裡、要保留哪個部位」的判斷。
+
+v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 verbose resolved regions。本機會把模型選出的 entity IDs 對回一份 hash-bound `selected-clip-card-evidence.json`，確定性補出 target descriptions、相容欄位與 executable region contracts；projection 可由原始模型輸出和這份證據快照完整重現。相較 v2，送入模型的 Clip Card payload 約縮小 30%，response schema 字元數約縮小 44%，也移除了先前造成付費整批重試的 mirror-field 不一致來源。
+
+目前自動 candidate routing 已接到 9:16 路徑：renderer 依候選順序，先核對 asset／event／frame lineage 與單一 shot 邊界，再從原始來源抽 exact frame，以 Gemini bbox 建立 SAM seed，完成 shot-local tracking 與實際 crop path，最後才執行本機 preflight。16:9 的 Top-K 也會保存在 schema 與 provenance 中，但目前仍採投影後的選定候選，尚未執行同等的 runtime geometry switching。
+
+構圖需求使用領域中立的 region contract：
+
+- `hard_core`：語意上必須完整保留的區域；來自 `required`。
+- `soft_extent`：有助構圖但可以有限取捨的脈絡；來自 `preferred`，並有明確的最小可見比例。
+- `overlay_keepout`：後續圖卡或版面不應遮住的區域；來自 `avoid_overlay`。
+- `atomic=true`：局部裁切會破壞意義的單一區域，不論原角色為何都視為 hard core，必須 100% 保留。
+
+同一候選可把多個 region 分別 Grounding，並在同一個 SAM session 內建立獨立 track。Crop solver 以 hard-core tracks 求每個 sample 的合法窗口，soft-extent tracks 只影響構圖中心與可見比例稽核；它們不會擠掉 hard core。Preflight 另外檢查來源 lineage、shot 範圍、Grounding／tracking gate、首尾與中段 coverage、hard-core containment、soft-extent floor、overlay keepout、crop speed、acceleration、jerk，以及 source／track／geometry SHA-256。
+
+自動路徑使用版本化 `auto_bounded_clip_v1`：候選必須先用 `preserve_all` 解出 hard core；只有 soft extent 仍高於明列 floor 時，才可標記為 bounded clip。它不授權裁掉 hard core 或 atomic region。相對地，`controlled_clip` 仍必須來自 content-addressed 的真人 policy sidecar；一旦存在此 binding，renderer 會停用自動換候選，完全依真人核准的候選與 edge priority 執行。
+
+失敗會保存 typed failure code 與 recovery action，例如 shot crossing、coverage 不足、hard core 被裁、soft extent 低於門檻、keepout 違規或 crop motion 過快。現行 executor 會實際嘗試下一個 Top-K 候選，並把預先規劃的 safe-fit 候選延後到 tracked candidates 之後；其他 recovery action 目前是可稽核建議，尚未自動執行。所有候選都失敗時，輸出只是一份 `policy_blocked_preview_fit` 全內容補邊預覽並固定要求人工 review，不會偷偷改用未驗證的中心裁切。
+
+這個設計也控制成本：Clip Card 可跨 brief 重用；Top-K planner 預設只允許一次 text-only Structured Output request，`--repair-attempts` 預設為 `0`，若要付費重新產生完整規劃必須明確開啟。bbox／SAM geometry 採 lazy evaluation，只有已選 chapter 的候選才依序執行，遇到第一個通過 preflight 的候選就停止。每次 model request、raw response、usage、prompt/schema/model fingerprint，以及每個候選的嘗試與 geometry fingerprint 都會保存。Top-K 會增加 planner output token，候選失敗也會增加 Grounding 與 SAM 時間，因此成本報告仍須以實際 raw usage 與本機 tracker timing 為準，不能只用候選數乘固定牌價。
+
+429／quota failure 不屬於候選內容問題。SDK 重試後只要仍回傳 429、`RESOURCE_EXHAUSTED` 或 spending-cap error，geometry executor 會立即寫出 `geometry-model-circuit-breaker.json` 並中止整次 render，不再換候選、不再繼續輸出看似完成但沒有 Gemini geometry 證據的 fallback 成片。一般的 target 不可見、tracking coverage 或構圖不可行才會繼續嘗試下一個候選。
+
+Full Auto v2 目前仍有清楚限制：尚未在 candidate preflight 內執行週期性語意 identity checkpoint、遮擋後自動 re-identification 或自動圖卡避讓；`overlay_keepout` 在有字卡但沒有 layout solver 時會 fail closed。獨立的成片 QA 可以提出語意 review，但不會替 preflight 補造證據或覆蓋 geometry gate。Safe-fit 只是方便人工觀看的預覽，不是核准構圖；模型 rank、confidence、SAM mask 與 schema validation 也都不是 human ground truth。
+
 每個 tracked 9:16 segment 現在保存 renderer 真正使用的 crop keyframes、required-region union、逐時刻合法 crop interval、containment、可見寬度比例、首尾／中段 tracking coverage、crop speed 與 acceleration。裁切器不再先平滑 target 中心後直接裁切，而是先由每一個 required bbox 算出合法範圍，再把平滑路徑投影回該範圍；這可避免平滑延遲把快速移動主體推出畫面。`primary_center` 只會放寬 target 外圍的 8% safety margin，不暗中授權裁掉 target。
 
 Reframe geometry 使用 FFmpeg 自動旋轉後的 display dimensions 做 aspect-preserving cover，不再假設來源一定是 16:9。4:3、直式、超寬與相同比例素材都共用二維 x／y crop solver；manifest 保存來源／縮放／輸出座標空間、兩軸合法區間與實際 crop keyframes。非方形像素來源會先依 FFmpeg frame SAR 還原顯示比例；在 tracking 尚未建立同一顯示座標系前，只能 fail closed 到已正規化 SAR 的靜態 reframe 並標記人工複核。track seed 尺寸、analysis aspect 或多 track lineage 與來源不一致時同樣不能把 normalized 座標硬套進 renderer。
@@ -233,13 +272,13 @@ Feature renderer 同樣接受無音軌來源：有原音時保留並淡入淡出
 
 完整的 Clip Card-driven A/B 則分成兩次 Gemini 任務：第一輪逐片產生 Clip Cards；第二輪只讀已驗證 Clip Cards 與使用者 brief，輸出 Structured narrative plan。`scripts/plan_selected_clip_cards.py` 實作第二輪，`scripts/render_clip_card_narrative.py` 只從通過 evidence gate 的 source/event/MM:SS 建立 16:9 review cut。第二輪仍可能產生規格換算錯誤，Clip Card 也可能把局部可見的數字或型號字元誤判成另一個相似值。因此任何 OCR／身分衝突只能觸發 `needs_human_review`，必須回查 orientation-corrected 原始影格後才能採用或排除；schema validation 不能取代 claim validation，也不能把模型 OCR 當成 ground truth。
 
-`scripts/plan_clip_card_feature_cut.py` 將這個方法延伸到完整 feature cut：模型可閱讀整個已驗證 Clip Card library，但只能選 catalog 中既有的 asset／event／RF frame ID；本機會再次驗證影格確實屬於該素材且位在事件區間，才投影成 `feature-cut` 可使用的 plan。選片階段不產生 bbox 或剪點，只有真正入選、需要動態構圖的區間才執行 exact-frame Grounding 與 SAM。實務上的幾何降級順序應保留多個候選：先允許 brief 明示的少量主體裁切，再嘗試同事件的另一 seed／更明確 target，其次換用候選素材，最後才採本機 fallback。`vertical_fallback_strategy=center_crop` 可明確禁止模糊背景；所有 fallback 原因仍寫入 render manifest，不能冒充成功追蹤。
+`scripts/plan_clip_card_feature_cut.py` 將這個方法延伸到完整 feature cut：模型可閱讀整個已驗證 Clip Card library，但只能選 catalog 中既有的 asset／event／entity／RF frame ID；本機會再次驗證影格確實屬於該素材、位在事件區間，且每個 brief-specific entity priority 都能回溯到 event，再以 hash-bound Clip Card evidence 投影出 `feature-cut` 可使用的 target 與 region contract。選片階段不產生 bbox 或剪點，只有真正入選、需要動態構圖的區間才執行 exact-frame Grounding 與 SAM。新版保留每章 2–4 個候選，9:16 renderer 會先試可驗證的 tracked candidates，再考慮 planner 明列的 safe-fit；所有候選均失敗時只輸出待審 preview，不會把中心裁切冒充成成功追蹤。
 
 Clip Card plan 轉成 renderer plan 時會另寫不可變的 external-projection sidecar，保存來源 catalog、brief、模型 request／raw response、projection contract 與輸出 plan 的 hash。candidate override 也必須接續並驗證這條 provenance；任一上游內容改變就 fail closed。早於此 contract 的舊 artifact 不可手動複製 plan 冒充可重用結果，必須從仍保存的原始 artifact 重新投影。
 
 `scripts/plan_clip_card_open_edit.py` 是沒有內容 brief 的對照實驗：只給 60–90 秒與雙比例等操作限制，讓 Gemini 從完整 Clip Card library 自行推論主題、時間軸位置與每格 2–4 個候選。新版 evidence payload 也保留 Entity kind、required／optional／avoid-overlay 關係，讓模型可產生泛用 `vertical_regions`，而不是把多個獨立主體合寫成一個 bbox target。局部 Trim Intent 可能為保留完整動作而使成片超過模型原先配置的秒數，因此 `scripts/reconcile_open_edit_budget.py` 另讀實際 segment durations，只以 keep／drop／reorder 完整片段把全片拉回 duration contract；它不會在動作中間靜默截短。
 
-當 9:16 audit 證明 required union 不可容納或 tracking coverage 不足時，處理順序是先換同一 editorial role 的候選 take，而不是立刻套模糊背景。`scripts/apply_open_edit_candidate_overrides.py` 接受人工審查過的 `feature_id + aspect + candidate_id + reason` patch，保留原始 OpenEditPlan 與兩邊 hash，再重新投影 brief／feature plan／trim plan；候選不存在或同一 aspect 重複覆寫會 fail closed。這仍是 human-in-the-loop 工具，尚未宣稱能自動把所有替代 take 做完 geometry 排名。
+當 9:16 audit 證明 hard-core union 不可容納或 tracking coverage 不足時，自動路徑會先換同一 chapter 的下一個 evidence-bound candidate，而不是立刻套背景補邊。`scripts/apply_open_edit_candidate_overrides.py` 仍可接受人工審查過的 `feature_id + aspect + candidate_id + reason` patch，保留原始 OpenEditPlan 與兩邊 hash，再重新投影 brief／feature plan／trim plan；候選不存在或同一 aspect 重複覆寫會 fail closed。人工 override 與自動 candidate routing 是不同權限層，不能互相冒充。
 
 成片 Gemini QA 採成本分級，不是每次 render 都重看全部。所有片段先跑零 API 成本的本機 geometry／coverage／media gate；只有文字／UI、多 required targets、controlled clip、tracking risk 或 fallback 段落需要語意複核。`scripts/verify_feature_cut.py` 可把完成版 9:16 壓成 720×1280 proxy，以一次 `gemini-3.6-flash`、`thinking_level=low` Structured Output call 檢查主體身分、重要文字、語意是否符合與重複／突兀問題；它不回時間戳、不驗證 frame-accurate geometry，也不會自行改剪。相同 render／manifest／prompt／schema／model 會重用結果，最終仍由真人核准。若 schema 驗證失敗或重試，每一次 request、raw response、錯誤、timing 與 pricing 都保存於不可覆寫的 attempt 目錄，總成本會聚合所有實際有 usage 的請求。
 

@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import html
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -95,8 +96,14 @@ def _region_payloads(
     if not isinstance(raw_regions, list):
         raise ValueError("rendered vertical_regions must be a list")
     for raw_region in raw_regions:
-        region = FramingRegionIntent.model_validate(raw_region)
-        regions.append(region.model_dump(mode="json"))
+        if not isinstance(raw_region, dict):
+            raise ValueError("rendered vertical region must be an object")
+        # Validate the expanded model, but retain the exact serialized shape.
+        # Historical manifests were hashed before newer optional fields existed;
+        # filling their defaults here would make their artifact directory and
+        # composite fingerprint impossible to reproduce.
+        FramingRegionIntent.model_validate(raw_region)
+        regions.append(dict(raw_region))
     return regions
 
 
@@ -113,6 +120,217 @@ def _shared_geometry_fingerprint(
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _v2_shared_geometry_fingerprint(
+    regions: list[dict[str, Any]],
+    track_fingerprints: list[str],
+) -> str:
+    payload = {
+        "contract_version": "feature-vertical-region-tracks-v2",
+        "regions": regions,
+        "tracks": track_fingerprints,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _region_execution_role(region: dict[str, Any]) -> str:
+    role = region.get("role")
+    if role == "avoid_overlay":
+        return "overlay_keepout"
+    if role == "required" or region.get("atomic") is True:
+        return "hard_core"
+    return "soft_extent"
+
+
+def _resolve_v2_manifest_tracks(
+    *,
+    geometry_root: Path,
+    expected: str,
+    all_regions: list[dict[str, Any]],
+    routing: dict[str, Any],
+    feature_id: str,
+) -> tuple[list[tuple[Path, SegmentationTrack]], dict[str, object]]:
+    """Resolve the exact candidate-scoped artifacts selected by Full Auto v2."""
+
+    candidate_id = routing.get("selected_candidate_id")
+    candidate_rank = routing.get("selected_candidate_rank")
+    if not isinstance(candidate_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,64}", candidate_id
+    ):
+        raise ValueError(f"invalid selected candidate ID for feature {feature_id}")
+    if not isinstance(candidate_rank, int) or not 1 <= candidate_rank <= 4:
+        raise ValueError(f"invalid selected candidate rank for feature {feature_id}")
+    candidate_root = (
+        geometry_root / f"candidate-{candidate_rank:02d}-{candidate_id}"
+    ).resolve(strict=False)
+    try:
+        candidate_root.relative_to(geometry_root)
+    except ValueError as error:
+        raise ValueError(f"unsafe selected candidate for feature {feature_id}") from error
+    if not candidate_root.is_dir():
+        raise ValueError(
+            f"selected candidate has no geometry directory: {feature_id}/{candidate_id}"
+        )
+
+    crop_regions = [
+        region
+        for region in all_regions
+        if _region_execution_role(region) != "overlay_keepout"
+    ]
+    region_ids = [str(region["region_id"]) for region in crop_regions]
+    matches: list[
+        tuple[list[tuple[Path, SegmentationTrack]], dict[str, object]]
+    ] = []
+
+    if len(crop_regions) >= 2:
+        for session_path in sorted(candidate_root.glob("**/shared-session.json")):
+            payload = read_json(session_path)
+            if not isinstance(payload, dict):
+                continue
+            targets = payload.get("targets")
+            if not isinstance(targets, list):
+                continue
+            target_ids = [
+                target.get("target_id") if isinstance(target, dict) else None
+                for target in targets
+            ]
+            if target_ids != region_ids:
+                continue
+            tracks: list[tuple[Path, SegmentationTrack]] = []
+            fingerprints: list[str] = []
+            artifacts: list[dict[str, object]] = []
+            valid = True
+            for target in targets:
+                assert isinstance(target, dict)
+                relative_path = target.get("track_path")
+                expected_sha256 = target.get("track_sha256")
+                if not isinstance(relative_path, str) or not isinstance(
+                    expected_sha256, str
+                ):
+                    valid = False
+                    break
+                try:
+                    track_path = _contained_session_file(
+                        session_path.parent, relative_path
+                    )
+                except (OSError, ValueError):
+                    valid = False
+                    break
+                actual_sha256 = sha256_file(track_path)
+                if actual_sha256 != expected_sha256:
+                    valid = False
+                    break
+                try:
+                    track = SegmentationTrack.model_validate(read_json(track_path))
+                except (OSError, ValueError):
+                    valid = False
+                    break
+                fingerprint = _track_geometry_fingerprint(track)
+                tracks.append((track_path, track))
+                fingerprints.append(fingerprint)
+                artifacts.append(
+                    {
+                        "path": str(track_path.resolve()),
+                        "sha256": actual_sha256,
+                        "geometry_fingerprint": fingerprint,
+                        "target_id": target["target_id"],
+                    }
+                )
+            if not valid or _v2_shared_geometry_fingerprint(
+                crop_regions, fingerprints
+            ) != expected:
+                continue
+            matches.append(
+                (
+                    tracks,
+                    {
+                        "match_kind": "full_auto_v2_shared_session_fingerprint",
+                        "manifest_track_geometry_fingerprint": expected,
+                        "selected_candidate_id": candidate_id,
+                        "selected_candidate_rank": candidate_rank,
+                        "shared_session_manifest_path": str(session_path.resolve()),
+                        "shared_session_manifest_sha256": sha256_file(session_path),
+                        "track_artifacts": artifacts,
+                    },
+                )
+            )
+    elif len(crop_regions) == 1:
+        region = crop_regions[0]
+        root = candidate_root / "regions" / str(region["region_id"])
+        for track_path in sorted(root.glob("**/segmentation-track.json")):
+            try:
+                track = SegmentationTrack.model_validate(read_json(track_path))
+            except (OSError, ValueError):
+                continue
+            fingerprint = _track_geometry_fingerprint(track)
+            if _v2_shared_geometry_fingerprint([region], [fingerprint]) != expected:
+                continue
+            matches.append(
+                (
+                    [(track_path, track)],
+                    {
+                        "match_kind": "full_auto_v2_single_region_fingerprint",
+                        "manifest_track_geometry_fingerprint": expected,
+                        "selected_candidate_id": candidate_id,
+                        "selected_candidate_rank": candidate_rank,
+                        "track_artifacts": [
+                            {
+                                "path": str(track_path.resolve()),
+                                "sha256": sha256_file(track_path),
+                                "geometry_fingerprint": fingerprint,
+                                "target_id": region["region_id"],
+                            }
+                        ],
+                    },
+                )
+            )
+    else:
+        for track_path in sorted(candidate_root.glob("**/segmentation-track.json")):
+            if "shared-sam21" in track_path.relative_to(candidate_root).parts:
+                continue
+            try:
+                track = SegmentationTrack.model_validate(read_json(track_path))
+            except (OSError, ValueError):
+                continue
+            fingerprint = _track_geometry_fingerprint(track)
+            if fingerprint != expected:
+                continue
+            matches.append(
+                (
+                    [(track_path, track)],
+                    {
+                        "match_kind": "full_auto_v2_single_target_fingerprint",
+                        "manifest_track_geometry_fingerprint": expected,
+                        "selected_candidate_id": candidate_id,
+                        "selected_candidate_rank": candidate_rank,
+                        "track_artifacts": [
+                            {
+                                "path": str(track_path.resolve()),
+                                "sha256": sha256_file(track_path),
+                                "geometry_fingerprint": fingerprint,
+                            }
+                        ],
+                    },
+                )
+            )
+    if not matches:
+        raise ValueError(
+            f"no Full Auto v2 track lineage matches feature {feature_id}"
+        )
+    if len(matches) != 1:
+        raise ValueError(
+            f"ambiguous Full Auto v2 track lineage for feature {feature_id}: "
+            f"{len(matches)} matches"
+        )
+    return matches[0]
 
 
 def _resolve_manifest_tracks(
@@ -155,6 +373,18 @@ def _resolve_manifest_tracks(
         )
 
     all_regions = _region_payloads(rendered)
+    routing = rendered.get("automatic_candidate_selection")
+    if (
+        isinstance(routing, dict)
+        and routing.get("contract_version") == "full-auto-candidate-routing-v2"
+    ):
+        return _resolve_v2_manifest_tracks(
+            geometry_root=geometry_root,
+            expected=expected,
+            all_regions=all_regions,
+            routing=routing,
+            feature_id=feature_id,
+        )
     required_regions = [
         region for region in all_regions if region["role"] == "required"
     ]

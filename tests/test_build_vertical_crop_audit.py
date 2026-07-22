@@ -262,6 +262,74 @@ def test_resolver_reproduces_single_required_region_composite(
     )
 
 
+def test_resolver_reproduces_full_auto_v2_candidate_scoped_region_fingerprint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    regions = [
+        {
+            "region_id": "visible_core",
+            "entity_id": "entity_1",
+            "target_description": "the complete selected visible subject",
+            "kind": "subject",
+            "role": "required",
+            "atomic": False,
+            "minimum_visible_fraction": 1.0,
+            "observable_relations": ["event_relation=required"],
+            "exclusions": [],
+        }
+    ]
+    candidate_root = (
+        tmp_path
+        / "geometry"
+        / "scene_01"
+        / "vertical"
+        / "candidate-02-take_b"
+    )
+    track_path = (
+        candidate_root
+        / "regions"
+        / "visible_core"
+        / "sam21"
+        / "segmentation-track.json"
+    )
+    track_path.parent.mkdir(parents=True)
+    track_path.write_text('{"fingerprint":"region"}', encoding="utf-8")
+    fingerprint = "c" * 64
+    expected = audit_script._v2_shared_geometry_fingerprint(
+        regions, [fingerprint]
+    )
+    monkeypatch.setattr(
+        audit_script,
+        "SegmentationTrack",
+        SimpleNamespace(model_validate=lambda value: value),
+    )
+    monkeypatch.setattr(
+        audit_script,
+        "_track_geometry_fingerprint",
+        lambda _track: fingerprint,
+    )
+
+    tracks, lineage = audit_script._resolve_manifest_tracks(
+        render_manifest_dir=tmp_path,
+        feature_id="scene_01",
+        rendered={
+            "track_geometry_fingerprint": expected,
+            "vertical_regions": regions,
+            "automatic_candidate_selection": {
+                "contract_version": "full-auto-candidate-routing-v2",
+                "selected_candidate_id": "take_b",
+                "selected_candidate_rank": 2,
+            },
+        },
+    )
+
+    assert [path for path, _track in tracks] == [track_path]
+    assert lineage is not None
+    assert lineage["match_kind"] == "full_auto_v2_single_region_fingerprint"
+    assert lineage["selected_candidate_id"] == "take_b"
+
+
 def test_resolver_requires_shared_session_track_hashes_and_composite_fingerprint(
     monkeypatch,
     tmp_path: Path,

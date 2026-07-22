@@ -14,6 +14,14 @@ from typing import Any, Literal, Mapping, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
+from .auto_reframe import (
+    AutoReframePolicy,
+    CandidatePreflight,
+    FailureCode,
+    RegionAssessment,
+    audit_auto_bounded_clip,
+    choose_recovery,
+)
 from .billing import summarize_usage_and_list_price, summarize_usage_files
 from .gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
@@ -71,7 +79,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
-_RENDER_PIPELINE_VERSION = "feature-cut-v9-sar-aware-2d-reframe"
+_RENDER_PIPELINE_VERSION = "feature-cut-v10-full-auto-v2"
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
 _TRACKING_SEED_BOX_PADDING_RATIO = 0.04
@@ -92,6 +100,24 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
             "source_raw_output",
         ],
     },
+    "clip-card-open-edit-v2": {
+        "source": (
+            "validated no-brief open edit plan with Top-K aspect candidates"
+        ),
+        "transform": (
+            "project_feature_contracts preserves selected-first runtime candidate "
+            "lists without mutating the editorial source plan"
+        ),
+        "target": "FeatureEditPlan",
+        "module": "scripts.plan_clip_card_open_edit",
+        "source_model": "OpenEditPlan",
+        "projector": "reproject_external_feature_plan_v2",
+        "raw_output_role": "source_raw_output",
+        "required_artifact_roles": [
+            "source_raw_interaction",
+            "source_raw_output",
+        ],
+    },
     "clip-card-feature-cut-v1": {
         "source": "validated brief-aware Clip Card feature plan",
         "transform": "chapter selections are projected in order into FeatureChapterSelect",
@@ -105,6 +131,46 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
             "source_raw_output",
         ],
     },
+    "clip-card-feature-cut-v2": {
+        "source": (
+            "validated brief-aware Clip Card feature plan with hash-bound Top-K "
+            "aspect candidates and entity-resolved framing regions"
+        ),
+        "transform": (
+            "selected-first candidate lists and legacy rank-1 fields are "
+            "deterministically projected into FeatureEditPlan"
+        ),
+        "target": "FeatureEditPlan",
+        "module": "scripts.plan_clip_card_feature_cut",
+        "source_model": "ClipCardFeaturePlanV2",
+        "projector": "reproject_external_feature_plan_v2",
+        "raw_output_role": "source_raw_output",
+        "required_artifact_roles": [
+            "source_raw_interaction",
+            "source_raw_output",
+        ],
+    },
+    "clip-card-feature-cut-v3": {
+        "source": (
+            "selection-only brief-aware Top-K choices plus hash-bound local "
+            "Clip Card evidence"
+        ),
+        "transform": (
+            "rank-one mirrors, target descriptions, and executable framing "
+            "regions are derived locally from selected entity priorities and "
+            "the bound Clip Card evidence"
+        ),
+        "target": "FeatureEditPlan",
+        "module": "scripts.plan_clip_card_feature_cut",
+        "source_model": "ClipCardFeaturePlanV3",
+        "projector": "reproject_external_feature_plan_v3",
+        "raw_output_role": "source_raw_output",
+        "required_artifact_roles": [
+            "source_raw_interaction",
+            "source_raw_output",
+            "selected_clip_card_evidence",
+        ],
+    },
     "open-edit-candidate-overrides-v1": {
         "source": "validated upstream open edit plan plus human-reviewed candidate patch",
         "transform": "only named aspect candidates are replaced before project_feature_contracts",
@@ -112,6 +178,28 @@ _EXTERNAL_PROJECTION_CONTRACTS = {
         "module": "scripts.apply_open_edit_candidate_overrides",
         "source_model": "OpenEditPlan",
         "projector": "reproject_external_feature_plan",
+        "raw_output_role": None,
+        "required_artifact_roles": [
+            "input_open_edit_plan",
+            "candidate_override_patch",
+            "candidate_override_audit",
+            "upstream_projection_pointer",
+            "upstream_projection_record",
+        ],
+    },
+    "open-edit-candidate-overrides-v2": {
+        "source": (
+            "validated upstream open edit plan plus human-reviewed candidate "
+            "patch with Top-K runtime candidates"
+        ),
+        "transform": (
+            "only named aspect candidates are replaced before selected-first "
+            "candidate-preserving project_feature_contracts"
+        ),
+        "target": "FeatureEditPlan",
+        "module": "scripts.apply_open_edit_candidate_overrides",
+        "source_model": "OpenEditPlan",
+        "projector": "reproject_external_feature_plan_v2",
         "raw_output_role": None,
         "required_artifact_roles": [
             "input_open_edit_plan",
@@ -949,6 +1037,7 @@ def _chapter_bounds_with_approved_trim(
     shots_dir: Path,
     scdet_threshold: float,
     approved_decisions: Sequence[tuple[Path, TrimIntentDecision]],
+    expected_event_id: str | None = None,
 ) -> tuple[int, int, str, dict[str, Any]]:
     fallback_start, fallback_end, shot_id = _chapter_bounds(
         frame,
@@ -964,6 +1053,7 @@ def _chapter_bounds_with_approved_trim(
         for path, decision in approved_decisions
         if decision.source_asset_id == asset_id
         and decision.shot_id == shot_id
+        and (expected_event_id is None or decision.event_id == expected_event_id)
         and decision.source_in_ms is not None
         and decision.source_out_ms is not None
     ]
@@ -1677,6 +1767,7 @@ def _tracked_crop_geometry(
     safety_multiplier: float = 1.0,
     overflow_policy: Literal["preserve_all", "controlled_clip"] = "preserve_all",
     edge_priority: Literal["balanced", "preserve_start", "preserve_end"] = "balanced",
+    desired_centers_y: Sequence[float] | None = None,
 ) -> tuple[list[float], list[float], dict[str, Any]]:
     """Return a 2D crop path projected into per-sample safety constraints.
 
@@ -1689,6 +1780,8 @@ def _tracked_crop_geometry(
     """
     if not times or len(times) != len(centers_x) or len(times) != len(boxes):
         raise ValueError("tracked crop geometry needs aligned non-empty samples")
+    if desired_centers_y is not None and len(desired_centers_y) != len(times):
+        raise ValueError("desired y centers must align with tracked crop samples")
     if safety_multiplier < 1.0:
         raise ValueError("safety_multiplier must be at least 1")
     transform = _cover_transform(
@@ -1717,7 +1810,12 @@ def _tracked_crop_geometry(
         validated_boxes.append([x_min, y_min, x_max, y_max])
         centers_y.append((y_min + y_max) / 2)
     smooth_centers_x = _smooth(centers_x)
-    smooth_centers_y = _smooth(centers_y)
+    composition_centers_y = (
+        [float(value) for value in desired_centers_y]
+        if desired_centers_y is not None
+        else centers_y
+    )
+    smooth_centers_y = _smooth(composition_centers_y)
     desired_left = [
         max(
             0.0,
@@ -1947,6 +2045,12 @@ def _tracked_crop_geometry(
             zip(combined_velocities[:-1], combined_velocities[1:], strict=True)
         )
     ]
+    jerks = [
+        abs(a1 - a0) / max(0.001, times[index + 3] - times[index + 2])
+        for index, (a0, a1) in enumerate(
+            zip(accelerations[:-1], accelerations[1:], strict=True)
+        )
+    ]
     source_x_edge_contacts = sum(
         box[0] <= 5 or box[2] >= 995 for box in boxes
     )
@@ -1988,6 +2092,9 @@ def _tracked_crop_geometry(
         ),
         "max_crop_acceleration_pixels_per_second_squared": round(
             max(accelerations, default=0.0), 4
+        ),
+        "max_crop_jerk_pixels_per_second_cubed": round(
+            max(jerks, default=0.0), 4
         ),
         "source_x_edge_contact_count": source_x_edge_contacts,
         "source_y_edge_contact_count": source_y_edge_contacts,
@@ -2178,6 +2285,96 @@ def _required_track_union(
         "per_region": per_region,
     }
     return times, centers, boxes, coverage
+
+
+def _soft_extent_visibility_audit(
+    *,
+    tracks: Sequence[SegmentationTrack],
+    regions: Sequence[FramingRegionIntent],
+    crop_audit: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Measure preferred context after the hard-core crop path is fixed.
+
+    A preferred region may be clipped, but only up to its explicit/default
+    visible-fraction floor. Missing or low-confidence geometry fails closed.
+    """
+
+    if len(tracks) != len(regions):
+        raise ValueError("soft extent tracks and region contracts must align")
+    keyframes = crop_audit.get("crop_keyframes")
+    coordinate_space = crop_audit.get("crop_coordinate_space")
+    if not isinstance(keyframes, list) or not isinstance(coordinate_space, Mapping):
+        raise ValueError("crop audit is missing coordinate-space evidence")
+    scaled_width = float(coordinate_space["scaled_width"])
+    scaled_height = float(coordinate_space["scaled_height"])
+    crop_width = float(crop_audit["crop_width_normalized"])
+    crop_height = float(crop_audit["crop_height_normalized"])
+    per_region: list[dict[str, Any]] = []
+    all_passed = True
+    for track, region in zip(tracks, regions, strict=True):
+        boxes_by_relative_ms = {
+            sample.analysis_sample_time_ms - track.analysis_start_ms: list(
+                sample.derived_tracking_box
+            )
+            for sample in track.samples
+            if sample.tracking_state == TrackingState.TRACKED
+            and sample.derived_tracking_box is not None
+        }
+        fractions: list[float] = []
+        clipped_edges: set[str] = set()
+        missing_samples = 0
+        for keyframe in keyframes:
+            relative_ms = round(float(keyframe["time_seconds"]) * 1000)
+            box = boxes_by_relative_ms.get(relative_ms)
+            if box is None:
+                missing_samples += 1
+                fractions.append(0.0)
+                continue
+            crop_left = float(keyframe["crop_x_pixels"]) * 1000 / scaled_width
+            crop_top = float(keyframe["crop_y_pixels"]) * 1000 / scaled_height
+            x_min, y_min, x_max, y_max = (float(value) for value in box)
+            if x_min < crop_left - 1e-6:
+                clipped_edges.add("left")
+            if x_max > crop_left + crop_width + 1e-6:
+                clipped_edges.add("right")
+            if y_min < crop_top - 1e-6:
+                clipped_edges.add("top")
+            if y_max > crop_top + crop_height + 1e-6:
+                clipped_edges.add("bottom")
+            visible_width = max(
+                0.0,
+                min(x_max, crop_left + crop_width) - max(x_min, crop_left),
+            )
+            visible_height = max(
+                0.0,
+                min(y_max, crop_top + crop_height) - max(y_min, crop_top),
+            )
+            fractions.append(
+                visible_width
+                / max(1e-6, x_max - x_min)
+                * visible_height
+                / max(1e-6, y_max - y_min)
+            )
+        minimum = min(fractions, default=0.0)
+        required = region.effective_minimum_visible_fraction
+        passed = missing_samples == 0 and minimum + 1e-6 >= required
+        all_passed = all_passed and passed
+        per_region.append(
+            {
+                "region_id": region.region_id,
+                "entity_id": region.entity_id,
+                "minimum_visible_area_fraction": round(minimum, 6),
+                "required_visible_area_fraction": round(required, 6),
+                "missing_sample_count": missing_samples,
+                "clipped_edges": sorted(clipped_edges),
+                "passed": passed,
+            }
+        )
+    return {
+        "soft_extent_count": len(regions),
+        "soft_extent_visibility_passed": all_passed,
+        "soft_extent_regions": per_region,
+    }
 
 
 def _horizontal_filter_from_track(
@@ -2413,6 +2610,8 @@ def _vertical_filter_from_track(
         "fit_with_background"
     ),
     display_sample_aspect_ratio: float = 1.0,
+    preferred_tracks: Sequence[SegmentationTrack] = (),
+    preferred_regions: Sequence[FramingRegionIntent] = (),
 ) -> tuple[str, dict[str, Any]]:
     fallback_filter = (
         _vertical_center_crop_filter()
@@ -2420,6 +2619,10 @@ def _vertical_filter_from_track(
         else _vertical_fit_filter()
     )
     tracks = [track] if isinstance(track, SegmentationTrack) else list(track)
+    preferred_tracks = list(preferred_tracks)
+    preferred_regions = list(preferred_regions)
+    if len(preferred_tracks) != len(preferred_regions):
+        raise ValueError("preferred tracks and region contracts must align")
     if not math.isclose(display_sample_aspect_ratio, 1.0, rel_tol=0, abs_tol=1e-6):
         return fallback_filter, {
             "applied_strategy": fallback_strategy,
@@ -2510,6 +2713,48 @@ def _vertical_filter_from_track(
             **lineage,
             **coverage,
         }
+    composition_audit: dict[str, Any] = {
+        "preferred_composition_used": False,
+        "preferred_composition_reason": "no_preferred_regions",
+    }
+    desired_centers_y: list[float] | None = None
+    if preferred_tracks:
+        preferred_ids = [region.region_id for region in preferred_regions]
+        try:
+            (
+                composition_times,
+                composition_centers_x,
+                composition_boxes,
+                composition_coverage,
+            ) = _required_track_union(
+                [*tracks, *preferred_tracks],
+                region_ids=[*(region_ids or []), *preferred_ids]
+                if region_ids is not None
+                else None,
+            )
+            if composition_times == times and composition_coverage["coverage_passed"]:
+                centers_x = composition_centers_x
+                desired_centers_y = [
+                    (box[1] + box[3]) / 2 for box in composition_boxes
+                ]
+                composition_audit = {
+                    "preferred_composition_used": True,
+                    "preferred_composition_reason": "shared_coverage_available",
+                    "preferred_region_ids": preferred_ids,
+                }
+            else:
+                composition_audit = {
+                    "preferred_composition_used": False,
+                    "preferred_composition_reason": "preferred_coverage_not_aligned",
+                    "preferred_region_ids": preferred_ids,
+                    "preferred_composition_coverage": composition_coverage,
+                }
+        except ValueError as error:
+            composition_audit = {
+                "preferred_composition_used": False,
+                "preferred_composition_reason": f"preferred_geometry_invalid:{error}",
+                "preferred_region_ids": preferred_ids,
+            }
     target_safety_multiplier = 1.0 if allow_subject_clipping else 1.08
     x_values, y_values, crop_audit = _tracked_crop_geometry(
         times,
@@ -2522,6 +2767,7 @@ def _vertical_filter_from_track(
         safety_multiplier=target_safety_multiplier,
         overflow_policy=overflow_policy,
         edge_priority=edge_priority,
+        desired_centers_y=desired_centers_y,
     )
     crop_width_normalized = float(crop_audit["crop_width_normalized"])
     crop_height_normalized = float(crop_audit["crop_height_normalized"])
@@ -2581,6 +2827,19 @@ def _vertical_filter_from_track(
     y_expression = _piecewise_expression(times, y_values)
     controlled_clip_applied = bool(crop_audit["controlled_clip_applied"])
     risk_codes = ["controlled_required_region_clip"] if controlled_clip_applied else []
+    soft_extent_audit: dict[str, Any] = {
+        "soft_extent_count": 0,
+        "soft_extent_visibility_passed": True,
+        "soft_extent_regions": [],
+    }
+    if preferred_tracks:
+        soft_extent_audit = _soft_extent_visibility_audit(
+            tracks=preferred_tracks,
+            regions=preferred_regions,
+            crop_audit=crop_audit,
+        )
+        if not soft_extent_audit["soft_extent_visibility_passed"]:
+            risk_codes.append("soft_extent_visibility_below_floor")
     edge_hold_warning_ms = float(coverage["expected_sample_interval_ms"]) * 0.55 + 35
     if (
         float(coverage["analysis_head_gap_ms"]) > edge_hold_warning_ms
@@ -2609,6 +2868,8 @@ def _vertical_filter_from_track(
             "requires_gemini_review": bool(risk_codes),
             **lineage,
             **coverage,
+            **composition_audit,
+            **soft_extent_audit,
             **crop_audit,
         },
     )
@@ -2658,6 +2919,32 @@ def _has_complete_cached_primary_track(output_dir: Path) -> bool:
 def _is_non_retryable_spending_cap_error(error: Exception) -> bool:
     message = str(error).lower()
     return "spending cap" in message or "monthly spend" in message
+
+
+def _is_exhausted_model_quota_error(error: Exception) -> bool:
+    """Identify quota failures for which trying another candidate cannot help.
+
+    Candidate switching is useful for evidence and geometry failures. It only
+    repeats the same unavailable service call when the SDK has already returned
+    an exhausted rate limit or account spending limit.
+    """
+
+    message = str(error).lower()
+    return _is_non_retryable_spending_cap_error(error) or any(
+        marker in message
+        for marker in (
+            "429",
+            "resource_exhausted",
+            "resource exhausted",
+            "quota exceeded",
+            "rate limit exceeded",
+            "too many requests",
+        )
+    )
+
+
+class GeometryModelQuotaError(RuntimeError):
+    """Geometry processing stopped because another candidate cannot help."""
 
 
 def _ground_tracking_seed(
@@ -3084,7 +3371,7 @@ def _validate_shared_sam_session_cache(
     return tracks
 
 
-def _build_required_region_tracks(
+def _build_framing_region_tracks(
     *,
     client: GeminiLabClient,
     clip: RushClip,
@@ -3099,14 +3386,21 @@ def _build_required_region_tracks(
     output_dir: Path,
     analysis_fps: float,
     scdet_threshold: float,
+    include_execution_roles: frozenset[
+        Literal["hard_core", "soft_extent", "overlay_keepout"]
+    ] = frozenset({"hard_core"}),
     model_request_block_reason: str | None = None,
 ) -> tuple[list[GroundingProposal], list[SegmentationTrack], list[Path]]:
-    """Ground required regions separately and share one SAM session when possible."""
-    required = [region for region in regions if region.role == "required"]
-    if not required:
-        raise ValueError("a tracked portrait crop needs at least one required region")
-    if len(required) == 1:
-        region = required[0]
+    """Ground named regions separately and share one SAM session when possible."""
+    tracked_regions = [
+        region
+        for region in regions
+        if region.execution_role in include_execution_roles
+    ]
+    if not tracked_regions:
+        raise ValueError("a tracked portrait crop needs at least one selected region")
+    if len(tracked_regions) == 1:
+        region = tracked_regions[0]
         region_root = output_dir / "regions" / region.region_id
         proposal, track = _build_track(
             client=client,
@@ -3123,7 +3417,7 @@ def _build_required_region_tracks(
             run_id=f"feature-v-{region.region_id}-{uuid.uuid4().hex[:8]}",
             analysis_fps=analysis_fps,
             scdet_threshold=scdet_threshold,
-            entity_id=f"reframe_{region.region_id}",
+            entity_id=region.entity_id or f"reframe_{region.region_id}",
             model_request_block_reason=model_request_block_reason,
         )
         return [proposal], [track], [region_root / "grounding-debug.png"]
@@ -3131,7 +3425,7 @@ def _build_required_region_tracks(
     proposals: list[GroundingProposal] = []
     seeds: list[SharedSam21BBoxSeed] = []
     debug_paths: list[Path] = []
-    for region in required:
+    for region in tracked_regions:
         region_root = output_dir / "regions" / region.region_id
         (
             proposal,
@@ -3149,7 +3443,7 @@ def _build_required_region_tracks(
             end_ms=end_ms,
             feature_id=feature_id,
             event_description=event_description,
-            entity_id=f"reframe_{region.region_id}",
+            entity_id=region.entity_id or f"reframe_{region.region_id}",
             target_description=region.target_description,
             grounding_prompt=grounding_prompt,
             output_dir=region_root,
@@ -3173,7 +3467,7 @@ def _build_required_region_tracks(
         )
 
     request_key = {
-        "contract_version": "feature-cut-shared-required-regions-v1",
+        "contract_version": "feature-cut-shared-framing-regions-v2",
         "asset_id": proposals[0].asset_id,
         "video_path": str(Path(clip.path).expanduser().resolve()),
         "feature_id": feature_id,
@@ -3233,6 +3527,483 @@ def _build_required_region_tracks(
         seed_box_padding_ratio=_TRACKING_SEED_BOX_PADDING_RATIO,
     )
     return proposals, tracks, debug_paths
+
+
+def _build_required_region_tracks(
+    *,
+    client: GeminiLabClient,
+    clip: RushClip,
+    frame: RushFrame,
+    start_ms: int,
+    end_ms: int,
+    feature_id: str,
+    event_description: str,
+    regions: Sequence[FramingRegionIntent],
+    checkpoint_path: Path,
+    grounding_prompt: str,
+    output_dir: Path,
+    analysis_fps: float,
+    scdet_threshold: float,
+    model_request_block_reason: str | None = None,
+) -> tuple[list[GroundingProposal], list[SegmentationTrack], list[Path]]:
+    """Compatibility wrapper that tracks only hard-core framing regions."""
+
+    return _build_framing_region_tracks(
+        client=client,
+        clip=clip,
+        frame=frame,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        feature_id=feature_id,
+        event_description=event_description,
+        regions=regions,
+        checkpoint_path=checkpoint_path,
+        grounding_prompt=grounding_prompt,
+        output_dir=output_dir,
+        analysis_fps=analysis_fps,
+        scdet_threshold=scdet_threshold,
+        include_execution_roles=frozenset({"hard_core"}),
+        model_request_block_reason=model_request_block_reason,
+    )
+
+
+def _vertical_candidate_geometry(
+    *,
+    client: GeminiLabClient,
+    clip: RushClip,
+    frame: RushFrame,
+    start_ms: int,
+    end_ms: int,
+    feature_id: str,
+    event_description: str,
+    target_description: str | None,
+    regions: Sequence[FramingRegionIntent],
+    crop_mode: Literal["strict", "primary_center"],
+    overflow_policy: Literal["preserve_all", "controlled_clip"],
+    edge_priority: Literal["balanced", "preserve_start", "preserve_end"],
+    fallback_strategy: Literal["fit_with_background", "center_crop"],
+    checkpoint_path: Path,
+    grounding_prompt: str,
+    output_dir: Path,
+    analysis_fps: float,
+    scdet_threshold: float,
+    display_sample_aspect_ratio: float,
+    track_cache: dict[
+        tuple[str, str, int, int],
+        tuple[GroundingProposal, SegmentationTrack, Path],
+    ],
+    model_request_block_reason: str | None = None,
+) -> tuple[str, dict[str, Any], list[Path], str | None]:
+    """Evaluate one immutable vertical candidate without rendering a segment."""
+
+    crop_regions = [
+        region for region in regions if region.execution_role != "overlay_keepout"
+    ]
+    hard_regions = [
+        region for region in crop_regions if region.execution_role == "hard_core"
+    ]
+    soft_regions = [
+        region for region in crop_regions if region.execution_role == "soft_extent"
+    ]
+    debug_paths: list[Path] = []
+    track_fingerprint: str | None = None
+    if crop_regions:
+        if not hard_regions:
+            raise ValueError("candidate region contract has no hard core")
+        _, tracks, debug_paths = _build_framing_region_tracks(
+            client=client,
+            clip=clip,
+            frame=frame,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            feature_id=feature_id,
+            event_description=event_description,
+            regions=crop_regions,
+            checkpoint_path=checkpoint_path,
+            grounding_prompt=grounding_prompt,
+            output_dir=output_dir,
+            analysis_fps=analysis_fps,
+            scdet_threshold=scdet_threshold,
+            include_execution_roles=frozenset({"hard_core", "soft_extent"}),
+            model_request_block_reason=model_request_block_reason,
+        )
+        tracks_by_region = {
+            region.region_id: track
+            for region, track in zip(crop_regions, tracks, strict=True)
+        }
+        hard_tracks = [tracks_by_region[region.region_id] for region in hard_regions]
+        soft_tracks = [tracks_by_region[region.region_id] for region in soft_regions]
+        track_fingerprint = _stable_fingerprint(
+            {
+                "contract_version": "feature-vertical-region-tracks-v2",
+                "regions": [region.model_dump(mode="json") for region in crop_regions],
+                "tracks": [
+                    _track_geometry_fingerprint(tracks_by_region[region.region_id])
+                    for region in crop_regions
+                ],
+            }
+        )
+        filter_graph, geometry = _vertical_filter_from_track(
+            hard_tracks,
+            allow_subject_clipping=crop_mode == "primary_center",
+            overflow_policy=overflow_policy,
+            edge_priority=edge_priority,
+            region_ids=[region.region_id for region in hard_regions],
+            fallback_strategy=fallback_strategy,
+            display_sample_aspect_ratio=display_sample_aspect_ratio,
+            preferred_tracks=soft_tracks,
+            preferred_regions=soft_regions,
+        )
+    else:
+        target = (target_description or "").strip()
+        if not target:
+            raise ValueError("tracked vertical candidate has no resolved target")
+        cache_key = (frame.frame_id, target, start_ms, end_ms)
+        if cache_key not in track_cache:
+            proposal, track = _build_track(
+                client=client,
+                clip=clip,
+                frame=frame,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                feature_id=feature_id,
+                event_description=event_description,
+                target_description=target,
+                checkpoint_path=checkpoint_path,
+                grounding_prompt=grounding_prompt,
+                output_dir=output_dir,
+                run_id=f"feature-v-{uuid.uuid4().hex[:8]}",
+                analysis_fps=analysis_fps,
+                scdet_threshold=scdet_threshold,
+                model_request_block_reason=model_request_block_reason,
+            )
+            track_cache[cache_key] = (proposal, track, output_dir)
+        _, track, cached_root = track_cache[cache_key]
+        debug_paths = [cached_root / "grounding-debug.png"]
+        track_fingerprint = _track_geometry_fingerprint(track)
+        filter_graph, geometry = _vertical_filter_from_track(
+            track,
+            allow_subject_clipping=crop_mode == "primary_center",
+            overflow_policy=overflow_policy,
+            edge_priority=edge_priority,
+            fallback_strategy=fallback_strategy,
+            display_sample_aspect_ratio=display_sample_aspect_ratio,
+        )
+
+    semantic_review_reasons: list[str] = []
+    if len(hard_regions) > 1:
+        semantic_review_reasons.append("multiple_hard_core_regions")
+    if any(
+        region.kind in {"text_region", "ui_region"} or region.atomic
+        for region in crop_regions
+    ):
+        semantic_review_reasons.append("atomic_text_or_ui_region")
+    if any(region.execution_role == "overlay_keepout" for region in regions):
+        semantic_review_reasons.append("overlay_keepout_requires_layout_gate")
+    if geometry.get("fallback_reason"):
+        semantic_review_reasons.append("fallback_applied")
+    if not geometry.get("soft_extent_visibility_passed", True):
+        semantic_review_reasons.append("soft_extent_visibility_below_floor")
+    geometry["semantic_review_reasons"] = list(
+        dict.fromkeys(semantic_review_reasons)
+    )
+    if semantic_review_reasons:
+        geometry["requires_gemini_review"] = True
+    geometry["framing_regions"] = [
+        {
+            **region.model_dump(mode="json"),
+            "execution_role": region.execution_role,
+            "effective_minimum_visible_fraction": (
+                region.effective_minimum_visible_fraction
+            ),
+        }
+        for region in regions
+    ]
+    return filter_graph, geometry, debug_paths, track_fingerprint
+
+
+def _vertical_candidate_preflight(
+    *,
+    candidate_id: str,
+    rank: int,
+    confidence: float,
+    source_sha256: str,
+    filter_graph: str,
+    geometry: Mapping[str, Any],
+    regions: Sequence[FramingRegionIntent],
+    track_fingerprint: str | None,
+    titles_rendered: bool,
+) -> tuple[CandidatePreflight, str]:
+    """Translate renderer evidence into the versioned auto-reframe contract."""
+
+    geometry_fingerprint = _stable_fingerprint(
+        {
+            "contract_version": "vertical-candidate-geometry-preflight-v1",
+            "source_sha256": source_sha256,
+            "filter_graph": filter_graph,
+            "geometry": dict(geometry),
+            "track_fingerprint": track_fingerprint,
+        }
+    )
+    soft_by_id = {
+        str(item.get("region_id")): item
+        for item in geometry.get("soft_extent_regions", [])
+        if isinstance(item, Mapping)
+    }
+    hard_minimum = float(
+        geometry.get("minimum_visible_required_area_fraction", 1.0)
+    )
+    assessed_regions: list[RegionAssessment] = []
+    for region in regions:
+        if region.execution_role == "hard_core":
+            assessed_regions.append(
+                RegionAssessment(
+                    region_id=region.region_id,
+                    role="hard_core",
+                    atomic=region.atomic,
+                    assessed=True,
+                    minimum_visible_fraction=hard_minimum,
+                    required_visible_fraction=1.0,
+                )
+            )
+        elif region.execution_role == "soft_extent":
+            item = soft_by_id.get(region.region_id)
+            assessed_regions.append(
+                RegionAssessment(
+                    region_id=region.region_id,
+                    role="soft_extent",
+                    atomic=False,
+                    assessed=item is not None,
+                    minimum_visible_fraction=(
+                        float(item["minimum_visible_area_fraction"])
+                        if item is not None
+                        else 0.0
+                    ),
+                    required_visible_fraction=(
+                        region.effective_minimum_visible_fraction
+                    ),
+                    clipped_edges=(
+                        list(item.get("clipped_edges", []))
+                        if item is not None
+                        else []
+                    ),
+                )
+            )
+        else:
+            # Until the title/layout solver emits exact overlay rectangles, a
+            # keepout is safe only when this experiment renders no overlay.
+            assessed_regions.append(
+                RegionAssessment(
+                    region_id=region.region_id,
+                    role="overlay_keepout",
+                    atomic=region.atomic,
+                    assessed=not titles_rendered,
+                    minimum_visible_fraction=1.0,
+                    required_visible_fraction=0.0,
+                    overlay_overlap_fraction=1.0 if titles_rendered else 0.0,
+                )
+            )
+    preflight = CandidatePreflight(
+        candidate_id=candidate_id,
+        rank=rank,
+        presentation=(
+            "tracked_crop"
+            if geometry.get("applied_strategy") == "tracked_crop"
+            else "static_anchor"
+            if geometry.get("applied_strategy") == "seed_anchor_crop"
+            else "center_crop"
+            if geometry.get("applied_strategy") == "center_crop"
+            else "fit_with_background"
+        ),
+        source_lineage_valid=bool(
+            geometry.get("source_geometry_lineage_passed", True)
+        ),
+        within_single_shot=True,
+        evidence_confidence=confidence,
+        semantic_status="matched",
+        tracking_confidence_gate_passed=bool(
+            geometry.get("tracking_confidence_gate_passed", True)
+        ),
+        tracking_coverage_passed=bool(geometry.get("coverage_passed", True)),
+        semantic_checkpoints_passed=None,
+        regions=assessed_regions,
+        max_crop_speed_pixels_per_second=float(
+            geometry.get("max_crop_speed_pixels_per_second", 0.0)
+        ),
+        max_crop_acceleration_pixels_per_second_squared=float(
+            geometry.get(
+                "max_crop_acceleration_pixels_per_second_squared", 0.0
+            )
+        ),
+        max_crop_jerk_pixels_per_second_cubed=float(
+            geometry.get("max_crop_jerk_pixels_per_second_cubed", 0.0)
+        ),
+        geometry_fingerprint=geometry_fingerprint,
+        source_fingerprint=source_sha256,
+        track_fingerprints=(
+            [track_fingerprint] if track_fingerprint is not None else []
+        ),
+    )
+    return preflight, geometry_fingerprint
+
+
+def _failure_codes_from_geometry_error(error: Exception) -> list[FailureCode]:
+    """Map existing Grounding/SAM errors to stable recovery categories."""
+
+    message = f"{type(error).__name__}:{error}".casefold()
+    if "ambiguous" in message:
+        return [FailureCode.TARGET_AMBIGUITY_ABOVE_MAXIMUM]
+    if any(
+        marker in message
+        for marker in (
+            "not_visible",
+            "target_mismatch",
+            "insufficient_evidence",
+            "request_match",
+        )
+    ):
+        return [FailureCode.SEMANTIC_MATCH_BELOW_MINIMUM]
+    if "confidence" in message:
+        return [FailureCode.TRACK_CONFIDENCE_BELOW_MINIMUM]
+    if any(marker in message for marker in ("coverage", "fewer_than_two")):
+        return [FailureCode.TRACK_COVERAGE_BELOW_MINIMUM]
+    if "shot" in message and "boundary" in message:
+        return [FailureCode.SHOT_BOUNDARY_CROSSING]
+    return [FailureCode.NO_FEASIBLE_PRESENTATION]
+
+
+def _resolve_vertical_candidate_intent(
+    *,
+    option_regions: Sequence[FramingRegionIntent | Mapping[str, Any]],
+    option_target_description: str | None,
+    selected_target_description: str | None,
+    brief_primary_target_description: str | None,
+    brief_regions: Sequence[FramingRegionIntent],
+    inherit_reviewed_brief_intent: bool,
+) -> tuple[list[FramingRegionIntent], str | None]:
+    """Resolve one take without allowing rank-1 prose to leak into rank-N."""
+
+    regions = [
+        region
+        if isinstance(region, FramingRegionIntent)
+        else FramingRegionIntent.model_validate(region)
+        for region in option_regions
+    ]
+    if not regions and inherit_reviewed_brief_intent:
+        regions = list(brief_regions)
+    hard_regions = [
+        region for region in regions if region.execution_role == "hard_core"
+    ]
+    if hard_regions:
+        target = "; ".join(region.target_description for region in hard_regions)
+    elif option_target_description:
+        target = option_target_description
+    elif inherit_reviewed_brief_intent:
+        target = selected_target_description or brief_primary_target_description
+    else:
+        target = None
+    return regions, target
+
+
+def _vertical_runtime_candidate_options(
+    selected: FeatureChapterSelect,
+    *,
+    human_policy_binding_present: bool,
+    max_candidates: int = 4,
+) -> list[dict[str, Any]]:
+    """Return immutable auto options or one legacy/human-reviewed selection."""
+
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
+    if selected.vertical_candidates and not human_policy_binding_present:
+        return [
+            candidate.model_dump(mode="python")
+            for candidate in sorted(
+                selected.vertical_candidates, key=lambda item: item.rank
+            )[:max_candidates]
+        ]
+    return [
+        {
+            "candidate_id": "legacy-primary",
+            "rank": 1,
+            "source_asset_id": None,
+            "event_id": None,
+            "frame_id": selected.vertical_frame_id,
+            "observed_visual_evidence": selected.observed_visual_evidence,
+            "selection_reason": selected.selection_reason,
+            "strategy": selected.vertical_strategy,
+            "crop_mode": "strict",
+            "target_description": selected.vertical_target_description,
+            "regions": [],
+            "quality_risks": selected.quality_risks,
+            "confidence": selected.confidence,
+        }
+    ]
+
+
+def _summarize_automatic_reframe(
+    vertical_chapters: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build a compact, deterministic handoff gate from chapter audit trails."""
+
+    chapters: list[dict[str, Any]] = []
+    failure_counts: dict[str, int] = {}
+    total_attempts = 0
+    for chapter in vertical_chapters:
+        routing = chapter.get("automatic_candidate_selection")
+        routing = routing if isinstance(routing, Mapping) else {}
+        attempts_value = routing.get("attempts")
+        attempts = attempts_value if isinstance(attempts_value, list) else []
+        total_attempts += len(attempts)
+        for attempt in attempts:
+            if not isinstance(attempt, Mapping):
+                continue
+            codes = attempt.get("failure_codes")
+            if not isinstance(codes, list):
+                continue
+            for code in codes:
+                if isinstance(code, str) and code:
+                    failure_counts[code] = failure_counts.get(code, 0) + 1
+        selected_rank = routing.get("selected_candidate_rank")
+        policy_blocked = (
+            chapter.get("applied_strategy") == "policy_blocked_preview_fit"
+        )
+        review_required = bool(chapter.get("requires_gemini_review"))
+        chapters.append(
+            {
+                "feature_id": chapter.get("feature_id"),
+                "automatic_routing_enabled": bool(routing.get("enabled")),
+                "selected_candidate_id": routing.get("selected_candidate_id"),
+                "selected_candidate_rank": selected_rank,
+                "candidate_switch_applied": bool(
+                    isinstance(selected_rank, int) and selected_rank > 1
+                ),
+                "candidate_attempt_count": len(attempts),
+                "applied_strategy": chapter.get("applied_strategy"),
+                "policy_blocked": policy_blocked,
+                "review_required": review_required,
+            }
+        )
+    body = {
+        "contract_version": "full-auto-reframe-summary-v1",
+        "chapter_count": len(chapters),
+        "automatic_routing_chapter_count": sum(
+            bool(item["automatic_routing_enabled"]) for item in chapters
+        ),
+        "candidate_attempt_count": total_attempts,
+        "candidate_switch_count": sum(
+            bool(item["candidate_switch_applied"]) for item in chapters
+        ),
+        "policy_blocked_chapter_count": sum(
+            bool(item["policy_blocked"]) for item in chapters
+        ),
+        "review_required_chapter_count": sum(
+            bool(item["review_required"]) for item in chapters
+        ),
+        "failure_code_counts": dict(sorted(failure_counts.items())),
+        "chapters": chapters,
+    }
+    return {**body, "summary_sha256": _stable_fingerprint(body)}
 
 
 def _render_review_html(
@@ -3385,25 +4156,38 @@ def run_feature_cut_experiment(
         },
     )
 
-    def latch_non_retryable_geometry_error(error: Exception) -> None:
+    def latch_geometry_quota_error(error: Exception) -> bool:
         nonlocal gemini_geometry_block_reason
-        if (
-            gemini_geometry_block_reason is None
-            and _is_non_retryable_spending_cap_error(error)
-        ):
+        if not _is_exhausted_model_quota_error(error):
+            return False
+        if gemini_geometry_block_reason is None:
             gemini_geometry_block_reason = f"{type(error).__name__}:{error}"
+            spending_cap = _is_non_retryable_spending_cap_error(error)
             write_json(
                 output_dir / "geometry-model-circuit-breaker.json",
                 {
                     "blocked": True,
                     "reason": gemini_geometry_block_reason,
+                    "retryable_later": not spending_cap,
+                    "action": "abort_render_before_trying_another_candidate",
                     "interpretation": (
-                        "non_retryable_spending_cap_latched_remaining_uncached_"
-                        "grounding_requests_are_skipped"
+                        "spending_cap_requires_account_action"
+                        if spending_cap
+                        else "sdk_retries_exhausted_retry_the_run_later"
                     ),
                     "latched_at": utc_now(),
                 },
             )
+        return True
+
+    def abort_for_geometry_quota(error: Exception) -> None:
+        if not latch_geometry_quota_error(error):
+            return
+        raise GeometryModelQuotaError(
+            "Gemini geometry is unavailable; stopped before trying another "
+            "candidate because candidate switching cannot resolve a 429/quota "
+            "failure. See geometry-model-circuit-breaker.json."
+        ) from error
     try:
         if controlled_reframe_requested and not plan_path.exists():
             raise ValueError(
@@ -3705,9 +4489,7 @@ def run_feature_cut_experiment(
                     scdet_threshold,
                     trim_decisions,
                 )
-                vertical_frame = frames[selected.vertical_frame_id or ""]
-                vertical_clip = clips[vertical_frame.clip_id]
-                for source_clip in (horizontal_clip, vertical_clip):
+                for source_clip in (horizontal_clip,):
                     if source_clip.sha256 not in source_audio_cache:
                         source_audio_cache[source_clip.sha256] = has_audio_stream(
                             Path(source_clip.path)
@@ -3717,25 +4499,10 @@ def run_feature_cut_experiment(
                             Path(source_clip.path)
                         )
                 horizontal_source_has_audio = source_audio_cache[horizontal_clip.sha256]
-                vertical_source_has_audio = source_audio_cache[vertical_clip.sha256]
                 horizontal_source_media = source_media_cache[horizontal_clip.sha256]
-                vertical_source_media = source_media_cache[vertical_clip.sha256]
                 horizontal_display_sar = (
                     horizontal_source_media.video.display_sample_aspect_ratio.numerator
                     / horizontal_source_media.video.display_sample_aspect_ratio.denominator
-                )
-                vertical_display_sar = (
-                    vertical_source_media.video.display_sample_aspect_ratio.numerator
-                    / vertical_source_media.video.display_sample_aspect_ratio.denominator
-                )
-                v_start, v_end, v_shot, vertical_trim = _chapter_bounds_with_approved_trim(
-                    vertical_frame,
-                    vertical_clip,
-                    brief_chapter.target_duration_seconds,
-                    shot_cache,
-                    shots_dir,
-                    scdet_threshold,
-                    trim_decisions,
                 )
                 if brief.render_title_overlays:
                     _render_text_layer(
@@ -3792,7 +4559,7 @@ def run_feature_cut_experiment(
                         )
                         horizontal_debug = track_root / "grounding-debug.png"
                     except Exception as error:
-                        latch_non_retryable_geometry_error(error)
+                        abort_for_geometry_quota(error)
                         horizontal_geometry = _horizontal_reframe_failure_geometry(
                             selected.horizontal_zoom_intent,
                             fallback_reason=(
@@ -3829,276 +4596,423 @@ def run_feature_cut_experiment(
                         output_path=horizontal_segment,
                         source_has_audio=horizontal_source_has_audio,
                     )
-                vertical_fallback_strategy = brief.vertical_fallback_strategy
-                vertical_filter = (
-                    _vertical_center_crop_filter()
-                    if vertical_fallback_strategy == "center_crop"
-                    else _vertical_fit_filter()
+                # Candidate alternatives are already hash-bound inside the saved
+                # FeatureEditPlan. Geometry may select among them at runtime, but
+                # never rewrites the editorial plan. A human policy binding disables
+                # this automatic switching path entirely.
+                vertical_primary_override = (
+                    brief_chapter.vertical_primary_target_description
                 )
-                vertical_geometry: dict[str, Any] = {
-                    "applied_strategy": vertical_fallback_strategy,
-                    "fallback_reason": None,
-                }
-                vertical_debug: Path | None = None
-                vertical_debugs: list[Path] = []
-                vertical_track_fingerprint: str | None = None
-                vertical_primary_override = brief_chapter.vertical_primary_target_description
-                vertical_regions = list(brief_chapter.vertical_regions)
-                required_regions = [
-                    region for region in vertical_regions if region.role == "required"
-                ]
-                vertical_target_description = (
-                    "; ".join(region.target_description for region in required_regions)
-                    if required_regions
-                    else vertical_primary_override
-                    or selected.vertical_target_description
+                auto_reframe_policy = AutoReframePolicy()
+                vertical_options = _vertical_runtime_candidate_options(
+                    selected,
+                    human_policy_binding_present=human_reframe_policy_requested,
+                    max_candidates=auto_reframe_policy.max_candidates,
                 )
-                if (
-                    selected.vertical_strategy == "tracked_crop"
-                    or vertical_primary_override
-                    or required_regions
-                ):
-                    target = vertical_target_description or ""
-                    cache_key = (vertical_frame.frame_id, target, v_start, v_end)
-                    vertical_geometry_root = (
-                        output_dir / "geometry" / selected.feature_id / "vertical"
+                candidate_attempts: list[dict[str, Any]] = []
+                deferred_fit: dict[str, Any] | None = None
+                selected_vertical: dict[str, Any] | None = None
+                for option_index, option in enumerate(vertical_options):
+                    option_data = option
+                    candidate_id = str(option_data["candidate_id"])
+                    candidate_rank = int(option_data["rank"])
+                    frame_id = str(option_data["frame_id"])
+                    candidate_frame = frames[frame_id]
+                    candidate_clip = clips[candidate_frame.clip_id]
+                    expected_asset = option_data.get("source_asset_id")
+                    if expected_asset is not None and expected_asset != (
+                        f"sha256:{candidate_clip.sha256}"
+                    ):
+                        raise ValueError(
+                            f"vertical candidate frame belongs to another asset: {frame_id}"
+                        )
+                    if candidate_clip.sha256 not in source_audio_cache:
+                        source_audio_cache[candidate_clip.sha256] = has_audio_stream(
+                            Path(candidate_clip.path)
+                        )
+                    if candidate_clip.sha256 not in source_media_cache:
+                        source_media_cache[candidate_clip.sha256] = probe_video(
+                            Path(candidate_clip.path)
+                        )
+                    candidate_media = source_media_cache[candidate_clip.sha256]
+                    candidate_display_sar = (
+                        candidate_media.video.display_sample_aspect_ratio.numerator
+                        / candidate_media.video.display_sample_aspect_ratio.denominator
                     )
-                    track_root = vertical_geometry_root
-                    if vertical_regions:
-                        region_key = hashlib.sha256(
-                            json.dumps(
-                                [region.model_dump(mode="json") for region in vertical_regions],
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ).encode("utf-8")
-                        ).hexdigest()[:12]
-                        track_root = track_root / f"regions-{region_key}"
-                    elif vertical_primary_override:
-                        target_key = hashlib.sha256(target.encode("utf-8")).hexdigest()[:10]
-                        track_root = track_root / f"primary-{target_key}"
+                    candidate_start, candidate_end, candidate_shot, candidate_trim = (
+                        _chapter_bounds_with_approved_trim(
+                            candidate_frame,
+                            candidate_clip,
+                            brief_chapter.target_duration_seconds,
+                            shot_cache,
+                            shots_dir,
+                            scdet_threshold,
+                            trim_decisions,
+                            expected_event_id=option_data.get("event_id"),
+                        )
+                    )
+                    candidate_regions, candidate_target = (
+                        _resolve_vertical_candidate_intent(
+                            option_regions=option_data.get("regions", []),
+                            option_target_description=option_data.get(
+                                "target_description"
+                            ),
+                            selected_target_description=(
+                                selected.vertical_target_description
+                            ),
+                            brief_primary_target_description=(
+                                brief_chapter.vertical_primary_target_description
+                            ),
+                            brief_regions=brief_chapter.vertical_regions,
+                            inherit_reviewed_brief_intent=(
+                                not selected.vertical_candidates
+                                or human_reframe_policy_requested
+                            ),
+                        )
+                    )
+                    attempt: dict[str, Any] = {
+                        "candidate_id": candidate_id,
+                        "rank": candidate_rank,
+                        "frame_id": frame_id,
+                        "source_asset_id": f"sha256:{candidate_clip.sha256}",
+                        "event_id": option_data.get("event_id"),
+                        "strategy": option_data["strategy"],
+                        "target_description": candidate_target,
+                        "regions": [
+                            region.model_dump(mode="json")
+                            for region in candidate_regions
+                        ],
+                    }
+                    if option_data["strategy"] == "fit_with_background":
+                        attempt.update(
+                            {
+                                "decision": "deferred_safe_fit",
+                                "reason_code": "planner_requested_fit",
+                            }
+                        )
+                        candidate_attempts.append(attempt)
+                        if deferred_fit is None:
+                            deferred_fit = {
+                                "option": option_data,
+                                "frame": candidate_frame,
+                                "clip": candidate_clip,
+                                "media": candidate_media,
+                                "start_ms": candidate_start,
+                                "end_ms": candidate_end,
+                                "shot_id": candidate_shot,
+                                "trim": candidate_trim,
+                                "regions": candidate_regions,
+                                "target": candidate_target,
+                                "filter": _vertical_fit_filter(),
+                                "geometry": {
+                                    "applied_strategy": "fit_with_background",
+                                    "fallback_reason": None,
+                                    "risk_codes": ["auto_candidate_used_safe_fit"],
+                                    "requires_gemini_review": False,
+                                },
+                                "debugs": [],
+                                "track_fingerprint": None,
+                            }
+                        continue
+
+                    candidate_root = (
+                        output_dir
+                        / "geometry"
+                        / selected.feature_id
+                        / "vertical"
+                        / f"candidate-{candidate_rank:02d}-{candidate_id}"
+                    )
                     try:
-                        if required_regions:
-                            _, tracks, vertical_debugs = _build_required_region_tracks(
-                                client=client,
-                                clip=vertical_clip,
-                                frame=vertical_frame,
-                                start_ms=v_start,
-                                end_ms=v_end,
-                                feature_id=selected.feature_id,
-                                event_description=(
-                                    brief_chapter.title + "；" + selected.observed_visual_evidence
-                                ),
-                                regions=vertical_regions,
-                                checkpoint_path=checkpoint_path,
-                                grounding_prompt=grounding_prompt,
-                                output_dir=track_root,
-                                analysis_fps=sam_analysis_fps,
-                                scdet_threshold=scdet_threshold,
-                                model_request_block_reason=(
-                                    gemini_geometry_block_reason
-                                ),
-                            )
-                            track_fingerprints = [
-                                _track_geometry_fingerprint(track) for track in tracks
-                            ]
-                            vertical_track_fingerprint = hashlib.sha256(
-                                json.dumps(
-                                    {
-                                        "regions": [
-                                            region.model_dump(mode="json")
-                                            for region in required_regions
-                                        ],
-                                        "tracks": track_fingerprints,
-                                    },
-                                    ensure_ascii=False,
-                                    sort_keys=True,
-                                ).encode("utf-8")
-                            ).hexdigest()
-                            vertical_filter, vertical_geometry = _vertical_filter_from_track(
-                                tracks,
-                                allow_subject_clipping=(
-                                    brief_chapter.vertical_crop_mode == "primary_center"
-                                ),
-                                overflow_policy=brief_chapter.vertical_overflow_policy,
-                                edge_priority=brief_chapter.vertical_edge_priority,
-                                region_ids=[region.region_id for region in required_regions],
-                                fallback_strategy=vertical_fallback_strategy,
-                                display_sample_aspect_ratio=vertical_display_sar,
-                            )
-                            vertical_debug = next(
-                                (path for path in vertical_debugs if path.exists()), None
+                        (
+                            candidate_filter,
+                            candidate_geometry,
+                            candidate_debugs,
+                            candidate_track_fingerprint,
+                        ) = _vertical_candidate_geometry(
+                            client=client,
+                            clip=candidate_clip,
+                            frame=candidate_frame,
+                            start_ms=candidate_start,
+                            end_ms=candidate_end,
+                            feature_id=selected.feature_id,
+                            event_description=(
+                                brief_chapter.title
+                                + "；"
+                                + str(option_data["observed_visual_evidence"])
+                            ),
+                            target_description=(
+                                str(candidate_target) if candidate_target else None
+                            ),
+                            regions=candidate_regions,
+                            crop_mode=option_data.get(
+                                "crop_mode", brief_chapter.vertical_crop_mode
+                            ),
+                            overflow_policy=(
+                                brief_chapter.vertical_overflow_policy
+                                if human_reframe_policy_requested
+                                else "preserve_all"
+                            ),
+                            edge_priority=(
+                                brief_chapter.vertical_edge_priority
+                                if human_reframe_policy_requested
+                                else "balanced"
+                            ),
+                            fallback_strategy=(
+                                brief.vertical_fallback_strategy
+                                if human_reframe_policy_requested
+                                else "fit_with_background"
+                            ),
+                            checkpoint_path=checkpoint_path,
+                            grounding_prompt=grounding_prompt,
+                            output_dir=candidate_root,
+                            analysis_fps=sam_analysis_fps,
+                            scdet_threshold=scdet_threshold,
+                            display_sample_aspect_ratio=candidate_display_sar,
+                            track_cache=track_cache,
+                            model_request_block_reason=gemini_geometry_block_reason,
+                        )
+                        auto_audit = None
+                        failure_codes: list[FailureCode] = []
+                        if human_reframe_policy_requested:
+                            hard_gate_passed = True
+                        elif candidate_geometry.get("fallback_reason") is not None:
+                            hard_gate_passed = False
+                            failure_codes = _failure_codes_from_geometry_error(
+                                ValueError(str(candidate_geometry["fallback_reason"]))
                             )
                         else:
-                            if cache_key not in track_cache:
-                                proposal, track = _build_track(
-                                    client=client,
-                                    clip=vertical_clip,
-                                    frame=vertical_frame,
-                                    start_ms=v_start,
-                                    end_ms=v_end,
-                                    feature_id=selected.feature_id,
-                                    event_description=(
-                                        brief_chapter.title
-                                        + "；"
-                                        + selected.observed_visual_evidence
+                            preflight, expected_geometry_fingerprint = (
+                                _vertical_candidate_preflight(
+                                    candidate_id=candidate_id,
+                                    rank=candidate_rank,
+                                    confidence=float(option_data["confidence"]),
+                                    source_sha256=candidate_clip.sha256,
+                                    filter_graph=candidate_filter,
+                                    geometry=candidate_geometry,
+                                    regions=candidate_regions,
+                                    track_fingerprint=(
+                                        candidate_track_fingerprint
                                     ),
-                                    target_description=target,
-                                    checkpoint_path=checkpoint_path,
-                                    grounding_prompt=grounding_prompt,
-                                    output_dir=track_root,
-                                    run_id=f"feature-v-{uuid.uuid4().hex[:8]}",
-                                    analysis_fps=sam_analysis_fps,
-                                    scdet_threshold=scdet_threshold,
-                                    model_request_block_reason=(
-                                        gemini_geometry_block_reason
-                                    ),
+                                    titles_rendered=brief.render_title_overlays,
                                 )
-                                track_cache[cache_key] = (proposal, track, track_root)
-                            _, track, track_root = track_cache[cache_key]
-                            vertical_track_fingerprint = _track_geometry_fingerprint(track)
-                            vertical_filter, vertical_geometry = _vertical_filter_from_track(
-                                track,
-                                allow_subject_clipping=(
-                                    brief_chapter.vertical_crop_mode == "primary_center"
-                                ),
-                                overflow_policy=brief_chapter.vertical_overflow_policy,
-                                edge_priority=brief_chapter.vertical_edge_priority,
-                                fallback_strategy=vertical_fallback_strategy,
-                                display_sample_aspect_ratio=vertical_display_sar,
                             )
-                            vertical_debug = track_root / "grounding-debug.png"
-                            vertical_debugs = [vertical_debug]
-                        semantic_review_reasons: list[str] = []
-                        if len(required_regions) > 1:
-                            semantic_review_reasons.append("multiple_required_regions")
-                        if any(
-                            region.kind in {"text_region", "ui_region"}
-                            for region in required_regions
-                        ):
-                            semantic_review_reasons.append("text_or_ui_region")
-                        if vertical_geometry.get("fallback_reason"):
-                            semantic_review_reasons.append("fallback_applied")
-                        if semantic_review_reasons:
-                            vertical_geometry["requires_gemini_review"] = True
-                        vertical_geometry["semantic_review_reasons"] = (
-                            semantic_review_reasons
-                        )
-                    except Exception as error:
-                        latch_non_retryable_geometry_error(error)
-                        primary_target = (
-                            vertical_primary_override
-                            or selected.vertical_target_description
-                            or ""
-                        )
-                        primary_key = hashlib.sha256(
-                            primary_target.encode("utf-8")
-                        ).hexdigest()[:10]
-                        primary_root = vertical_geometry_root / f"primary-{primary_key}"
-                        reused_cached_composite = False
-                        cached_composite_error: Exception | None = None
-                        if (
-                            required_regions
-                            and primary_target
-                            and _has_complete_cached_primary_track(primary_root)
-                        ):
-                            try:
-                                _, track = _build_track(
-                                    client=client,
-                                    clip=vertical_clip,
-                                    frame=vertical_frame,
-                                    start_ms=v_start,
-                                    end_ms=v_end,
-                                    feature_id=selected.feature_id,
-                                    event_description=(
-                                        brief_chapter.title
-                                        + "；"
-                                        + selected.observed_visual_evidence
-                                    ),
-                                    target_description=primary_target,
-                                    checkpoint_path=checkpoint_path,
-                                    grounding_prompt=grounding_prompt,
-                                    output_dir=primary_root,
-                                    run_id=f"feature-v-cache-{uuid.uuid4().hex[:8]}",
-                                    analysis_fps=sam_analysis_fps,
-                                    scdet_threshold=scdet_threshold,
-                                    model_request_block_reason=(
-                                        gemini_geometry_block_reason
-                                    ),
-                                )
-                                vertical_track_fingerprint = (
-                                    _track_geometry_fingerprint(track)
-                                )
-                                vertical_filter, vertical_geometry = (
-                                    _vertical_filter_from_track(
-                                        track,
-                                        allow_subject_clipping=(
-                                            brief_chapter.vertical_crop_mode
-                                            == "primary_center"
-                                        ),
-                                        overflow_policy=(
-                                            brief_chapter.vertical_overflow_policy
-                                        ),
-                                        edge_priority=(
-                                            brief_chapter.vertical_edge_priority
-                                        ),
-                                        fallback_strategy=(
-                                            vertical_fallback_strategy
-                                        ),
-                                        display_sample_aspect_ratio=(
-                                            vertical_display_sar
-                                        ),
-                                    )
-                                )
-                                prior_fallback = vertical_geometry.get(
-                                    "fallback_reason"
-                                )
-                                vertical_geometry["fallback_reason"] = (
-                                    "required_region_grounding_failed_used_cached_"
-                                    f"composite_track:{type(error).__name__}"
-                                    + (
-                                        f":{prior_fallback}"
-                                        if prior_fallback
-                                        else ""
-                                    )
-                                )
-                                vertical_geometry["risk_codes"] = list(
-                                    dict.fromkeys(
-                                        list(vertical_geometry.get("risk_codes") or [])
-                                        + [
-                                            "cached_composite_track_fallback",
-                                            "required_region_contract_not_verified",
-                                        ]
-                                    )
-                                )
-                                vertical_geometry["requires_gemini_review"] = True
-                                vertical_geometry["semantic_review_reasons"] = [
-                                    "required_region_grounding_failed",
-                                    "cached_composite_track_fallback",
-                                ]
-                                vertical_debug = primary_root / "grounding-debug.png"
-                                vertical_debugs = [vertical_debug]
-                                reused_cached_composite = True
-                            except Exception as composite_error:
-                                cached_composite_error = composite_error
-                                reused_cached_composite = False
-                        if not reused_cached_composite:
-                            composite_suffix = (
-                                ";cached_composite_failed:"
-                                f"{type(cached_composite_error).__name__}:"
-                                f"{cached_composite_error}"
-                                if cached_composite_error is not None
-                                else ""
-                            )
-                            vertical_geometry = {
-                                "applied_strategy": vertical_fallback_strategy,
-                                "fallback_reason": (
-                                    f"tracking_or_grounding_failed:{type(error).__name__}:{error}"
-                                    + composite_suffix
+                            auto_audit = audit_auto_bounded_clip(
+                                preflight,
+                                auto_reframe_policy,
+                                expected_geometry_fingerprint=(
+                                    expected_geometry_fingerprint
                                 ),
-                                "risk_codes": ["tracking_or_grounding_failed"],
-                                "requires_gemini_review": True,
-                                "semantic_review_reasons": ["fallback_applied"],
+                            )
+                            hard_gate_passed = auto_audit.approved
+                            failure_codes = list(auto_audit.failure_codes)
+                            candidate_geometry["auto_bounded_clip_audit"] = (
+                                auto_audit.model_dump(mode="json")
+                            )
+                            candidate_geometry["auto_bounded_clip_applied"] = (
+                                auto_audit.auto_bounded_clip_applied
+                            )
+                            if auto_audit.auto_bounded_clip_applied:
+                                candidate_geometry["automatic_policy_label"] = (
+                                    "auto_bounded_clip_v1"
+                                )
+                        recovery = (
+                            None
+                            if hard_gate_passed
+                            else choose_recovery(
+                                failure_codes,
+                                candidates_remaining=(
+                                    option_index + 1 < len(vertical_options)
+                                ),
+                            )
+                        )
+                        attempt.update(
+                            {
+                                "decision": (
+                                    "accepted" if hard_gate_passed else "try_next"
+                                ),
+                                "reason_code": (
+                                    "all_hard_gates_passed"
+                                    if hard_gate_passed
+                                    else ",".join(
+                                        failure.value for failure in failure_codes
+                                    )
+                                    or candidate_geometry.get("fallback_reason")
+                                    or "geometry_quality_gate_failed"
+                                ),
+                                "failure_codes": [
+                                    failure.value for failure in failure_codes
+                                ],
+                                "recovery_action": (
+                                    recovery.value if recovery is not None else None
+                                ),
+                                "geometry": candidate_geometry,
+                                "track_fingerprint": candidate_track_fingerprint,
                             }
+                        )
+                        candidate_attempts.append(attempt)
+                        if hard_gate_passed or human_reframe_policy_requested:
+                            selected_vertical = {
+                                "option": option_data,
+                                "frame": candidate_frame,
+                                "clip": candidate_clip,
+                                "media": candidate_media,
+                                "start_ms": candidate_start,
+                                "end_ms": candidate_end,
+                                "shot_id": candidate_shot,
+                                "trim": candidate_trim,
+                                "regions": candidate_regions,
+                                "target": candidate_target,
+                                "filter": candidate_filter,
+                                "geometry": candidate_geometry,
+                                "debugs": candidate_debugs,
+                                "track_fingerprint": candidate_track_fingerprint,
+                            }
+                            break
+                    except Exception as error:
+                        abort_for_geometry_quota(error)
+                        failure_codes = _failure_codes_from_geometry_error(error)
+                        recovery = choose_recovery(
+                            failure_codes,
+                            candidates_remaining=(
+                                option_index + 1 < len(vertical_options)
+                            ),
+                        )
+                        attempt.update(
+                            {
+                                "decision": "try_next",
+                                "reason_code": ",".join(
+                                    failure.value for failure in failure_codes
+                                ),
+                                "failure_codes": [
+                                    failure.value for failure in failure_codes
+                                ],
+                                "recovery_action": recovery.value,
+                                "error": str(error),
+                            }
+                        )
+                        candidate_attempts.append(attempt)
+                        if human_reframe_policy_requested:
+                            selected_vertical = {
+                                "option": option_data,
+                                "frame": candidate_frame,
+                                "clip": candidate_clip,
+                                "media": candidate_media,
+                                "start_ms": candidate_start,
+                                "end_ms": candidate_end,
+                                "shot_id": candidate_shot,
+                                "trim": candidate_trim,
+                                "regions": candidate_regions,
+                                "target": candidate_target,
+                                "filter": (
+                                    _vertical_center_crop_filter()
+                                    if brief.vertical_fallback_strategy == "center_crop"
+                                    else _vertical_fit_filter()
+                                ),
+                                "geometry": {
+                                    "applied_strategy": brief.vertical_fallback_strategy,
+                                    "fallback_reason": (
+                                        "tracking_or_grounding_failed:"
+                                        f"{type(error).__name__}:{error}"
+                                    ),
+                                    "risk_codes": [
+                                        "tracking_or_grounding_failed",
+                                        "human_policy_geometry_failed",
+                                    ],
+                                    "requires_gemini_review": True,
+                                },
+                                "debugs": [],
+                                "track_fingerprint": None,
+                            }
+                            break
+
+                if selected_vertical is None:
+                    selected_vertical = deferred_fit
+                if selected_vertical is None:
+                    # All evidence-bound crop candidates failed. Render a safe,
+                    # fully visible preview for human review instead of silently
+                    # applying the brief's center crop.
+                    first_data = vertical_options[0]
+                    vertical_frame = frames[str(first_data["frame_id"])]
+                    vertical_clip = clips[vertical_frame.clip_id]
+                    if vertical_clip.sha256 not in source_audio_cache:
+                        source_audio_cache[vertical_clip.sha256] = has_audio_stream(
+                            Path(vertical_clip.path)
+                        )
+                    if vertical_clip.sha256 not in source_media_cache:
+                        source_media_cache[vertical_clip.sha256] = probe_video(
+                            Path(vertical_clip.path)
+                        )
+                    vertical_source_media = source_media_cache[vertical_clip.sha256]
+                    v_start, v_end, v_shot, vertical_trim = (
+                        _chapter_bounds_with_approved_trim(
+                            vertical_frame,
+                            vertical_clip,
+                            brief_chapter.target_duration_seconds,
+                            shot_cache,
+                            shots_dir,
+                            scdet_threshold,
+                            trim_decisions,
+                        )
+                    )
+                    vertical_regions = list(brief_chapter.vertical_regions)
+                    vertical_target_description = (
+                        selected.vertical_target_description
+                        or brief_chapter.vertical_primary_target_description
+                    )
+                    vertical_filter = _vertical_fit_filter()
+                    vertical_geometry = {
+                        "applied_strategy": "policy_blocked_preview_fit",
+                        "fallback_reason": "all_automatic_candidates_exhausted",
+                        "risk_codes": [
+                            "automatic_candidate_exhaustion",
+                            "human_review_required",
+                        ],
+                        "requires_gemini_review": True,
+                    }
+                    vertical_debugs = []
+                    vertical_track_fingerprint = None
+                    selected_candidate_id = str(first_data["candidate_id"])
+                    selected_candidate_rank = int(first_data["rank"])
+                else:
+                    vertical_frame = selected_vertical["frame"]
+                    vertical_clip = selected_vertical["clip"]
+                    vertical_source_media = selected_vertical["media"]
+                    v_start = selected_vertical["start_ms"]
+                    v_end = selected_vertical["end_ms"]
+                    v_shot = selected_vertical["shot_id"]
+                    vertical_trim = selected_vertical["trim"]
+                    vertical_regions = selected_vertical["regions"]
+                    vertical_target_description = selected_vertical["target"]
+                    vertical_filter = selected_vertical["filter"]
+                    vertical_geometry = selected_vertical["geometry"]
+                    vertical_debugs = selected_vertical["debugs"]
+                    vertical_track_fingerprint = selected_vertical[
+                        "track_fingerprint"
+                    ]
+                    selected_candidate_id = str(
+                        selected_vertical["option"]["candidate_id"]
+                    )
+                    selected_candidate_rank = int(
+                        selected_vertical["option"]["rank"]
+                    )
+                vertical_source_has_audio = source_audio_cache[vertical_clip.sha256]
+                vertical_debug = next(
+                    (path for path in vertical_debugs if path.exists()), None
+                )
+                vertical_geometry["automatic_candidate_selection"] = {
+                    "contract_version": "full-auto-candidate-routing-v2",
+                    "policy_id": auto_reframe_policy.policy_id,
+                    "policy_sha256": auto_reframe_policy.definition_sha256(),
+                    "enabled": bool(
+                        selected.vertical_candidates
+                        and not human_reframe_policy_requested
+                    ),
+                    "selected_candidate_id": selected_candidate_id,
+                    "selected_candidate_rank": selected_candidate_rank,
+                    "attempts": candidate_attempts,
+                    "human_policy_binding_present": human_reframe_policy_requested,
+                    "center_crop_used_as_unverified_fallback": False,
+                }
                 vertical_segment_fingerprint = _segment_variant_fingerprint(
                     source_sha256=vertical_clip.sha256,
                     start_ms=v_start,
@@ -4239,6 +5153,9 @@ def run_feature_cut_experiment(
         manifest["vertical"]["output_path"] = str(vertical_output.resolve())
         manifest["horizontal"]["media"] = _output_media_metadata(horizontal_output)
         manifest["vertical"]["media"] = _output_media_metadata(vertical_output)
+        manifest["automatic_reframe_summary"] = _summarize_automatic_reframe(
+            manifest["vertical"]["chapters"]
+        )
         manifest["generated_at"] = utc_now()
         write_json(output_dir / "render-manifest.json", manifest)
         pricing = summarize_usage_and_list_price(output_dir)

@@ -23,6 +23,7 @@ from jascue_video_lab.feature_cut import (
     _current_external_projection_binding,
     _has_complete_cached_primary_track,
     _horizontal_filter_from_track,
+    _is_exhausted_model_quota_error,
     _is_non_retryable_spending_cap_error,
     _load_trim_decisions,
     _migrate_legacy_feature_plan_binding,
@@ -31,7 +32,10 @@ from jascue_video_lab.feature_cut import (
     _render_source_segment,
     _render_text_layer,
     _required_track_union,
+    _resolve_vertical_candidate_intent,
     _segment_variant_fingerprint,
+    _soft_extent_visibility_audit,
+    _summarize_automatic_reframe,
     _tracking_seed_request_ms,
     _tracked_crop_geometry,
     _usable_track_centers,
@@ -41,6 +45,7 @@ from jascue_video_lab.feature_cut import (
     _vertical_center_crop_filter,
     _vertical_filter_from_track,
     _vertical_fit_filter,
+    _vertical_runtime_candidate_options,
     _vertical_target_fits_crop,
     _write_incremental_pricing,
     write_external_feature_plan_projection,
@@ -55,6 +60,7 @@ from jascue_video_lab.models import (
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
+    FeatureVerticalCandidate,
     FramingRegionIntent,
     ModelProvenance,
     TrimIntentDecision,
@@ -204,8 +210,17 @@ def test_legacy_feature_plan_reuse_migrates_without_overwriting_evidence(
         )
 
 
+@pytest.mark.parametrize(
+    ("projection_contract_id", "preserve_runtime_candidates"),
+    [
+        ("clip-card-open-edit-v1", False),
+        ("clip-card-open-edit-v2", True),
+    ],
+)
 def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
     tmp_path: Path,
+    projection_contract_id: str,
+    preserve_runtime_candidates: bool,
 ) -> None:
     raw_provenance = ModelProvenance(
         model_id=MODEL_ID,
@@ -297,7 +312,12 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
     source_plan = raw_source_plan.model_copy(
         update={"model_provenance": source_provenance}
     )
-    brief, feature_plan, _ = project_feature_contracts(source_plan)
+    # Exercise both deterministic projection generations.  v1 predates
+    # runtime Top-K candidates; v2 preserves them for automatic recovery.
+    brief, feature_plan, _ = project_feature_contracts(
+        source_plan,
+        preserve_runtime_candidates=preserve_runtime_candidates,
+    )
     catalog_path = tmp_path / "catalog.json"
     brief_path = tmp_path / "brief.json"
     plan_dir = tmp_path / "gemini-plan"
@@ -332,7 +352,7 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
     with pytest.raises(ValueError, match="registered model"):
         write_external_feature_plan_projection(
             plan_dir=plan_dir,
-            projection_contract_id="clip-card-open-edit-v1",
+                projection_contract_id=projection_contract_id,
             catalog_path=catalog_path,
             brief_path=brief_path,
             feature_plan_path=feature_plan_path,
@@ -355,7 +375,7 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
     with pytest.raises(ValueError, match="raw model output"):
         write_external_feature_plan_projection(
             plan_dir=plan_dir,
-            projection_contract_id="clip-card-open-edit-v1",
+                projection_contract_id=projection_contract_id,
             catalog_path=catalog_path,
             brief_path=brief_path,
             feature_plan_path=feature_plan_path,
@@ -373,7 +393,7 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
     with pytest.raises(ValueError, match="deterministic projector"):
         write_external_feature_plan_projection(
             plan_dir=plan_dir,
-            projection_contract_id="clip-card-open-edit-v1",
+                projection_contract_id=projection_contract_id,
             catalog_path=catalog_path,
             brief_path=brief_path,
             feature_plan_path=feature_plan_path,
@@ -388,7 +408,7 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
 
     pointer_path = write_external_feature_plan_projection(
         plan_dir=plan_dir,
-        projection_contract_id="clip-card-open-edit-v1",
+        projection_contract_id=projection_contract_id,
         catalog_path=catalog_path,
         brief_path=brief_path,
         feature_plan_path=feature_plan_path,
@@ -409,7 +429,7 @@ def test_external_projection_binding_verifies_source_request_plan_and_artifacts(
 
     assert pointer_path.name == "feature-plan.external-projection.json"
     assert binding["origin"] == "external_projection"
-    assert binding["external_projection_contract_id"] == "clip-card-open-edit-v1"
+    assert binding["external_projection_contract_id"] == projection_contract_id
     _validate_feature_plan_binding(binding, dict(binding))
 
     write_json(raw_output_path, {"output_text": '{"changed":true}'})
@@ -517,6 +537,132 @@ def test_vertical_crop_geometry_preserves_rendered_x_audit_keyframes() -> None:
     assert audit["crop_width_normalized"] == pytest.approx(316.3445)
     assert audit["max_target_width_normalized"] == 200
     assert x_values == sorted(x_values)
+
+
+def test_soft_extent_visibility_is_measured_without_relaxing_hard_containment() -> None:
+    _, _, crop_audit = _tracked_crop_geometry(
+        [0.0, 0.5],
+        [500.0, 500.0],
+        [[450, 200, 550, 800], [450, 200, 550, 800]],
+        source_width=1920,
+        source_height=1080,
+        output_width=1080,
+        output_height=1920,
+    )
+    soft_track = SimpleNamespace(
+        analysis_start_ms=0,
+        samples=[
+            SimpleNamespace(
+                analysis_sample_time_ms=time_ms,
+                tracking_state=TrackingState.TRACKED,
+                derived_tracking_box=[0, 200, 400, 800],
+            )
+            for time_ms in (0, 500)
+        ],
+    )
+    permissive = FramingRegionIntent(
+        region_id="context",
+        target_description="visible surrounding context",
+        role="preferred",
+        minimum_visible_fraction=0.1,
+    )
+    strict = permissive.model_copy(update={"minimum_visible_fraction": 0.9})
+
+    accepted = _soft_extent_visibility_audit(
+        tracks=[soft_track],  # type: ignore[list-item]
+        regions=[permissive],
+        crop_audit=crop_audit,
+    )
+    rejected = _soft_extent_visibility_audit(
+        tracks=[soft_track],  # type: ignore[list-item]
+        regions=[strict],
+        crop_audit=crop_audit,
+    )
+
+    assert crop_audit["containment_failure_count"] == 0
+    assert accepted["soft_extent_visibility_passed"] is True
+    assert rejected["soft_extent_visibility_passed"] is False
+    assert rejected["soft_extent_regions"][0]["minimum_visible_area_fraction"] < 0.9
+
+
+def test_ranked_candidate_intent_is_not_overridden_by_generic_brief_target() -> None:
+    regions, target = _resolve_vertical_candidate_intent(
+        option_regions=[],
+        option_target_description="the rightmost visible instance beside the sign",
+        selected_target_description="the leftmost selected instance",
+        brief_primary_target_description="the main object",
+        brief_regions=[],
+        inherit_reviewed_brief_intent=False,
+    )
+
+    assert regions == []
+    assert target == "the rightmost visible instance beside the sign"
+
+
+def test_legacy_or_human_candidate_can_inherit_reviewed_brief_regions() -> None:
+    reviewed = FramingRegionIntent(
+        region_id="reviewed-core",
+        target_description="reviewed visible core",
+        role="required",
+    )
+
+    regions, target = _resolve_vertical_candidate_intent(
+        option_regions=[],
+        option_target_description=None,
+        selected_target_description=None,
+        brief_primary_target_description="reviewed target",
+        brief_regions=[reviewed],
+        inherit_reviewed_brief_intent=True,
+    )
+
+    assert regions == [reviewed]
+    assert target == "reviewed visible core"
+
+
+def test_runtime_candidates_preserve_rank_but_human_binding_disables_switching() -> None:
+    candidates = [
+        FeatureVerticalCandidate(
+            candidate_id=f"take-{rank}",
+            rank=rank,
+            source_asset_id="sha256:" + ("a" if rank == 1 else "b") * 64,
+            event_id=f"event-{rank}",
+            frame_id=f"RF{rank:06d}",
+            observed_visual_evidence=f"Visible evidence {rank}",
+            selection_reason=f"Reason {rank}",
+            strategy="fit_with_background",
+            target_description=None,
+            confidence=0.8,
+        )
+        for rank in (1, 2)
+    ]
+    selected = FeatureChapterSelect(
+        feature_id="scene",
+        evidence_status="supported",
+        horizontal_frame_id="RF000001",
+        vertical_frame_id="RF000001",
+        observed_visual_evidence="Visible evidence 1",
+        selection_reason="Reason 1",
+        horizontal_strategy="original",
+        horizontal_zoom_intent="none",
+        horizontal_target_description=None,
+        vertical_strategy="fit_with_background",
+        vertical_target_description=None,
+        quality_risks=[],
+        confidence=0.8,
+        vertical_candidates=candidates,
+    )
+
+    automatic = _vertical_runtime_candidate_options(
+        selected, human_policy_binding_present=False
+    )
+    reviewed = _vertical_runtime_candidate_options(
+        selected, human_policy_binding_present=True
+    )
+
+    assert [item["candidate_id"] for item in automatic] == ["take-1", "take-2"]
+    assert reviewed[0]["candidate_id"] == "legacy-primary"
+    assert reviewed[0]["frame_id"] == "RF000001"
+    assert reviewed[0]["target_description"] is None
 
 
 @pytest.mark.parametrize(
@@ -888,6 +1034,15 @@ def test_only_non_retryable_spending_cap_errors_trip_geometry_circuit_breaker() 
     )
     assert not _is_non_retryable_spending_cap_error(
         RuntimeError("429 transient requests per minute quota")
+    )
+    assert _is_exhausted_model_quota_error(
+        RuntimeError("429 transient requests per minute quota")
+    )
+    assert _is_exhausted_model_quota_error(
+        RuntimeError("RESOURCE_EXHAUSTED: quota exceeded")
+    )
+    assert not _is_exhausted_model_quota_error(
+        RuntimeError("the selected entity is not visible in this frame")
     )
 
 
@@ -1949,3 +2104,53 @@ def test_video_only_source_gets_explicit_synthetic_silence(tmp_path: Path) -> No
     stream_types = {stream["codec_type"] for stream in json.loads(completed.stdout)["streams"]}
     assert audio_origin == "synthetic_silence"
     assert stream_types == {"video", "audio"}
+
+
+def test_automatic_reframe_summary_preserves_switch_and_failure_audit() -> None:
+    summary = _summarize_automatic_reframe(
+        [
+            {
+                "feature_id": "opening",
+                "applied_strategy": "tracked_crop",
+                "requires_gemini_review": False,
+                "automatic_candidate_selection": {
+                    "enabled": True,
+                    "selected_candidate_id": "take-b",
+                    "selected_candidate_rank": 2,
+                    "attempts": [
+                        {
+                            "candidate_id": "take-a",
+                            "failure_codes": ["hard_core_not_fully_retained"],
+                        },
+                        {"candidate_id": "take-b", "failure_codes": []},
+                    ],
+                },
+            },
+            {
+                "feature_id": "closing",
+                "applied_strategy": "policy_blocked_preview_fit",
+                "requires_gemini_review": True,
+                "automatic_candidate_selection": {
+                    "enabled": True,
+                    "selected_candidate_id": "take-c",
+                    "selected_candidate_rank": 1,
+                    "attempts": [
+                        {
+                            "candidate_id": "take-c",
+                            "failure_codes": ["track_coverage_below_minimum"],
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+
+    assert summary["candidate_attempt_count"] == 3
+    assert summary["candidate_switch_count"] == 1
+    assert summary["policy_blocked_chapter_count"] == 1
+    assert summary["review_required_chapter_count"] == 1
+    assert summary["failure_code_counts"] == {
+        "hard_core_not_fully_retained": 1,
+        "track_coverage_below_minimum": 1,
+    }
+    assert len(summary["summary_sha256"]) == 64

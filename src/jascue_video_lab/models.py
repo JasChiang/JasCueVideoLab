@@ -4,7 +4,7 @@ import hashlib
 import json
 from enum import StrEnum
 from fractions import Fraction
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -2029,7 +2029,7 @@ class RushesEditPlan(StrictModel):
 
 
 class FramingRegionIntent(StrictModel):
-    """One domain-neutral visual region used to constrain a reframe.
+    """One domain-neutral visual region used to guide a reframe.
 
     A region may describe a person, animal, product, document, sign, UI area,
     or any other directly visible subject.  The vocabulary intentionally does
@@ -2037,11 +2037,134 @@ class FramingRegionIntent(StrictModel):
     """
 
     region_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+    entity_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$",
+        description=(
+            "Immutable Clip Card entity reference when this region was resolved "
+            "from catalog evidence. Legacy/manual regions may omit it."
+        ),
+    )
     target_description: str = Field(min_length=1)
     kind: Literal["subject", "text_region", "ui_region", "graphic", "other"] = (
         "subject"
     )
     role: Literal["required", "preferred", "avoid_overlay"] = "required"
+    atomic: bool = Field(
+        default=False,
+        description=(
+            "True when partial clipping changes the meaning of the region, for "
+            "example a text or UI state. Atomic regions are treated as hard cores."
+        ),
+    )
+    minimum_visible_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+    observable_relations: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def upgrade_relation_field(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "relation_constraints" in value:
+            if "observable_relations" in value:
+                raise ValueError("region cannot define both relation field versions")
+            value = dict(value)
+            value["observable_relations"] = value.pop("relation_constraints")
+        return value
+
+    @model_validator(mode="after")
+    def validate_region_policy(self) -> "FramingRegionIntent":
+        for field_name in ("observable_relations", "exclusions"):
+            values = getattr(self, field_name)
+            if any(not value.strip() for value in values):
+                raise ValueError(f"{field_name} values must be non-empty")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field_name} values must be unique")
+        if self.role == "required" and self.minimum_visible_fraction not in (None, 1.0):
+            raise ValueError("required regions must be fully visible")
+        if self.atomic and self.minimum_visible_fraction not in (None, 1.0):
+            raise ValueError("atomic regions must be fully visible")
+        if self.role == "avoid_overlay" and self.minimum_visible_fraction is not None:
+            raise ValueError("avoid_overlay regions do not use a crop visible fraction")
+        return self
+
+    @property
+    def execution_role(self) -> Literal["hard_core", "soft_extent", "overlay_keepout"]:
+        if self.role == "avoid_overlay":
+            return "overlay_keepout"
+        if self.role == "required" or self.atomic:
+            return "hard_core"
+        return "soft_extent"
+
+    @property
+    def effective_minimum_visible_fraction(self) -> float:
+        if self.execution_role == "hard_core":
+            return 1.0
+        if self.execution_role == "overlay_keepout":
+            return 0.0
+        return self.minimum_visible_fraction if self.minimum_visible_fraction is not None else 0.72
+
+
+class FeatureHorizontalCandidate(StrictModel):
+    """One evidence-bound 16:9 option retained for local automatic routing."""
+
+    candidate_id: str = Field(pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=64)
+    rank: int = Field(ge=1, le=4)
+    source_asset_id: str = Field(min_length=1)
+    event_id: str = Field(min_length=1)
+    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    observed_visual_evidence: str = Field(min_length=1)
+    selection_reason: str = Field(min_length=1)
+    strategy: Literal["original", "tracked_reframe"]
+    zoom_intent: Literal["none", "subtle", "detail"]
+    target_description: str | None = None
+    quality_risks: list[str] = Field(default_factory=list)
+    confidence: Confidence
+
+    @model_validator(mode="after")
+    def validate_geometry_intent(self) -> "FeatureHorizontalCandidate":
+        if self.strategy == "tracked_reframe":
+            if self.zoom_intent == "none" or not self.target_description:
+                raise ValueError("tracked_reframe candidate requires zoom intent and target")
+        elif self.zoom_intent != "none":
+            raise ValueError("original candidate must use zoom intent none")
+        return self
+
+
+class FeatureVerticalCandidate(StrictModel):
+    """One evidence-bound 9:16 option retained for geometry-first selection."""
+
+    candidate_id: str = Field(pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=64)
+    rank: int = Field(ge=1, le=4)
+    source_asset_id: str = Field(min_length=1)
+    event_id: str = Field(min_length=1)
+    frame_id: str = Field(pattern=r"^RF[0-9]{6}$")
+    observed_visual_evidence: str = Field(min_length=1)
+    selection_reason: str = Field(min_length=1)
+    strategy: Literal["tracked_crop", "fit_with_background"]
+    crop_mode: Literal["strict", "primary_center"] = "strict"
+    target_description: str | None = None
+    regions: list[FramingRegionIntent] = Field(default_factory=list, max_length=8)
+    quality_risks: list[str] = Field(default_factory=list)
+    confidence: Confidence
+
+    @model_validator(mode="after")
+    def validate_geometry_intent(self) -> "FeatureVerticalCandidate":
+        hard_regions = [
+            region for region in self.regions if region.execution_role == "hard_core"
+        ]
+        if self.strategy == "tracked_crop" and not (
+            self.target_description or hard_regions
+        ):
+            raise ValueError("tracked_crop candidate requires a target or hard-core region")
+        if self.regions and self.strategy != "tracked_crop":
+            raise ValueError("region constraints require tracked_crop")
+        ids = [region.region_id for region in self.regions]
+        if len(ids) != len(set(ids)):
+            raise ValueError("candidate region IDs must be unique")
+        entity_ids = [region.entity_id for region in self.regions if region.entity_id]
+        if len(entity_ids) != len(set(entity_ids)):
+            raise ValueError("candidate entity references must be unique")
+        return self
 
 
 class ReframePolicyBinding(StrictModel):
@@ -2136,6 +2259,12 @@ class FeatureChapterSelect(StrictModel):
     vertical_target_description: str | None
     quality_risks: list[str]
     confidence: Confidence
+    horizontal_candidates: list[FeatureHorizontalCandidate] = Field(
+        default_factory=list, max_length=4
+    )
+    vertical_candidates: list[FeatureVerticalCandidate] = Field(
+        default_factory=list, max_length=4
+    )
 
     @model_validator(mode="after")
     def validate_evidence(self) -> "FeatureChapterSelect":
@@ -2152,7 +2281,45 @@ class FeatureChapterSelect(StrictModel):
         elif self.horizontal_zoom_intent != "none":
             raise ValueError("original horizontal strategy must use zoom intent none")
         if self.vertical_strategy == "tracked_crop" and not self.vertical_target_description:
-            raise ValueError("tracked_crop requires a precise vertical_target_description")
+            primary_candidate = next(
+                (candidate for candidate in self.vertical_candidates if candidate.rank == 1),
+                None,
+            )
+            if primary_candidate is None or not primary_candidate.regions:
+                raise ValueError(
+                    "tracked_crop requires a precise target or rank-1 region contract"
+                )
+        for field_name in ("horizontal_candidates", "vertical_candidates"):
+            candidates = getattr(self, field_name)
+            if candidates and not 2 <= len(candidates) <= 4:
+                raise ValueError(f"{field_name} must preserve 2-4 options when present")
+            ids = [candidate.candidate_id for candidate in candidates]
+            ranks = [candidate.rank for candidate in candidates]
+            if len(ids) != len(set(ids)) or len(ranks) != len(set(ranks)):
+                raise ValueError(f"{field_name} candidate IDs and ranks must be unique")
+            if ranks and sorted(ranks) != list(range(1, len(ranks) + 1)):
+                raise ValueError(f"{field_name} ranks must be contiguous from 1")
+        if self.evidence_status == "not_found" and (
+            self.horizontal_candidates or self.vertical_candidates
+        ):
+            raise ValueError("not_found chapters cannot retain execution candidates")
+        if self.horizontal_candidates:
+            primary = min(self.horizontal_candidates, key=lambda item: item.rank)
+            if (
+                self.horizontal_frame_id != primary.frame_id
+                or self.horizontal_strategy != primary.strategy
+                or self.horizontal_zoom_intent != primary.zoom_intent
+                or self.horizontal_target_description != primary.target_description
+            ):
+                raise ValueError("rank-1 horizontal candidate must match legacy projection")
+        if self.vertical_candidates:
+            primary = min(self.vertical_candidates, key=lambda item: item.rank)
+            if (
+                self.vertical_frame_id != primary.frame_id
+                or self.vertical_strategy != primary.strategy
+                or self.vertical_target_description != primary.target_description
+            ):
+                raise ValueError("rank-1 vertical candidate must match legacy projection")
         return self
 
 

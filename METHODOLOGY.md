@@ -37,19 +37,11 @@ Gemini 建議 MM:SS → 本機驗證片長 → FFmpeg 抽原始幀／保存 PTS
 
 ## 實際觀察
 
-在 22 秒的匿名化產品展示影片中，未指定 target 的泛化實驗三次雖都產生合法結果，但模型有時選招牌、有時選紫色手機。改用候選階段後，Gemini 一次提出 5 個可選實例：
+在含多個相似實例、背景描繪與局部遮擋的授權測試素材中，未指定 target 的重跑雖都能產生 schema 合法結果，模型選中的實例卻可能不同。改成先提出可區分候選，再鎖定位置、外觀、關係與排除條件後，單幀 bbox 的身分一致性明顯較容易人工檢查。
 
-- 左側白色手機
-- 中央紫色手機
-- 中央白色手機
-- 銀色手提包
-- 粉紅花瓶
+另一組雙比例粗剪測試則顯示：模型 rank 1 可能有合理畫面內容，但在 9:16 中未必具有可行的完整保留窗口；只看單張 seed 也可能忽略片段後段的移動。這促成 Top-K、shot-local tracking 與整段 crop-path preflight 的分工。
 
-Structured Output 通過本機 Pydantic schema；呼叫耗時 5.65 秒，依 Standard paid-tier 公開牌價估算為 US$0.012141。這次沿用先前上傳的 File API 物件，沒有重複上傳影片。
-
-選定中央紫色手機後，Gemini 建議 `00:02`、`00:10`、`00:18`；在 2.002 秒的原始 3840×2160 frame 上，bbox proposal 為 `[412, 684, 467, 871]`（左上角原點、0–1000 normalized x-first），人工視覺抽查選中了正確的紫色實體手機，而不是大型紫色背板或旁邊的白色手機。
-
-這只證明該測例可行，不等於全域準確率，也不是獨立 human ground truth。
+這些都是方法設計用的觀察，不等於全域準確率，也不是獨立 human ground truth。公開文件不保存原始檔名、私人路徑或可回推素材來源的標籤。
 
 ## 技術流程
 
@@ -91,7 +83,7 @@ Gemini File API 的檔案會保存 48 小時，期間可重複用同一個 file 
 
 ### 4. 鎖定 target 後才找時間
 
-選定候選後，`candidate_id` 與 `target_description` 會成為不可變輸入。每個 Direct Moment 都必須逐字回傳同一 target；模型若改選背板或其他手機，本機 contract 直接判定失敗。
+選定候選後，`candidate_id` 與 `target_description` 會成為不可變輸入。每個 Direct Moment 都必須逐字回傳同一 target；模型若改選背景描繪或其他相似實例，本機 contract 直接判定失敗。
 
 若使用者一開始已提供 target ID 與精確描述，可以直接跳過候選階段。描述應包含：
 
@@ -130,6 +122,41 @@ Gemini 不需要每次重看整支成片。成本合理的順序是先跑零 API
 本機再以 FFmpeg 將 coarse in／exclusive-out 解析到原始來源：入點保存第一張保留 decoded frame 的 PTS／hash；一般出點保存第一張不保留 decoded frame，片尾沒有下一張影格時則明確保存 EOS time boundary，不偽造 frame hash。2／4／8 FPS DF contact sheet 只在快速 UI、短暫動作、低信心或人工質疑邊界時局部啟用，讓 Gemini 從既有 ID refine；不以全事件 dense 抽格取代影片理解。相鄰 handles 另外保存供人檢查，不能因模型建議而丟棄原片。
 
 靜止片尾不自動視為廢尾。模型只能以可見證據提出 `natural_pause`、`intentional_hold`、`title_safe_hold`、`clean_plate`、`reset_or_false_end` 或 `uncertain`；「疑似刻意」仍不是導演意圖的 ground truth。每份 proposal 都固定 `requires_human_review=true`，並輸出可播放 preview。只有 `review-trim` 寫入明確真人核准紀錄後，`feature-cut --trim-decision` 才會套用；未核准、被拒絕、跨 shot、source hash 不符或多筆重疊都 fail closed。沒有 matching reviewed decision 的段落仍保留原本的 keyframe-centered rough trim，且 manifest 明確標成 fallback。
+
+### 8. Full Auto v2 executor＋selection planner v3
+
+敘事規劃與構圖可行性是兩個不同問題。Planner 現在為每個有證據的 chapter 保存 2–4 個不同 frame 的候選，每個候選都綁定 source asset、event、frame、可見證據、品質風險與雙比例策略。v3 仍由 Gemini 針對 brief 排出 `required`、`preferred`、`sacrificable` entity priorities 與簡短 framing intent，但不讓模型重抄 target descriptions、rank-1 mirrors 或 verbose regions；這些執行資料由 hash-bound Clip Card evidence 確定性投影。Top-K 和 projection contract 會一起 hash-bound；runtime 換到下一候選不會修改或覆蓋原始 plan。
+
+9:16 自動路徑採 lazy geometry evaluation：
+
+```text
+Top-K evidence-bound candidates
+  → 驗證 asset／event／frame lineage 與 shot bounds
+  → exact-frame Gemini bbox
+  → SAM 在單一 shot 內傳播
+  → 求整段 crop path
+  → 本機 preflight
+       ├─ 通過：採用並停止
+       └─ 失敗：保存 failure code，嘗試下一候選
+  → 全部失敗：輸出 policy-blocked safe-fit preview，要求人工 review
+```
+
+Preflight 不依賴一個總 confidence，而是分開檢查 source lineage、單一 shot、Grounding／tracking gate、coverage、crop containment、soft visibility floor、overlay keepout、crop speed／acceleration／jerk，以及 source、track、geometry fingerprints。每個候選的輸入、錯誤、決定、typed failure codes 與 recovery action 都保存到 render manifest，讓「模型選錯」、「Grounding 失敗」、「tracking 不完整」與「構圖幾何不可行」可以分開診斷。
+
+Region contract 只表達構圖語意，不綁定內容類別：
+
+- `hard_core`：必須完整保留；由 required region 產生。
+- `soft_extent`：可有限犧牲的脈絡，但不得低於明列的可見比例。
+- `overlay_keepout`：版面元素不可覆蓋的區域。
+- `atomic`：裁掉任何部分都可能改變意義，因此永遠當 hard core。
+
+自動政策 `auto_bounded_clip_v1` 只在 hard core／atomic 仍完整、soft extent 仍高於 floor 時接受有限裁切。它不是「讓 AI 自己決定犧牲必留內容」。真正能裁掉 required union 的 `controlled_clip` 仍只能由真人核准的 content-addressed policy sidecar 啟用；有這份 binding 時，自動換候選也會停用，避免 runtime 推翻審核決定。
+
+Typed recovery 目前同時扮演執行與診斷契約：executor 已會嘗試下一候選、延後 safe-fit 候選，並在耗盡後產生待審 preview；split shot、改字卡位置、簡化 motion、換 seed 或重新尋回等 action 目前只會被建議與保存，尚未形成無人值守的自動 repair loop。未驗證 center crop 不會被當成隱形 fallback。
+
+這個路徑不是完整自動品質保證。現階段尚未在 candidate preflight 中執行週期性語意 identity checkpoint、遮擋後 re-identification 或實際 overlay layout collision solver；有 overlay keepout 且需要上字時會 fail closed。獨立成片 QA 可作額外 review 訊號，但不會覆蓋本機 geometry gate，也不等同真人核准。
+
+成本控制採分層方式：已驗證 Clip Cards 可跨 brief 重用；Top-K 規劃預設最多只做一次 text Structured Output，完整付費 repair 必須以 `--repair-attempts` 明確開啟；exact-frame Grounding 與 SAM 僅對入選 chapter 的候選按需執行，第一個通過者即停止。SDK 已用盡重試後若仍回 429、quota exhaustion 或 spending cap，整次 geometry render 立即中止，因為換素材無法修復帳戶／服務層錯誤。Planner output 增加、失敗候選、Grounding 與 tracker 時間都會增加實際成本，因此 artifact 分開保存 incremental usage、歷史 usage、API latency 與本機處理時間，不用固定估價冒充帳單。
 
 ## 怎麼執行
 
