@@ -8,6 +8,8 @@ const state = {
   drawing: false,
   drawEnabled: false,
   startPoint: null,
+  queryProposal: null,
+  queryLock: null,
 };
 
 function busy(title, copy = "請勿關閉此頁。") {
@@ -68,7 +70,7 @@ function renderBase(session) {
   $("#media-hash").textContent = session.media.sha256;
   setSessionUrl(session.session_id);
   if (session.candidate_map) renderCandidates(session.candidate_map, session.file_api_cache);
-  if (session.selection) renderSelection(session.selection);
+  if (session.selection) renderSelection(session.selection, session.query_lock || null);
   if (session.moment_map) renderMoments(session.moment_map);
   const pending = (session.review_states || []).find((item) => item.status === "pending_human_review");
   if (pending) renderRestoredReview(pending);
@@ -103,23 +105,102 @@ function renderCandidates(candidateMap, cache = null) {
   });
 }
 
-function renderSelection(selection) {
+function renderSelection(selection, queryLock = null) {
   const node = $("#selection-summary");
   node.classList.remove("hidden");
   node.innerHTML = "";
   const title = document.createElement("strong");
-  title.textContent = `已由使用者鎖定：${selection.target_id}`;
+  title.textContent = queryLock
+    ? `已核准 target：${selection.target_id}`
+    : selection.query_proposal
+    ? `Query proposal 待核准：${selection.target_id}`
+    : `Legacy target selection：${selection.target_id}`;
   const description = document.createElement("span");
   description.textContent = selection.target_description;
   node.append(title, description);
-  updateStage("target_selected");
+  if (queryLock) {
+    state.queryProposal = null;
+    renderQueryLock(queryLock);
+  } else if (selection.query_proposal) {
+    state.queryProposal = {
+      proposal_id: selection.query_proposal.proposal_id,
+      definition_sha256: selection.query_proposal_hashes.definition_sha256,
+    };
+    const proposalPreview = document.createElement("pre");
+    proposalPreview.className = "query-proposal-preview";
+    proposalPreview.textContent = JSON.stringify({
+      proposal_id: selection.query_proposal.proposal_id,
+      definition_sha256: selection.query_proposal_hashes.definition_sha256,
+      claim_source: selection.query_proposal.claim_source,
+      identity: selection.query_proposal.identity,
+      predicate: selection.query_proposal.predicate,
+      framing: selection.query_proposal.framing,
+    }, null, 2);
+    node.append(proposalPreview);
+    $("#query-approval").classList.remove("hidden");
+    $("#moment-step").classList.add("locked");
+    updateStage("query_proposal_ready");
+  } else {
+    $("#query-approval").classList.add("hidden");
+    updateStage("target_selected");
+    unlock("#moment-step");
+  }
+}
+
+function renderQueryLock(lockOrResult) {
+  const lock = lockOrResult.query_lock || lockOrResult;
+  state.queryLock = lock;
+  const node = $("#selection-summary");
+  const title = node.querySelector("strong");
+  if (title) title.textContent = `已核准 QueryLock target：${lock.identity.targets.at(-1).target_id}`;
+  const status = document.createElement("small");
+  status.textContent = `已核准 QueryLock ${lock.query_id} · ${lock.approval.approval_source}`;
+  node.append(status);
+  $("#query-approval").classList.add("hidden");
   unlock("#moment-step");
+  updateStage("query_locked");
+}
+
+function nonEmptyLines(selector) {
+  return $(selector).value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+}
+
+function optionalValue(selector) {
+  const value = $(selector).value.trim();
+  return value || null;
+}
+
+function queryOptionsFor(targetId) {
+  const role = $("#query-framing-role").value;
+  return {
+    editorial_goal: optionalValue("#query-editorial-goal"),
+    identity_cues: nonEmptyLines("#query-identity-cues"),
+    context_cues: nonEmptyLines("#query-context-cues"),
+    stable_exclusions: nonEmptyLines("#query-exclusions"),
+    observable_predicate: optionalValue("#query-predicate"),
+    predicate_required_at: $("#query-predicate-required-at").value,
+    predicate_precondition: optionalValue("#query-precondition"),
+    predicate_apex: optionalValue("#query-apex"),
+    predicate_postcondition: optionalValue("#query-postcondition"),
+    framing_required_target_ids: role === "required" ? [targetId] : [],
+    framing_preferred_target_ids: role === "preferred" ? [targetId] : [],
+    framing_sacrificable_target_ids: role === "sacrificable" ? [targetId] : [],
+    framing_overlay_keepout_target_ids: $("#query-keepout").checked ? [targetId] : [],
+    framing_intent: optionalValue("#query-framing-intent"),
+  };
 }
 
 function renderMoments(momentMap) {
   unlock("#moment-step");
   const grid = $("#moment-grid");
   grid.innerHTML = "";
+  const requiresTemporalRefinement = Boolean(state.queryLock?.predicate);
+  if (requiresTemporalRefinement) {
+    const notice = document.createElement("p");
+    notice.className = "contract-warning";
+    notice.textContent = "這些 MM:SS 只是假設性 coarse candidates。此 QueryLock 含 predicate，需先匯出並完成 DF frame-ID refinement，Web 才能安全進入 Grounding。";
+    grid.appendChild(notice);
+  }
   momentMap.moments.forEach((moment) => {
     const card = document.createElement("article");
     card.className = "moment";
@@ -134,9 +215,11 @@ function renderMoments(momentMap) {
     });
     card.querySelector(".exact").addEventListener("click", () => groundMoment(moment.moment_id, "exact_frame"));
     card.querySelector(".direct").addEventListener("click", () => groundMoment(moment.moment_id, "direct_video"));
+    card.querySelector(".exact").disabled = requiresTemporalRefinement;
+    card.querySelector(".direct").disabled = requiresTemporalRefinement;
     grid.appendChild(card);
   });
-  unlock("#review-step");
+  if (!requiresTemporalRefinement) unlock("#review-step");
   updateStage("moments_ready");
 }
 
@@ -162,7 +245,10 @@ async function suggestCandidates() {
 
 async function selectCandidate(candidateId) {
   try {
-    const selection = await api(`/api/sessions/${state.session.session_id}/target`, jsonPost({ candidate_id: candidateId }));
+    const selection = await api(`/api/sessions/${state.session.session_id}/target`, jsonPost({
+      candidate_id: candidateId,
+      ...queryOptionsFor(candidateId),
+    }));
     renderSelection(selection);
   } catch (error) { toast(error.message); }
 }
@@ -173,8 +259,30 @@ async function selectManual(event) {
   const targetDescription = $("#manual-target-description").value.trim();
   if (!targetId || !targetDescription) return toast("請同時填寫 Target ID 與精確描述。");
   try {
-    const selection = await api(`/api/sessions/${state.session.session_id}/target`, jsonPost({ target_id: targetId, target_description: targetDescription }));
+    const selection = await api(`/api/sessions/${state.session.session_id}/target`, jsonPost({
+      target_id: targetId,
+      target_description: targetDescription,
+      ...queryOptionsFor(targetId),
+    }));
     renderSelection(selection);
+  } catch (error) { toast(error.message); }
+}
+
+async function approveQuery() {
+  const approvedBy = $("#query-approved-by").value.trim();
+  if (!approvedBy) return toast("請填寫核准者姓名或代號。");
+  if (!state.queryProposal) return toast("目前沒有可核准的 Query Proposal。");
+  try {
+    const result = await api(
+      `/api/sessions/${state.session.session_id}/query/approve`,
+      jsonPost({
+        approved_by: approvedBy,
+        approval_source: "human_review",
+        proposal_id: state.queryProposal.proposal_id,
+        proposal_definition_sha256: state.queryProposal.definition_sha256,
+      }),
+    );
+    renderQueryLock(result);
   } catch (error) { toast(error.message); }
 }
 
@@ -310,6 +418,7 @@ dropZone.addEventListener("drop", (event) => { const file = event.dataTransfer.f
 $("#video-file").addEventListener("change", (event) => { const file = event.target.files[0]; if (file) uploadVideo(file); });
 $("#suggest-button").addEventListener("click", suggestCandidates);
 $("#manual-target-form").addEventListener("submit", selectManual);
+$("#approve-query-button").addEventListener("click", approveQuery);
 $("#moments-button").addEventListener("click", analyzeMoments);
 $("#review-form").addEventListener("submit", submitReview);
 $("#draw-correction").addEventListener("click", () => { state.drawEnabled = true; toast("請在影像上拖曳出人工修正框。"); });

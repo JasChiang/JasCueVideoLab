@@ -18,6 +18,10 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class FrozenStrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
 def _mmss_to_ms(value: str) -> int:
     minutes, seconds = (int(part) for part in value.split(":"))
     return (minutes * 60 + seconds) * 1000
@@ -273,6 +277,641 @@ class EvidenceQueryLock(StrictModel):
 
     def definition_sha256(self) -> str:
         return hashlib.sha256(self.canonical_definition_json().encode("utf-8")).hexdigest()
+
+
+class TargetIdentityScope(StrEnum):
+    """The geometric level at which a persistent target is identified."""
+
+    WHOLE_INSTANCE = "whole_instance"
+    SUBPART = "subpart"
+    VISIBLE_REGION = "visible_region"
+
+
+class PredicateRequiredAt(StrEnum):
+    """The stage or interval at which an observable predicate must hold."""
+
+    CANDIDATE = "candidate"
+    SEED = "seed"
+    TRANSITION = "transition"
+    INTERVAL = "interval"
+
+
+class EvidenceApprovalSource(StrEnum):
+    """An approval authority. Models are deliberately not an authority here."""
+
+    USER_BRIEF = "user_brief"
+    HUMAN_REVIEW = "human_review"
+    AUTO_POLICY = "auto_policy"
+
+
+def _canonical_contract_json(value: Any) -> str:
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json", exclude_none=True)
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _contract_sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_contract_json(value).encode("utf-8")).hexdigest()
+
+
+def _validate_unique_non_empty_strings(
+    values: tuple[str, ...], field_name: str
+) -> None:
+    if any(not value.strip() for value in values):
+        raise ValueError(f"{field_name} values must be non-empty")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{field_name} values must be unique")
+
+
+class EvidenceAnchor(FrozenStrictModel):
+    """A content-addressed crop from one immutable evidence frame."""
+
+    frame_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    crop_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class EvidenceTargetIdentityV2(FrozenStrictModel):
+    """Persistent instance identity, separated from temporary event state."""
+
+    target_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    target_description: str = Field(min_length=1)
+    scope: TargetIdentityScope = TargetIdentityScope.WHOLE_INSTANCE
+    parent_target_id: str | None = Field(
+        default=None, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    identity_cues: tuple[str, ...] = ()
+    context_cues: tuple[str, ...] = ()
+    positive_anchors: tuple[EvidenceAnchor, ...] = ()
+    stable_exclusions: tuple[str, ...] = ()
+    negative_anchors: tuple[EvidenceAnchor, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "EvidenceTargetIdentityV2":
+        for field_name in (
+            "identity_cues",
+            "context_cues",
+            "stable_exclusions",
+        ):
+            _validate_unique_non_empty_strings(getattr(self, field_name), field_name)
+        if self.scope == TargetIdentityScope.WHOLE_INSTANCE:
+            if self.parent_target_id is not None:
+                raise ValueError("whole_instance targets cannot have parent_target_id")
+        elif self.parent_target_id is None:
+            raise ValueError("subpart and visible_region targets require parent_target_id")
+        if self.parent_target_id == self.target_id:
+            raise ValueError("target cannot be its own parent")
+        if not self.identity_cues and not self.positive_anchors:
+            raise ValueError("identity requires identity_cues or positive_anchors")
+        identity = {value.casefold() for value in self.identity_cues}
+        exclusions = {value.casefold() for value in self.stable_exclusions}
+        if identity & exclusions:
+            raise ValueError("identity cues and stable exclusions must not overlap")
+        positive = {
+            (anchor.frame_id, anchor.crop_sha256) for anchor in self.positive_anchors
+        }
+        negative = {
+            (anchor.frame_id, anchor.crop_sha256) for anchor in self.negative_anchors
+        }
+        if len(positive) != len(self.positive_anchors):
+            raise ValueError("positive_anchors must be unique")
+        if len(negative) != len(self.negative_anchors):
+            raise ValueError("negative_anchors must be unique")
+        if positive & negative:
+            raise ValueError("positive and negative anchors must not overlap")
+        positive_crop_hashes = {
+            anchor.crop_sha256 for anchor in self.positive_anchors
+        }
+        negative_crop_hashes = {
+            anchor.crop_sha256 for anchor in self.negative_anchors
+        }
+        if positive_crop_hashes & negative_crop_hashes:
+            raise ValueError(
+                "the same crop bytes cannot be both a positive and negative anchor"
+            )
+        return self
+
+
+class EvidenceIdentityContractV2(FrozenStrictModel):
+    targets: tuple[EvidenceTargetIdentityV2, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_target_graph(self) -> "EvidenceIdentityContractV2":
+        target_ids = [target.target_id for target in self.targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("identity target_id values must be unique")
+        known = set(target_ids)
+        parents = {
+            target.target_id: target.parent_target_id
+            for target in self.targets
+            if target.parent_target_id is not None
+        }
+        unknown = set(parents.values()) - known
+        if unknown:
+            raise ValueError(f"identity parents reference unknown targets: {sorted(unknown)}")
+        for target_id in target_ids:
+            visited: set[str] = set()
+            cursor: str | None = target_id
+            while cursor is not None:
+                if cursor in visited:
+                    raise ValueError("identity parent links must not contain cycles")
+                visited.add(cursor)
+                cursor = parents.get(cursor)
+        return self
+
+    def canonical_definition_json(self) -> str:
+        return _canonical_contract_json(self)
+
+    def definition_sha256(self) -> str:
+        return _contract_sha256(self)
+
+    def target(self, target_id: str) -> EvidenceTargetIdentityV2:
+        try:
+            return next(target for target in self.targets if target.target_id == target_id)
+        except StopIteration as error:
+            raise ValueError(f"unknown identity target: {target_id}") from error
+
+    def ancestors(self, target_id: str) -> tuple[EvidenceTargetIdentityV2, ...]:
+        """Return nearest-to-farthest parent identities for subpart disambiguation."""
+
+        ancestors: list[EvidenceTargetIdentityV2] = []
+        cursor = self.target(target_id)
+        while cursor.parent_target_id is not None:
+            cursor = self.target(cursor.parent_target_id)
+            ancestors.append(cursor)
+        return tuple(ancestors)
+
+
+class EvidencePredicatePhasesV2(FrozenStrictModel):
+    precondition: str = Field(min_length=1)
+    apex: str = Field(min_length=1)
+    postcondition: str = Field(min_length=1)
+
+
+class EvidencePredicateContractV2(FrozenStrictModel):
+    """A media-observable eligibility condition, not a persistent identity cue."""
+
+    predicate_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    statement: str = Field(min_length=1)
+    participant_target_ids: tuple[str, ...] = Field(min_length=1)
+    required_at: PredicateRequiredAt
+    phases: EvidencePredicatePhasesV2 | None = None
+    required_evidence: tuple[str, ...] = ()
+    disqualifying_conditions: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_predicate(self) -> "EvidencePredicateContractV2":
+        for field_name in (
+            "participant_target_ids",
+            "required_evidence",
+            "disqualifying_conditions",
+        ):
+            _validate_unique_non_empty_strings(getattr(self, field_name), field_name)
+        if self.required_at == PredicateRequiredAt.TRANSITION and self.phases is None:
+            raise ValueError("transition predicates require pre/apex/post phases")
+        return self
+
+    def canonical_definition_json(self) -> str:
+        return _canonical_contract_json(self)
+
+    def definition_sha256(self) -> str:
+        return _contract_sha256(self)
+
+
+class EvidenceTargetVisibilityConstraintV2(FrozenStrictModel):
+    """A domain-neutral visibility floor for one target in one layout."""
+
+    target_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    minimum_visible_fraction: float = Field(gt=0.0, le=1.0)
+    atomic: bool = False
+
+
+class EvidenceAspectConstraintV2(FrozenStrictModel):
+    aspect_ratio: AspectRatio
+    required_target_ids: tuple[str, ...] = ()
+    constraint: str = Field(min_length=1)
+    target_visibility_constraints: tuple[
+        EvidenceTargetVisibilityConstraintV2, ...
+    ] = ()
+    required_target_clipping_policy: Literal[
+        "forbid", "allow_controlled"
+    ] = "forbid"
+
+    @model_validator(mode="after")
+    def validate_aspect(self) -> "EvidenceAspectConstraintV2":
+        _validate_unique_non_empty_strings(
+            self.required_target_ids, "required_target_ids"
+        )
+        visibility_ids = [
+            item.target_id for item in self.target_visibility_constraints
+        ]
+        if len(visibility_ids) != len(set(visibility_ids)):
+            raise ValueError("target visibility constraints must be unique")
+        if any(
+            item.atomic and item.minimum_visible_fraction != 1.0
+            for item in self.target_visibility_constraints
+        ):
+            raise ValueError("atomic target visibility must be 1.0")
+        return self
+
+
+class EvidenceFramingObligationsV2(FrozenStrictModel):
+    """Semantic framing priorities; contains no generated crop coordinates."""
+
+    required_target_ids: tuple[str, ...] = ()
+    preferred_target_ids: tuple[str, ...] = ()
+    sacrificable_target_ids: tuple[str, ...] = ()
+    overlay_keepout_target_ids: tuple[str, ...] = ()
+    framing_intent: str = Field(min_length=1)
+    editing_uses: tuple[str, ...] = ()
+    aspect_constraints: tuple[EvidenceAspectConstraintV2, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_obligations(self) -> "EvidenceFramingObligationsV2":
+        for field_name in (
+            "required_target_ids",
+            "preferred_target_ids",
+            "sacrificable_target_ids",
+            "overlay_keepout_target_ids",
+            "editing_uses",
+        ):
+            _validate_unique_non_empty_strings(getattr(self, field_name), field_name)
+        required = set(self.required_target_ids)
+        preferred = set(self.preferred_target_ids)
+        sacrificable = set(self.sacrificable_target_ids)
+        if required & preferred or required & sacrificable or preferred & sacrificable:
+            raise ValueError(
+                "required, preferred, and sacrificable target roles must be disjoint"
+            )
+        return self
+
+    def canonical_definition_json(self) -> str:
+        return _canonical_contract_json(self)
+
+    def definition_sha256(self) -> str:
+        return _contract_sha256(self)
+
+
+class EvidenceQueryApprovalProvenance(FrozenStrictModel):
+    approved_at: str = Field(min_length=1)
+    approved_by: str = Field(min_length=1)
+    approval_source: EvidenceApprovalSource
+    source_reference: str | None = None
+    policy_reference: str | None = None
+
+    @model_validator(mode="after")
+    def validate_approval(self) -> "EvidenceQueryApprovalProvenance":
+        if self.approval_source == EvidenceApprovalSource.AUTO_POLICY:
+            if self.policy_reference is None or not self.policy_reference.strip():
+                raise ValueError("auto_policy approval requires policy_reference")
+        elif self.policy_reference is not None:
+            raise ValueError("policy_reference is only valid for auto_policy approval")
+        return self
+
+
+class EvidenceQueryProvenanceV2(FrozenStrictModel):
+    created_at: str = Field(min_length=1)
+    created_by: str = Field(min_length=1)
+    source_reference: str | None = None
+    parent_query_id: str | None = None
+
+
+def _validate_query_v2_cross_references(
+    *,
+    identity: EvidenceIdentityContractV2,
+    predicate: EvidencePredicateContractV2 | None,
+    framing: EvidenceFramingObligationsV2,
+) -> None:
+    known_targets = {target.target_id for target in identity.targets}
+    if predicate is not None:
+        unknown = set(predicate.participant_target_ids) - known_targets
+        if unknown:
+            raise ValueError(
+                f"predicate references unknown participant targets: {sorted(unknown)}"
+            )
+    for field_name in (
+        "required_target_ids",
+        "preferred_target_ids",
+        "sacrificable_target_ids",
+        "overlay_keepout_target_ids",
+    ):
+        unknown = set(getattr(framing, field_name)) - known_targets
+        if unknown:
+            raise ValueError(
+                f"framing {field_name} references unknown targets: {sorted(unknown)}"
+            )
+    for aspect in framing.aspect_constraints:
+        if len(aspect.required_target_ids) != len(set(aspect.required_target_ids)):
+            raise ValueError("aspect required_target_ids must be unique")
+        unknown = set(aspect.required_target_ids) - known_targets
+        if unknown:
+            raise ValueError(
+                f"aspect constraint references unknown targets: {sorted(unknown)}"
+            )
+        visibility_unknown = {
+            item.target_id for item in aspect.target_visibility_constraints
+        } - known_targets
+        if visibility_unknown:
+            raise ValueError(
+                "aspect visibility constraints reference unknown targets: "
+                f"{sorted(visibility_unknown)}"
+            )
+
+
+def _query_v2_component_hashes(
+    *,
+    identity: EvidenceIdentityContractV2,
+    predicate: EvidencePredicateContractV2 | None,
+    framing: EvidenceFramingObligationsV2,
+) -> dict[str, str]:
+    return {
+        "identity_sha256": identity.definition_sha256(),
+        "predicate_sha256": _contract_sha256(predicate),
+        "framing_sha256": framing.definition_sha256(),
+    }
+
+
+def _query_v2_composite_sha256(
+    *,
+    editorial_goal: str,
+    identity: EvidenceIdentityContractV2,
+    predicate: EvidencePredicateContractV2 | None,
+    framing: EvidenceFramingObligationsV2,
+) -> str:
+    return _contract_sha256(
+        {
+            "contract_version": "evidence-query-v2",
+            "editorial_goal": editorial_goal,
+            **_query_v2_component_hashes(
+                identity=identity,
+                predicate=predicate,
+                framing=framing,
+            ),
+        }
+    )
+
+
+class EvidenceQueryProposalV2(StrictModel):
+    """Unapproved three-layer query definition suitable for review."""
+
+    contract_version: Literal["evidence-query-proposal-v2"] = (
+        "evidence-query-proposal-v2"
+    )
+    proposal_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    revision: int = Field(ge=1)
+    editorial_goal: str = Field(min_length=1)
+    identity: EvidenceIdentityContractV2
+    predicate: EvidencePredicateContractV2 | None = None
+    framing: EvidenceFramingObligationsV2
+    claim_source: EvidenceClaimSource
+    provenance: EvidenceQueryProvenanceV2
+
+    @model_validator(mode="after")
+    def validate_proposal(self) -> "EvidenceQueryProposalV2":
+        _validate_query_v2_cross_references(
+            identity=self.identity,
+            predicate=self.predicate,
+            framing=self.framing,
+        )
+        return self
+
+    def component_hashes(self) -> dict[str, str]:
+        return _query_v2_component_hashes(
+            identity=self.identity,
+            predicate=self.predicate,
+            framing=self.framing,
+        )
+
+    def composite_sha256(self) -> str:
+        return _query_v2_composite_sha256(
+            editorial_goal=self.editorial_goal,
+            identity=self.identity,
+            predicate=self.predicate,
+            framing=self.framing,
+        )
+
+
+class EvidenceQueryLockV2(StrictModel):
+    """Approved, frozen query definition with separate claim and approval origins."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    contract_version: Literal["evidence-query-lock-v2"] = "evidence-query-lock-v2"
+    query_id: str = Field(
+        min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
+    )
+    revision: int = Field(ge=1)
+    editorial_goal: str = Field(min_length=1)
+    identity: EvidenceIdentityContractV2
+    predicate: EvidencePredicateContractV2 | None = None
+    framing: EvidenceFramingObligationsV2
+    claim_source: EvidenceClaimSource
+    provenance: EvidenceQueryProvenanceV2
+    approval: EvidenceQueryApprovalProvenance
+
+    @model_validator(mode="after")
+    def validate_lock(self) -> "EvidenceQueryLockV2":
+        _validate_query_v2_cross_references(
+            identity=self.identity,
+            predicate=self.predicate,
+            framing=self.framing,
+        )
+        return self
+
+    def component_hashes(self) -> dict[str, str]:
+        return _query_v2_component_hashes(
+            identity=self.identity,
+            predicate=self.predicate,
+            framing=self.framing,
+        )
+
+    def composite_sha256(self) -> str:
+        return _query_v2_composite_sha256(
+            editorial_goal=self.editorial_goal,
+            identity=self.identity,
+            predicate=self.predicate,
+            framing=self.framing,
+        )
+
+    def canonical_definition_json(self) -> str:
+        return _canonical_contract_json(self)
+
+    def definition_sha256(self) -> str:
+        return _contract_sha256(self)
+
+
+def approve_evidence_query_proposal_v2(
+    proposal: EvidenceQueryProposalV2,
+    *,
+    query_id: str,
+    approval: EvidenceQueryApprovalProvenance,
+) -> EvidenceQueryLockV2:
+    """Create a new immutable lock without mutating or relabeling the proposal."""
+
+    return EvidenceQueryLockV2(
+        query_id=query_id,
+        revision=proposal.revision,
+        editorial_goal=proposal.editorial_goal,
+        identity=proposal.identity,
+        predicate=proposal.predicate,
+        framing=proposal.framing,
+        claim_source=proposal.claim_source,
+        provenance=proposal.provenance,
+        approval=approval,
+    )
+
+
+def migrate_evidence_query_lock_v1_to_proposal_v2(
+    lock: EvidenceQueryLock,
+) -> EvidenceQueryProposalV2:
+    """Losslessly move a v1 lock definition into the reviewable v2 layers."""
+
+    targets: list[EvidenceTargetIdentityV2] = []
+    for target in lock.targets:
+        if len(target.reference_frame_ids) != len(target.reference_crop_hashes):
+            raise ValueError(
+                "v1 reference frame IDs and crop hashes must have equal lengths "
+                "for lossless v2 migration"
+            )
+        targets.append(
+            EvidenceTargetIdentityV2(
+                target_id=target.target_id,
+                target_description=target.target_description,
+                scope=TargetIdentityScope.WHOLE_INSTANCE,
+                identity_cues=(
+                    tuple(target.positive_attributes)
+                    or (target.target_description,)
+                ),
+                positive_anchors=tuple(
+                    EvidenceAnchor(frame_id=frame_id, crop_sha256=crop_hash)
+                    for frame_id, crop_hash in zip(
+                        target.reference_frame_ids,
+                        target.reference_crop_hashes,
+                        strict=True,
+                    )
+                ),
+                stable_exclusions=tuple(target.negative_attributes),
+            )
+        )
+    if not targets:
+        raise ValueError("v1 lock must contain a target for v2 identity migration")
+
+    if (
+        (lock.required_evidence or lock.negative_constraints)
+        and not lock.observable_predicate
+        and lock.predicate_phases is None
+    ):
+        raise ValueError(
+            "v1 evidence constraints without an observable predicate cannot be "
+            "losslessly migrated to QueryLock v2"
+        )
+    has_predicate_evidence = bool(
+        lock.observable_predicate or lock.predicate_phases
+    )
+    predicate = (
+        EvidencePredicateContractV2(
+            predicate_id=f"{lock.query_id}:predicate",
+            statement=(
+                lock.observable_predicate
+                or (
+                    "Observable transition: "
+                    f"{lock.predicate_phases.precondition}; "
+                    f"{lock.predicate_phases.apex}; "
+                    f"{lock.predicate_phases.postcondition}"
+                )
+            ),
+            participant_target_ids=tuple(target.target_id for target in lock.targets),
+            required_at=(
+                PredicateRequiredAt.TRANSITION
+                if lock.predicate_phases is not None
+                else PredicateRequiredAt.SEED
+            ),
+            phases=(
+                EvidencePredicatePhasesV2(
+                    precondition=lock.predicate_phases.precondition,
+                    apex=lock.predicate_phases.apex,
+                    postcondition=lock.predicate_phases.postcondition,
+                )
+                if lock.predicate_phases is not None
+                else None
+            ),
+            required_evidence=tuple(lock.required_evidence),
+            disqualifying_conditions=tuple(lock.negative_constraints),
+        )
+        if has_predicate_evidence
+        else None
+    )
+    required_targets = tuple(
+        dict.fromkeys(
+            target_id
+            for aspect in lock.aspect_constraints
+            for target_id in aspect.required_target_ids
+        )
+    )
+    return EvidenceQueryProposalV2(
+        proposal_id=f"{lock.query_id}:migrated-v2",
+        revision=lock.revision,
+        editorial_goal=lock.editorial_goal,
+        identity=EvidenceIdentityContractV2(targets=tuple(targets)),
+        predicate=predicate,
+        framing=EvidenceFramingObligationsV2(
+            required_target_ids=required_targets,
+            preferred_target_ids=tuple(
+                target.target_id
+                for target in lock.targets
+                if target.target_id not in required_targets
+            ),
+            framing_intent=(
+                "; ".join(aspect.constraint for aspect in lock.aspect_constraints)
+                or "Preserve the selected evidence targets for the intended edit."
+            ),
+            editing_uses=tuple(lock.editing_uses),
+            aspect_constraints=tuple(
+                EvidenceAspectConstraintV2(
+                    aspect_ratio=aspect.aspect_ratio,
+                    required_target_ids=tuple(aspect.required_target_ids),
+                    constraint=aspect.constraint,
+                )
+                for aspect in lock.aspect_constraints
+            ),
+        ),
+        claim_source=lock.claim_source,
+        provenance=EvidenceQueryProvenanceV2(
+            created_at=lock.provenance.created_at,
+            created_by=lock.provenance.created_by,
+            source_reference=lock.provenance.source_reference,
+            parent_query_id=lock.provenance.parent_query_id,
+        ),
+    )
+
+
+def migrate_evidence_query_lock_v1_to_v2(
+    lock: EvidenceQueryLock,
+    *,
+    approval: EvidenceQueryApprovalProvenance,
+) -> EvidenceQueryLockV2:
+    """Migrate v1 through an explicit proposal and truthful approval record."""
+
+    proposal = migrate_evidence_query_lock_v1_to_proposal_v2(lock)
+    return approve_evidence_query_proposal_v2(
+        proposal,
+        query_id=lock.query_id,
+        approval=approval,
+    )
 
 
 def _validated_grounding_match_status(
@@ -2297,6 +2936,14 @@ class FeatureChapterSelect(StrictModel):
             ranks = [candidate.rank for candidate in candidates]
             if len(ids) != len(set(ids)) or len(ranks) != len(set(ranks)):
                 raise ValueError(f"{field_name} candidate IDs and ranks must be unique")
+            references = [
+                (candidate.source_asset_id, candidate.event_id, candidate.frame_id)
+                for candidate in candidates
+            ]
+            if len(references) != len(set(references)):
+                raise ValueError(
+                    f"{field_name} candidates must reference distinct evidence frames"
+                )
             if ranks and sorted(ranks) != list(range(1, len(ranks) + 1)):
                 raise ValueError(f"{field_name} ranks must be contiguous from 1")
         if self.evidence_status == "not_found" and (

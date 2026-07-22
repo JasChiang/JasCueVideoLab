@@ -130,6 +130,14 @@ class OpenEditShot(StrictModel):
         ids = [candidate.candidate_id for candidate in self.candidates]
         if len(ids) != len(set(ids)):
             raise ValueError("candidate IDs must be unique within a timeline slot")
+        references = [
+            (candidate.source_asset_id, candidate.event_id, candidate.frame_id)
+            for candidate in self.candidates
+        ]
+        if len(references) != len(set(references)):
+            raise ValueError(
+                "Top-K candidates must reference distinct evidence frames"
+            )
         if self.horizontal_candidate_id not in ids or self.vertical_candidate_id not in ids:
             raise ValueError("selected candidate must be present in candidates")
         return self

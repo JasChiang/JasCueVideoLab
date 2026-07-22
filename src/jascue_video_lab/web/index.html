@@ -68,9 +68,44 @@
             <label class="wide">精確描述<textarea id="manual-target-description" rows="3" placeholder="描述物件層級、顏色、位置，以及應排除的相似物件。"></textarea></label>
             <button class="secondary-button" type="submit">使用我的 target</button>
           </form>
+          <details id="query-options" class="query-options">
+            <summary>進階 QueryLock 條件（選填）</summary>
+            <p>Identity 是持續不變的辨識依據；Context 與 Predicate 是只在指定情境成立的條件，兩者不會混成同一個 target。</p>
+            <div class="query-options-grid">
+              <label class="wide">剪輯／查找目的<textarea id="query-editorial-goal" rows="2" placeholder="這次想用這個目標完成什麼？"></textarea></label>
+              <label>穩定 Identity cues<textarea id="query-identity-cues" rows="4" placeholder="每行一項，例如可持續辨識的外觀或實例特徵"></textarea></label>
+              <label>Context cues<textarea id="query-context-cues" rows="4" placeholder="每行一項，例如與人物、場景或其他物件的關係"></textarea></label>
+              <label>Stable exclusions<textarea id="query-exclusions" rows="4" placeholder="每行一項，列出容易混淆但必須排除的實例"></textarea></label>
+              <label>Observable predicate<textarea id="query-predicate" rows="4" placeholder="只寫可由畫面或音訊直接驗證的條件"></textarea></label>
+              <label>Predicate 必須在哪裡成立
+                <select id="query-predicate-required-at">
+                  <option value="candidate">候選片段</option>
+                  <option value="seed">Grounding seed</option>
+                  <option value="transition">狀態轉換</option>
+                  <option value="interval">整個使用區間</option>
+                </select>
+              </label>
+              <label>Precondition<input id="query-precondition" placeholder="轉換前可觀察狀態" /></label>
+              <label>Apex<input id="query-apex" placeholder="事件發生時可觀察狀態" /></label>
+              <label>Postcondition<input id="query-postcondition" placeholder="轉換後可觀察狀態" /></label>
+              <label>所選 target 的構圖角色
+                <select id="query-framing-role">
+                  <option value="required">必須保留</option>
+                  <option value="preferred">優先保留</option>
+                  <option value="sacrificable">必要時可犧牲</option>
+                </select>
+              </label>
+              <label class="checkbox-line"><input id="query-keepout" type="checkbox" />字卡不得遮擋此 target</label>
+              <label class="wide">Framing intent<textarea id="query-framing-intent" rows="2" placeholder="只描述語意構圖意圖，不輸出 crop 座標"></textarea></label>
+            </div>
+          </details>
           <div id="candidate-meta" class="callout hidden"></div>
           <div id="candidate-grid" class="candidate-grid"></div>
           <div id="selection-summary" class="selection-summary hidden"></div>
+          <div id="query-approval" class="query-approval hidden">
+            <label>核准者<input id="query-approved-by" placeholder="姓名或代號" /></label>
+            <button id="approve-query-button" class="primary-button" type="button">核准並建立 QueryLock</button>
+          </div>
         </section>
 
         <section class="workflow-step locked" id="moment-step">

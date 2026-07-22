@@ -17,6 +17,7 @@ from .compare import compare_runs
 from .feature_cut import run_feature_cut_experiment
 from .fixtures import generate_fixtures
 from .full_v1 import (
+    run_query_predicate_refinement,
     run_full_clip,
     run_full_event_geometry,
     run_full_library,
@@ -715,7 +716,28 @@ def command_full_ground_event(args: argparse.Namespace) -> int:
         grounding_candidate_number=args.grounding_candidate_number,
         query_lock_path=args.query_lock,
         query_target_id=args.query_target_id,
+        query_reference_dir=args.query_reference_dir,
+        predicate_decision_path=args.predicate_decision,
+        predicate_prompt_template=_load_prompt(
+            "query_predicate_frame_selection_zh-TW.txt"
+        ),
         sam_analysis_fps=args.sam_analysis_fps,
+        identity_checkpoint_budget=args.identity_checkpoint_budget,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_refine_query_predicate(args: argparse.Namespace) -> int:
+    result = run_query_predicate_refinement(
+        args.clip_run_dir,
+        args.event_id,
+        query_lock_path=args.query_lock,
+        query_target_id=args.query_target_id,
+        prompt_template=_load_prompt("query_predicate_frame_selection_zh-TW.txt"),
+        sampling_fps=args.sampling_fps,
+        window_ms=args.window_ms,
+        output_dir=args.output_dir,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1799,6 +1821,32 @@ def build_parser() -> argparse.ArgumentParser:
     review_trim_parser.add_argument("--output", type=Path, required=True)
     review_trim_parser.set_defaults(handler=command_review_trim)
 
+    refine_query_parser = subparsers.add_parser(
+        "refine-query-predicate",
+        help=(
+            "Explicitly use one Gemini request to select lock-aware DF evidence IDs; "
+            "no bbox or SAM is performed"
+        ),
+    )
+    refine_query_parser.add_argument("clip_run_dir", type=Path)
+    refine_query_parser.add_argument("event_id")
+    refine_query_parser.add_argument("--query-lock", type=Path, required=True)
+    refine_query_parser.add_argument(
+        "--query-target-id",
+        help="Required when the QueryLock contains multiple identity targets",
+    )
+    refine_query_parser.add_argument(
+        "--sampling-fps", type=float, choices=[4.0, 8.0], default=8.0
+    )
+    refine_query_parser.add_argument(
+        "--window-ms",
+        type=int,
+        default=4000,
+        help="Shot-local dense window in milliseconds (1000..5000)",
+    )
+    refine_query_parser.add_argument("--output-dir", type=Path)
+    refine_query_parser.set_defaults(handler=command_refine_query_predicate)
+
     full_ground_parser = subparsers.add_parser(
         "full-ground-event",
         help="Ground one selected Clip Card event and optionally propagate SAM in that interval",
@@ -1817,6 +1865,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Select one target when the query lock contains multiple target references",
     )
     full_ground_parser.add_argument(
+        "--query-reference-dir",
+        type=Path,
+        help=(
+            "Directory of content-addressed identity crops named <sha256>.<image-ext>; "
+            "required only when a v2 lock contains positive or negative anchors"
+        ),
+    )
+    full_ground_parser.add_argument(
+        "--predicate-decision",
+        type=Path,
+        help=(
+            "Resolved query_temporal.decision.json from refine-query-predicate; "
+            "required when a QueryLock v2 contains a predicate"
+        ),
+    )
+    full_ground_parser.add_argument(
         "--accept-proposed-target",
         action="store_true",
         help="Explicitly accept the Clip Card target only when exactly one proposal exists",
@@ -1828,6 +1892,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     full_ground_parser.add_argument("--sam-checkpoint", type=Path)
     full_ground_parser.add_argument("--sam-analysis-fps", type=float, default=2.0)
+    full_ground_parser.add_argument(
+        "--identity-checkpoint-budget",
+        type=int,
+        default=2,
+        help=(
+            "Plan at most this many risk-triggered semantic revalidation frames (0..8). "
+            "Planning is local and makes no model calls."
+        ),
+    )
     full_ground_parser.set_defaults(handler=command_full_ground_event)
     return parser
 

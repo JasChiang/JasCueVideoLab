@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -9,9 +10,14 @@ from pydantic import ValidationError
 
 from jascue_video_lab.full_v1 import (
     _matching_dense_seed_frame,
+    _load_evidence_query_lock,
     _query_lock_event_description,
     _query_lock_target_description,
+    _query_lock_v2_identity_context,
+    _query_lock_v2_target_description,
+    _query_temporal_seed_frame,
     _render_dense_contact_sheets,
+    _resolve_query_identity_references,
     _revalidate_saved_clip_card,
     _select_query_lock_target,
     _shared_upload_dir,
@@ -33,9 +39,16 @@ from jascue_video_lab.models import (
     DenseFrame,
     DenseFrameCatalog,
     EvidenceClaimSource,
+    EvidenceApprovalSource,
+    EvidenceFramingObligationsV2,
+    EvidenceIdentityContractV2,
+    EvidenceQueryApprovalProvenance,
     EvidenceQueryLock,
+    EvidenceQueryLockV2,
     EvidenceQueryProvenance,
+    EvidenceQueryProvenanceV2,
     EvidenceQueryTargetRef,
+    EvidenceTargetIdentityV2,
     Entity,
     EntityKind,
     FullClipCard,
@@ -45,6 +58,11 @@ from jascue_video_lab.models import (
     RushesCatalog,
 )
 from jascue_video_lab.shots import ShotManifest, ShotSegment
+from jascue_video_lab.query_refinement import (
+    QueryTemporalDecision,
+    ResolvedDenseFrame,
+    ResolvedQueryTemporalObservation,
+)
 
 
 def _provenance(model_id: str = "gemini-3.5-flash") -> ModelProvenance:
@@ -110,6 +128,215 @@ def test_query_lock_prompt_material_is_generic_and_keeps_exclusions() -> None:
     assert lock.observable_predicate in event_text
     assert lock.negative_constraints[0] in event_text
     assert not any(term in (target_text + event_text).lower() for term in ("oppo", "reno"))
+
+
+def _query_lock_v2(*targets: EvidenceTargetIdentityV2) -> EvidenceQueryLockV2:
+    return EvidenceQueryLockV2(
+        query_id="query-v2-demo",
+        revision=1,
+        editorial_goal="Keep the reviewer-selected evidence instance visible.",
+        identity=EvidenceIdentityContractV2(targets=targets),
+        predicate=None,
+        framing=EvidenceFramingObligationsV2(
+            required_target_ids=(targets[0].target_id,),
+            framing_intent="Preserve the selected instance without assuming a media domain.",
+        ),
+        claim_source=EvidenceClaimSource.HUMAN_REVIEW,
+        provenance=EvidenceQueryProvenanceV2(
+            created_at="2026-07-22T00:00:00Z",
+            created_by="reviewer",
+        ),
+        approval=EvidenceQueryApprovalProvenance(
+            approved_at="2026-07-22T00:01:00Z",
+            approved_by="reviewer",
+            approval_source=EvidenceApprovalSource.HUMAN_REVIEW,
+        ),
+    )
+
+
+def test_v2_exact_frame_grounding_keeps_predicate_out_of_identity_context() -> None:
+    target = EvidenceTargetIdentityV2(
+        target_id="subject.primary",
+        target_description="the reviewer-selected foreground instance",
+        identity_cues=("persistent outline and surface mark",),
+        context_cues=("next to the active participant at the chosen moment",),
+        stable_exclusions=("reflection", "background depiction"),
+    )
+    lock = _query_lock_v2(target)
+    assert _select_query_lock_target(lock, None) == target
+    target_text = _query_lock_v2_target_description(target)
+    identity_context = _query_lock_v2_identity_context(lock.identity, target)
+    assert "persistent outline" in target_text
+    assert "不得取代 identity" in target_text
+    assert "reflection" in identity_context
+    assert "只驗證指定 identity" in identity_context
+    assert "precondition" not in identity_context
+    assert "apex" not in identity_context
+
+
+def test_v2_lock_loader_and_content_addressed_reference_resolution(
+    tmp_path: Path,
+) -> None:
+    crop_bytes = b"reviewer selected crop"
+    digest = hashlib.sha256(crop_bytes).hexdigest()
+    target = EvidenceTargetIdentityV2(
+        target_id="subject.primary",
+        target_description="the selected instance",
+        positive_anchors=({"frame_id": "RF000001", "crop_sha256": digest},),
+    )
+    lock = _query_lock_v2(target)
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text(lock.model_dump_json(indent=2), encoding="utf-8")
+    loaded = _load_evidence_query_lock(lock_path)
+    assert isinstance(loaded, EvidenceQueryLockV2)
+    assert loaded.definition_sha256() == lock.definition_sha256()
+
+    with pytest.raises(ValueError, match="query-reference-dir"):
+        _resolve_query_identity_references(lock.identity, target, None)
+    reference_dir = tmp_path / "references"
+    reference_dir.mkdir()
+    crop_path = reference_dir / f"{digest}.png"
+    crop_path.write_bytes(crop_bytes)
+    resolved = _resolve_query_identity_references(
+        lock.identity, target, reference_dir
+    )
+    assert len(resolved) == 1
+    assert resolved[0].role == "positive"
+    assert resolved[0].sha256 == digest
+
+
+def test_v2_child_grounding_uses_parent_only_as_identity_disambiguator(
+    tmp_path: Path,
+) -> None:
+    parent_bytes = b"parent identity crop"
+    child_bytes = b"child subpart crop"
+    parent_digest = hashlib.sha256(parent_bytes).hexdigest()
+    child_digest = hashlib.sha256(child_bytes).hexdigest()
+    parent = EvidenceTargetIdentityV2(
+        target_id="subject.parent",
+        target_description="the selected parent instance",
+        identity_cues=("persistent parent mark",),
+        positive_anchors=(
+            {"frame_id": "RF000001", "crop_sha256": parent_digest},
+        ),
+    )
+    child = EvidenceTargetIdentityV2(
+        target_id="subject.child",
+        target_description="the requested visible subpart",
+        scope="subpart",
+        parent_target_id=parent.target_id,
+        identity_cues=("localized child edge",),
+        positive_anchors=(
+            {"frame_id": "RF000002", "crop_sha256": child_digest},
+        ),
+    )
+    lock = _query_lock_v2(parent, child)
+    reference_dir = tmp_path / "references"
+    reference_dir.mkdir()
+    (reference_dir / f"{parent_digest}.png").write_bytes(parent_bytes)
+    (reference_dir / f"{child_digest}.png").write_bytes(child_bytes)
+
+    context = _query_lock_v2_identity_context(lock.identity, child)
+    references = _resolve_query_identity_references(
+        lock.identity, child, reference_dir
+    )
+
+    assert "parent instance disambiguator subject.parent" in context
+    assert "bbox must still tightly bound the requested child target" in context
+    assert [reference.anchor_target_id for reference in references] == [
+        "subject.child",
+        "subject.parent",
+    ]
+    assert all(reference.target_id == "subject.child" for reference in references)
+
+
+def _resolved_frame(frame_id: str, pts: int) -> ResolvedDenseFrame:
+    return ResolvedDenseFrame(
+        frame_id=frame_id,
+        requested_time_ms=pts * 10,
+        frame_time_ms=pts * 10,
+        frame_pts=pts,
+        frame_hash=f"{pts:064x}",
+        width=1920,
+        height=1080,
+    )
+
+
+def _temporal_decision(
+    required_at: str,
+) -> QueryTemporalDecision:
+    common = {
+        "source_asset_id": "sha256:" + "a" * 64,
+        "event_id": "event-demo",
+        "query_id": "query-v2-demo",
+        "grounding_target_id": "subject.primary",
+        "identity_sha256": "b" * 64,
+        "predicate_sha256": "c" * 64,
+        "catalog_sha256": "d" * 64,
+        "request_sha256": "e" * 64,
+        "required_at": required_at,
+        "match_status": "matched",
+        "predicate_status": "satisfied",
+        "observable_evidence_summary": "directly visible in supplied samples",
+        "confidence": 0.8,
+        "model_provenance": _provenance(MODEL_ID),
+    }
+    if required_at == "candidate":
+        candidate = _resolved_frame("DF000002", 20)
+        return QueryTemporalDecision(
+            **common,
+            coverage_claim="single_frame_only",
+            candidate_frame=candidate,
+            evidence=(
+                ResolvedQueryTemporalObservation(
+                    frame=candidate,
+                    identity_status_by_target={"subject.primary": "observed"},
+                    predicate_observed=True,
+                    observation="the locked instance and candidate state are visible",
+                ),
+            ),
+        )
+    precondition = _resolved_frame("DF000001", 10)
+    apex = _resolved_frame("DF000002", 20)
+    postcondition = _resolved_frame("DF000003", 30)
+    return QueryTemporalDecision(
+        **common,
+        coverage_claim="transition_samples_only",
+        precondition_frame=precondition,
+        apex_frame=apex,
+        postcondition_frame=postcondition,
+        evidence=tuple(
+            ResolvedQueryTemporalObservation(
+                frame=frame,
+                identity_status_by_target={"subject.primary": "observed"},
+                predicate_observed=True,
+                transition_phase=(
+                    "precondition"
+                    if frame == precondition
+                    else "apex"
+                    if frame == apex
+                    else "postcondition"
+                ),
+                observation="directly observed transition evidence",
+            )
+            for frame in (precondition, apex, postcondition)
+        ),
+    )
+
+
+def test_temporal_predicate_scope_controls_grounding_seed_semantics() -> None:
+    candidate_frame, candidate_source = _query_temporal_seed_frame(
+        _temporal_decision("candidate")
+    )
+    assert candidate_frame is None
+    assert candidate_source == "candidate_predicate_gate_only"
+
+    transition_frame, transition_source = _query_temporal_seed_frame(
+        _temporal_decision("transition")
+    )
+    assert transition_frame is not None
+    assert transition_frame.frame_id == "DF000002"
+    assert transition_source == "query_predicate_transition_apex"
 
 
 def _event(**updates) -> FullClipEvent:

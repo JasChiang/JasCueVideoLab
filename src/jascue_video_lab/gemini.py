@@ -5,19 +5,25 @@ import importlib.metadata
 import json
 import mimetypes
 import os
+import re
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Sequence
 
 from google import genai
+from google.genai import types
 
 from .geometry import native_yxyx_to_canonical_xyxy
+from .media import sha256_file
 from .models import (
     ContentMap,
     DirectVideoGroundingProposal,
     DirectMomentMap,
     DenseEventSelection,
     DenseFrameCatalog,
+    EvidenceQueryLockV2,
     ExtractedFrame,
     FeatureEditBrief,
     FeatureEditPlan,
@@ -37,6 +43,17 @@ from .models import (
     TemporalMap,
     TrimIntentProposal,
     VideoTrimIntentProposal,
+)
+from .query_refinement import (
+    QUERY_TEMPORAL_GENERATION_CONFIG,
+    QUERY_TEMPORAL_PROTOCOL_VERSION,
+    QUERY_TEMPORAL_TASK_INSTRUCTIONS,
+    QueryTemporalDecision,
+    QueryTemporalSelection,
+    build_query_temporal_fingerprint,
+    query_temporal_contract_sha256,
+    resolve_query_temporal_selection,
+    write_query_temporal_consumer_lineage,
 )
 from .schema import gemini_response_schema
 from .storage import append_error, utc_now, write_json
@@ -63,6 +80,40 @@ class GeminiContractError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class GroundingIdentityReference:
+    """A locally resolved visual identity anchor or explicit confuser.
+
+    The public query contract binds the digest.  The local runtime resolves that
+    digest to a file and validates it before any bytes are sent to Gemini.  The
+    path is deliberately omitted from the saved API request.
+    """
+
+    reference_id: str
+    role: Literal["positive", "negative"]
+    target_id: str
+    description: str
+    path: Path
+    sha256: str
+    anchor_target_id: str | None = None
+
+    def validate(self) -> None:
+        if not self.reference_id.strip() or not self.target_id.strip():
+            raise ValueError("identity reference IDs must be non-empty")
+        if self.anchor_target_id is not None and not self.anchor_target_id.strip():
+            raise ValueError("identity anchor target ID must be non-empty")
+        if not self.description.strip():
+            raise ValueError("identity reference description must be non-empty")
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
+            raise ValueError("identity reference sha256 must be lowercase hexadecimal")
+        if not self.path.is_file():
+            raise FileNotFoundError(f"identity reference image is missing: {self.reference_id}")
+        if sha256_file(self.path) != self.sha256:
+            raise ValueError(f"identity reference hash mismatch: {self.reference_id}")
+
+
 def _provenance(
     run_id: str,
     interaction_id: str | None = None,
@@ -86,6 +137,52 @@ def _raw_dump(value: Any) -> Any:
     return value
 
 
+def _record_interaction_attempt(
+    *,
+    run_dir: Path,
+    operation: str,
+    canonical_filename: str,
+    interaction: Any,
+) -> tuple[Any, Path]:
+    """Persist one paid response immutably plus a replaceable convenience pointer.
+
+    A repeated request must never erase the usage of an earlier response.  The
+    canonical file remains compatible with existing consumers, while billing
+    treats every file below ``attempts/`` as a distinct API response.
+    """
+
+    raw_interaction = _raw_dump(interaction)
+    raw_id = str(getattr(interaction, "id", "") or "unknown")
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_id).strip("-") or "unknown"
+    safe_operation = re.sub(r"[^A-Za-z0-9._-]+", "-", operation).strip("-")
+    attempt_path = (
+        run_dir
+        / "attempts"
+        / f"{safe_operation}.{safe_id}.{uuid.uuid4().hex}.raw_interaction.json"
+    )
+    write_json(attempt_path, raw_interaction)
+    write_json(run_dir / canonical_filename, raw_interaction)
+    try:
+        # Import locally to keep the Gemini client independent of pricing data
+        # at module import time. A pricing failure must never hide the API result.
+        from .billing import summarize_usage_and_list_price
+
+        write_json(
+            run_dir / "pricing.observed.json",
+            summarize_usage_and_list_price(run_dir),
+        )
+    except Exception as pricing_error:
+        write_json(
+            run_dir / "pricing.observed.error.json",
+            {
+                "error_type": type(pricing_error).__name__,
+                "message": str(pricing_error),
+                "interpretation": "raw attempt is preserved; list-price summary unavailable",
+            },
+        )
+    return raw_interaction, attempt_path
+
+
 def _is_file_api_not_found(error: BaseException) -> bool:
     values = [
         getattr(error, "code", None),
@@ -101,7 +198,14 @@ class GeminiLabClient:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not resolved_key:
             raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required for live Gemini calls")
-        self.client = genai.Client(api_key=resolved_key)
+        # Keep paid request cardinality explicit. Candidate routing owns any
+        # later user-initiated retry; the SDK must not hide extra attempts.
+        self.client = genai.Client(
+            api_key=resolved_key,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1)
+            ),
+        )
         self.model_id = model_id
 
     def close(self) -> None:
@@ -233,7 +337,12 @@ class GeminiLabClient:
         write_json(run_dir / "target_candidates.request.json", request_record)
         try:
             interaction = self.client.interactions.create(**request_record)
-            write_json(run_dir / "target_candidates.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="target_candidates",
+                canonical_filename="target_candidates.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 run_dir / "target_candidates.raw_output.json",
                 {"output_text": interaction.output_text},
@@ -312,9 +421,6 @@ class GeminiLabClient:
                 },
             }
             attempt_request = run_dir / f"content_map.attempt-{attempt_number:02d}.request.json"
-            attempt_interaction = (
-                run_dir / f"content_map.attempt-{attempt_number:02d}.raw_interaction.json"
-            )
             attempt_output = run_dir / f"content_map.attempt-{attempt_number:02d}.raw_output.json"
             write_json(attempt_request, request_record)
             if attempt_number == 1:
@@ -324,7 +430,12 @@ class GeminiLabClient:
                 previous_output = interaction.output_text
                 raw_interaction = _raw_dump(interaction)
                 raw_output = {"output_text": previous_output}
-                write_json(attempt_interaction, raw_interaction)
+                _record_interaction_attempt(
+                    run_dir=run_dir,
+                    operation=f"content_map_attempt_{attempt_number:02d}",
+                    canonical_filename="content_map.raw_interaction.json",
+                    interaction=interaction,
+                )
                 write_json(attempt_output, raw_output)
                 parsed = ContentMap.model_validate_json(previous_output)
                 if parsed.asset_id != media.asset_id or parsed.duration_ms != media.duration_ms:
@@ -384,7 +495,19 @@ class GeminiLabClient:
         prompt_template: str,
         run_id: str,
         output_dir: Path,
+        identity_references: Sequence[GroundingIdentityReference] = (),
     ) -> GroundingProposal:
+        if len(identity_references) > 4:
+            raise ValueError("Grounding accepts at most four identity reference images")
+        reference_ids = [reference.reference_id for reference in identity_references]
+        if len(reference_ids) != len(set(reference_ids)):
+            raise ValueError("Grounding identity reference IDs must be unique")
+        for reference in identity_references:
+            reference.validate()
+            if reference.target_id != entity_id:
+                raise ValueError(
+                    "Grounding identity references must belong to the requested entity_id"
+                )
         provenance = _provenance(run_id, model_id=self.model_id)
         replacements = {
             "target_description": target_description,
@@ -399,7 +522,18 @@ class GeminiLabClient:
         for key, value in replacements.items():
             prompt = prompt.replace("{{" + key + "}}", value)
         prompt += (
-            "\n\n## 本次不可變輸入 metadata\n"
+            "\n\n## Identity reference 規則\n"
+            + (
+                "後續標示為 IDENTITY_REFERENCE 的影像只用來辨識指定實例。"
+                "reference role 是針對標籤中的 anchor_target_id：positive 表示該"
+                "anchor identity 的正例，negative 表示該 anchor identity 的排除例。"
+                "若 anchor_target_id 與 entity_id 不同，它只用來辨識 parent instance，"
+                "不得把 parent 當成 bbox target。不得輸出 reference 影像的座標。"
+                "只有最後標示 FRAME_TO_GROUND 的原始影格可以產生 candidates。\n"
+                if identity_references
+                else "本次沒有提供視覺 identity reference；只能依目標影格與文字條件判斷。\n"
+            )
+            + "\n\n## 本次不可變輸入 metadata\n"
             + f"asset_id: {media.asset_id}\n"
             + f"event_id: {event_id}\n"
             + f"entity_id: {entity_id}\n"
@@ -413,14 +547,68 @@ class GeminiLabClient:
         )
         image_data = base64.b64encode(Path(frame.path).read_bytes()).decode("ascii")
         mime_type = mimetypes.guess_type(frame.path)[0] or "image/png"
+        api_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        recorded_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for reference in identity_references:
+            reference_mime_type = (
+                mimetypes.guess_type(reference.path)[0] or "image/png"
+            )
+            label = (
+                f"IDENTITY_REFERENCE id={reference.reference_id} "
+                f"role={reference.role} target_id={reference.target_id} "
+                f"anchor_target_id={reference.anchor_target_id or reference.target_id}\n"
+                f"description={reference.description}"
+            )
+            api_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(reference.path.read_bytes()).decode(
+                            "ascii"
+                        ),
+                        "mime_type": reference_mime_type,
+                    },
+                ]
+            )
+            recorded_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image",
+                        "mime_type": reference_mime_type,
+                        "sha256": reference.sha256,
+                        "reference_id": reference.reference_id,
+                        "reference_role": reference.role,
+                        "target_id": reference.target_id,
+                    },
+                ]
+            )
+        frame_label = (
+            f"FRAME_TO_GROUND sha256={frame.frame_hash} frame_pts={frame.frame_pts}"
+        )
+        api_input.extend(
+            [
+                {"type": "text", "text": frame_label},
+                {"type": "image", "data": image_data, "mime_type": mime_type},
+            ]
+        )
+        recorded_input.extend(
+            [
+                {"type": "text", "text": frame_label},
+                {
+                    "type": "image",
+                    "mime_type": mime_type,
+                    "sha256": frame.frame_hash,
+                    "image_role": "frame_to_ground",
+                },
+            ]
+        )
         api_request = {
             "model": self.model_id,
             "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
             "store": False,
-            "input": [
-                {"type": "text", "text": prompt},
-                {"type": "image", "data": image_data, "mime_type": mime_type},
-            ],
+            "input": api_input,
             "generation_config": {"thinking_level": "low"},
             "response_format": {
                 "type": "text",
@@ -430,17 +618,19 @@ class GeminiLabClient:
         }
         request_record = {
             **api_request,
-            "input": [
-                api_request["input"][0],
-                {"type": "image", "mime_type": mime_type, "sha256": frame.frame_hash},
-            ],
+            "input": recorded_input,
             "api_coordinate_order": "ymin,xmin,ymax,xmax",
             "canonical_coordinate_order": "xmin,ymin,xmax,ymax",
         }
         write_json(output_dir / "grounding.request.json", request_record)
         try:
             interaction = self.client.interactions.create(**api_request)
-            write_json(output_dir / "grounding.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=output_dir,
+                operation="grounding",
+                canonical_filename="grounding.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(output_dir / "grounding.raw_output.json", {"output_text": interaction.output_text})
             parsed = GeminiNativeGroundingProposal.model_validate_json(interaction.output_text)
             expected = {
@@ -601,7 +791,12 @@ model_provenance (return it unchanged with interaction_id=null):
         )
         try:
             interaction = self.client.interactions.create(**api_request)
-            write_json(output_dir / "segmentation.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=output_dir,
+                operation="segmentation",
+                canonical_filename="segmentation.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 output_dir / "segmentation.raw_output.json",
                 {"output_text": interaction.output_text},
@@ -693,8 +888,11 @@ model_provenance (return it unchanged with interaction_id=null):
         write_json(output_dir / "direct_video_grounding.request.json", request_record)
         try:
             interaction = self.client.interactions.create(**request_record)
-            write_json(
-                output_dir / "direct_video_grounding.raw_interaction.json", _raw_dump(interaction)
+            _record_interaction_attempt(
+                run_dir=output_dir,
+                operation="direct_video_grounding",
+                canonical_filename="direct_video_grounding.raw_interaction.json",
+                interaction=interaction,
             )
             write_json(
                 output_dir / "direct_video_grounding.raw_output.json",
@@ -794,7 +992,12 @@ model_provenance (return it unchanged with interaction_id=null):
             interaction = self.client.interactions.create(**request_record)
             raw_interaction = _raw_dump(interaction)
             raw_output = {"output_text": interaction.output_text}
-            write_json(run_dir / "temporal_map.raw_interaction.json", raw_interaction)
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="temporal_map",
+                canonical_filename="temporal_map.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(run_dir / "temporal_map.raw_output.json", raw_output)
             parsed = TemporalMap.model_validate_json(interaction.output_text)
             if parsed.asset_id != media.asset_id or parsed.duration_ms != media.duration_ms:
@@ -882,7 +1085,12 @@ model_provenance (return it unchanged with interaction_id=null):
         )
         try:
             interaction = self.client.interactions.create(**api_request)
-            write_json(run_dir / "indexed_storyboard.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="indexed_storyboard",
+                canonical_filename="indexed_storyboard.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 run_dir / "indexed_storyboard.raw_output.json",
                 {"output_text": interaction.output_text},
@@ -978,7 +1186,12 @@ model_provenance (return it unchanged with interaction_id=null):
         write_json(run_dir / "direct_moments.request.json", request_record)
         try:
             interaction = self.client.interactions.create(**request_record)
-            write_json(run_dir / "direct_moments.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="direct_moments",
+                canonical_filename="direct_moments.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 run_dir / "direct_moments.raw_output.json",
                 {"output_text": interaction.output_text},
@@ -1062,7 +1275,12 @@ model_provenance (return it unchanged with interaction_id=null):
         write_json(run_dir / "clip_card.request.json", request_record)
         try:
             interaction = self.client.interactions.create(**request_record)
-            write_json(run_dir / "clip_card.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="clip_card",
+                canonical_filename="clip_card.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 run_dir / "clip_card.raw_output.json",
                 {"output_text": interaction.output_text},
@@ -1171,7 +1389,12 @@ model_provenance (return it unchanged with interaction_id=null):
         )
         try:
             interaction = self.client.interactions.create(**api_request)
-            write_json(run_dir / "dense_selection.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="dense_selection",
+                canonical_filename="dense_selection.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 run_dir / "dense_selection.raw_output.json",
                 {"output_text": interaction.output_text},
@@ -1227,6 +1450,254 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "dense_selection", error)
+            raise
+
+    def refine_query_lock_frames(
+        self,
+        *,
+        query_lock: EvidenceQueryLockV2,
+        grounding_target_id: str,
+        catalog: DenseFrameCatalog,
+        prompt_template: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> QueryTemporalDecision:
+        """Resolve a QueryLock predicate to supplied DF IDs in one API call.
+
+        Gemini only selects identifiers rendered into existing contact sheets.
+        Local code validates those identifiers and maps them back to source PTS;
+        there is deliberately no repair call or generated source timestamp.
+        """
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        predicate = query_lock.predicate
+        if predicate is None:
+            raise ValueError("QueryLock temporal refinement requires a predicate")
+        known_target_ids = {target.target_id for target in query_lock.identity.targets}
+        unknown_participants = set(predicate.participant_target_ids) - known_target_ids
+        if unknown_participants:
+            # The lock model already enforces this.  Keep the boundary explicit
+            # for callers loading older or dynamically constructed instances.
+            raise GeminiContractError(
+                f"predicate references unknown identity targets: {sorted(unknown_participants)}"
+            )
+
+        ordered_ids = [frame.frame_id for frame in catalog.frames]
+        response_schema = gemini_response_schema(QueryTemporalSelection)
+        fingerprint = build_query_temporal_fingerprint(
+            query_lock=query_lock,
+            grounding_target_id=grounding_target_id,
+            catalog=catalog,
+            model_id=self.model_id,
+            prompt_template=prompt_template,
+            system_instruction=VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+            response_schema=response_schema,
+        )
+        provenance = _provenance(run_id, model_id=self.model_id)
+        prompt = (
+            prompt_template
+            + f"\n\n## Protocol\n{QUERY_TEMPORAL_PROTOCOL_VERSION}\n"
+            + QUERY_TEMPORAL_TASK_INSTRUCTIONS
+            + "\n## 不可變 metadata（逐字回傳）\n"
+            + f"source_asset_id: {catalog.source_asset_id}\n"
+            + f"event_id: {catalog.event_id}\n"
+            + f"query_id: {query_lock.query_id}\n"
+            + f"grounding_target_id: {grounding_target_id}\n"
+            + f"identity_sha256: {fingerprint.identity_sha256}\n"
+            + f"predicate_sha256: {fingerprint.predicate_sha256}\n"
+            + f"catalog_sha256: {fingerprint.catalog_sha256}\n"
+            + f"request_sha256: {fingerprint.request_sha256}\n"
+            + f"required_at: {predicate.required_at.value}\n"
+            + "合法 DF frame IDs（依時間順序）：\n"
+            + json.dumps(ordered_ids, ensure_ascii=False)
+            + "\n\n## Locked identity contract\n"
+            + query_lock.identity.model_dump_json(indent=2)
+            + "\n\n## Locked observable predicate\n"
+            + predicate.model_dump_json(indent=2)
+            + "\n\nmodel_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+
+        api_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        recorded_input: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for page_number, (page_path_value, page_hash) in enumerate(
+            zip(
+                catalog.contact_sheet_paths,
+                catalog.contact_sheet_hashes,
+                strict=True,
+            ),
+            start=1,
+        ):
+            page_path = Path(page_path_value)
+            if not page_path.is_file():
+                raise FileNotFoundError(f"dense contact sheet is missing: page {page_number}")
+            if sha256_file(page_path) != page_hash:
+                raise GeminiContractError(
+                    f"dense contact sheet hash mismatch: page {page_number}"
+                )
+            mime_type = mimetypes.guess_type(page_path)[0] or "image/jpeg"
+            label = f"CONTACT_SHEET_PAGE={page_number} sha256={page_hash}"
+            api_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(page_path.read_bytes()).decode("ascii"),
+                        "mime_type": mime_type,
+                    },
+                ]
+            )
+            recorded_input.extend(
+                [
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image",
+                        "mime_type": mime_type,
+                        "sha256": page_hash,
+                        "image_role": "dense_contact_sheet",
+                        "page_number": page_number,
+                    },
+                ]
+            )
+
+        api_request = {
+            "model": self.model_id,
+            "system_instruction": VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
+            "store": False,
+            "input": api_input,
+            "generation_config": QUERY_TEMPORAL_GENERATION_CONFIG,
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": response_schema,
+            },
+        }
+        write_json(run_dir / "query_temporal.response_schema.json", response_schema)
+        write_json(
+            run_dir / "query_temporal.prompt_template.json",
+            {"prompt_template": prompt_template},
+        )
+        write_json(
+            run_dir / "query_temporal.request.json",
+            {
+                **api_request,
+                "input": recorded_input,
+                "frame_ids_in_order": ordered_ids,
+                "fingerprint": fingerprint.model_dump(mode="json"),
+            },
+        )
+
+        try:
+            interaction = self.client.interactions.create(**api_request)
+            raw_interaction, _attempt_path = _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="query_temporal",
+                canonical_filename="query_temporal.raw_interaction.json",
+                interaction=interaction,
+            )
+            write_json(
+                run_dir / "query_temporal.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            if isinstance(raw_interaction, dict):
+                write_json(
+                    run_dir / "query_temporal.usage.json",
+                    {
+                        "model": self.model_id,
+                        "interaction_id": interaction.id,
+                        "usage": raw_interaction.get("usage"),
+                    },
+                )
+            parsed = QueryTemporalSelection.model_validate_json(
+                interaction.output_text
+            )
+            expected_provenance = provenance.model_dump(
+                mode="json", exclude={"interaction_id"}
+            )
+            actual_provenance = parsed.model_provenance.model_dump(
+                mode="json", exclude={"interaction_id"}
+            )
+            if actual_provenance != expected_provenance:
+                raise GeminiContractError(
+                    "temporal refinement changed immutable model provenance"
+                )
+            final_selection = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            decision = resolve_query_temporal_selection(
+                selection=final_selection,
+                query_lock=query_lock,
+                catalog=catalog,
+                fingerprint=fingerprint,
+            )
+            write_json(run_dir / "query_temporal.selection.json", final_selection)
+            write_json(run_dir / "query_temporal.decision.json", decision)
+            write_json(run_dir / "query_temporal.catalog.snapshot.json", catalog)
+            write_json(
+                run_dir / "query_temporal.schema_validation.json",
+                {
+                    "ok": True,
+                    "errors": [],
+                    "repair_attempted": False,
+                    "api_call_count": 1,
+                },
+            )
+            write_json(
+                run_dir / "query_temporal.bundle.json",
+                {
+                    "contract_version": "query-temporal-evidence-bundle-v2",
+                    "temporal_contract_sha256": query_temporal_contract_sha256(
+                        query_lock, grounding_target_id
+                    ),
+                    "grounding_target_id": grounding_target_id,
+                    "request_fingerprint": fingerprint.model_dump(mode="json"),
+                    "request_file_sha256": sha256_file(
+                        run_dir / "query_temporal.request.json"
+                    ),
+                    "selection_file_sha256": sha256_file(
+                        run_dir / "query_temporal.selection.json"
+                    ),
+                    "decision_file_sha256": sha256_file(
+                        run_dir / "query_temporal.decision.json"
+                    ),
+                    "catalog_snapshot_file_sha256": sha256_file(
+                        run_dir / "query_temporal.catalog.snapshot.json"
+                    ),
+                    "raw_interaction_file_sha256": sha256_file(
+                        run_dir / "query_temporal.raw_interaction.json"
+                    ),
+                    "prompt_template_file_sha256": sha256_file(
+                        run_dir / "query_temporal.prompt_template.json"
+                    ),
+                    "response_schema_file_sha256": sha256_file(
+                        run_dir / "query_temporal.response_schema.json"
+                    ),
+                },
+            )
+            write_query_temporal_consumer_lineage(
+                run_dir,
+                query_lock=query_lock,
+                grounding_target_id=grounding_target_id,
+                request_sha256=fingerprint.request_sha256,
+            )
+            return decision
+        except Exception as error:
+            write_json(
+                run_dir / "query_temporal.schema_validation.json",
+                {
+                    "ok": False,
+                    "errors": [
+                        {"type": type(error).__name__, "message": str(error)}
+                    ],
+                    "repair_attempted": False,
+                    "api_call_count": 1,
+                },
+            )
+            append_error(run_dir, "query_temporal", error)
             raise
 
     def analyze_trim_intent(
@@ -1300,7 +1771,12 @@ model_provenance (return it unchanged with interaction_id=null):
         )
         try:
             interaction = self.client.interactions.create(**api_request)
-            write_json(run_dir / "trim_intent.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="trim_intent",
+                canonical_filename="trim_intent.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 run_dir / "trim_intent.raw_output.json",
                 {"output_text": interaction.output_text},
@@ -1414,9 +1890,11 @@ model_provenance (return it unchanged with interaction_id=null):
         write_json(run_dir / "video_trim_intent.request.json", request)
         try:
             interaction = self.client.interactions.create(**request)
-            write_json(
-                run_dir / "video_trim_intent.raw_interaction.json",
-                _raw_dump(interaction),
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="video_trim_intent",
+                canonical_filename="video_trim_intent.raw_interaction.json",
+                interaction=interaction,
             )
             write_json(
                 run_dir / "video_trim_intent.raw_output.json",
@@ -1486,7 +1964,12 @@ model_provenance (return it unchanged with interaction_id=null):
         write_json(run_dir / "rushes_edit_plan.request.json", request_record)
         try:
             interaction = self.client.interactions.create(**request_record)
-            write_json(run_dir / "rushes_edit_plan.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="rushes_edit_plan",
+                canonical_filename="rushes_edit_plan.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 run_dir / "rushes_edit_plan.raw_output.json",
                 {"output_text": interaction.output_text},
@@ -1568,7 +2051,12 @@ model_provenance (return it unchanged with interaction_id=null):
         write_json(run_dir / "feature_edit_plan.request.json", request_record)
         try:
             interaction = self.client.interactions.create(**request_record)
-            write_json(run_dir / "feature_edit_plan.raw_interaction.json", _raw_dump(interaction))
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="feature_edit_plan",
+                canonical_filename="feature_edit_plan.raw_interaction.json",
+                interaction=interaction,
+            )
             write_json(
                 run_dir / "feature_edit_plan.raw_output.json",
                 {"output_text": interaction.output_text},

@@ -16,7 +16,7 @@
 * { box-sizing: border-box; }
 html { background: var(--bg); color: var(--text); }
 body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 75% -20%, #163629 0, transparent 36rem), var(--bg); }
-button, input, textarea { font: inherit; }
+button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 .hidden { display: none !important; }
 
@@ -79,8 +79,16 @@ dd code { display: inline-block; max-width: 150px; overflow: hidden; text-overfl
 
 .manual-form { margin: 22px 0 0 54px; display: grid; grid-template-columns: 1fr 2fr auto; align-items: end; gap: 12px; }
 label { color: var(--muted); font-size: 13px; display: grid; gap: 8px; }
-input, textarea { width: 100%; color: var(--text); background: #0d1012; border: 1px solid var(--line); border-radius: 9px; padding: 11px 12px; outline: none; resize: vertical; }
-input:focus, textarea:focus { border-color: var(--mint); box-shadow: 0 0 0 3px rgba(102,240,178,.09); }
+input, textarea, select { width: 100%; color: var(--text); background: #0d1012; border: 1px solid var(--line); border-radius: 9px; padding: 11px 12px; outline: none; resize: vertical; }
+input:focus, textarea:focus, select:focus { border-color: var(--mint); box-shadow: 0 0 0 3px rgba(102,240,178,.09); }
+
+.query-options { margin: 20px 0 0 54px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 12px; background: #101416; }
+.query-options summary { cursor: pointer; color: var(--mint); font-weight: 750; }
+.query-options > p { color: var(--muted); line-height: 1.5; font-size: 13px; }
+.query-options-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.query-options-grid .wide { grid-column: 1 / -1; }
+.checkbox-line { display: flex; flex-direction: row; align-items: center; align-self: end; min-height: 43px; }
+.checkbox-line input { width: auto; accent-color: var(--mint); }
 
 .callout { margin: 26px 0 0 54px; padding: 13px 16px; border-radius: 10px; background: #10241d; color: #b8e7d2; font-size: 13px; }
 .candidate-grid, .moment-grid { margin: 18px 0 0 54px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
@@ -94,6 +102,10 @@ input:focus, textarea:focus { border-color: var(--mint); box-shadow: 0 0 0 3px r
 .candidate button, .moment button { width: 100%; }
 .selection-summary { margin: 24px 0 0 54px; border-left: 3px solid var(--mint); background: #101a16; padding: 18px 20px; }
 .selection-summary strong { display: block; color: var(--mint); margin-bottom: 7px; }
+.query-proposal-preview { max-height: 360px; overflow: auto; margin: 16px 0 0; padding: 14px; border-radius: 10px; background: #080a0b; color: #b9c8c2; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.contract-warning { grid-column: 1 / -1; margin: 0; padding: 14px; border: 1px solid #735d23; border-radius: 10px; background: #211c0f; color: #f1d889; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+.query-approval { margin: 14px 0 0 54px; display: grid; grid-template-columns: minmax(180px, 1fr) auto; align-items: end; gap: 12px; }
 
 .empty-state { margin-left: 54px; padding: 54px; border: 1px dashed var(--line); color: var(--muted); text-align: center; border-radius: 12px; }
 .review-card { margin: 24px 0 0 54px; }
@@ -130,6 +142,9 @@ legend { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
   .media-grid { grid-template-columns: 1fr; }
   .candidate-grid, .moment-grid { grid-template-columns: 1fr 1fr; }
   .manual-form { grid-template-columns: 1fr; }
+  .query-options-grid { grid-template-columns: 1fr; }
+  .query-options-grid .wide { grid-column: auto; }
+  .query-approval { grid-template-columns: 1fr; }
   .review-toolbar { grid-template-columns: 1fr; }
   .review-toolbar div { border-right: 0; border-bottom: 1px solid var(--line); }
 }
@@ -142,7 +157,7 @@ legend { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
   .lede { font-size: 16px; }
   .session-strip { flex-wrap: wrap; }
   .text-link { width: 100%; margin: 0; }
-  .step-copy, .action-row, .manual-form, .candidate-grid, .moment-grid, .selection-summary, .empty-state, .review-card, .reveal-card { margin-left: 0; }
+  .step-copy, .action-row, .manual-form, .query-options, .candidate-grid, .moment-grid, .selection-summary, .query-approval, .empty-state, .review-card, .reveal-card { margin-left: 0; }
   .candidate-grid, .moment-grid, .verdict-grid { grid-template-columns: 1fr; }
   .action-row { align-items: flex-start; flex-direction: column; }
   .workflow-step { padding: 22px 16px; }

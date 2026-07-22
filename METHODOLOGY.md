@@ -8,29 +8,38 @@
 
 如果畫面同時有多個相似實例、背景描繪、反射或物件局部，只問 AI「幫我框重要物件」，AI 可能每次選到不同東西。它也許都框得很準，但框的不是你想要的那一個。這個問題和物件是人、產品、動物、工具、螢幕或文件無關。
 
-因此流程改成四步：
+因此流程改成五步：
 
 1. **AI 先提候選**：列出畫面中可區分的實例，不產生座標。
-2. **人選目標並鎖定條件**：使用者選擇真正關心的實例、必要特徵、排除特徵與可選的事件條件；如果一開始已指定，就跳過候選步驟。
-3. **AI 找代表時間**：Gemini 只用 `MM:SS` 建議幾個物件清楚可見的時刻。
-4. **本機抽原始幀再框選**：FFmpeg 找到真正的 frame PTS，Gemini 對那張原始影格只輸出 bbox，最後產生 debug overlay 供人檢查。需要連續幾何時，才把人工核准的 bbox 交給 SAM。
+2. **建立 Proposal，再核准 Lock**：把持續身分、暫時動作／狀態與構圖義務分開；人工流程必須明確核准，自動流程只能引用具名政策，不能把模型提案冒充人選結果。
+3. **AI 找代表時間**：一般事件先以 `MM:SS` 找 coarse window；predicate 需要更細證據時，才對單一 shot 的局部 DF contact sheet 做一次 frame-ID selection。
+4. **本機解出 exact frame**：程式將模型選的既有 DF ID 查回 PTS；模型不能自行發明毫秒或 frame number。
+5. **單幀只做 Identity Grounding**：Gemini 對那張原始影格只依 locked identity 輸出 bbox，不再重新解釋 predicate；最後產生 debug overlay。需要連續幾何時，才把核准的 bbox 交給 SAM。
 
 簡化成一句話：
 
 ```text
-沒指定目標 → Gemini 提候選 → 使用者選一個
-已指定目標 ────────────────────┘
-                 ↓
-Gemini 建議 MM:SS → 本機驗證片長 → FFmpeg 抽原始幀／保存 PTS
-                 ↓
-      Gemini 單幀 bbox → debug overlay → 人工確認
-                                      ↓
-                    選配：SAM 在同一 shot 內傳播 mask
+沒指定目標 → Gemini 提候選 → Query Proposal
+已指定目標 ───────────────────────┘
+                         ↓ 人工核准／具名 auto policy
+                  QueryLock v2
+             ┌───────────┼────────────┐
+             ↓           ↓            ↓
+          Identity    Predicate      Framing
+             │      局部 DF frame ID    │
+             ↓           ↓              │
+       exact-frame bbox ← PTS            │
+             ↓                          │
+       shot-local SAM track ────────────┘
+             ↓
+       crop／layout preflight → 人工確認
 ```
 
 這個順序把兩個不同問題拆開：
 
-- **Query Lock**：到底要找哪個實例、驗證哪個可觀察條件？這是使用者意圖。
+- **Identity Lock**：跨影格要維持的是哪一個實例或哪一個局部？
+- **Predicate Lock**：什麼可直接觀察的條件成立時才算命中？它只在指定的 candidate、seed、transition 或 interval 階段生效。
+- **Framing Lock**：哪些 target 必留、偏好、可犧牲或不可被圖卡覆蓋？
 - **Geometry**：該實例在這張圖的哪裡？這才是 Grounding。
 
 「bbox 很準」不代表「target 選對」。把 selection 留給使用者，是目前最重要的可靠性改進。
@@ -64,7 +73,7 @@ Gemini File API 的檔案會保存 48 小時，期間可重複用同一個 file 
 
 官方說明：[Files API](https://ai.google.dev/gemini-api/docs/files)、[File input methods](https://ai.google.dev/gemini-api/docs/file-input-methods)。
 
-### 3. Target Candidate Map 與 EvidenceQueryLock
+### 3. Target Candidate Map、Proposal 與 EvidenceQueryLock v2
 
 沒有 target 時，不再讓 Content Map 或時間模型順便替使用者挑物件。獨立的 `TargetCandidateMap` 至少保存：
 
@@ -77,13 +86,21 @@ Gemini File API 的檔案會保存 48 小時，期間可重複用同一個 file 
 
 候選階段禁止 bbox、crop、mask 與 tracking data。它只回答「可以選什麼」，不回答「框在哪裡」。
 
-候選由使用者選定後會形成 domain-neutral `EvidenceQueryLock`，至少保存穩定 target ID、正向／排除特徵、可選的 observable predicate、必要證據、負面限制、版本與 hash。後續 Grounding 和 tracking artifact 都保存同一份 lock hash；變更條件會建立新 cache variant，不會沿用舊框。
+候選或使用者描述先形成尚未核准的 `EvidenceQueryProposalV2`。它將資料拆成三層：
 
-既有 dense frame selection 若是在 QueryLock 建立前產生，即使剛好使用相同 target ID 也不會重用，因為它沒有 lock hash，無法證明採用了新的排除條件或 predicate。現階段會退回事件的 coarse keyframe／本機中點並讓 exact-frame gate 決定是否有足夠證據；未來的 lock-aware dense refinement 必須把完整 lock hash 寫入 artifact 才能重用。
+- `identity`：穩定 target ID、whole／part scope、可持續辨識 cues、輔助 context、正負 reference crop 與相似實例排除條件。
+- `predicate`：可直接觀察的 statement、參與 target、`candidate`／`seed`／`transition`／`interval` 生效階段，以及 pre／apex／post、必要證據與 disqualifier。
+- `framing`：required、preferred、sacrificable、overlay keepout、aspect constraints 與 editing uses。
+
+Proposal 另保存 `claim_source`，表示內容主張來自 user brief、human review、metadata 或 model proposal。它不等於核准。只有 `approve_evidence_query_proposal_v2` 才會產生 frozen `EvidenceQueryLockV2`，並另存 `approval_source`、`approved_by` 與時間；Full Auto 只能使用含 `policy_reference` 的 `auto_policy`，不能宣稱是 human review。Blind Review 會先顯示完整 identity／predicate／framing、Proposal ID 與 definition hash，再以兩者做 compare-and-approve；server 也會為同一 session 序列化核准，過期分頁或同時送出的第二筆核准不能悄悄改鎖。
+
+三層各自有 SHA-256。Temporal cache 使用 identity＋predicate＋dense catalog；exact-frame Grounding 使用 identity＋exact frame；SAM 使用 identity＋seed／shot interval；crop／layout 則再綁 framing＋track。Framing hash 也包含各 target 的可見比例 floor，以及該比例是否允許受控裁切；不會只因 target ID 相同就誤認為構圖義務相同。因而只修改構圖或圖卡避讓時可以重用相同 bbox，修改 predicate 時不會把舊 temporal decision 當成新證據，完整 lock lineage仍會另外保存在 artifact 中。
+
+既有 dense frame selection 若是在 QueryLock 建立前產生，即使剛好使用相同 target ID 也不會重用，因為它沒有 identity／predicate／catalog lineage。V2 的 `refine-query-predicate` 會在 `coarse event ∩ 單一 shot` 建立或重用 4／8 FPS immutable DF catalog，以一次 Interactions request 只選現有 frame ID：`candidate` 只做資格 gate、`seed` 選一張 seed、`transition` 必須依 PTS 滿足 pre < apex < post、`interval` 必須選一段不跳號的連續 sample run，且逐張、逐 participant 保存 identity status 與 predicate observation。Temporal target 只需是 predicate participant；之後要做 bbox／framing 的 geometry target 可以是同一份 lock 中另一個 identity。沒有 repair retry，也不把未抽到的中間影格宣稱為已驗證；interval 的 SAM 傳播也只限於該段 sampled-evidence bracket。
 
 ### 4. 鎖定 target 後才找時間
 
-選定候選後，`candidate_id` 與 `target_description` 會成為不可變輸入。每個 Direct Moment 都必須逐字回傳同一 target；模型若改選背景描繪或其他相似實例，本機 contract 直接判定失敗。
+選定候選並核准後，`query_id`、identity targets、predicate 與 framing 都成為不可變輸入。Blind Review Web App 的 server 會拒絕尚未核准 Proposal 的 moment search 與 Grounding，不只在 UI 隱藏按鈕。Moment search 可讀 identity＋predicate 來找 coarse 候選時刻；Web 尚未接上 formal DF refinement，因此只要 lock 含 predicate 就會在 Grounding 前 fail closed，不能把 coarse `MM:SS` 當成 predicate 已滿足。正式 CLI 路徑必須先驗證 content-addressed temporal evidence bundle；通過後 exact-frame Grounding 仍只讀 identity、reference crops 與該張影格，不得把事件敘述或時間當成目標位置證據。
 
 若使用者一開始已提供 target ID 與精確描述，可以直接跳過候選階段。描述應包含：
 
@@ -95,7 +112,7 @@ Gemini File API 的檔案會保存 48 小時，期間可重複用同一個 file 
 
 FFmpeg 從 orientation-corrected 原始 source 抽幀後，以官方 Gemini image bbox convention 接收 `[y_min, x_min, y_max, x_max]`。API boundary schema 明確命名為 `box_2d_yxyx`，再由本機做純軸序轉換，輸出專案 canonical `[x_min, y_min, x_max, y_max]`。
 
-如果 target 不可見，模型必須回傳 `visible=false`、`candidates=[]`，不得利用前後時刻猜位置。`match_status` 另外區分 `matched`、`ambiguous`、`not_visible`、`target_mismatch` 與 `insufficient_evidence`；可選的 `predicate_status` 只回答指定動作／狀態是否有證據，不能取代物件身分或可見性。多候選不得依最高 confidence 自動選框，必須由人指定 candidate。Debug overlay 必須畫在原始影格上供人工檢查。
+如果 target 不可見，模型必須回傳 `visible=false`、`candidates=[]`，不得利用前後時刻猜位置。`match_status` 另外區分 `matched`、`ambiguous`、`not_visible`、`target_mismatch` 與 `insufficient_evidence`。V2 的 predicate 已在獨立 temporal gate 處理，Grounding prompt 不再攜帶事件狀態，避免模型因「應該正在發生某事」而換成另一個相似實例。正／負 reference crop 可交錯放在待框影格之前，但只用於 identity，比對前會先核對 content SHA-256，模型也被禁止輸出 reference image 的座標。若 target 是 subpart／visible region，父層 identity 的文字與有限 reference 只用來辨認是哪一個 parent instance，bbox 仍必須框 child scope；實際傳送的最多四張 reference 及選擇版本會進入 Grounding fingerprint。多候選不得依最高 confidence 自動選框，必須由人指定 candidate。Debug overlay 必須畫在原始影格上供人工檢查。
 
 ### 6. Gemini bbox → SAM；不使用 Gemini polygon 當主路徑
 
@@ -132,6 +149,7 @@ Gemini 不需要每次重看整支成片。成本合理的順序是先跑零 API
 ```text
 Top-K evidence-bound candidates
   → 驗證 asset／event／frame lineage 與 shot bounds
+  → 對真正嘗試的候選建立 Proposal＋具名 auto-policy QueryLock
   → exact-frame Gemini bbox
   → SAM 在單一 shot 內傳播
   → 求整段 crop path
@@ -154,9 +172,9 @@ Region contract 只表達構圖語意，不綁定內容類別：
 
 Typed recovery 目前同時扮演執行與診斷契約：executor 已會嘗試下一候選、延後 safe-fit 候選，並在耗盡後產生待審 preview；split shot、改字卡位置、簡化 motion、換 seed 或重新尋回等 action 目前只會被建議與保存，尚未形成無人值守的自動 repair loop。未驗證 center crop 不會被當成隱形 fallback。
 
-這個路徑不是完整自動品質保證。現階段尚未在 candidate preflight 中執行週期性語意 identity checkpoint、遮擋後 re-identification 或實際 overlay layout collision solver；有 overlay keepout 且需要上字時會 fail closed。獨立成片 QA 可作額外 review 訊號，但不會覆蓋本機 geometry gate，也不等同真人核准。
+這個路徑不是完整自動品質保證。目前已有固定預算的本機 identity checkpoint scheduler：根據 shot boundary、drift、低信心、面積／中心跳動與遮擋後重現，優先挑出 start／mid／end 等風險點；它只輸出 `planned_not_executed` artifact，`model_calls_made=0`。真正的 Gemini identity verifier、遮擋後 re-identification 與 overlay layout collision solver 尚未接上，不能把 checkpoint plan 寫成已通過驗證。有 overlay keepout 且需要上字時會 fail closed。獨立成片 QA 可作額外 review 訊號，但不會覆蓋本機 geometry gate，也不等同真人核准。
 
-成本控制採分層方式：已驗證 Clip Cards 可跨 brief 重用；Top-K 規劃預設最多只做一次 text Structured Output，完整付費 repair 必須以 `--repair-attempts` 明確開啟；exact-frame Grounding 與 SAM 僅對入選 chapter 的候選按需執行，第一個通過者即停止。SDK 已用盡重試後若仍回 429、quota exhaustion 或 spending cap，整次 geometry render 立即中止，因為換素材無法修復帳戶／服務層錯誤。Planner output 增加、失敗候選、Grounding 與 tracker 時間都會增加實際成本，因此 artifact 分開保存 incremental usage、歷史 usage、API latency 與本機處理時間，不用固定估價冒充帳單。
+成本控制採分層方式：Top-K 是一次 text Structured Output 裡的候選陣列，不是 K 次影片分析；已驗證 Clip Cards 可跨 brief 重用，完整付費 repair 必須以 `--repair-attempts` 明確開啟。Predicate refinement 只有明確需要時才做一次局部 frame-ID call；exact-frame Grounding 與 SAM 僅對入選 chapter 的候選按需執行，第一個通過者即停止。候選 Lock 的建立與 checkpoint planning 都是本機 contract，不產生 API 費用；Full Auto 的具名批准政策本身也另存 content hash。為避免隱藏成本，SDK 對每個 Gemini operation 明確只嘗試一次；真正的 HTTP 429、quota exhaustion 或 spending cap 會立即中止整次 geometry render，因為換素材無法修復帳戶／服務層錯誤。每次已取得 response 的 API attempt 都以 immutable raw artifact 保存，失敗後重跑也不會把舊 usage 覆蓋；cached input 與一般 input 分開依牌價估算。若 raw response 缺少 usage，報告會把它列為 `unpriced_request` 並將金額標成不完整下限，不會默認為零元。Planner output 增加、失敗候選、Grounding 與 tracker 時間都會增加實際成本，因此 artifact 分開保存 incremental usage、歷史 usage、API latency 與本機處理時間，不用固定估價冒充帳單。
 
 ## 怎麼執行
 
@@ -195,12 +213,23 @@ uv run jascue-video-lab direct-moment-repeat ARTIFACT \
 
 若直接執行 `direct-moment-repeat` 卻沒有任何 target，CLI 會只產生候選並停止，不會偷偷挑一個物件進行 bbox。
 
-Full v1 的 selected event 也可以直接使用版本化 QueryLock；若 lock 有多個 targets，必須另外明選一個 ID：
+Full v1 的 selected event 也可以直接使用版本化 QueryLock v2；若 lock 有 predicate，先顯式做一次局部 refinement：
+
+```bash
+uv run jascue-video-lab refine-query-predicate ARTIFACT EVENT_ID \
+  --query-lock examples/evidence-query-lock-v2.json \
+  --query-target-id subject.primary \
+  --sampling-fps 8 --window-ms 4000 \
+  --output-dir ARTIFACT/query-refinement/EVENT_ID
+```
+
+接著把 `result.json` 指向的 decision 交給 exact-frame Grounding；若 lock 有多個 targets，必須另外明選一個 ID：
 
 ```bash
 uv run jascue-video-lab full-ground-event ARTIFACT EVENT_ID \
-  --query-lock query-lock.json \
-  --query-target-id selected-subject \
+  --query-lock examples/evidence-query-lock-v2.json \
+  --query-target-id subject.primary \
+  --predicate-decision DECISION_JSON \
   --sam-checkpoint artifacts/models/sam2.1_hiera_tiny.pt
 ```
 

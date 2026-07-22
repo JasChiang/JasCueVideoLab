@@ -2,7 +2,7 @@
 
 這是一個**完全獨立、實驗性**的 Gemini 3.6 Flash 影片理解與單幀 Grounding 驗證專案。它不是 JasCue 正式產品，不引用也不修改任何 JasCue 程式碼；實驗未通過前，不應將這裡的程式合併回 JasCue。
 
-最新方法採用「先鎖定證據，再驗證 geometry」：未指定 target 時先提出候選，使用者以 QueryLock 鎖定實例與可選事件條件後才找時間與 bbox；自動直式構圖則保留 Top-K 素材候選，逐一通過 exact-frame geometry preflight 才可採用。完整說明見 [METHODOLOGY.md](METHODOLOGY.md)，毛片 coarse-to-fine 全量流程見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)。Gemini polygon 與 bbox seed 的舊 A/B 僅保留為唯讀歷史資料；目前支援路徑只使用 Gemini／人工 bbox → SAM。
+最新方法採用「先鎖定證據，再驗證 geometry」：未指定 target 時先提出候選，使用者先審核 `EvidenceQueryProposalV2`，再明確核准成不可變的 `EvidenceQueryLockV2`。V2 把持續物件身分（Identity）、只在特定時刻成立的動作／狀態（Predicate）與構圖義務（Framing）分成三份 contract 與 hash；時間 refinement、單幀 bbox、SAM seed 與 layout 因此可各自重用正確層級的證據。自動直式構圖則在一份 planner response 內保留 Top-K 素材候選，只有實際嘗試的候選才由具名自動政策建立 QueryLock 並進入 exact-frame geometry preflight。完整說明見 [METHODOLOGY.md](METHODOLOGY.md)，毛片 coarse-to-fine 全量流程見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)。Gemini polygon 與 bbox seed 的舊 A/B 僅保留為唯讀歷史資料；目前支援路徑只使用 Gemini／人工 bbox → SAM。
 
 ## 這個專案要驗證什麼
 
@@ -54,8 +54,10 @@ Full v1 不會把整支毛片切成數百張圖片送入模型。每支影片先
   → Clip Cards 可重用於不同剪輯 brief
 
 只有選中的事件需要空間座標時：
-  → 人工鎖定 target／排除條件／可選 predicate
-  → FFmpeg 抽原始 exact frame／PTS／hash
+  → 建立 Proposal（Identity／Predicate／Framing 分層）
+  → 人工核准成 QueryLock；自動流程只能引用具名 policy
+  → predicate 存在時，在單一 shot 的 4／8 FPS DF catalog 做一次 frame-ID refinement
+  → 本機把 DF ID 查回 PTS，再由 FFmpeg 抽原始 exact frame／hash
   → Gemini image bbox（多候選需人工指定）
   → SAM 2.1 bbox-only、shot-local mask propagation
 
@@ -87,11 +89,20 @@ uv run jascue-video-lab full-selected \
   --prepared-library artifacts/full-v1-library-prepared \
   --output-dir artifacts/my-selected-clip-cards
 
-# 只有被選中的事件才抽原始影格並選配 SAM
+# 有 predicate 時先做一次局部 frame-ID refinement；輸出只引用既有 DF ID
+uv run jascue-video-lab refine-query-predicate \
+  artifacts/full-v1-library/clips/ASSET_PREFIX EVENT_ID \
+  --query-lock examples/evidence-query-lock-v2.json \
+  --query-target-id subject.primary \
+  --sampling-fps 8 --window-ms 4000 \
+  --output-dir artifacts/query-refinement/EVENT_ID
+
+# 只有被選中的事件才抽原始影格並選配 SAM；DECISION_JSON 由上一步 result.json 指向
 uv run jascue-video-lab full-ground-event \
   artifacts/full-v1-library/clips/ASSET_PREFIX EVENT_ID \
-  --query-lock examples/evidence-query-lock.json \
+  --query-lock examples/evidence-query-lock-v2.json \
   --query-target-id subject.primary \
+  --predicate-decision DECISION_JSON \
   --sam-checkpoint artifacts/models/sam2.1_hiera_tiny.pt
 
 # 明確要求某個短暫事件進入 4／8 FPS 局部 fallback
@@ -141,8 +152,8 @@ uv run jascue-video-lab full-library /path/to/rushes \
 
 1. **已完成核心 contract**：SAM predictor 的實際輸入只含 `允許區間 ∩ seed shot`，不跨切鏡傳播。
 2. **已完成核心 contract**：多候選不取最高 model confidence；自動 seed 只接受唯一 `matched` candidate，其餘必須人工指定。
-3. **部分完成**：exact-frame Grounding 與 bbox seed/SAM 有完整 fingerprint，仍要補齊較早的 proxy、shot 與 dense cache。
-4. **部分完成**：每個新 SAM sample 可回映原始 decoded source PTS，但 renderer 的 in/out、seed、track、crop 核准狀態與週期性 identity revalidation 尚未完成。
+3. **部分完成**：QueryLock v2 已把 temporal（identity＋predicate＋catalog）、Grounding（identity＋exact frame）、SAM（identity＋seed／interval）與 framing lineage 分開；較早的 proxy、shot 與部分 dense cache 仍要補齊全鏈路 fingerprint。
+4. **部分完成**：每個新 SAM sample 可回映原始 decoded source PTS，並會以零 API 成本規劃 bounded identity checkpoints；實際 checkpoint Gemini verifier、遮擋後 re-identification 與完整 renderer 核准狀態尚未完成。`planned_not_executed` 不得解讀成已驗證。
 5. **已完成效率／一致性 contract**：同一 shot 內的多個 bbox target 可共用一次 decoded-frame catalog、predictor 與 SAM inference state；每個 target 仍保存獨立 seed、mask、狀態與 provenance。共享與獨立執行可用逐格 mask agreement 自動比較，但 agreement 不是 ground truth。
 
 另外，silent source 不得生成 audio evidence、失敗但已有 usage 的 API response 仍必須計價、公開匯出需採 allowlist sanitizer。完整測試還要加入 non-zero PTS、VFR、B-frame、rotation/edit-list、快速 UI 命中，以及相似物件跨鏡 identity-switch 等 fixture。
@@ -177,7 +188,7 @@ uv run jascue-video-lab detect-shots VIDEO.mp4 --threshold 4 --output shots.json
 
 v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 verbose resolved regions。本機會把模型選出的 entity IDs 對回一份 hash-bound `selected-clip-card-evidence.json`，確定性補出 target descriptions、相容欄位與 executable region contracts；projection 可由原始模型輸出和這份證據快照完整重現。相較 v2，送入模型的 Clip Card payload 約縮小 30%，response schema 字元數約縮小 44%，也移除了先前造成付費整批重試的 mirror-field 不一致來源。
 
-目前自動 candidate routing 已接到 9:16 路徑：renderer 依候選順序，先核對 asset／event／frame lineage 與單一 shot 邊界，再從原始來源抽 exact frame，以 Gemini bbox 建立 SAM seed，完成 shot-local tracking 與實際 crop path，最後才執行本機 preflight。16:9 的 Top-K 也會保存在 schema 與 provenance 中，但目前仍採投影後的選定候選，尚未執行同等的 runtime geometry switching。
+目前自動 candidate routing 已接到 9:16 路徑：renderer 依候選順序，先核對 asset／event／frame lineage 與單一 shot 邊界；只有真的要跑 geometry 的候選，才由 `policy:full-auto-topk-lazy-geometry-querylock-v2:v1` 建立具真實 `auto_policy` provenance 的 QueryLock。接著從原始來源抽 exact frame，以 identity-only Gemini bbox 建立 SAM seed，完成 shot-local tracking 與實際 crop path，最後才執行本機 preflight。16:9 的 Top-K 也會保存在 schema 與 provenance 中，但目前仍採投影後的選定候選，尚未執行同等的 runtime geometry switching。
 
 構圖需求使用領域中立的 region contract：
 
@@ -192,11 +203,11 @@ v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 
 
 失敗會保存 typed failure code 與 recovery action，例如 shot crossing、coverage 不足、hard core 被裁、soft extent 低於門檻、keepout 違規或 crop motion 過快。現行 executor 會實際嘗試下一個 Top-K 候選，並把預先規劃的 safe-fit 候選延後到 tracked candidates 之後；其他 recovery action 目前是可稽核建議，尚未自動執行。所有候選都失敗時，輸出只是一份 `policy_blocked_preview_fit` 全內容補邊預覽並固定要求人工 review，不會偷偷改用未驗證的中心裁切。
 
-這個設計也控制成本：Clip Card 可跨 brief 重用；Top-K planner 預設只允許一次 text-only Structured Output request，`--repair-attempts` 預設為 `0`，若要付費重新產生完整規劃必須明確開啟。bbox／SAM geometry 採 lazy evaluation，只有已選 chapter 的候選才依序執行，遇到第一個通過 preflight 的候選就停止。每次 model request、raw response、usage、prompt/schema/model fingerprint，以及每個候選的嘗試與 geometry fingerprint 都會保存。Top-K 會增加 planner output token，候選失敗也會增加 Grounding 與 SAM 時間，因此成本報告仍須以實際 raw usage 與本機 tracker timing 為準，不能只用候選數乘固定牌價。
+這個設計也控制成本：Top-K 是同一次 planner 回應中的 2–4 個備選，不是把每支影片重送 K 次。Clip Card 可跨 brief 重用；planner 預設只允許一次 text-only Structured Output request，`--repair-attempts` 預設為 `0`。bbox／SAM geometry 採 lazy evaluation，只有已選 chapter 的候選才依序執行，遇到第一個通過 preflight 的候選就停止。Predicate refinement 也是明確指令才執行的一次局部 image call，不會在 Grounding 內暗中 repair；同一 identity＋exact frame 可在 framing 改變後重用 bbox。每次 model request、raw response、usage、prompt/schema/model fingerprint，以及每個候選的嘗試與 geometry fingerprint 都會保存；重跑時每次 response 另存 immutable attempt，canonical 檔不再覆蓋歷史成本。計價會把 `total_cached_tokens` 依 cached-input 牌價和一般 input 分開計算；若某份 response 沒有 usage，會列為未計價 request 並把總額標成不完整下限，不會當成免費。失敗候選仍可能增加 Grounding 費用與 SAM 時間，因此成本報告須以實際 raw usage 與本機 tracker timing 為準，不能只用候選數乘固定牌價。
 
-429／quota failure 不屬於候選內容問題。SDK 重試後只要仍回傳 429、`RESOURCE_EXHAUSTED` 或 spending-cap error，geometry executor 會立即寫出 `geometry-model-circuit-breaker.json` 並中止整次 render，不再換候選、不再繼續輸出看似完成但沒有 Gemini geometry 證據的 fallback 成片。一般的 target 不可見、tracking coverage 或構圖不可行才會繼續嘗試下一個候選。
+429／quota failure 不屬於候選內容問題。為了避免隱藏成本，SDK 明確設成每個 Gemini operation 只嘗試一次；若上游回傳真正的 HTTP 429、`RESOURCE_EXHAUSTED` 或 spending-cap error，geometry executor 會立即寫出 `geometry-model-circuit-breaker.json` 並中止整次 render，不再換候選、不再繼續輸出看似完成但沒有 Gemini geometry 證據的 fallback 成片。一般的 target 不可見、tracking coverage 或構圖不可行才會繼續嘗試下一個候選。
 
-Full Auto v2 目前仍有清楚限制：尚未在 candidate preflight 內執行週期性語意 identity checkpoint、遮擋後自動 re-identification 或自動圖卡避讓；`overlay_keepout` 在有字卡但沒有 layout solver 時會 fail closed。獨立的成片 QA 可以提出語意 review，但不會替 preflight 補造證據或覆蓋 geometry gate。Safe-fit 只是方便人工觀看的預覽，不是核准構圖；模型 rank、confidence、SAM mask 與 schema validation 也都不是 human ground truth。
+Full Auto v2 目前仍有清楚限制：已有風險導向、固定預算的 identity checkpoint **規劃器**，但尚未在 candidate preflight 執行其 Gemini 驗證、遮擋後自動 re-identification 或自動圖卡避讓；`overlay_keepout` 在有字卡但沒有 layout solver 時會 fail closed。獨立的成片 QA 可以提出語意 review，但不會替 preflight 補造證據或覆蓋 geometry gate。Safe-fit 只是方便人工觀看的預覽，不是核准構圖；模型 rank、confidence、SAM mask 與 schema validation 也都不是 human ground truth。
 
 每個 tracked 9:16 segment 現在保存 renderer 真正使用的 crop keyframes、required-region union、逐時刻合法 crop interval、containment、可見寬度比例、首尾／中段 tracking coverage、crop speed 與 acceleration。裁切器不再先平滑 target 中心後直接裁切，而是先由每一個 required bbox 算出合法範圍，再把平滑路徑投影回該範圍；這可避免平滑延遲把快速移動主體推出畫面。`primary_center` 只會放寬 target 外圍的 8% safety margin，不暗中授權裁掉 target。
 
@@ -340,8 +351,8 @@ App 的固定順序是：
 1. 影片串流寫入本機，ffprobe 與 SHA-256 驗證後建立 session。
 2. 可選擇建立 1080p／30fps analysis proxy；Gemini 語意分析使用 proxy，bbox 仍從原始影片抽幀。
 3. 沒有 target 時只顯示候選卡，且不預選、不顯示候選 confidence。
-4. 使用者選擇候選或自行輸入精確 target，才允許產生 target-locked `MM:SS` 時刻。
-5. 選一個時刻後，FFmpeg 保存原始 frame PTS，再執行單幀 Grounding。
+4. 使用者選擇候選或自行輸入精確 target 後，先檢查完整 Identity／Predicate／Framing Proposal 與 hash，再明確核准 QueryLock，才允許產生 target-locked `MM:SS` coarse candidates。
+5. Identity-only QueryLock 可選一個時刻，由 FFmpeg 保存原始 frame PTS，再執行單幀 Grounding。若 QueryLock 含 predicate，Web 只顯示 coarse candidates 並鎖住 Grounding；必須先匯出、執行 `refine-query-predicate` 取得正式 DF frame-ID evidence，不能把 `MM:SS` 冒充為 predicate 已驗證。
 6. Blind review 只顯示 `Candidate A/B` 框；提交「正確／錯物件／太大／太小／不可見／無法判斷」前，reveal API 會拒絕提供模型 label、confidence 與理由。
 7. 可在畫面拖曳人工修正框；人工判定寫入後才能揭露完整 Gemini proposal。
 8. `匯出完整 JSON` 包含 media identity、human annotations、已揭露 proposals 與尚未審核清單。

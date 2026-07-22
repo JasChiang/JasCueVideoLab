@@ -5,6 +5,7 @@ import html
 import importlib
 import json
 import math
+import re
 import shutil
 import subprocess
 import uuid
@@ -36,10 +37,23 @@ from .grounding_selection import (
 from .media import extract_frame, has_audio_stream, probe_video, sha256_file
 from .multi_tracking import validate_segmentation_track_alignment
 from .models import (
+    EvidenceApprovalSource,
+    EvidenceAspectConstraintV2,
+    EvidenceClaimSource,
+    EvidenceFramingObligationsV2,
+    EvidenceIdentityContractV2,
+    EvidencePredicateContractV2,
+    EvidenceQueryApprovalProvenance,
+    EvidenceQueryLockV2,
+    EvidenceQueryProposalV2,
+    EvidenceQueryProvenanceV2,
+    EvidenceTargetIdentityV2,
+    EvidenceTargetVisibilityConstraintV2,
     FeatureChapterBrief,
     FeatureChapterSelect,
     FeatureEditBrief,
     FeatureEditPlan,
+    FeatureVerticalCandidate,
     FramingRegionIntent,
     GeminiNativeGroundingProposal,
     GroundingProposal,
@@ -53,6 +67,7 @@ from .models import (
     SharedSam21SessionManifest,
     TrackingState,
     TrimIntentDecision,
+    approve_evidence_query_proposal_v2,
 )
 from .overlay import draw_grounding_overlay
 from .reframe_policy import (
@@ -853,7 +868,7 @@ def _write_incremental_pricing(
     try:
         incremental_interaction_paths = [
             path
-            for path in output_dir.rglob("*.raw_interaction.json")
+            for path in output_dir.rglob("*raw_interaction.json")
             if prior_interaction_hashes.get(str(path.relative_to(output_dir)))
             != sha256_file(path)
         ]
@@ -1464,9 +1479,471 @@ def _stable_fingerprint(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _feature_candidate_query_target_id(region: FramingRegionIntent) -> str:
+    """Keep legacy regions addressable without claiming an upstream entity ID."""
+
+    return region.entity_id or f"reframe_{region.region_id}"
+
+
+def _feature_candidate_framing_intent(
+    *,
+    required_target_ids: Sequence[str],
+    preferred_target_ids: Sequence[str],
+    overlay_keepout_target_ids: Sequence[str],
+    allow_controlled_required_clipping: bool,
+) -> str:
+    obligations: list[str] = []
+    if required_target_ids:
+        obligations.append(
+            (
+                "Keep required targets recognizable under the saved controlled "
+                "clipping policy."
+            )
+            if allow_controlled_required_clipping
+            else "Keep required targets fully visible and recognizable."
+        )
+    if preferred_target_ids:
+        obligations.append("Retain preferred targets when the frame permits.")
+    if overlay_keepout_target_ids:
+        obligations.append("Keep overlay-protected targets unobscured.")
+    return " ".join(obligations) or "Keep the selected target recognizable."
+
+
+def feature_vertical_candidate_to_query_proposal_v2(
+    candidate: FeatureVerticalCandidate,
+    *,
+    editorial_goal: str,
+    created_at: str,
+    created_by: str,
+    source_reference: str | None = None,
+    eligible_predicate: EvidencePredicateContractV2 | None = None,
+    claim_source: EvidenceClaimSource = EvidenceClaimSource.MODEL_PROPOSAL,
+    revision: int = 1,
+) -> EvidenceQueryProposalV2:
+    """Project a candidate into reviewable identity/predicate/framing layers.
+
+    The adapter deliberately does not infer an event predicate from observed
+    evidence or selection prose.  Callers may pass a separately established
+    ``eligible_predicate``; normal v2 cross-reference validation then proves
+    that its participants belong to the persistent identity contract.
+
+    This function creates a proposal only.  It never creates approval
+    provenance and never mutates the editorial candidate.
+    """
+
+    targets: list[EvidenceTargetIdentityV2] = []
+    required_target_ids: list[str] = []
+    preferred_target_ids: list[str] = []
+    overlay_keepout_target_ids: list[str] = []
+    visibility_constraints: list[EvidenceTargetVisibilityConstraintV2] = []
+
+    for region in candidate.regions:
+        target_description = region.target_description.strip()
+        if not target_description:
+            raise ValueError("candidate region target descriptions must be non-empty")
+        target_id = _feature_candidate_query_target_id(region)
+        targets.append(
+            EvidenceTargetIdentityV2(
+                target_id=target_id,
+                target_description=target_description,
+                identity_cues=(target_description,),
+                context_cues=tuple(region.observable_relations),
+                stable_exclusions=tuple(region.exclusions),
+            )
+        )
+        if region.execution_role == "hard_core":
+            required_target_ids.append(target_id)
+        elif region.execution_role == "soft_extent":
+            preferred_target_ids.append(target_id)
+        else:
+            overlay_keepout_target_ids.append(target_id)
+        if region.execution_role != "overlay_keepout":
+            visibility_constraints.append(
+                EvidenceTargetVisibilityConstraintV2(
+                    target_id=target_id,
+                    minimum_visible_fraction=(
+                        region.effective_minimum_visible_fraction
+                    ),
+                    atomic=region.atomic,
+                )
+            )
+
+    if not required_target_ids and candidate.target_description is not None:
+        target_description = candidate.target_description.strip()
+        if not target_description:
+            raise ValueError("candidate target_description must be non-empty")
+        target_id = "reframe_subject"
+        if any(target.target_id == target_id for target in targets):
+            raise ValueError(
+                "candidate target and region identities collide at reframe_subject"
+            )
+        targets.append(
+            EvidenceTargetIdentityV2(
+                target_id=target_id,
+                target_description=target_description,
+                identity_cues=(target_description,),
+            )
+        )
+        required_target_ids.append(target_id)
+        visibility_constraints.append(
+            EvidenceTargetVisibilityConstraintV2(
+                target_id=target_id,
+                minimum_visible_fraction=1.0,
+            )
+        )
+
+    if not targets:
+        raise ValueError(
+            "candidate has no persistent target identity; a fit-only candidate "
+            "without a target does not require an evidence query"
+        )
+    target_ids = [target.target_id for target in targets]
+    if len(target_ids) != len(set(target_ids)):
+        raise ValueError("candidate regions resolve to duplicate query target IDs")
+
+    identity = EvidenceIdentityContractV2(targets=tuple(targets))
+    framing = EvidenceFramingObligationsV2(
+        required_target_ids=tuple(required_target_ids),
+        preferred_target_ids=tuple(preferred_target_ids),
+        overlay_keepout_target_ids=tuple(overlay_keepout_target_ids),
+        framing_intent=_feature_candidate_framing_intent(
+            required_target_ids=required_target_ids,
+            preferred_target_ids=preferred_target_ids,
+            overlay_keepout_target_ids=overlay_keepout_target_ids,
+            allow_controlled_required_clipping=(
+                candidate.crop_mode == "primary_center"
+            ),
+        ),
+        editing_uses=("portrait_reframe",),
+        aspect_constraints=(
+            EvidenceAspectConstraintV2(
+                aspect_ratio="9:16",
+                required_target_ids=tuple(required_target_ids),
+                constraint=(
+                    "Required targets must remain directly visible in the portrait frame."
+                ),
+                target_visibility_constraints=tuple(visibility_constraints),
+                required_target_clipping_policy=(
+                    "forbid"
+                    if candidate.crop_mode == "strict"
+                    else "allow_controlled"
+                ),
+            ),
+        ),
+    )
+    resolved_claim_source = EvidenceClaimSource(claim_source)
+    provenance = EvidenceQueryProvenanceV2(
+        created_at=created_at,
+        created_by=created_by,
+        source_reference=(
+            source_reference
+            if source_reference is not None
+            else f"feature-vertical-candidate:{candidate.candidate_id}"
+        ),
+    )
+    proposal_fingerprint = _stable_fingerprint(
+        {
+            "contract_version": "feature-vertical-candidate-query-adapter-v1",
+            "candidate": candidate.model_dump(mode="json", exclude_none=True),
+            "revision": revision,
+            "editorial_goal": editorial_goal,
+            "identity_sha256": identity.definition_sha256(),
+            "predicate_sha256": (
+                eligible_predicate.definition_sha256()
+                if eligible_predicate is not None
+                else None
+            ),
+            "framing_sha256": framing.definition_sha256(),
+            "claim_source": resolved_claim_source.value,
+            "provenance": provenance.model_dump(mode="json", exclude_none=True),
+        }
+    )
+    return EvidenceQueryProposalV2(
+        proposal_id=f"feature-query-proposal:{proposal_fingerprint[:24]}",
+        revision=revision,
+        editorial_goal=editorial_goal,
+        identity=identity,
+        predicate=eligible_predicate,
+        framing=framing,
+        claim_source=resolved_claim_source,
+        provenance=provenance,
+    )
+
+
+def _require_named_auto_policy_approval(
+    approval: EvidenceQueryApprovalProvenance,
+) -> None:
+    if approval.approval_source != EvidenceApprovalSource.AUTO_POLICY:
+        raise ValueError(
+            "Full Auto QueryLock v2 runtime requires auto_policy approval provenance"
+        )
+    if approval.policy_reference is None or not approval.policy_reference.strip():
+        raise ValueError(
+            "Full Auto QueryLock v2 runtime requires a named policy_reference"
+        )
+
+
+def approve_feature_query_proposal_v2_for_auto(
+    proposal: EvidenceQueryProposalV2,
+    *,
+    query_id: str,
+    approval: EvidenceQueryApprovalProvenance,
+) -> EvidenceQueryLockV2:
+    """Approve a proposal only through explicit, named Full Auto policy provenance."""
+
+    _require_named_auto_policy_approval(approval)
+    return approve_evidence_query_proposal_v2(
+        proposal,
+        query_id=query_id,
+        approval=approval,
+    )
+
+
+_FULL_AUTO_QUERYLOCK_POLICY_REFERENCE = (
+    "policy:full-auto-topk-lazy-geometry-querylock-v2:v1"
+)
+_FULL_AUTO_QUERYLOCK_POLICY = {
+    "contract_version": "full-auto-querylock-approval-policy-v1",
+    "policy_reference": _FULL_AUTO_QUERYLOCK_POLICY_REFERENCE,
+    "eligible_input": "validated FeatureVerticalCandidate from saved Top-K plan",
+    "approval_timing": "only when lazy geometry evaluation is attempted",
+    "maximum_topk_candidates": 4,
+    "predicate_inference": "forbidden unless separately established",
+    "semantic_effect": "authorize bounded geometry evaluation, not final edit approval",
+}
+_FULL_AUTO_QUERYLOCK_POLICY_SHA256 = _stable_fingerprint(
+    _FULL_AUTO_QUERYLOCK_POLICY
+)
+
+
+def _load_or_create_feature_candidate_query_lock_v2(
+    candidate: FeatureVerticalCandidate,
+    *,
+    feature_id: str,
+    output_dir: Path,
+) -> EvidenceQueryLockV2:
+    """Persist one truthful auto-policy lock only when geometry is attempted."""
+
+    candidate_sha256 = _stable_fingerprint(
+        candidate.model_dump(mode="json", exclude_none=True)
+    )
+    query_scope_sha256 = _stable_fingerprint(
+        {
+            "contract_version": "feature-auto-querylock-v2-scope-v1",
+            "feature_id": feature_id,
+            "candidate_sha256": candidate_sha256,
+        }
+    )
+    query_parent = output_dir / "query-lock-v2"
+    query_dir = query_parent / f"variant-{query_scope_sha256[:16]}"
+    proposal_path = query_dir / "proposal.json"
+    lock_path = query_dir / "lock.json"
+    manifest_path = query_dir / "manifest.json"
+    policy_path = query_dir / "approval-policy.json"
+    if (
+        proposal_path.exists()
+        or lock_path.exists()
+        or manifest_path.exists()
+        or policy_path.exists()
+    ):
+        if not all(
+            path.exists()
+            for path in (proposal_path, lock_path, manifest_path, policy_path)
+        ):
+            raise RuntimeError(f"incomplete automatic QueryLock v2 artifacts: {query_dir}")
+        proposal = EvidenceQueryProposalV2.model_validate(read_json(proposal_path))
+        lock = EvidenceQueryLockV2.model_validate(read_json(lock_path))
+        manifest = read_json(manifest_path)
+        expected_source_reference = (
+            f"feature:{feature_id}:candidate:{candidate.candidate_id}"
+        )
+        expected = {
+            "contract_version": "feature-auto-querylock-v2-manifest-v3",
+            "feature_id": feature_id,
+            "candidate_id": candidate.candidate_id,
+            "candidate_sha256": candidate_sha256,
+            "proposal_definition_sha256": _stable_fingerprint(
+                proposal.model_dump(mode="json", exclude_none=True)
+            ),
+            "lock_definition_sha256": lock.definition_sha256(),
+            "policy_reference": _FULL_AUTO_QUERYLOCK_POLICY_REFERENCE,
+            "approval_policy_sha256": _FULL_AUTO_QUERYLOCK_POLICY_SHA256,
+        }
+        if any(manifest.get(key) != value for key, value in expected.items()):
+            raise ValueError("cached automatic QueryLock v2 lineage does not match candidate")
+        if (
+            proposal.provenance.source_reference != expected_source_reference
+            or lock.approval.source_reference != expected_source_reference
+        ):
+            raise ValueError(
+                "cached automatic QueryLock v2 source provenance does not match candidate"
+            )
+        if read_json(policy_path) != _FULL_AUTO_QUERYLOCK_POLICY:
+            raise ValueError("cached automatic QueryLock approval policy was modified")
+        if (
+            lock.approval.policy_reference
+            != _FULL_AUTO_QUERYLOCK_POLICY_REFERENCE
+        ):
+            raise ValueError("cached automatic QueryLock used an unregistered policy")
+        _require_named_auto_policy_approval(lock.approval)
+        write_json(
+            query_parent / "current.json",
+            {
+                "query_scope_sha256": query_scope_sha256,
+                "variant": query_dir.name,
+                "lock_definition_sha256": lock.definition_sha256(),
+                "approval_policy_sha256": _FULL_AUTO_QUERYLOCK_POLICY_SHA256,
+            },
+        )
+        return lock
+
+    created_at = utc_now()
+    proposal = feature_vertical_candidate_to_query_proposal_v2(
+        candidate,
+        editorial_goal=(
+            "Preserve the selected evidence identities while evaluating the saved "
+            "portrait framing candidate."
+        ),
+        created_at=created_at,
+        created_by="feature-edit-plan.vertical-candidates",
+        source_reference=f"feature:{feature_id}:candidate:{candidate.candidate_id}",
+        claim_source=EvidenceClaimSource.MODEL_PROPOSAL,
+    )
+    lock = approve_feature_query_proposal_v2_for_auto(
+        proposal,
+        query_id=f"feature-query:{proposal.composite_sha256()[:24]}",
+        approval=EvidenceQueryApprovalProvenance(
+            approved_at=created_at,
+            approved_by="full-auto-querylock-router",
+            approval_source=EvidenceApprovalSource.AUTO_POLICY,
+            source_reference=f"feature:{feature_id}:candidate:{candidate.candidate_id}",
+            policy_reference=_FULL_AUTO_QUERYLOCK_POLICY_REFERENCE,
+        ),
+    )
+    write_json(proposal_path, proposal)
+    write_json(lock_path, lock)
+    write_json(policy_path, _FULL_AUTO_QUERYLOCK_POLICY)
+    write_json(
+        manifest_path,
+        {
+            "contract_version": "feature-auto-querylock-v2-manifest-v3",
+            "feature_id": feature_id,
+            "candidate_id": candidate.candidate_id,
+            "candidate_sha256": candidate_sha256,
+            "query_scope_sha256": query_scope_sha256,
+            "proposal_definition_sha256": _stable_fingerprint(
+                proposal.model_dump(mode="json", exclude_none=True)
+            ),
+            "lock_definition_sha256": lock.definition_sha256(),
+            "component_hashes": lock.component_hashes(),
+            "policy_reference": _FULL_AUTO_QUERYLOCK_POLICY_REFERENCE,
+            "approval_policy_sha256": _FULL_AUTO_QUERYLOCK_POLICY_SHA256,
+            "created_at": created_at,
+        },
+    )
+    write_json(
+        query_parent / "current.json",
+        {
+            "query_scope_sha256": query_scope_sha256,
+            "variant": query_dir.name,
+            "lock_definition_sha256": lock.definition_sha256(),
+            "approval_policy_sha256": _FULL_AUTO_QUERYLOCK_POLICY_SHA256,
+        },
+    )
+    return lock
+
+
+def evidence_query_lock_v2_lineage(
+    lock: EvidenceQueryLockV2,
+    *,
+    target_id: str | None = None,
+    target_description: str | None = None,
+) -> dict[str, Any]:
+    """Return the narrow, hash-bound lineage accepted by Full Auto geometry."""
+
+    _require_named_auto_policy_approval(lock.approval)
+    if target_id is not None:
+        target = next(
+            (item for item in lock.identity.targets if item.target_id == target_id),
+            None,
+        )
+        if target is None:
+            raise ValueError(
+                f"QueryLock v2 does not define runtime target {target_id!r}"
+            )
+        if (
+            target_description is not None
+            and target.target_description.strip() != target_description.strip()
+        ):
+            raise ValueError(
+                "runtime target description does not match its QueryLock v2 identity"
+            )
+
+    component_hashes = lock.component_hashes()
+    lineage: dict[str, Any] = {
+        "contract_version": "evidence-query-lock-v2-runtime-lineage-v1",
+        "query_contract_version": lock.contract_version,
+        "query_id": lock.query_id,
+        "revision": lock.revision,
+        **component_hashes,
+        "composite_sha256": lock.composite_sha256(),
+        "definition_sha256": lock.definition_sha256(),
+        "claim_source": lock.claim_source.value,
+        "approval": lock.approval.model_dump(mode="json", exclude_none=True),
+    }
+    if target_id is not None:
+        lineage["target_id"] = target_id
+    return lineage
+
+
+def _bind_evidence_query_lock_v2_lineage(
+    payload: Mapping[str, Any],
+    *,
+    lock: EvidenceQueryLockV2 | None,
+    target_id: str,
+    target_description: str,
+) -> dict[str, Any]:
+    """Copy a request/seed payload and optionally bind an approved v2 lock."""
+
+    bound = dict(payload)
+    if lock is not None:
+        bound["evidence_query_v2"] = evidence_query_lock_v2_lineage(
+            lock,
+            target_id=target_id,
+            target_description=target_description,
+        )
+    return bound
+
+
 def _track_geometry_fingerprint(track: SegmentationTrack) -> str:
     """Fingerprint every consumed tracking sample and its model/source provenance."""
     return _stable_fingerprint(track.model_dump(mode="json"))
+
+
+def _query_lock_v2_runtime_geometry_lineage(
+    *,
+    lock: EvidenceQueryLockV2,
+    target_id: str,
+    target_description: str,
+    seed_fingerprint: str,
+    seed_manifest_path: Path,
+    track_path: Path,
+    track: SegmentationTrack,
+) -> dict[str, Any]:
+    """Bind the approved definition to the exact SAM seed and resulting geometry."""
+
+    return {
+        "contract_version": "feature-query-lock-v2-runtime-geometry-lineage-v1",
+        "evidence_query_v2": evidence_query_lock_v2_lineage(
+            lock,
+            target_id=target_id,
+            target_description=target_description,
+        ),
+        "seed_fingerprint": seed_fingerprint,
+        "seed_selection_sha256": sha256_file(seed_manifest_path),
+        "track_sha256": sha256_file(track_path),
+        "track_geometry_sha256": _track_geometry_fingerprint(track),
+    }
 
 
 def _segment_variant_fingerprint(
@@ -2925,22 +3402,31 @@ def _is_exhausted_model_quota_error(error: Exception) -> bool:
     """Identify quota failures for which trying another candidate cannot help.
 
     Candidate switching is useful for evidence and geometry failures. It only
-    repeats the same unavailable service call when the SDK has already returned
-    an exhausted rate limit or account spending limit.
+    repeats the same unavailable service call after the upstream API has
+    returned a rate-limit, quota, or account spending failure.
     """
 
     message = str(error).lower()
+    status_values = (
+        getattr(error, "status_code", None),
+        getattr(error, "code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    )
+    explicit_429 = any(
+        value == 429 or str(value).strip() == "429"
+        for value in status_values
+        if value is not None
+    ) or re.match(r"^\s*(?:http(?:\s+status)?\s*)?429(?:\b|:)", message)
     return _is_non_retryable_spending_cap_error(error) or any(
         marker in message
         for marker in (
-            "429",
             "resource_exhausted",
             "resource exhausted",
             "quota exceeded",
             "rate limit exceeded",
             "too many requests",
         )
-    )
+    ) or bool(explicit_429)
 
 
 class GeometryModelQuotaError(RuntimeError):
@@ -2962,6 +3448,7 @@ def _ground_tracking_seed(
     output_dir: Path,
     run_id: str,
     model_request_block_reason: str | None = None,
+    query_lock_v2: EvidenceQueryLockV2 | None = None,
 ) -> tuple[GroundingProposal, Any, Any, Any, Path, int, str]:
     """Ground one immutable semantic region on one exact decoded source frame."""
     exact_frame_path = output_dir / "evidence-frame.png"
@@ -2976,37 +3463,75 @@ def _ground_tracking_seed(
         exact_frame_path,
     )
     media = probe_video(Path(clip.path))
+    query_lineage: dict[str, Any] | None = None
+    grounding_target_description = target_description
+    grounding_event_description = event_description
     grounding_key = {
-        "contract_version": (
-            "exact-frame-grounding-v2"
-            if entity_id == "reframe_subject"
-            else "exact-frame-grounding-v3-region-intent"
-        ),
-        "model_id": MODEL_ID,
-        "source_asset_id": media.asset_id,
-        "feature_id": feature_id,
-        "frame_hash": exact_frame.frame_hash,
-        "frame_pts": exact_frame.frame_pts,
-        "frame_time_ms": exact_frame.frame_time_ms,
-        "source_width": exact_frame.width,
-        "source_height": exact_frame.height,
-        "entity_id": entity_id,
-        "event_description": event_description,
-        "target_description": target_description,
-        "prompt_sha256": hashlib.sha256(grounding_prompt.encode("utf-8")).hexdigest(),
-        "system_instruction_sha256": hashlib.sha256(
-            VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
-        ).hexdigest(),
-        "response_schema_sha256": hashlib.sha256(
-            json.dumps(
-                gemini_response_schema(GeminiNativeGroundingProposal),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest(),
-        "thinking_level": "low",
-    }
+            "contract_version": (
+                "exact-frame-grounding-v2"
+                if entity_id == "reframe_subject"
+                else "exact-frame-grounding-v3-region-intent"
+            ),
+            "model_id": MODEL_ID,
+            "source_asset_id": media.asset_id,
+            "feature_id": feature_id,
+            "frame_hash": exact_frame.frame_hash,
+            "frame_pts": exact_frame.frame_pts,
+            "frame_time_ms": exact_frame.frame_time_ms,
+            "source_width": exact_frame.width,
+            "source_height": exact_frame.height,
+            "entity_id": entity_id,
+            "event_description": event_description,
+            "target_description": target_description,
+            "prompt_sha256": hashlib.sha256(
+                grounding_prompt.encode("utf-8")
+            ).hexdigest(),
+            "system_instruction_sha256": hashlib.sha256(
+                VISUAL_EVIDENCE_SYSTEM_INSTRUCTION.encode("utf-8")
+            ).hexdigest(),
+            "response_schema_sha256": hashlib.sha256(
+                json.dumps(
+                    gemini_response_schema(GeminiNativeGroundingProposal),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "thinking_level": "low",
+        }
+    if query_lock_v2 is not None:
+        query_lineage = evidence_query_lock_v2_lineage(
+            query_lock_v2,
+            target_id=entity_id,
+            target_description=target_description,
+        )
+        identity = next(
+            item for item in query_lock_v2.identity.targets if item.target_id == entity_id
+        )
+        identity_parts = [identity.target_description]
+        if identity.identity_cues:
+            identity_parts.append("identity cues: " + "; ".join(identity.identity_cues))
+        if identity.context_cues:
+            identity_parts.append(
+                "context cues are auxiliary only: " + "; ".join(identity.context_cues)
+            )
+        if identity.stable_exclusions:
+            identity_parts.append(
+                "must exclude: " + "; ".join(identity.stable_exclusions)
+            )
+        grounding_target_description = "\n".join(identity_parts)
+        grounding_event_description = (
+            "Exact-frame identity Grounding only. Use only the supplied image pixels "
+            "and locked identity cues; do not infer an event predicate or position "
+            "from time, neighboring frames, or editorial prose."
+        )
+        grounding_key["evidence_query_v2_identity"] = {
+            "contract_version": "evidence-query-v2-grounding-identity-v1",
+            "identity_sha256": query_lock_v2.component_hashes()["identity_sha256"],
+            "target_id": entity_id,
+        }
+        grounding_key["target_description"] = grounding_target_description
+        grounding_key["event_description"] = grounding_event_description
     if seed_anchor_source != "catalog_anchor":
         grounding_key.update(
             {
@@ -3027,8 +3552,17 @@ def _ground_tracking_seed(
     grounding_dir = output_dir / "grounding" / f"bbox-{grounding_fingerprint[:16]}"
     write_json(
         grounding_dir / "request-key.json",
-        {**grounding_key, "request_fingerprint": grounding_fingerprint},
+        {
+            **grounding_key,
+            "request_fingerprint": grounding_fingerprint,
+        },
     )
+    if query_lineage is not None:
+        write_json(
+            grounding_dir
+            / f"query-lineage-{query_lineage['definition_sha256'][:16]}.json",
+            query_lineage,
+        )
     grounding_path = grounding_dir / "grounding.json"
     if grounding_path.exists():
         proposal = GroundingProposal.model_validate(read_json(grounding_path))
@@ -3055,9 +3589,9 @@ def _ground_tracking_seed(
             media=media,
             frame=exact_frame,
             event_id=feature_id,
-            event_description=event_description,
+            event_description=grounding_event_description,
             entity_id=entity_id,
-            target_description=target_description,
+            target_description=grounding_target_description,
             prompt_template=grounding_prompt,
             run_id=run_id,
             output_dir=grounding_dir,
@@ -3100,6 +3634,7 @@ def _build_track(
     scdet_threshold: float,
     entity_id: str = "reframe_subject",
     model_request_block_reason: str | None = None,
+    query_lock_v2: EvidenceQueryLockV2 | None = None,
 ) -> tuple[GroundingProposal, SegmentationTrack]:
     track_root = output_dir / "sam21"
     (
@@ -3124,40 +3659,65 @@ def _build_track(
         output_dir=output_dir,
         run_id=run_id,
         model_request_block_reason=model_request_block_reason,
+        query_lock_v2=query_lock_v2,
     )
     checkpoint_sha256 = sha256_file(checkpoint_path)
     seed_manifest = {
-        "contract_version": "bbox-seed-v2-exact-pts",
-        "asset_id": proposal.asset_id,
-        "event_id": proposal.event_id,
-        "entity_id": proposal.entity_id,
-        "target_description": target_description,
-        "frame_hash": proposal.frame_hash,
-        "frame_pts": proposal.frame_pts,
-        "candidate_number": selected_seed.candidate_number,
-        "candidate_index": selected_seed.candidate_index,
-        "candidate_selection_source": selected_seed.selection_source,
-        "box_2d": list(selected_seed.candidate.box_2d),
-        "seed_type": "gemini_bbox",
-        "source_start_ms": start_ms,
-        "source_end_ms": end_ms,
-        "normalized_seed_shot_start_ms": start_ms,
-        "normalized_seed_shot_end_ms": end_ms,
-        "analysis_fps": analysis_fps,
-        "analysis_max_side": _TRACKING_MAX_SIDE,
-        "ffmpeg_scdet_threshold": scdet_threshold,
-        "seed_box_padding_ratio": _TRACKING_SEED_BOX_PADDING_RATIO,
-        "device_request": _TRACKING_DEVICE,
-        "sam_config": SAM21_CONFIG,
-        "sam_implementation_revision": SAM21_IMPLEMENTATION_REVISION,
-        "checkpoint_sha256": checkpoint_sha256,
-    }
+            "contract_version": "bbox-seed-v2-exact-pts",
+            "asset_id": proposal.asset_id,
+            "event_id": proposal.event_id,
+            "entity_id": proposal.entity_id,
+            "target_description": target_description,
+            "frame_hash": proposal.frame_hash,
+            "frame_pts": proposal.frame_pts,
+            "candidate_number": selected_seed.candidate_number,
+            "candidate_index": selected_seed.candidate_index,
+            "candidate_selection_source": selected_seed.selection_source,
+            "box_2d": list(selected_seed.candidate.box_2d),
+            "seed_type": "gemini_bbox",
+            "source_start_ms": start_ms,
+            "source_end_ms": end_ms,
+            "normalized_seed_shot_start_ms": start_ms,
+            "normalized_seed_shot_end_ms": end_ms,
+            "analysis_fps": analysis_fps,
+            "analysis_max_side": _TRACKING_MAX_SIDE,
+            "ffmpeg_scdet_threshold": scdet_threshold,
+            "seed_box_padding_ratio": _TRACKING_SEED_BOX_PADDING_RATIO,
+            "device_request": _TRACKING_DEVICE,
+            "sam_config": SAM21_CONFIG,
+            "sam_implementation_revision": SAM21_IMPLEMENTATION_REVISION,
+            "checkpoint_sha256": checkpoint_sha256,
+        }
+    query_lineage: dict[str, Any] | None = None
+    if query_lock_v2 is not None:
+        query_lineage = evidence_query_lock_v2_lineage(
+            query_lock_v2,
+            target_id=entity_id,
+            target_description=target_description,
+        )
+        seed_manifest["evidence_query_v2_identity"] = {
+            "contract_version": "evidence-query-v2-sam-seed-identity-v1",
+            "identity_sha256": query_lock_v2.component_hashes()["identity_sha256"],
+            "target_id": entity_id,
+        }
     seed_fingerprint = hashlib.sha256(
         json.dumps(seed_manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     track_dir = track_root / f"bbox-{seed_fingerprint[:16]}"
     seed_manifest_path = track_dir / "seed-selection.json"
-    write_json(seed_manifest_path, {**seed_manifest, "seed_fingerprint": seed_fingerprint})
+    write_json(
+        seed_manifest_path,
+        {
+            **seed_manifest,
+            "seed_fingerprint": seed_fingerprint,
+        },
+    )
+    if query_lineage is not None:
+        write_json(
+            track_dir
+            / f"query-lineage-{query_lineage['definition_sha256'][:16]}.json",
+            query_lineage,
+        )
     track_path = track_dir / "segmentation-track.json"
     if track_path.exists():
         track = SegmentationTrack.model_validate(read_json(track_path))
@@ -3200,6 +3760,29 @@ def _build_track(
         seed_source_width=proposal.source_width,
         seed_source_height=proposal.source_height,
     )
+    if query_lock_v2 is not None:
+        runtime_lineage = _query_lock_v2_runtime_geometry_lineage(
+            lock=query_lock_v2,
+            target_id=entity_id,
+            target_description=target_description,
+            seed_fingerprint=seed_fingerprint,
+            seed_manifest_path=seed_manifest_path,
+            track_path=track_path,
+            track=track,
+        )
+        runtime_lineage_path = (
+            track_dir
+            / "runtime-geometry-lineage-"
+            f"{runtime_lineage['evidence_query_v2']['definition_sha256'][:16]}.json"
+        )
+        if (
+            runtime_lineage_path.exists()
+            and read_json(runtime_lineage_path) != runtime_lineage
+        ):
+            raise ValueError(
+                "cached QueryLock v2 runtime geometry lineage does not match request"
+            )
+        write_json(runtime_lineage_path, runtime_lineage)
     return proposal, track
 
 
@@ -3390,6 +3973,7 @@ def _build_framing_region_tracks(
         Literal["hard_core", "soft_extent", "overlay_keepout"]
     ] = frozenset({"hard_core"}),
     model_request_block_reason: str | None = None,
+    query_lock_v2: EvidenceQueryLockV2 | None = None,
 ) -> tuple[list[GroundingProposal], list[SegmentationTrack], list[Path]]:
     """Ground named regions separately and share one SAM session when possible."""
     tracked_regions = [
@@ -3419,6 +4003,7 @@ def _build_framing_region_tracks(
             scdet_threshold=scdet_threshold,
             entity_id=region.entity_id or f"reframe_{region.region_id}",
             model_request_block_reason=model_request_block_reason,
+            query_lock_v2=query_lock_v2,
         )
         return [proposal], [track], [region_root / "grounding-debug.png"]
 
@@ -3449,6 +4034,7 @@ def _build_framing_region_tracks(
             output_dir=region_root,
             run_id=f"feature-v-{region.region_id}-{uuid.uuid4().hex[:8]}",
             model_request_block_reason=model_request_block_reason,
+            query_lock_v2=query_lock_v2,
         )
         proposals.append(proposal)
         debug_paths.append(region_root / "grounding-debug.png")
@@ -3526,6 +4112,30 @@ def _build_framing_region_tracks(
         seeds=seeds,
         seed_box_padding_ratio=_TRACKING_SEED_BOX_PADDING_RATIO,
     )
+    if query_lock_v2 is not None:
+        full_lineage = evidence_query_lock_v2_lineage(query_lock_v2)
+        target_mappings = [
+            {
+                "region_id": region.region_id,
+                "grounding_entity_id": (
+                    region.entity_id or f"reframe_{region.region_id}"
+                ),
+                "query_target_id": _feature_candidate_query_target_id(region),
+                "sam_target_id": seed.target_id,
+            }
+            for region, seed in zip(tracked_regions, seeds, strict=True)
+        ]
+        write_json(
+            session_dir
+            / f"runtime-query-lineage-{full_lineage['definition_sha256'][:16]}.json",
+            {
+                "contract_version": "feature-shared-sam-query-lineage-v1",
+                "evidence_query_v2": full_lineage,
+                "shared_session_manifest_sha256": sha256_file(manifest_path),
+                "target_ids": [seed.target_id for seed in seeds],
+                "target_namespace_mapping": target_mappings,
+            },
+        )
     return proposals, tracks, debug_paths
 
 
@@ -3545,6 +4155,7 @@ def _build_required_region_tracks(
     analysis_fps: float,
     scdet_threshold: float,
     model_request_block_reason: str | None = None,
+    query_lock_v2: EvidenceQueryLockV2 | None = None,
 ) -> tuple[list[GroundingProposal], list[SegmentationTrack], list[Path]]:
     """Compatibility wrapper that tracks only hard-core framing regions."""
 
@@ -3564,6 +4175,7 @@ def _build_required_region_tracks(
         scdet_threshold=scdet_threshold,
         include_execution_roles=frozenset({"hard_core"}),
         model_request_block_reason=model_request_block_reason,
+        query_lock_v2=query_lock_v2,
     )
 
 
@@ -3593,6 +4205,7 @@ def _vertical_candidate_geometry(
         tuple[GroundingProposal, SegmentationTrack, Path],
     ],
     model_request_block_reason: str | None = None,
+    query_lock_v2: EvidenceQueryLockV2 | None = None,
 ) -> tuple[str, dict[str, Any], list[Path], str | None]:
     """Evaluate one immutable vertical candidate without rendering a segment."""
 
@@ -3626,6 +4239,7 @@ def _vertical_candidate_geometry(
             scdet_threshold=scdet_threshold,
             include_execution_roles=frozenset({"hard_core", "soft_extent"}),
             model_request_block_reason=model_request_block_reason,
+            query_lock_v2=query_lock_v2,
         )
         tracks_by_region = {
             region.region_id: track
@@ -3658,7 +4272,12 @@ def _vertical_candidate_geometry(
         target = (target_description or "").strip()
         if not target:
             raise ValueError("tracked vertical candidate has no resolved target")
-        cache_key = (frame.frame_id, target, start_ms, end_ms)
+        identity_cache_target = target
+        if query_lock_v2 is not None:
+            identity_cache_target += (
+                "#identity:" + query_lock_v2.component_hashes()["identity_sha256"]
+            )
+        cache_key = (frame.frame_id, identity_cache_target, start_ms, end_ms)
         if cache_key not in track_cache:
             proposal, track = _build_track(
                 client=client,
@@ -3676,9 +4295,36 @@ def _vertical_candidate_geometry(
                 analysis_fps=analysis_fps,
                 scdet_threshold=scdet_threshold,
                 model_request_block_reason=model_request_block_reason,
+                query_lock_v2=query_lock_v2,
             )
             track_cache[cache_key] = (proposal, track, output_dir)
         _, track, cached_root = track_cache[cache_key]
+        if query_lock_v2 is not None:
+            matching_targets = [
+                locked_target
+                for locked_target in query_lock_v2.identity.targets
+                if locked_target.target_description.strip() == target
+            ]
+            if len(matching_targets) != 1:
+                raise ValueError(
+                    "cached track target does not resolve to exactly one QueryLock identity"
+                )
+            reused_lineage = evidence_query_lock_v2_lineage(
+                query_lock_v2,
+                target_id=matching_targets[0].target_id,
+                target_description=target,
+            )
+            write_json(
+                output_dir
+                / "reused-track-query-lineage-"
+                f"{reused_lineage['definition_sha256'][:16]}.json",
+                {
+                    "contract_version": "feature-reused-track-query-lineage-v1",
+                    "evidence_query_v2": reused_lineage,
+                    "cached_track_root": str(cached_root.resolve()),
+                    "track_fingerprint": _track_geometry_fingerprint(track),
+                },
+            )
         debug_paths = [cached_root / "grounding-debug.png"]
         track_fingerprint = _track_geometry_fingerprint(track)
         filter_graph, geometry = _vertical_filter_from_track(
@@ -4084,7 +4730,7 @@ def run_feature_cut_experiment(
     output_dir.mkdir(parents=True, exist_ok=True)
     prior_interaction_hashes = {
         str(path.relative_to(output_dir)): sha256_file(path)
-        for path in output_dir.rglob("*.raw_interaction.json")
+        for path in output_dir.rglob("*raw_interaction.json")
     }
     prior_error_hashes = {
         str(path.relative_to(output_dir)): sha256_file(path)
@@ -4146,14 +4792,23 @@ def run_feature_cut_experiment(
     client = GeminiLabClient()
     plan_reuse_record_path: Path | None = None
     gemini_geometry_block_reason: str | None = None
+    geometry_circuit_run_id = uuid.uuid4().hex
+    circuit_started = {
+        "run_id": geometry_circuit_run_id,
+        "blocked": False,
+        "reason": None,
+        "interpretation": "no_geometry_quota_error_seen_in_this_run",
+        "started_at": utc_now(),
+    }
     write_json(
         output_dir / "geometry-model-circuit-breaker.json",
-        {
-            "blocked": False,
-            "reason": None,
-            "interpretation": "no_non_retryable_geometry_error_seen_in_this_run",
-            "started_at": utc_now(),
-        },
+        circuit_started,
+    )
+    write_json(
+        output_dir
+        / "geometry-model-circuit-breaker-events"
+        / f"{geometry_circuit_run_id}.started.json",
+        circuit_started,
     )
 
     def latch_geometry_quota_error(error: Exception) -> bool:
@@ -4163,9 +4818,8 @@ def run_feature_cut_experiment(
         if gemini_geometry_block_reason is None:
             gemini_geometry_block_reason = f"{type(error).__name__}:{error}"
             spending_cap = _is_non_retryable_spending_cap_error(error)
-            write_json(
-                output_dir / "geometry-model-circuit-breaker.json",
-                {
+            blocked_record = {
+                    "run_id": geometry_circuit_run_id,
                     "blocked": True,
                     "reason": gemini_geometry_block_reason,
                     "retryable_later": not spending_cap,
@@ -4173,10 +4827,19 @@ def run_feature_cut_experiment(
                     "interpretation": (
                         "spending_cap_requires_account_action"
                         if spending_cap
-                        else "sdk_retries_exhausted_retry_the_run_later"
+                        else "upstream_quota_rejected_retry_the_run_later"
                     ),
                     "latched_at": utc_now(),
-                },
+                }
+            write_json(
+                output_dir / "geometry-model-circuit-breaker.json",
+                blocked_record,
+            )
+            write_json(
+                output_dir
+                / "geometry-model-circuit-breaker-events"
+                / f"{geometry_circuit_run_id}.blocked.json",
+                blocked_record,
             )
         return True
 
@@ -4708,7 +5371,10 @@ def run_feature_cut_experiment(
                                     "applied_strategy": "fit_with_background",
                                     "fallback_reason": None,
                                     "risk_codes": ["auto_candidate_used_safe_fit"],
-                                    "requires_gemini_review": False,
+                                    "requires_gemini_review": True,
+                                    "semantic_review_reasons": [
+                                        "safe_fit_is_review_only"
+                                    ],
                                 },
                                 "debugs": [],
                                 "track_fingerprint": None,
@@ -4723,6 +5389,33 @@ def run_feature_cut_experiment(
                         / f"candidate-{candidate_rank:02d}-{candidate_id}"
                     )
                     try:
+                        candidate_query_lock: EvidenceQueryLockV2 | None = None
+                        if (
+                            selected.vertical_candidates
+                            and not human_reframe_policy_requested
+                        ):
+                            candidate_query_lock = (
+                                _load_or_create_feature_candidate_query_lock_v2(
+                                    FeatureVerticalCandidate.model_validate(option_data),
+                                    feature_id=selected.feature_id,
+                                    output_dir=candidate_root,
+                                )
+                            )
+                            attempt["evidence_query_v2"] = {
+                                "query_id": candidate_query_lock.query_id,
+                                "definition_sha256": (
+                                    candidate_query_lock.definition_sha256()
+                                ),
+                                "component_hashes": (
+                                    candidate_query_lock.component_hashes()
+                                ),
+                                "approval_source": (
+                                    candidate_query_lock.approval.approval_source.value
+                                ),
+                                "policy_reference": (
+                                    candidate_query_lock.approval.policy_reference
+                                ),
+                            }
                         (
                             candidate_filter,
                             candidate_geometry,
@@ -4770,6 +5463,7 @@ def run_feature_cut_experiment(
                             display_sample_aspect_ratio=candidate_display_sar,
                             track_cache=track_cache,
                             model_request_block_reason=gemini_geometry_block_reason,
+                            query_lock_v2=candidate_query_lock,
                         )
                         auto_audit = None
                         failure_codes: list[FailureCode] = []

@@ -50,6 +50,40 @@ from jascue_video_lab.feature_cut import (
     _write_incremental_pricing,
     write_external_feature_plan_projection,
 )
+
+
+def test_no_brief_topk_rejects_candidate_aliases_of_same_evidence_frame() -> None:
+    base = {
+        "source_asset_id": "sha256:" + "a" * 64,
+        "event_id": "event-generic",
+        "frame_id": "RF000001",
+        "observed_visual_evidence": "One directly visible instance.",
+        "selection_reason": "Representative evidence.",
+        "quality_risks": [],
+        "horizontal_strategy": "original",
+        "horizontal_zoom_intent": "none",
+        "horizontal_target_description": None,
+        "vertical_strategy": "fit_with_background",
+        "vertical_target_description": None,
+        "vertical_crop_mode": "strict",
+        "confidence": 0.8,
+    }
+    candidates = [
+        OpenEditCandidate(candidate_id="alias-a", **base),
+        OpenEditCandidate(candidate_id="alias-b", **base),
+    ]
+
+    with pytest.raises(ValidationError, match="distinct evidence frames"):
+        OpenEditShot(
+            feature_id="generic_slot",
+            title="Generic slot",
+            editorial_role="action",
+            intended_effect="Advance the observable sequence.",
+            target_duration_seconds=6,
+            candidates=candidates,
+            horizontal_candidate_id="alias-a",
+            vertical_candidate_id="alias-b",
+        )
 from jascue_video_lab.gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
     MODEL_ID,
@@ -665,6 +699,42 @@ def test_runtime_candidates_preserve_rank_but_human_binding_disables_switching()
     assert reviewed[0]["target_description"] is None
 
 
+def test_canonical_feature_plan_rejects_topk_aliases_of_same_evidence() -> None:
+    candidates = [
+        FeatureVerticalCandidate(
+            candidate_id=f"alias-{rank}",
+            rank=rank,
+            source_asset_id="sha256:" + "a" * 64,
+            event_id="event-shared",
+            frame_id="RF000001",
+            observed_visual_evidence="Same directly visible evidence.",
+            selection_reason="Alias should not create another paid attempt.",
+            strategy="fit_with_background",
+            target_description=None,
+            confidence=0.8,
+        )
+        for rank in (1, 2)
+    ]
+
+    with pytest.raises(ValidationError, match="distinct evidence frames"):
+        FeatureChapterSelect(
+            feature_id="scene",
+            evidence_status="supported",
+            horizontal_frame_id="RF000001",
+            vertical_frame_id="RF000001",
+            observed_visual_evidence="Same directly visible evidence.",
+            selection_reason="One evidence frame cannot become two Top-K choices.",
+            horizontal_strategy="original",
+            horizontal_zoom_intent="none",
+            horizontal_target_description=None,
+            vertical_strategy="fit_with_background",
+            vertical_target_description=None,
+            quality_risks=[],
+            confidence=0.8,
+            vertical_candidates=candidates,
+        )
+
+
 @pytest.mark.parametrize(
     (
         "source_dimensions",
@@ -1040,6 +1110,9 @@ def test_only_non_retryable_spending_cap_errors_trip_geometry_circuit_breaker() 
     )
     assert _is_exhausted_model_quota_error(
         RuntimeError("RESOURCE_EXHAUSTED: quota exceeded")
+    )
+    assert not _is_exhausted_model_quota_error(
+        ValueError("the selected feature429 marker is not visible")
     )
     assert not _is_exhausted_model_quota_error(
         RuntimeError("the selected entity is not visible in this frame")

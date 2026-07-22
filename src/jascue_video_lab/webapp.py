@@ -11,9 +11,18 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import Field, model_validator
 
-from .blind_review import BlindReviewService, ReviewVerdict
+from .blind_review import (
+    BlindReviewService,
+    QueryProposalOptions,
+    ReviewVerdict,
+)
 from .media import MediaCommandError
-from .models import StrictModel
+from .models import (
+    EvidenceApprovalSource,
+    PredicateRequiredAt,
+    StrictModel,
+    TargetIdentityScope,
+)
 
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -28,6 +37,26 @@ class TargetRequest(StrictModel):
     candidate_id: str | None = None
     target_id: str | None = None
     target_description: str | None = None
+    editorial_goal: str | None = None
+    identity_scope: TargetIdentityScope = TargetIdentityScope.WHOLE_INSTANCE
+    parent_target_id: str | None = None
+    parent_target_description: str | None = None
+    parent_identity_cues: tuple[str, ...] = ()
+    identity_cues: tuple[str, ...] = ()
+    context_cues: tuple[str, ...] = ()
+    stable_exclusions: tuple[str, ...] = ()
+    observable_predicate: str | None = None
+    predicate_required_at: PredicateRequiredAt = PredicateRequiredAt.CANDIDATE
+    predicate_precondition: str | None = None
+    predicate_apex: str | None = None
+    predicate_postcondition: str | None = None
+    predicate_required_evidence: tuple[str, ...] = ()
+    predicate_disqualifying_conditions: tuple[str, ...] = ()
+    framing_required_target_ids: tuple[str, ...] = ()
+    framing_preferred_target_ids: tuple[str, ...] = ()
+    framing_sacrificable_target_ids: tuple[str, ...] = ()
+    framing_overlay_keepout_target_ids: tuple[str, ...] = ()
+    framing_intent: str | None = None
 
     @model_validator(mode="after")
     def validate_mode(self) -> "TargetRequest":
@@ -37,6 +66,35 @@ class TargetRequest(StrictModel):
             raise ValueError("provide exactly one candidate or one manual target")
         if has_manual and (not self.target_id or not self.target_description):
             raise ValueError("manual target_id and target_description are required together")
+        return self
+
+    def query_options(self) -> QueryProposalOptions:
+        fields = QueryProposalOptions.model_fields
+        return QueryProposalOptions(
+            **{
+                name: getattr(self, name)
+                for name in fields
+            }
+        )
+
+
+class QueryApprovalRequest(StrictModel):
+    approved_by: str = Field(min_length=1)
+    proposal_id: str = Field(min_length=1)
+    proposal_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    approval_source: EvidenceApprovalSource = EvidenceApprovalSource.HUMAN_REVIEW
+    query_id: str | None = None
+    source_reference: str | None = None
+    policy_reference: str | None = None
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> "QueryApprovalRequest":
+        if self.approval_source != EvidenceApprovalSource.HUMAN_REVIEW:
+            raise ValueError(
+                "the interactive review endpoint only records human_review approval"
+            )
+        if self.policy_reference is not None:
+            raise ValueError("interactive human approval cannot claim an auto policy")
         return self
 
 
@@ -161,8 +219,26 @@ def create_app(service: BlindReviewService | None = None) -> FastAPI:
             candidate_id=body.candidate_id,
             target_id=body.target_id,
             target_description=body.target_description,
+            query_options=body.query_options(),
         )
         return selection.model_dump(mode="json")
+
+    @app.post("/api/sessions/{session_id}/query/approve")
+    def approve_query(
+        session_id: str, body: QueryApprovalRequest
+    ) -> dict[str, object]:
+        return workflow.approve_query_proposal(
+            session_id,
+            approved_by=body.approved_by,
+            expected_proposal_id=body.proposal_id,
+            expected_proposal_definition_sha256=(
+                body.proposal_definition_sha256
+            ),
+            approval_source=body.approval_source,
+            query_id=body.query_id,
+            source_reference=body.source_reference,
+            policy_reference=body.policy_reference,
+        )
 
     @app.post("/api/sessions/{session_id}/moments")
     def moments(session_id: str, body: MomentRequest) -> dict[str, object]:

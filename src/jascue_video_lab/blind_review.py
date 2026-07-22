@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import uuid
@@ -19,10 +21,24 @@ from .media import create_analysis_proxy, extract_frame, probe_video
 from .models import (
     DirectMomentMap,
     DirectVideoGroundingProposal,
+    EvidenceApprovalSource,
+    EvidenceClaimSource,
+    EvidenceFramingObligationsV2,
+    EvidenceIdentityContractV2,
+    EvidencePredicateContractV2,
+    EvidencePredicatePhasesV2,
+    EvidenceQueryApprovalProvenance,
+    EvidenceQueryLockV2,
+    EvidenceQueryProposalV2,
+    EvidenceQueryProvenanceV2,
+    EvidenceTargetIdentityV2,
     GroundingProposal,
     MediaInfo,
+    PredicateRequiredAt,
     StrictModel,
     TargetCandidateMap,
+    TargetIdentityScope,
+    approve_evidence_query_proposal_v2,
 )
 from .overlay import draw_blind_review_overlay, draw_grounding_overlay
 from .storage import append_error, read_json, utc_now, write_json
@@ -52,6 +68,70 @@ class TargetSelection(StrictModel):
     selected_by: Literal["human_candidate_selection", "human_manual_description"]
     source_candidate_id: str | None = None
     selected_at: str
+    contract_target_id: str | None = None
+    query_status: Literal[
+        "legacy_selection", "proposal_pending_approval", "query_locked"
+    ] = "legacy_selection"
+    query_proposal: EvidenceQueryProposalV2 | None = None
+    query_proposal_hashes: dict[str, str] | None = None
+    query_lock_id: str | None = None
+    query_lock_hashes: dict[str, str] | None = None
+
+
+class QueryProposalOptions(StrictModel):
+    """Optional, domain-neutral refinements for a selected target proposal."""
+
+    editorial_goal: str | None = None
+    identity_scope: TargetIdentityScope = TargetIdentityScope.WHOLE_INSTANCE
+    parent_target_id: str | None = None
+    parent_target_description: str | None = None
+    parent_identity_cues: tuple[str, ...] = ()
+    identity_cues: tuple[str, ...] = ()
+    context_cues: tuple[str, ...] = ()
+    stable_exclusions: tuple[str, ...] = ()
+    observable_predicate: str | None = None
+    predicate_required_at: PredicateRequiredAt = PredicateRequiredAt.CANDIDATE
+    predicate_precondition: str | None = None
+    predicate_apex: str | None = None
+    predicate_postcondition: str | None = None
+    predicate_required_evidence: tuple[str, ...] = ()
+    predicate_disqualifying_conditions: tuple[str, ...] = ()
+    framing_required_target_ids: tuple[str, ...] = ()
+    framing_preferred_target_ids: tuple[str, ...] = ()
+    framing_sacrificable_target_ids: tuple[str, ...] = ()
+    framing_overlay_keepout_target_ids: tuple[str, ...] = ()
+    framing_intent: str | None = None
+
+    @model_validator(mode="after")
+    def validate_predicate_options(self) -> "QueryProposalOptions":
+        if self.identity_scope == TargetIdentityScope.WHOLE_INSTANCE:
+            if self.parent_target_id or self.parent_target_description or self.parent_identity_cues:
+                raise ValueError("whole_instance proposals cannot define a parent target")
+        elif not self.parent_target_id or not self.parent_target_description:
+            raise ValueError(
+                "subpart and visible_region proposals require parent target ID and description"
+            )
+        phase_values = (
+            self.predicate_precondition,
+            self.predicate_apex,
+            self.predicate_postcondition,
+        )
+        populated_phase_count = sum(bool(value and value.strip()) for value in phase_values)
+        if populated_phase_count not in {0, 3}:
+            raise ValueError("predicate phases must be omitted or supplied as a complete triplet")
+        if any(phase_values) and not self.observable_predicate:
+            raise ValueError("predicate phases require observable_predicate")
+        if self.observable_predicate and self.predicate_required_at == PredicateRequiredAt.TRANSITION:
+            if not all(value and value.strip() for value in phase_values):
+                raise ValueError(
+                    "transition predicates require precondition, apex, and postcondition"
+                )
+        if not self.observable_predicate and (
+            self.predicate_required_evidence
+            or self.predicate_disqualifying_conditions
+        ):
+            raise ValueError("predicate evidence rules require observable_predicate")
+        return self
 
 
 class HumanReviewAnnotation(StrictModel):
@@ -106,6 +186,168 @@ def _safe_suffix(filename: str) -> str:
     return ".mp4"
 
 
+_CONTRACT_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$")
+
+
+def _contract_id(value: str, *, prefix: str) -> str:
+    """Preserve valid legacy IDs and deterministically map permissive old IDs."""
+
+    stripped = value.strip()
+    if _CONTRACT_ID.fullmatch(stripped):
+        return stripped
+    digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}-{digest}"
+
+
+def _definition_sha256(value: Any) -> str:
+    payload = value.model_dump(mode="json", exclude_none=True)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _query_artifact_hashes(
+    value: EvidenceQueryProposalV2 | EvidenceQueryLockV2,
+) -> dict[str, str]:
+    return {
+        **value.component_hashes(),
+        "composite_sha256": value.composite_sha256(),
+        "definition_sha256": _definition_sha256(value),
+    }
+
+
+def _remap_target_ids(
+    values: tuple[str, ...], *, aliases: dict[str, str]
+) -> tuple[str, ...]:
+    return tuple(aliases.get(value, value) for value in values)
+
+
+def _build_query_proposal(
+    *,
+    target_id: str,
+    target_description: str,
+    candidate_features: str | None,
+    claim_source: EvidenceClaimSource,
+    created_by: str,
+    source_reference: str | None,
+    options: QueryProposalOptions,
+) -> EvidenceQueryProposalV2:
+    contract_target_id = _contract_id(target_id, prefix="target")
+    aliases = {target_id: contract_target_id, contract_target_id: contract_target_id}
+    parent_contract_id: str | None = None
+    targets: list[EvidenceTargetIdentityV2] = []
+    if options.parent_target_id is not None:
+        parent_contract_id = _contract_id(options.parent_target_id, prefix="parent")
+        aliases.update(
+            {
+                options.parent_target_id: parent_contract_id,
+                parent_contract_id: parent_contract_id,
+            }
+        )
+        parent_description = options.parent_target_description or options.parent_target_id
+        targets.append(
+            EvidenceTargetIdentityV2(
+                target_id=parent_contract_id,
+                target_description=parent_description,
+                scope=TargetIdentityScope.WHOLE_INSTANCE,
+                identity_cues=(
+                    options.parent_identity_cues
+                    or (parent_description,)
+                ),
+            )
+        )
+    identity_cues = options.identity_cues
+    if not identity_cues:
+        identity_cues = tuple(
+            item
+            for item in (candidate_features, target_description)
+            if item and item.strip()
+        )
+    targets.append(
+        EvidenceTargetIdentityV2(
+            target_id=contract_target_id,
+            target_description=target_description,
+            scope=options.identity_scope,
+            parent_target_id=parent_contract_id,
+            identity_cues=identity_cues,
+            context_cues=options.context_cues,
+            stable_exclusions=options.stable_exclusions,
+        )
+    )
+    predicate: EvidencePredicateContractV2 | None = None
+    if options.observable_predicate:
+        phase_values = (
+            options.predicate_precondition,
+            options.predicate_apex,
+            options.predicate_postcondition,
+        )
+        predicate = EvidencePredicateContractV2(
+            predicate_id=f"{contract_target_id}:predicate",
+            statement=options.observable_predicate,
+            participant_target_ids=(contract_target_id,),
+            required_at=options.predicate_required_at,
+            phases=(
+                EvidencePredicatePhasesV2(
+                    precondition=phase_values[0],
+                    apex=phase_values[1],
+                    postcondition=phase_values[2],
+                )
+                if all(phase_values)
+                else None
+            ),
+            required_evidence=options.predicate_required_evidence,
+            disqualifying_conditions=options.predicate_disqualifying_conditions,
+        )
+    framing_roles = (
+        options.framing_required_target_ids,
+        options.framing_preferred_target_ids,
+        options.framing_sacrificable_target_ids,
+    )
+    if not any(framing_roles):
+        framing_required = (contract_target_id,)
+    else:
+        framing_required = _remap_target_ids(
+            options.framing_required_target_ids, aliases=aliases
+        )
+    framing = EvidenceFramingObligationsV2(
+        required_target_ids=framing_required,
+        preferred_target_ids=_remap_target_ids(
+            options.framing_preferred_target_ids, aliases=aliases
+        ),
+        sacrificable_target_ids=_remap_target_ids(
+            options.framing_sacrificable_target_ids, aliases=aliases
+        ),
+        overlay_keepout_target_ids=_remap_target_ids(
+            options.framing_overlay_keepout_target_ids, aliases=aliases
+        ),
+        framing_intent=(
+            options.framing_intent
+            or "Preserve the selected evidence target for the intended edit."
+        ),
+    )
+    return EvidenceQueryProposalV2(
+        proposal_id=f"query-proposal-{uuid.uuid4().hex}",
+        revision=1,
+        editorial_goal=(
+            options.editorial_goal
+            or "Ground and review the selected visual evidence target."
+        ),
+        identity=EvidenceIdentityContractV2(targets=tuple(targets)),
+        predicate=predicate,
+        framing=framing,
+        claim_source=claim_source,
+        provenance=EvidenceQueryProvenanceV2(
+            created_at=utc_now(),
+            created_by=created_by,
+            source_reference=source_reference,
+        ),
+    )
+
+
 class BlindReviewService:
     """Durable local workflow. Model details stay inaccessible until a human annotation exists."""
 
@@ -122,6 +364,7 @@ class BlindReviewService:
         self.data_root.mkdir(parents=True, exist_ok=True)
         self.file_cache_root.mkdir(parents=True, exist_ok=True)
         self._upload_locks: dict[str, threading.Lock] = {}
+        self._approval_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
     def _session_dir(self, session_id: str) -> Path:
@@ -174,6 +417,10 @@ class BlindReviewService:
             "asset_id": media.asset_id,
             "current_candidate_map": None,
             "current_selection": None,
+            "current_query_proposal": None,
+            "current_query_proposal_manifest": None,
+            "current_query_lock": None,
+            "current_query_lock_manifest": None,
             "current_moment_map": None,
             "reviews": [],
         }
@@ -203,6 +450,10 @@ class BlindReviewService:
     def _lock_for_upload(self, asset_hash: str) -> threading.Lock:
         with self._locks_guard:
             return self._upload_locks.setdefault(asset_hash, threading.Lock())
+
+    def _lock_for_approval(self, session_id: str) -> threading.Lock:
+        with self._locks_guard:
+            return self._approval_locks.setdefault(session_id, threading.Lock())
 
     def _adopt_legacy_upload(self, upload_media: MediaInfo, cache_dir: Path) -> str | None:
         initial = cache_dir / "file_upload_initial.json"
@@ -302,6 +553,10 @@ class BlindReviewService:
             (batch_dir / "run-01" / "target_candidates.json").relative_to(self._session_dir(session_id))
         )
         session["current_selection"] = None
+        session["current_query_proposal"] = None
+        session["current_query_proposal_manifest"] = None
+        session["current_query_lock"] = None
+        session["current_query_lock_manifest"] = None
         session["current_moment_map"] = None
         self._save_session(session)
         pricing = summarize_usage_and_list_price(batch_dir)
@@ -322,9 +577,12 @@ class BlindReviewService:
         candidate_id: str | None = None,
         target_id: str | None = None,
         target_description: str | None = None,
+        query_options: QueryProposalOptions | None = None,
     ) -> TargetSelection:
         session = self._session(session_id)
         media = self._media(session)
+        options = query_options or QueryProposalOptions()
+        candidate_features: str | None = None
         if candidate_id:
             if target_id or target_description:
                 raise ValueError("candidate selection and manual target are mutually exclusive")
@@ -339,31 +597,312 @@ class BlindReviewService:
             )
             if candidate is None:
                 raise ValueError(f"unknown candidate_id {candidate_id}")
-            selection = TargetSelection(
-                asset_id=media.asset_id,
-                target_id=candidate.candidate_id,
-                target_description=candidate.target_description,
-                selected_by="human_candidate_selection",
-                source_candidate_id=candidate.candidate_id,
-                selected_at=utc_now(),
+            selected_target_id = candidate.candidate_id
+            selected_description = candidate.target_description
+            candidate_features = candidate.distinguishing_features
+            selected_by = "human_candidate_selection"
+            source_candidate_id = candidate.candidate_id
+            claim_source = EvidenceClaimSource.MODEL_PROPOSAL
+            created_by = "gemini_target_candidate"
+            source_reference = (
+                f"{candidate_map.model_provenance.interaction_id}:"
+                f"{candidate.candidate_id}"
             )
         else:
             if not target_id or not target_description:
                 raise ValueError("manual target_id and target_description are required together")
-            selection = TargetSelection(
-                asset_id=media.asset_id,
-                target_id=target_id,
-                target_description=target_description,
-                selected_by="human_manual_description",
-                source_candidate_id=None,
-                selected_at=utc_now(),
-            )
+            selected_target_id = target_id
+            selected_description = target_description
+            selected_by = "human_manual_description"
+            source_candidate_id = None
+            claim_source = EvidenceClaimSource.USER_BRIEF
+            created_by = "human_manual_description"
+            source_reference = f"session:{session_id}:manual-target"
+        proposal = _build_query_proposal(
+            target_id=selected_target_id,
+            target_description=selected_description,
+            candidate_features=candidate_features,
+            claim_source=claim_source,
+            created_by=created_by,
+            source_reference=source_reference,
+            options=options,
+        )
+        proposal_hashes = _query_artifact_hashes(proposal)
+        selection = TargetSelection(
+            asset_id=media.asset_id,
+            target_id=selected_target_id,
+            target_description=selected_description,
+            selected_by=selected_by,
+            source_candidate_id=source_candidate_id,
+            selected_at=utc_now(),
+            contract_target_id=proposal.identity.targets[-1].target_id,
+            query_status="proposal_pending_approval",
+            query_proposal=proposal,
+            query_proposal_hashes=proposal_hashes,
+        )
         write_json(self._session_dir(session_id) / "target_selection.json", selection)
-        session["stage"] = "target_selected"
+        proposal_dir = Path("queries") / proposal.proposal_id
+        proposal_path = proposal_dir / "proposal.json"
+        proposal_manifest_path = proposal_dir / "proposal.manifest.json"
+        write_json(self._session_dir(session_id) / proposal_path, proposal)
+        proposal_manifest = {
+            "artifact_kind": "evidence_query_proposal_v2",
+            "proposal_id": proposal.proposal_id,
+            "hashes": proposal_hashes,
+            "approval_status": "pending",
+            "written_at": utc_now(),
+        }
+        write_json(
+            self._session_dir(session_id) / proposal_manifest_path,
+            proposal_manifest,
+        )
+        session["stage"] = "query_proposal_ready"
         session["current_selection"] = "target_selection.json"
+        session["current_query_proposal"] = str(proposal_path)
+        session["current_query_proposal_manifest"] = str(proposal_manifest_path)
+        session["current_query_lock"] = None
+        session["current_query_lock_manifest"] = None
         session["current_moment_map"] = None
         self._save_session(session)
         return selection
+
+    def approve_query_proposal(
+        self,
+        session_id: str,
+        *,
+        approved_by: str,
+        expected_proposal_id: str,
+        expected_proposal_definition_sha256: str,
+        approval_source: EvidenceApprovalSource = EvidenceApprovalSource.HUMAN_REVIEW,
+        query_id: str | None = None,
+        source_reference: str | None = None,
+        policy_reference: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically compare-and-approve one reviewed proposal per session."""
+
+        with self._lock_for_approval(session_id):
+            return self._approve_query_proposal_locked(
+                session_id,
+                approved_by=approved_by,
+                expected_proposal_id=expected_proposal_id,
+                expected_proposal_definition_sha256=(
+                    expected_proposal_definition_sha256
+                ),
+                approval_source=approval_source,
+                query_id=query_id,
+                source_reference=source_reference,
+                policy_reference=policy_reference,
+            )
+
+    def _approve_query_proposal_locked(
+        self,
+        session_id: str,
+        *,
+        approved_by: str,
+        expected_proposal_id: str,
+        expected_proposal_definition_sha256: str,
+        approval_source: EvidenceApprovalSource = EvidenceApprovalSource.HUMAN_REVIEW,
+        query_id: str | None = None,
+        source_reference: str | None = None,
+        policy_reference: str | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly promote the current proposal without rewriting its claim source."""
+
+        if isinstance(approval_source, str):
+            approval_source = EvidenceApprovalSource(approval_source)
+        if approval_source != EvidenceApprovalSource.HUMAN_REVIEW:
+            raise ValueError("Blind Review approval must be human_review")
+        if not approved_by.strip():
+            raise ValueError("approved_by is required")
+        if policy_reference is not None:
+            raise ValueError("Blind Review human approval cannot claim an auto policy")
+        session = self._session(session_id)
+        if session.get("current_query_lock"):
+            raise ValueError(
+                "the current proposal is already approved; create a new proposal to revise it"
+            )
+        proposal_path = session.get("current_query_proposal")
+        if not proposal_path:
+            raise ValueError("select a target and create a proposal before approval")
+        proposal = EvidenceQueryProposalV2.model_validate(
+            read_json(self._session_dir(session_id) / proposal_path)
+        )
+        proposal_hashes = _query_artifact_hashes(proposal)
+        if proposal.proposal_id != expected_proposal_id:
+            raise ValueError(
+                "approval refers to a stale proposal_id; review the current proposal"
+            )
+        if (
+            proposal_hashes["definition_sha256"]
+            != expected_proposal_definition_sha256
+        ):
+            raise ValueError(
+                "approval refers to a stale proposal definition; review the current proposal"
+            )
+        approval = EvidenceQueryApprovalProvenance(
+            approved_at=utc_now(),
+            approved_by=approved_by,
+            approval_source=approval_source,
+            source_reference=(
+                source_reference or f"session:{session_id}:proposal-review"
+            ),
+            policy_reference=policy_reference,
+        )
+        lock = approve_evidence_query_proposal_v2(
+            proposal,
+            query_id=(query_id or f"query-{uuid.uuid4().hex}"),
+            approval=approval,
+        )
+        lock_hashes = _query_artifact_hashes(lock)
+        lock_path = Path(proposal_path).parent / "lock.json"
+        lock_manifest_path = Path(proposal_path).parent / "lock.manifest.json"
+        write_json(self._session_dir(session_id) / lock_path, lock)
+        lock_manifest = {
+            "artifact_kind": "evidence_query_lock_v2",
+            "query_id": lock.query_id,
+            "source_proposal_id": proposal.proposal_id,
+            "source_proposal_definition_sha256": proposal_hashes["definition_sha256"],
+            "hashes": lock_hashes,
+            "approval": approval.model_dump(mode="json"),
+            "written_at": utc_now(),
+        }
+        write_json(
+            self._session_dir(session_id) / lock_manifest_path,
+            lock_manifest,
+        )
+        proposal_manifest_path = session.get("current_query_proposal_manifest")
+        if proposal_manifest_path:
+            proposal_manifest = read_json(
+                self._session_dir(session_id) / proposal_manifest_path
+            )
+            proposal_manifest["approval_status"] = "approved"
+            proposal_manifest["approved_query_id"] = lock.query_id
+            proposal_manifest["approved_at"] = approval.approved_at
+            write_json(
+                self._session_dir(session_id) / proposal_manifest_path,
+                proposal_manifest,
+            )
+        selection_path = session.get("current_selection")
+        if selection_path:
+            selection = TargetSelection.model_validate(
+                read_json(self._session_dir(session_id) / selection_path)
+            ).model_copy(
+                update={
+                    "query_status": "query_locked",
+                    "query_lock_id": lock.query_id,
+                    "query_lock_hashes": lock_hashes,
+                }
+            )
+            write_json(self._session_dir(session_id) / selection_path, selection)
+        session["stage"] = "query_locked"
+        session["current_query_lock"] = str(lock_path)
+        session["current_query_lock_manifest"] = str(lock_manifest_path)
+        self._save_session(session)
+        return {
+            "session_id": session_id,
+            "query_lock": lock.model_dump(mode="json"),
+            "hashes": lock_hashes,
+            "source_proposal": {
+                "proposal_id": proposal.proposal_id,
+                "claim_source": proposal.claim_source,
+                "definition_sha256": proposal_hashes["definition_sha256"],
+            },
+        }
+
+    def _locked_query_material(
+        self,
+        session_id: str,
+        session: dict[str, Any],
+        selection: TargetSelection,
+    ) -> tuple[str, str, str | None]:
+        """Return approved identity material, preserving legacy saved sessions."""
+
+        if selection.query_status == "legacy_selection":
+            return selection.target_id, selection.target_description, None
+        if selection.query_status != "query_locked":
+            raise ValueError(
+                "the current Query proposal must be explicitly approved before "
+                "moment analysis or Grounding"
+            )
+        lock_path = session.get("current_query_lock")
+        if not lock_path:
+            raise ValueError("query_locked selection is missing its lock artifact")
+        lock = EvidenceQueryLockV2.model_validate(
+            read_json(self._session_dir(session_id) / lock_path)
+        )
+        actual_hashes = _query_artifact_hashes(lock)
+        if selection.query_lock_hashes != actual_hashes:
+            raise ValueError("saved QueryLock hashes do not match the selected target")
+        contract_target_id = selection.contract_target_id
+        if contract_target_id is None:
+            raise ValueError("query_locked selection is missing contract_target_id")
+        target = next(
+            (
+                candidate
+                for candidate in lock.identity.targets
+                if candidate.target_id == contract_target_id
+            ),
+            None,
+        )
+        if target is None:
+            raise ValueError("QueryLock does not contain the selected contract target")
+        identity_parts = [
+            target.target_description,
+            f"identity scope: {target.scope.value}",
+        ]
+        if target.identity_cues:
+            identity_parts.append("identity cues: " + "; ".join(target.identity_cues))
+        if target.context_cues:
+            identity_parts.append(
+                "auxiliary context only: " + "; ".join(target.context_cues)
+            )
+        if target.stable_exclusions:
+            identity_parts.append(
+                "must exclude: " + "; ".join(target.stable_exclusions)
+            )
+        for ancestor in lock.identity.ancestors(target.target_id):
+            parent_parts = [
+                f"parent instance disambiguator {ancestor.target_id}: "
+                + ancestor.target_description
+            ]
+            if ancestor.identity_cues:
+                parent_parts.append("identity cues=" + "; ".join(ancestor.identity_cues))
+            if ancestor.context_cues:
+                parent_parts.append("context only=" + "; ".join(ancestor.context_cues))
+            if ancestor.stable_exclusions:
+                parent_parts.append("exclude=" + "; ".join(ancestor.stable_exclusions))
+            identity_parts.append("; ".join(parent_parts))
+        if lock.identity.ancestors(target.target_id):
+            identity_parts.append(
+                "Parent identity only disambiguates the requested subpart; Grounding "
+                "must still return the child target geometry."
+            )
+        predicate_material: str | None = None
+        if lock.predicate is not None:
+            predicate_parts = [
+                f"observable predicate ({lock.predicate.required_at.value}): "
+                + lock.predicate.statement
+            ]
+            if lock.predicate.phases is not None:
+                predicate_parts.extend(
+                    [
+                        "precondition: " + lock.predicate.phases.precondition,
+                        "apex: " + lock.predicate.phases.apex,
+                        "postcondition: " + lock.predicate.phases.postcondition,
+                    ]
+                )
+            if lock.predicate.required_evidence:
+                predicate_parts.append(
+                    "required evidence: "
+                    + "; ".join(lock.predicate.required_evidence)
+                )
+            if lock.predicate.disqualifying_conditions:
+                predicate_parts.append(
+                    "disqualifying conditions: "
+                    + "; ".join(lock.predicate.disqualifying_conditions)
+                )
+            predicate_material = "\n".join(predicate_parts)
+        return contract_target_id, "\n".join(identity_parts), predicate_material
 
     def analyze_moments(
         self, session_id: str, *, runs: int = 1
@@ -376,6 +915,12 @@ class BlindReviewService:
         selection = TargetSelection.model_validate(
             read_json(self._session_dir(session_id) / session["current_selection"])
         )
+        locked_target_id, identity_description, predicate_material = (
+            self._locked_query_material(session_id, session, selection)
+        )
+        moment_search_description = identity_description
+        if predicate_material is not None:
+            moment_search_description += "\n" + predicate_material
         media = self._media(session)
         batch_dir = self._session_dir(session_id) / "moments" / f"batch-{uuid.uuid4().hex[:8]}"
         client = self.client_factory()
@@ -391,8 +936,8 @@ class BlindReviewService:
                     prompt_template=_prompt("target_moments_mmss_zh-TW.txt"),
                     run_id=f"blind-moments-{index:02d}-{uuid.uuid4().hex[:8]}",
                     run_dir=run_dir,
-                    locked_target_id=selection.target_id,
-                    locked_target_description=selection.target_description,
+                    locked_target_id=locked_target_id,
+                    locked_target_description=moment_search_description,
                 )
                 maps.append(moment_map)
         finally:
@@ -426,12 +971,36 @@ class BlindReviewService:
         selection = TargetSelection.model_validate(
             read_json(self._session_dir(session_id) / session["current_selection"])
         )
+        locked_target_id, identity_description, _predicate_material = (
+            self._locked_query_material(session_id, session, selection)
+        )
+        if selection.query_status == "query_locked":
+            lock_path = session.get("current_query_lock")
+            if not lock_path:
+                raise ValueError("query_locked selection is missing its lock artifact")
+            lock = EvidenceQueryLockV2.model_validate(
+                read_json(self._session_dir(session_id) / lock_path)
+            )
+            if lock.predicate is not None:
+                raise ValueError(
+                    "Blind Review Web has only produced a coarse MM:SS candidate; "
+                    "formal QueryLock predicate refinement is required before Grounding. "
+                    "Export the session and run refine-query-predicate, or approve an "
+                    "identity-only QueryLock for geometry review."
+                )
         moment_map = DirectMomentMap.model_validate(
             read_json(self._session_dir(session_id) / session["current_moment_map"])
         )
         moment = next((item for item in moment_map.moments if item.moment_id == moment_id), None)
         if moment is None:
             raise ValueError(f"unknown moment_id {moment_id}")
+        grounding_context = (
+            "Exact-frame identity Grounding only. Use the supplied image pixels and "
+            "locked identity cues; do not infer the event predicate or target position "
+            "from the requested time."
+            if selection.query_status == "query_locked"
+            else f"{moment.label}；{moment.observable_evidence}"
+        )
         review_id = f"review-{uuid.uuid4().hex[:12]}"
         review_dir = self._session_dir(session_id) / "reviews" / review_id
         requested_ms = _mmss_to_ms(moment.timestamp_mmss)
@@ -446,9 +1015,9 @@ class BlindReviewService:
                     media=media,
                     frame=frame,
                     event_id=moment.moment_id,
-                    event_description=f"{moment.label}；{moment.observable_evidence}",
-                    entity_id=selection.target_id,
-                    target_description=selection.target_description,
+                    event_description=grounding_context,
+                    entity_id=locked_target_id,
+                    target_description=identity_description,
                     prompt_template=_prompt("grounding_native_yxyx_zh-TW.txt"),
                     run_id=f"blind-grounding-{uuid.uuid4().hex[:8]}",
                     output_dir=review_dir / "grounding",
@@ -465,9 +1034,9 @@ class BlindReviewService:
                     uploaded=uploaded,
                     requested_timestamp_mmss=moment.timestamp_mmss,
                     event_id=moment.moment_id,
-                    event_description=f"{moment.label}；{moment.observable_evidence}",
-                    entity_id=selection.target_id,
-                    target_description=selection.target_description,
+                    event_description=grounding_context,
+                    entity_id=locked_target_id,
+                    target_description=identity_description,
                     prompt_template=_prompt("direct_video_grounding_native_yxyx_zh-TW.txt"),
                     run_id=f"blind-direct-video-{uuid.uuid4().hex[:8]}",
                     output_dir=review_dir / "direct-video-grounding",
@@ -475,7 +1044,7 @@ class BlindReviewService:
                 projection = GroundingProposal(
                     asset_id=media.asset_id,
                     event_id=moment.moment_id,
-                    entity_id=selection.target_id,
+                    entity_id=locked_target_id,
                     frame_pts=frame.frame_pts,
                     frame_time_ms=frame.frame_time_ms,
                     frame_hash=frame.frame_hash,
@@ -503,8 +1072,8 @@ class BlindReviewService:
             "review_id": review_id,
             "status": "pending_human_review",
             "created_at": utc_now(),
-            "target_id": selection.target_id,
-            "target_description": selection.target_description,
+            "target_id": locked_target_id,
+            "target_description": identity_description,
             "grounding_method": grounding_method,
             "bbox_reference_frame": bbox_reference_frame,
             "proposal_type": proposal_type,
@@ -528,8 +1097,8 @@ class BlindReviewService:
             "session_id": session_id,
             "review_id": review_id,
             "status": manifest["status"],
-            "target_id": selection.target_id,
-            "target_description": selection.target_description,
+            "target_id": locked_target_id,
+            "target_description": identity_description,
             "grounding_method": grounding_method,
             "bbox_reference_frame": bbox_reference_frame,
             "requested_timestamp_mmss": moment.timestamp_mmss,
@@ -674,7 +1243,17 @@ class BlindReviewService:
         view: dict[str, Any] = {
             key: value
             for key, value in session.items()
-            if key not in {"source_path", "current_candidate_map", "current_selection", "current_moment_map"}
+            if key
+            not in {
+                "source_path",
+                "current_candidate_map",
+                "current_selection",
+                "current_query_proposal",
+                "current_query_proposal_manifest",
+                "current_query_lock",
+                "current_query_lock_manifest",
+                "current_moment_map",
+            }
         }
         view["media"] = media.model_dump(mode="json")
         view["video_url"] = f"/api/sessions/{session_id}/video"
@@ -685,6 +1264,24 @@ class BlindReviewService:
         if session.get("current_selection"):
             view["selection"] = read_json(
                 self._session_dir(session_id) / session["current_selection"]
+            )
+        if session.get("current_query_proposal"):
+            view["query_proposal"] = read_json(
+                self._session_dir(session_id) / session["current_query_proposal"]
+            )
+        if session.get("current_query_proposal_manifest"):
+            view["query_proposal_manifest"] = read_json(
+                self._session_dir(session_id)
+                / session["current_query_proposal_manifest"]
+            )
+        if session.get("current_query_lock"):
+            view["query_lock"] = read_json(
+                self._session_dir(session_id) / session["current_query_lock"]
+            )
+        if session.get("current_query_lock_manifest"):
+            view["query_lock_manifest"] = read_json(
+                self._session_dir(session_id)
+                / session["current_query_lock_manifest"]
             )
         if session.get("current_moment_map"):
             view["moment_map"] = read_json(

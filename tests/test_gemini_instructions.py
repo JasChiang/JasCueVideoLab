@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,8 +8,12 @@ from typing import Any, Callable
 
 import pytest
 
+import jascue_video_lab.gemini as gemini_module
+from jascue_video_lab.billing import summarize_usage_and_list_price
+
 from jascue_video_lab.gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
+    GroundingIdentityReference,
     MODEL_ID,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
     GeminiLabClient,
@@ -34,6 +39,60 @@ def _client() -> tuple[GeminiLabClient, _RejectingInteractions]:
     client.client = SimpleNamespace(interactions=interactions)
     client.model_id = MODEL_ID
     return client, interactions
+
+
+def test_live_client_disables_hidden_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Client:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(gemini_module.genai, "Client", _Client)
+    client = GeminiLabClient(api_key="test-key")
+    try:
+        retry_options = captured["http_options"].retry_options
+        assert retry_options is not None
+        assert retry_options.attempts == 1
+    finally:
+        client.close()
+
+
+def test_paid_responses_are_preserved_as_immutable_attempts(tmp_path: Path) -> None:
+    class _PaidInteraction:
+        id = "interaction-reused-by-test-double"
+
+        def model_dump(self, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "id": self.id,
+                "model": "gemini-3.6-flash",
+                "output_text": "{}",
+                "usage": {
+                    "total_input_tokens": 100,
+                    "total_output_tokens": 10,
+                    "total_thought_tokens": 0,
+                },
+            }
+
+    interaction = _PaidInteraction()
+    for _ in range(2):
+        gemini_module._record_interaction_attempt(
+            run_dir=tmp_path,
+            operation="contract_test",
+            canonical_filename="contract_test.raw_interaction.json",
+            interaction=interaction,
+        )
+
+    assert len(list((tmp_path / "attempts").glob("*.raw_interaction.json"))) == 2
+    assert (tmp_path / "contract_test.raw_interaction.json").is_file()
+    summary = summarize_usage_and_list_price(tmp_path)
+    assert summary["request_count"] == 2
+    assert summary["duplicate_artifact_count"] == 1
 
 
 def _capture_request(
@@ -206,3 +265,166 @@ def test_live_request_sources_do_not_use_deprecated_sampling_parameters() -> Non
             assert '"temperature"' not in source, path
             assert '"top_p"' not in source, path
             assert '"top_k"' not in source, path
+
+
+def test_ground_frame_interleaves_content_addressed_identity_references(
+    tmp_path: Path,
+) -> None:
+    target_frame = tmp_path / "target-frame.png"
+    target_frame.write_bytes(b"target frame bytes")
+    target_hash = hashlib.sha256(target_frame.read_bytes()).hexdigest()
+    positive = tmp_path / "positive.png"
+    positive.write_bytes(b"same locked instance")
+    negative = tmp_path / "negative.png"
+    negative.write_bytes(b"explicit confuser")
+
+    references = (
+        GroundingIdentityReference(
+            reference_id="anchor-positive",
+            role="positive",
+            target_id="subject.primary",
+            description="same reviewer-selected instance",
+            path=positive,
+            sha256=hashlib.sha256(positive.read_bytes()).hexdigest(),
+        ),
+        GroundingIdentityReference(
+            reference_id="anchor-negative",
+            role="negative",
+            target_id="subject.primary",
+            description="similar instance that must be excluded",
+            path=negative,
+            sha256=hashlib.sha256(negative.read_bytes()).hexdigest(),
+        ),
+    )
+    media = SimpleNamespace(asset_id="sha256:" + "a" * 64)
+    frame = SimpleNamespace(
+        path=str(target_frame),
+        frame_time_ms=1250,
+        frame_pts=30,
+        frame_hash=target_hash,
+        width=1920,
+        height=1080,
+    )
+
+    api_request, saved_request = _capture_request(
+        tmp_path,
+        "ground-references",
+        "grounding.request.json",
+        lambda client, run_dir: client.ground_frame(
+            media=media,
+            frame=frame,
+            event_id="event-generic",
+            event_description="identity-only exact-frame grounding",
+            entity_id="subject.primary",
+            target_description="the locked foreground instance",
+            prompt_template=(
+                "Target {{target_description}} in event {{event_description}} "
+                "for {{entity_id}} at {{frame_time_ms}}."
+            ),
+            run_id="run-ground-references",
+            output_dir=run_dir,
+            identity_references=references,
+        ),
+    )
+
+    api_input = api_request["input"]
+    labels = [item["text"] for item in api_input if item["type"] == "text"]
+    assert any("anchor-positive" in label and "role=positive" in label for label in labels)
+    assert any("anchor-negative" in label and "role=negative" in label for label in labels)
+    assert labels[-1].startswith("FRAME_TO_GROUND")
+    assert sum(item["type"] == "image" for item in api_input) == 3
+
+    recorded_images = [
+        item for item in saved_request["input"] if item["type"] == "image"
+    ]
+    assert [item.get("reference_role") for item in recorded_images[:-1]] == [
+        "positive",
+        "negative",
+    ]
+    assert recorded_images[-1]["image_role"] == "frame_to_ground"
+    assert all("data" not in item for item in recorded_images)
+    saved_text = json.dumps(saved_request, ensure_ascii=False)
+    assert str(positive) not in saved_text
+    assert str(negative) not in saved_text
+
+
+def test_ground_frame_rejects_tampered_identity_reference_before_network(
+    tmp_path: Path,
+) -> None:
+    reference_path = tmp_path / "reference.png"
+    reference_path.write_bytes(b"actual bytes")
+    frame_path = tmp_path / "frame.png"
+    frame_path.write_bytes(b"frame bytes")
+    client, interactions = _client()
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        client.ground_frame(
+            media=SimpleNamespace(asset_id="sha256:" + "a" * 64),
+            frame=SimpleNamespace(
+                path=str(frame_path),
+                frame_time_ms=0,
+                frame_pts=0,
+                frame_hash=hashlib.sha256(frame_path.read_bytes()).hexdigest(),
+                width=640,
+                height=360,
+            ),
+            event_id="event-generic",
+            event_description="identity-only",
+            entity_id="subject.primary",
+            target_description="the locked instance",
+            prompt_template="Ground {{target_description}}.",
+            run_id="run-tampered-reference",
+            output_dir=tmp_path / "tampered",
+            identity_references=(
+                GroundingIdentityReference(
+                    reference_id="tampered",
+                    role="positive",
+                    target_id="subject.primary",
+                    description="same instance",
+                    path=reference_path,
+                    sha256="0" * 64,
+                ),
+            ),
+        )
+    assert interactions.request is None
+
+
+def test_ground_frame_rejects_reference_for_another_requested_target(
+    tmp_path: Path,
+) -> None:
+    reference_path = tmp_path / "reference.png"
+    reference_path.write_bytes(b"valid reference bytes")
+    frame_path = tmp_path / "frame.png"
+    frame_path.write_bytes(b"frame bytes")
+    client, interactions = _client()
+
+    with pytest.raises(ValueError, match="requested entity_id"):
+        client.ground_frame(
+            media=SimpleNamespace(asset_id="sha256:" + "a" * 64),
+            frame=SimpleNamespace(
+                path=str(frame_path),
+                frame_time_ms=0,
+                frame_pts=0,
+                frame_hash=hashlib.sha256(frame_path.read_bytes()).hexdigest(),
+                width=640,
+                height=360,
+            ),
+            event_id="event-generic",
+            event_description="identity-only",
+            entity_id="subject.requested",
+            target_description="the requested instance",
+            prompt_template="Ground {{target_description}}.",
+            run_id="run-wrong-target-reference",
+            output_dir=tmp_path / "wrong-target",
+            identity_references=(
+                GroundingIdentityReference(
+                    reference_id="wrong-target",
+                    role="positive",
+                    target_id="subject.other",
+                    description="another instance",
+                    path=reference_path,
+                    sha256=hashlib.sha256(reference_path.read_bytes()).hexdigest(),
+                ),
+            ),
+        )
+    assert interactions.request is None

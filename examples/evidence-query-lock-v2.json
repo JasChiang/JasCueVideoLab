@@ -1,0 +1,94 @@
+{
+  "contract_version": "evidence-query-lock-v2",
+  "query_id": "query:review-v2-001",
+  "revision": 1,
+  "editorial_goal": "Show the reviewer-selected instance during a directly observable change.",
+  "identity": {
+    "targets": [
+      {
+        "target_id": "subject.primary",
+        "target_description": "the foreground instance selected by the reviewer",
+        "scope": "whole_instance",
+        "parent_target_id": null,
+        "identity_cues": [
+          "matches the persistent outline and visible surface details of the selected instance"
+        ],
+        "context_cues": [
+          "appears near the active participant during the selected event"
+        ],
+        "positive_anchors": [],
+        "stable_exclusions": [
+          "background depiction",
+          "reflection",
+          "another visually similar instance"
+        ],
+        "negative_anchors": []
+      }
+    ]
+  },
+  "predicate": {
+    "predicate_id": "predicate:observable-change-001",
+    "statement": "the selected instance reaches the requested directly visible state",
+    "participant_target_ids": [
+      "subject.primary"
+    ],
+    "required_at": "transition",
+    "phases": {
+      "precondition": "the requested state is not yet visible",
+      "apex": "the observable state change is in progress",
+      "postcondition": "the resulting state is directly visible"
+    },
+    "required_evidence": [
+      "the same selected instance remains identifiable across supplied evidence frames"
+    ],
+    "disqualifying_conditions": [
+      "only a depiction or reflection of the instance is visible"
+    ]
+  },
+  "framing": {
+    "required_target_ids": [
+      "subject.primary"
+    ],
+    "preferred_target_ids": [],
+    "sacrificable_target_ids": [],
+    "overlay_keepout_target_ids": [
+      "subject.primary"
+    ],
+    "framing_intent": "Keep the selected instance recognizable and do not cover it with an overlay.",
+    "editing_uses": [
+      "review",
+      "portrait_reframe"
+    ],
+    "aspect_constraints": [
+      {
+        "aspect_ratio": "9:16",
+        "required_target_ids": [
+          "subject.primary"
+        ],
+        "constraint": "keep the selected instance inside the visible frame",
+        "target_visibility_constraints": [
+          {
+            "target_id": "subject.primary",
+            "minimum_visible_fraction": 1.0,
+            "atomic": false
+          }
+        ],
+        "required_target_clipping_policy": "forbid"
+      }
+    ]
+  },
+  "claim_source": "human_review",
+  "provenance": {
+    "created_at": "2026-07-22T00:00:00Z",
+    "created_by": "reviewer",
+    "source_reference": null,
+    "parent_query_id": null
+  },
+  "approval": {
+    "approved_at": "2026-07-22T00:01:00Z",
+    "approved_by": "reviewer",
+    "approval_source": "human_review",
+    "source_reference": "manual-review:001",
+    "policy_reference": null
+  }
+}
