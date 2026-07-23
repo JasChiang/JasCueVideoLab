@@ -11,7 +11,8 @@
 3. **提出選片建議**：有剪輯 brief 時，AI 依指定主題、功能與片長挑選素材；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。
 4. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
 5. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。
-6. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄與失敗原因。真人看過選片、頭尾與裁切結果並核准後，才適合進一步完成正式剪輯。
+6. **需要時再規劃音樂卡點**：本機先分析音樂的節拍、重音、能量與段落變化；真人確認 BPM、第一個強拍與拍號後，程式才提出畫面事件和音樂 cue 的對齊建議。
+7. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
 
 ```text
 一批毛片
@@ -19,6 +20,7 @@
   → 有 brief 就照需求挑片；沒有 brief 就先提出故事候選
   → 真人確認選片與重要目標
   → 只有需要直式重構或圖卡避讓時才做 bbox／SAM tracking
+  → 有音樂時建立 MusicMap，真人鎖定音樂網格後再提出 CuePlan
   → 輸出可播放的人工審核版
   → 真人修改或核准
 ```
@@ -41,6 +43,9 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 | SAM 2.1（選配） | 以人工或 Gemini bbox 作為 seed，在同一個 shot 內產生 mask 並向前、向後追蹤 | 不理解剪輯 brief，也不應跨切鏡自行延續物件身分 |
 | Identity checkpoint | 在固定預算內挑出追蹤起點／終點、遮擋後重現或幾何異常的 exact frames，再驗證是否仍為鎖定實例 | 不修改 SAM geometry，也不能用未執行的檢查冒充通過 |
 | 本機 crop solver | 根據整段 tracking、required regions 與畫面邊界計算 9:16 安全裁切路徑 | 不自行決定哪個人物或物件最重要 |
+| 本機 MusicMap analyzer | 將音訊解碼成 PCM，提出 beat、accent、energy、section 與 ending-hit 候選 | 不理解歌詞、音樂情緒或剪輯 brief；BPM、第一個 downbeat 與 meter 未經真人核准不可執行 |
+| Gemini semantic music pairing（選配） | 聽取音樂的強弱、張力、留白與收尾感，再把既有 visual event ID 配對既有 music cue ID | 不重新偵測拍點、不輸出精確時間，也不能創造本機 MusicMap 沒有的 cue |
+| VisualSyncMap＋CuePlan | 把畫面的 cut、reveal、action apex、ending pose 等事件，在明確 timing window 內對到已核准的音樂 cue；可把 Gemini 配對當排序加分 | 不會為了卡拍暗中截斷 setup／action／result，也不會直接改寫選片、trim、identity 或 geometry |
 | Pillow | 把 bbox 或 mask 畫回原始影格，產生方便人工檢查的 debug 圖 | 不參與辨識或追蹤 |
 | 本機 HTML／JavaScript review page | 播放事件、候選片段、debug 圖與裁切結果，供真人核准或退回 | 不會因頁面能正常開啟就宣告模型結果正確 |
 | pytest | 驗證 schema contract、時間邊界、座標轉換、cache 與 geometry 規則 | 不取代對真實影片的人工觀看 |
@@ -358,6 +363,85 @@ Gemini 的成片 `pass` 不可覆蓋本機幾何證據。QA validator 會把 req
 主要影片／圖片辨識請求另使用 Interactions API `system_instruction` 建立 evidence-only 邊界：本次媒體與明確 metadata 是唯一證據，禁止以模型記憶、常見名稱、相似外觀或「最可能答案」補完品牌、型號、數字與 UI 文字。Full Clip Card prompt 也要求任一關鍵字元不清楚時改用泛稱並保存 uncertainty。控制 A/B 曾觀察到舊 prompt 以先驗補完一個相似但錯誤的型號；改用 domain-neutral 規則後該欄位在重跑中恢復正確，模型卻又把另一處模糊小字補成畫面不存在的規格。這證明 prompt guardrail 不是 ground truth：單一正確 claim 不代表整張 Clip Card 都正確，衝突與重要文字仍需 exact-frame 驗證及人工核准。
 
 `scripts/verify_clip_card_text.py` 實作不覆蓋原始 Clip Card 的文字驗證：從原片抽多張 exact frames、保存 PTS／hash、裁出文字證據，以 `resolution=high` 分別做 blind transcription，再以明列 `other`／`unreadable` 的候選式請求交叉檢查。方法不一致時輸出 `needs_human_review`；只有人工核准後才能另外產生 reviewed Clip Card。
+
+## 音樂卡點 MVP
+
+音樂卡點採獨立 evidence chain，不讓音樂分析器或 renderer 直接改寫已核准的選片、Identity、Trim 或 geometry：
+
+```text
+本機音樂檔
+  → FFmpeg 解碼單聲道 PCM
+  → MusicMap Proposal：beat／accent／energy／section／ending-hit 候選
+  → 真人核准 BPM、第一個 downbeat、meter
+  → immutable MusicMap Lock
+
+既有 feature-cut render manifest
+  → VisualSyncMap：目前 cut／chapter start／ending pose
+  → 可另外加入經證據確認的 reveal／action apex／UI change
+  → 選配：Gemini 聽音樂並把既有 visual ID 配對既有 cue ID
+  → 全局、順序保持的 CuePlan scheduler
+  → CuePlan Proposal＋HTML 人工審核
+  → 真人核准成 CuePlan Lock
+```
+
+零成本 baseline 全部在本機執行，不呼叫 Gemini。分析器只提出聲學候選，不把 `section_001` 冒充為 verse、chorus 或 drop；human review 之前，beat grid 不具執行權限。`narrative`、`balanced`、`montage` 三種 preset 只改變 section／downbeat／accent／一般 beat 的排序權重，不改變素材語意。
+
+若要減少規則式卡點的機械感，可選擇再執行一次 `gemini-3.6-flash` 音樂語意配對。Gemini 會同時取得音樂、已核准的 MusicMap cue IDs，以及 Clip Card／render manifest 衍生的視覺事件語意；它只能回答「哪個 visual event 適合哪些既有 cue IDs」，不能自己發明秒數。這是每支音樂一次、可由 File API 重用的選配請求，不會對每個鏡頭重送音樂。最終 sample-accurate 位置、合法 timing window、全局順序與 hard gate 仍由本機決定。
+
+```bash
+# 1. 本機分析音樂；輸出 proposal，不會自動核准
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab analyze-music MUSIC.wav \
+  --output-dir artifacts/music-demo
+
+# 2. 真人確認；可覆寫 BPM、第一個 downbeat 與拍號
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab review-music-map \
+  artifacts/music-demo/music-map.proposal.json \
+  --reviewer "human-editor" \
+  --decision approved \
+  --bpm 120 \
+  --first-downbeat-ms 240 \
+  --meter 4 \
+  --output-dir artifacts/music-demo/reviewed
+
+# 3. 從既有成片 manifest 建立視覺事件。預設 flex=0，因此只做唯讀稽核。
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab build-visual-sync-map \
+  FEATURE_OUTPUT/render-manifest.json \
+  --aspect 9:16 \
+  --output artifacts/music-demo/visual-sync-map.json
+
+# 若操作者明確允許 boundary 前後各移動 250 ms，才可另建有 window 的 proposal：
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab build-visual-sync-map \
+  FEATURE_OUTPUT/render-manifest.json \
+  --aspect 9:16 \
+  --default-flex-ms 250 \
+  --output artifacts/music-demo/visual-sync-map.flex-250.json
+
+# 4. 產生全局 CuePlan 與可播放的 HTML review；尚未修改影片
+# 選配：先讓 Gemini 做一次音樂—畫面語意配對
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab plan-semantic-music \
+  MUSIC.wav \
+  artifacts/music-demo/reviewed/music-map.lock.json \
+  artifacts/music-demo/visual-sync-map.flex-250.json \
+  --output-dir artifacts/music-demo/semantic-pairing
+
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab plan-music-cues \
+  artifacts/music-demo/reviewed/music-map.lock.json \
+  artifacts/music-demo/visual-sync-map.flex-250.json \
+  --preset balanced \
+  --semantic-pairing artifacts/music-demo/semantic-pairing/semantic-music-pairing.proposal.json \
+  --music MUSIC.wav \
+  --video FEATURE_OUTPUT/renders/feature-cut-9x16-clean.mp4 \
+  --output-dir artifacts/music-demo/cue-plan
+
+# 5. 真人核准 hash-bound CuePlan
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab review-cue-plan \
+  artifacts/music-demo/cue-plan/cue-plan.proposal.json \
+  --reviewer "human-editor" \
+  --decision approved \
+  --output-dir artifacts/music-demo/cue-plan/reviewed
+```
+
+目前 MVP **只完成卡點分析、排程、稽核與 lock，尚未自動重剪或混音**。這是刻意的 fail-closed 邊界：render manifest 只有既有 segment duration，不能證明把 cut 移動 250 ms 仍保留完整 setup／action／result、合法 source handle、同一 shot、可用構圖與片尾 hold。下一階段必須讓經核准的 Trim Intent 提供 action-safe timing window，通過 geometry preflight 後才可將 CuePlan 套入新的 RenderPlan；不會直接用 `setpts` 變速或裁掉動作來製造「有卡拍」的假象。
 
 ## 重要界線
 

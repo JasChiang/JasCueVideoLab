@@ -18,6 +18,8 @@ from google.genai import types
 from .geometry import native_yxyx_to_canonical_xyxy
 from .identity_checkpoints import IdentityCheckpointModelDecision
 from .media import sha256_file
+from .music import MusicMapLock
+from .music_cues import SemanticMusicPairingProposal, VisualSyncMap
 from .models import (
     ContentMap,
     DirectVideoGroundingProposal,
@@ -2253,4 +2255,165 @@ model_provenance (return it unchanged with interaction_id=null):
                 {"ok": False, "errors": [{"type": type(error).__name__, "message": str(error)}]},
             )
             append_error(run_dir, "feature_edit_plan", error)
+            raise
+
+    def plan_music_semantic_pairing(
+        self,
+        *,
+        music_lock: MusicMapLock,
+        visual_map: VisualSyncMap,
+        visual_sync_map_sha256: str,
+        uploaded_audio: Any,
+        prompt_template: str,
+        run_id: str,
+        run_dir: Path,
+    ) -> SemanticMusicPairingProposal:
+        """Pair audible structure with known edit events without inventing timing."""
+
+        provenance = _provenance(run_id, model_id=self.model_id)
+        prompt = (
+            prompt_template
+            + "\n\n## Immutable MusicMap Lock\n"
+            + json.dumps(
+                {
+                    "music_id": music_lock.music_id,
+                    "music_definition_sha256": music_lock.definition_sha256,
+                    "duration_ms": music_lock.duration_ms,
+                    "bpm": music_lock.bpm,
+                    "meter": music_lock.meter,
+                    "sections": [
+                        section.model_dump(mode="json")
+                        for section in music_lock.sections
+                    ],
+                    "cues": [
+                        cue.model_dump(mode="json") for cue in music_lock.cues
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n\n## Immutable VisualSyncMap\n"
+            + json.dumps(
+                {
+                    "visual_sync_map_sha256": visual_sync_map_sha256,
+                    "project_duration_ms": visual_map.project_duration_ms,
+                    "aspect_ratio": visual_map.aspect_ratio,
+                    "points": [
+                        point.model_dump(mode="json") for point in visual_map.points
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n\nmodel_provenance 必須原樣回傳以下內容"
+            "（interaction_id 先回傳 null）：\n"
+            + provenance.model_dump_json()
+        )
+        request_record = {
+            "model": self.model_id,
+            "system_instruction": EDITORIAL_SYSTEM_INSTRUCTION,
+            "store": False,
+            "input": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "audio",
+                    "uri": uploaded_audio.uri,
+                    "mime_type": uploaded_audio.mime_type,
+                },
+            ],
+            "generation_config": {
+                "thinking_level": "low",
+                "max_output_tokens": 4096,
+            },
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(SemanticMusicPairingProposal),
+            },
+        }
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_json(run_dir / "semantic_music_pairing.request.json", request_record)
+        try:
+            interaction = self.client.interactions.create(**request_record)
+            _record_interaction_attempt(
+                run_dir=run_dir,
+                operation="semantic_music_pairing",
+                canonical_filename="semantic_music_pairing.raw_interaction.json",
+                interaction=interaction,
+            )
+            write_json(
+                run_dir / "semantic_music_pairing.raw_output.json",
+                {"output_text": interaction.output_text},
+            )
+            parsed = SemanticMusicPairingProposal.model_validate_json(
+                interaction.output_text
+            )
+            if (
+                parsed.music_id != music_lock.music_id
+                or parsed.music_definition_sha256
+                != music_lock.definition_sha256
+                or parsed.visual_sync_map_sha256 != visual_sync_map_sha256
+            ):
+                raise GeminiContractError(
+                    "semantic music pairing changed immutable artifact identity"
+                )
+            known_sections = {
+                section.section_id for section in music_lock.sections
+            }
+            known_cues = {cue.cue_id for cue in music_lock.cues}
+            known_visual = {
+                point.visual_event_id for point in visual_map.points
+            }
+            unknown_sections = sorted(
+                {
+                    item.section_id
+                    for item in parsed.section_interpretations
+                    if item.section_id not in known_sections
+                }
+            )
+            unknown_cues = sorted(
+                {
+                    cue_id
+                    for pairing in parsed.pairings
+                    for cue_id in pairing.preferred_cue_ids
+                    if cue_id not in known_cues
+                }
+            )
+            unknown_visual = sorted(
+                {
+                    pairing.visual_event_id
+                    for pairing in parsed.pairings
+                    if pairing.visual_event_id not in known_visual
+                }
+            )
+            if unknown_sections or unknown_cues or unknown_visual:
+                raise GeminiContractError(
+                    "semantic music pairing referenced unknown IDs: "
+                    f"sections={unknown_sections}, cues={unknown_cues}, "
+                    f"visual={unknown_visual}"
+                )
+            final = parsed.model_copy(
+                update={
+                    "model_provenance": parsed.model_provenance.model_copy(
+                        update={"interaction_id": interaction.id}
+                    )
+                }
+            )
+            write_json(run_dir / "semantic-music-pairing.proposal.json", final)
+            write_json(
+                run_dir / "semantic_music_pairing.schema_validation.json",
+                {"ok": True, "errors": []},
+            )
+            return final
+        except Exception as error:
+            write_json(
+                run_dir / "semantic_music_pairing.schema_validation.json",
+                {
+                    "ok": False,
+                    "errors": [
+                        {"type": type(error).__name__, "message": str(error)}
+                    ],
+                },
+            )
+            append_error(run_dir, "semantic_music_pairing", error)
             raise

@@ -26,6 +26,16 @@ from .full_v1 import (
 from .gemini import GeminiLabClient, MODEL_ID
 from .grounding_selection import require_tracking_seed_candidate
 from .media import extract_frame, probe_video, sha256_file
+from .music import MusicMapLock, MusicMapProposal, analyze_music, review_music_map
+from .music_cues import (
+    CuePlanProposal,
+    SemanticMusicPairingProposal,
+    VisualSyncMap,
+    derive_visual_sync_map,
+    plan_music_cues,
+    render_cue_review,
+    review_cue_plan,
+)
 from .models import (
     ContentMap,
     ExtractedFrame,
@@ -647,6 +657,223 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         reuse_feature_plan=args.reuse_feature_plan,
         aspect=args.aspect,
     )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_analyze_music(args: argparse.Namespace) -> int:
+    proposal = analyze_music(args.music)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    proposal_path = args.output_dir / "music-map.proposal.json"
+    write_json(proposal_path, proposal)
+    write_json(
+        args.output_dir / "private-source.json",
+        {
+            "purpose": "local review only; excluded from public methodology artifacts",
+            "path": str(args.music.expanduser().resolve(strict=True)),
+            "sha256": proposal.source_sha256,
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "proposal_path": str(proposal_path.resolve()),
+                "music_id": proposal.music_id,
+                "duration_ms": proposal.duration_ms,
+                "estimated_bpm": proposal.estimated_bpm,
+                "tempo_confidence": proposal.tempo_confidence,
+                "cue_count": len(proposal.cues),
+                "section_count": len(proposal.sections),
+                "requires_human_review": True,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def command_review_music_map(args: argparse.Namespace) -> int:
+    proposal = MusicMapProposal.model_validate(read_json(args.proposal_json))
+    first_downbeat_sample = (
+        round(args.first_downbeat_ms * proposal.master_sample_rate / 1000)
+        if args.first_downbeat_ms is not None
+        else None
+    )
+    review, lock = review_music_map(
+        proposal,
+        proposal_path=args.proposal_json,
+        reviewer=args.reviewer,
+        decision=args.decision,
+        notes=args.notes,
+        bpm=args.bpm,
+        first_downbeat_sample=first_downbeat_sample,
+        meter=args.meter,
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    review_path = args.output_dir / "music-map.review.json"
+    write_json(review_path, review)
+    result: dict[str, object] = {
+        "review_path": str(review_path.resolve()),
+        "decision": review.decision,
+        "lock_path": None,
+    }
+    if lock is not None:
+        lock_path = args.output_dir / "music-map.lock.json"
+        write_json(lock_path, lock)
+        result["lock_path"] = str(lock_path.resolve())
+        result["locked_bpm"] = lock.bpm
+        result["locked_meter"] = lock.meter
+        result["locked_cue_count"] = len(lock.cues)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_build_visual_sync_map(args: argparse.Namespace) -> int:
+    visual_map = derive_visual_sync_map(
+        args.render_manifest,
+        aspect_ratio=args.aspect,
+        default_flex_ms=args.default_flex_ms,
+    )
+    write_json(args.output, visual_map)
+    print(
+        json.dumps(
+            {
+                "visual_sync_map_path": str(args.output.resolve()),
+                "aspect_ratio": visual_map.aspect_ratio,
+                "project_duration_ms": visual_map.project_duration_ms,
+                "point_count": len(visual_map.points),
+                "flexibility_authorization": visual_map.flexibility_authorization,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def command_plan_semantic_music(args: argparse.Namespace) -> int:
+    music_lock = MusicMapLock.model_validate(read_json(args.music_lock))
+    visual_map = VisualSyncMap.model_validate(read_json(args.visual_sync_map))
+    music_source = args.music.expanduser().resolve(strict=True)
+    if sha256_file(music_source) != music_lock.music_id.removeprefix("sha256:"):
+        raise ValueError("music file does not match the approved MusicMap lock")
+    visual_digest = sha256_file(args.visual_sync_map.expanduser().resolve(strict=True))
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    client = GeminiLabClient()
+    try:
+        uploaded, reused = client.ensure_video_upload(
+            music_source,
+            args.output_dir / "upload",
+            force_reupload=args.force_reupload,
+        )
+        proposal = client.plan_music_semantic_pairing(
+            music_lock=music_lock,
+            visual_map=visual_map,
+            visual_sync_map_sha256=visual_digest,
+            uploaded_audio=uploaded,
+            prompt_template=_load_prompt("music_semantic_pairing_zh-TW.txt"),
+            run_id=f"music-semantic-{uuid.uuid4().hex[:12]}",
+            run_dir=args.output_dir,
+        )
+    finally:
+        client.close()
+    pricing = summarize_usage_and_list_price(args.output_dir)
+    write_json(args.output_dir / "pricing.json", pricing)
+    print(
+        json.dumps(
+            {
+                "proposal_path": str(
+                    (args.output_dir / "semantic-music-pairing.proposal.json").resolve()
+                ),
+                "model": MODEL_ID,
+                "file_api_reused": reused,
+                "section_interpretation_count": len(
+                    proposal.section_interpretations
+                ),
+                "pairing_count": len(proposal.pairings),
+                "pricing": pricing,
+                "requires_human_review": True,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def command_plan_music_cues(args: argparse.Namespace) -> int:
+    music_lock = MusicMapLock.model_validate(read_json(args.music_lock))
+    visual_map = VisualSyncMap.model_validate(read_json(args.visual_sync_map))
+    semantic_pairing = (
+        SemanticMusicPairingProposal.model_validate(read_json(args.semantic_pairing))
+        if args.semantic_pairing is not None
+        else None
+    )
+    plan = plan_music_cues(
+        music_lock,
+        visual_map,
+        music_lock_path=args.music_lock,
+        visual_sync_map_path=args.visual_sync_map,
+        preset=args.preset,
+        semantic_pairing=semantic_pairing,
+        semantic_pairing_path=args.semantic_pairing,
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = args.output_dir / "cue-plan.proposal.json"
+    write_json(plan_path, plan)
+    review_path: Path | None = None
+    if args.music is not None:
+        if sha256_file(args.music.expanduser().resolve(strict=True)) != music_lock.music_id.removeprefix(
+            "sha256:"
+        ):
+            raise ValueError("review music file does not match the locked MusicMap")
+        review_path = render_cue_review(
+            music_path=args.music,
+            video_path=args.video,
+            visual_map=visual_map,
+            plan=plan,
+            output_path=args.output_dir / "cue-review.html",
+        )
+    print(
+        json.dumps(
+            {
+                "cue_plan_path": str(plan_path.resolve()),
+                "review_path": str(review_path) if review_path else None,
+                "aligned_count": plan.aligned_count,
+                "unmatched_count": plan.unmatched_count,
+                "hard_unmatched_count": plan.hard_unmatched_count,
+                "changes_applied": False,
+                "requires_human_review": True,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def command_review_cue_plan(args: argparse.Namespace) -> int:
+    plan = CuePlanProposal.model_validate(read_json(args.cue_plan))
+    review, lock = review_cue_plan(
+        plan,
+        cue_plan_path=args.cue_plan,
+        reviewer=args.reviewer,
+        decision=args.decision,
+        notes=args.notes,
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    review_path = args.output_dir / "cue-plan.review.json"
+    write_json(review_path, review)
+    result: dict[str, object] = {
+        "review_path": str(review_path.resolve()),
+        "decision": review.decision,
+        "lock_path": None,
+    }
+    if lock is not None:
+        lock_path = args.output_dir / "cue-plan.lock.json"
+        write_json(lock_path, lock)
+        result["lock_path"] = str(lock_path.resolve())
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -1777,6 +2004,129 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feature_cut_parser.add_argument("--output-dir", type=Path, required=True)
     feature_cut_parser.set_defaults(handler=command_feature_cut)
+
+    analyze_music_parser = subparsers.add_parser(
+        "analyze-music",
+        help=(
+            "Analyze a local music track into a review-required beat, accent, "
+            "energy, and section proposal without Gemini"
+        ),
+    )
+    analyze_music_parser.add_argument("music", type=Path)
+    analyze_music_parser.add_argument("--output-dir", type=Path, required=True)
+    analyze_music_parser.set_defaults(handler=command_analyze_music)
+
+    review_music_parser = subparsers.add_parser(
+        "review-music-map",
+        help="Approve or reject a MusicMap proposal and create an immutable lock",
+    )
+    review_music_parser.add_argument("proposal_json", type=Path)
+    review_music_parser.add_argument("--reviewer", required=True)
+    review_music_parser.add_argument(
+        "--decision", choices=["approved", "rejected"], required=True
+    )
+    review_music_parser.add_argument("--notes", default="")
+    review_music_parser.add_argument("--bpm", type=float)
+    review_music_parser.add_argument(
+        "--first-downbeat-ms",
+        type=int,
+        help=(
+            "Reviewed first downbeat on the music timeline. If omitted on approval, "
+            "the analyzer proposal is used."
+        ),
+    )
+    review_music_parser.add_argument("--meter", type=int)
+    review_music_parser.add_argument("--output-dir", type=Path, required=True)
+    review_music_parser.set_defaults(handler=command_review_music_map)
+
+    visual_sync_parser = subparsers.add_parser(
+        "build-visual-sync-map",
+        help=(
+            "Derive chapter-boundary visual sync points from a rendered feature-cut "
+            "manifest; no source trim is changed"
+        ),
+    )
+    visual_sync_parser.add_argument("render_manifest", type=Path)
+    visual_sync_parser.add_argument(
+        "--aspect", choices=["16:9", "9:16"], required=True
+    )
+    visual_sync_parser.add_argument(
+        "--default-flex-ms",
+        type=int,
+        default=0,
+        help=(
+            "Explicitly authorize this much timing movement around derived boundaries. "
+            "Default 0 keeps the map read-only."
+        ),
+    )
+    visual_sync_parser.add_argument("--output", type=Path, required=True)
+    visual_sync_parser.set_defaults(handler=command_build_visual_sync_map)
+
+    semantic_music_parser = subparsers.add_parser(
+        "plan-semantic-music",
+        help=(
+            "Optionally let Gemini interpret one music track and pair locked cue IDs "
+            "with existing visual event IDs; exact timing remains local"
+        ),
+    )
+    semantic_music_parser.add_argument("music", type=Path)
+    semantic_music_parser.add_argument("music_lock", type=Path)
+    semantic_music_parser.add_argument("visual_sync_map", type=Path)
+    semantic_music_parser.add_argument(
+        "--force-reupload",
+        action="store_true",
+        help="Ignore an ACTIVE saved File API object and upload the music again",
+    )
+    semantic_music_parser.add_argument("--output-dir", type=Path, required=True)
+    semantic_music_parser.set_defaults(handler=command_plan_semantic_music)
+
+    cue_plan_parser = subparsers.add_parser(
+        "plan-music-cues",
+        help=(
+            "Globally align approved visual sync points to an approved MusicMap; "
+            "the output is a review proposal and does not edit media"
+        ),
+    )
+    cue_plan_parser.add_argument("music_lock", type=Path)
+    cue_plan_parser.add_argument("visual_sync_map", type=Path)
+    cue_plan_parser.add_argument(
+        "--preset",
+        choices=["narrative", "balanced", "montage"],
+        default="balanced",
+    )
+    cue_plan_parser.add_argument(
+        "--semantic-pairing",
+        type=Path,
+        help=(
+            "Optional Gemini semantic pairing proposal. It only adds ranking "
+            "preferences; local timing windows and global ordering remain authoritative."
+        ),
+    )
+    cue_plan_parser.add_argument(
+        "--music",
+        type=Path,
+        help="Matching local music file used only to build the HTML review player",
+    )
+    cue_plan_parser.add_argument(
+        "--video",
+        type=Path,
+        help="Optional rendered picture edit used only in the HTML review player",
+    )
+    cue_plan_parser.add_argument("--output-dir", type=Path, required=True)
+    cue_plan_parser.set_defaults(handler=command_plan_music_cues)
+
+    cue_review_parser = subparsers.add_parser(
+        "review-cue-plan",
+        help="Approve or reject a hash-bound CuePlan proposal",
+    )
+    cue_review_parser.add_argument("cue_plan", type=Path)
+    cue_review_parser.add_argument("--reviewer", required=True)
+    cue_review_parser.add_argument(
+        "--decision", choices=["approved", "rejected"], required=True
+    )
+    cue_review_parser.add_argument("--notes", default="")
+    cue_review_parser.add_argument("--output-dir", type=Path, required=True)
+    cue_review_parser.set_defaults(handler=command_review_cue_plan)
 
     full_clip_parser = subparsers.add_parser(
         "full-clip",
