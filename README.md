@@ -2,6 +2,31 @@
 
 這是一個**完全獨立、實驗性**的 Gemini 3.6 Flash 影片理解與單幀 Grounding 驗證專案。它不是 JasCue 正式產品，不引用也不修改任何 JasCue 程式碼；實驗未通過前，不應將這裡的程式合併回 JasCue。
 
+## 一般人也看得懂的工作流程
+
+假設手上有一整批還沒整理的拍攝毛片，這套實驗流程會先幫忙「看帶、整理、提出剪輯建議」，而不是一開始就直接把影片自動剪完：
+
+1. **整理素材**：程式先讀取每支影片的長度、尺寸與切鏡等基本資訊，並建立較輕量的分析版本，不必反覆處理原始 4K 檔案。
+2. **AI 看帶**：Gemini 逐支理解影片，整理成可重用的 Clip Card，記錄拍到了什麼、有哪些人物或物件、動作是否完整，以及可能適合放在哪一段。
+3. **提出選片建議**：有剪輯 brief 時，AI 依指定主題、功能與片長挑選素材；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。
+4. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
+5. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。
+6. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄與失敗原因。真人看過選片、頭尾與裁切結果並核准後，才適合進一步完成正式剪輯。
+
+```text
+一批毛片
+  → AI 看帶並建立 Clip Cards
+  → 有 brief 就照需求挑片；沒有 brief 就先提出故事候選
+  → 真人確認選片與重要目標
+  → 只有需要直式重構或圖卡避讓時才做 bbox／SAM tracking
+  → 輸出可播放的人工審核版
+  → 真人修改或核准
+```
+
+Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主題、長度或比例時，可以先查既有資料，只重新分析真正入選且需要精確畫面座標的片段。AI 的選片、時間、bbox、mask 與 confidence 都只是待審建議，不會因為 schema 合法就自動成為正式剪輯資料。
+
+### 技術上的對應
+
 最新方法採用「先鎖定證據，再驗證 geometry」：未指定 target 時先提出候選，使用者先審核 `EvidenceQueryProposalV2`，再明確核准成不可變的 `EvidenceQueryLockV2`。V2 把持續物件身分（Identity）、只在特定時刻成立的動作／狀態（Predicate）與構圖義務（Framing）分成三份 contract 與 hash；時間 refinement、單幀 bbox、SAM seed 與 layout 因此可各自重用正確層級的證據。自動直式構圖則在一份 planner response 內保留 Top-K 素材候選，只有實際嘗試的候選才由具名自動政策建立 QueryLock 並進入 exact-frame geometry preflight。完整說明見 [METHODOLOGY.md](METHODOLOGY.md)，毛片 coarse-to-fine 全量流程見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)。Gemini polygon 與 bbox seed 的舊 A/B 僅保留為唯讀歷史資料；目前支援路徑只使用 Gemini／人工 bbox → SAM。
 
 ## 這個專案要驗證什麼
