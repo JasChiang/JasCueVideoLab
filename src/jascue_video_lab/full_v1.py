@@ -23,7 +23,12 @@ from .grounding_selection import (
     require_grounding_request_match,
     require_tracking_seed_candidate,
 )
-from .identity_checkpoints import plan_identity_checkpoints
+from .identity_checkpoints import (
+    IdentityCheckpointExecution,
+    IdentityCheckpointPlan,
+    execute_identity_checkpoints,
+    plan_identity_checkpoints,
+)
 from .media import create_analysis_proxy, extract_frame, has_audio_stream, probe_video, sha256_file
 from .models import (
     ClipShotCatalog,
@@ -37,6 +42,7 @@ from .models import (
     EvidenceQueryLockV2,
     EvidenceQueryTargetRef,
     EvidenceTargetIdentityV2,
+    ExtractedFrame,
     FullClipCard,
     FullClipEvent,
     FeatureEditPlan,
@@ -1565,6 +1571,92 @@ def run_query_predicate_refinement(
     return result
 
 
+def _identity_checkpoint_frames(
+    *,
+    track_dir: Path,
+    plan: IdentityCheckpointPlan,
+) -> dict[int, ExtractedFrame]:
+    frames: dict[int, ExtractedFrame] = {}
+    for candidate in plan.candidates:
+        if not candidate.selected_for_verification:
+            continue
+        if candidate.source_pts is None:
+            raise ValueError(
+                "semantic identity checkpoints require decoded source PTS"
+            )
+        path = track_dir / "analysis-frames" / f"{candidate.sample_index:06d}.jpg"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"missing SAM analysis frame for checkpoint: {path}"
+            )
+        with Image.open(path) as image:
+            width, height = image.size
+        frames[candidate.sample_index] = ExtractedFrame(
+            path=str(path.resolve()),
+            requested_time_ms=candidate.analysis_sample_time_ms,
+            frame_time_ms=candidate.analysis_sample_time_ms,
+            frame_pts=candidate.source_pts,
+            frame_hash=sha256_file(path),
+            width=width,
+            height=height,
+        )
+    return frames
+
+
+def _seed_identity_reference(
+    *,
+    frame: ExtractedFrame,
+    box_2d: list[int],
+    target_id: str,
+    target_description: str,
+    output_path: Path,
+) -> GroundingIdentityReference:
+    x_min, y_min, x_max, y_max = box_2d
+    with Image.open(frame.path).convert("RGB") as image:
+        crop_box = (
+            max(0, round(x_min * image.width / 1000)),
+            max(0, round(y_min * image.height / 1000)),
+            min(image.width, round(x_max * image.width / 1000)),
+            min(image.height, round(y_max * image.height / 1000)),
+        )
+        if crop_box[0] >= crop_box[2] or crop_box[1] >= crop_box[3]:
+            raise ValueError("semantic seed crop is empty")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        image.crop(crop_box).save(output_path)
+    return GroundingIdentityReference(
+        reference_id="grounded-seed-positive",
+        role="positive",
+        target_id=target_id,
+        description=(
+            "The exact-frame Grounding seed for the locked target identity: "
+            + target_description
+        ),
+        path=output_path,
+        sha256=sha256_file(output_path),
+    )
+
+
+def _is_fatal_identity_verifier_error(error: Exception) -> bool:
+    message = str(error).casefold()
+    status_values = (
+        getattr(error, "status_code", None),
+        getattr(error, "code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    )
+    return any(str(value).strip() == "429" for value in status_values) or any(
+        marker in message
+        for marker in (
+            "resource_exhausted",
+            "resource exhausted",
+            "quota exceeded",
+            "rate limit exceeded",
+            "too many requests",
+            "spending cap",
+            "monthly spend",
+        )
+    )
+
+
 def run_full_event_geometry(
     clip_run_dir: Path,
     event_id: str,
@@ -1981,6 +2073,10 @@ def run_full_event_geometry(
     selected_seed = None
     track_path: Path | None = None
     identity_checkpoint_plan_path: Path | None = None
+    identity_checkpoint_execution_path: Path | None = None
+    identity_checkpoint_execution: IdentityCheckpointExecution | None = None
+    identity_checkpoint_execution_reused = False
+    identity_execution_interactions: list[Path] = []
     if checkpoint_path is not None:
         if not proposal.visible or not proposal.candidates:
             raise ValueError(f"Gemini Grounding target is not visible for {event_id}")
@@ -2138,9 +2234,142 @@ def run_full_event_geometry(
                 "path": str(identity_checkpoint_plan_path.resolve()),
             },
         )
+        checkpoint_frames = _identity_checkpoint_frames(
+            track_dir=track_dir,
+            plan=identity_plan,
+        )
+        verifier_id = f"{MODEL_ID}:interactions:semantic-identity-medium:v1"
+        execution_pointer_path = (
+            track_dir / "identity-checkpoint-execution.current.json"
+        )
+        if execution_pointer_path.exists():
+            execution_pointer = read_json(execution_pointer_path)
+            candidate_path = Path(str(execution_pointer["path"]))
+            if candidate_path.is_file():
+                cached_execution = IdentityCheckpointExecution.model_validate(
+                    read_json(candidate_path)
+                )
+                current_hashes = {
+                    index: exact_frame.frame_hash
+                    for index, exact_frame in checkpoint_frames.items()
+                }
+                cached_hashes = {
+                    result.sample_index: result.frame_hash
+                    for result in cached_execution.results
+                }
+                if (
+                    cached_execution.planning_request_sha256
+                    == identity_plan.planning_request_sha256
+                    and cached_execution.track_fingerprint
+                    == identity_plan.track_fingerprint
+                    and cached_execution.identity_sha256
+                    == identity_plan.identity_sha256
+                    and cached_execution.verifier_id == verifier_id
+                    and cached_hashes == current_hashes
+                ):
+                    identity_checkpoint_execution = cached_execution
+                    identity_checkpoint_execution_path = candidate_path
+                    identity_checkpoint_execution_reused = True
+
+        if identity_checkpoint_execution is None:
+            verification_references = identity_references
+            if selected_seed is not None:
+                seed_reference = _seed_identity_reference(
+                    frame=frame,
+                    box_2d=list(selected_seed.candidate.box_2d),
+                    target_id=str(target_entity_id),
+                    target_description=str(target_description),
+                    output_path=(
+                        track_dir
+                        / "identity-checkpoint-references"
+                        / "grounded-seed-positive.png"
+                    ),
+                )
+                verification_references = (
+                    seed_reference,
+                    *identity_references[:3],
+                )
+
+            if identity_plan.selected_count == 0:
+                def unexpected_zero_budget_verifier(_candidate, _frame):
+                    raise AssertionError("zero-budget verifier must not be called")
+
+                identity_checkpoint_execution = execute_identity_checkpoints(
+                    identity_plan,
+                    frames_by_sample_index=checkpoint_frames,
+                    verifier=unexpected_zero_budget_verifier,
+                    verifier_id=verifier_id,
+                )
+            else:
+                checkpoint_client = GeminiLabClient()
+                try:
+                    def verify_checkpoint(candidate, exact_frame):
+                        checkpoint_dir = (
+                            track_dir
+                            / "identity-checkpoints"
+                            / f"sample-{candidate.sample_index:06d}"
+                        )
+                        try:
+                            return checkpoint_client.verify_identity_checkpoint(
+                                frame=exact_frame,
+                                target_id=str(target_entity_id),
+                                target_description=str(target_description),
+                                run_id=(
+                                    "identity-checkpoint-"
+                                    + uuid.uuid4().hex[:8]
+                                ),
+                                output_dir=checkpoint_dir,
+                                identity_references=verification_references,
+                            )
+                        finally:
+                            interaction_path = (
+                                checkpoint_dir
+                                / "identity_checkpoint.raw_interaction.json"
+                            )
+                            if interaction_path.exists():
+                                identity_execution_interactions.append(
+                                    interaction_path
+                                )
+
+                    identity_checkpoint_execution = execute_identity_checkpoints(
+                        identity_plan,
+                        frames_by_sample_index=checkpoint_frames,
+                        verifier=verify_checkpoint,
+                        verifier_id=verifier_id,
+                        abort_on_error=_is_fatal_identity_verifier_error,
+                    )
+                finally:
+                    checkpoint_client.close()
+            identity_checkpoint_execution_path = (
+                track_dir
+                / "identity-checkpoint-executions"
+                / (
+                    "execution-"
+                    f"{identity_checkpoint_execution.execution_request_sha256[:16]}.json"
+                )
+            )
+            write_json(
+                identity_checkpoint_execution_path,
+                identity_checkpoint_execution,
+            )
+            write_json(
+                execution_pointer_path,
+                {
+                    "artifact_type": "identity_checkpoint_execution_pointer_v1",
+                    "execution_request_sha256": (
+                        identity_checkpoint_execution.execution_request_sha256
+                    ),
+                    "path": str(identity_checkpoint_execution_path.resolve()),
+                },
+            )
     pricing = summarize_usage_and_list_price(geometry_dir)
     execution_pricing = summarize_usage_files(
-        [grounding_dir / "grounding.raw_interaction.json"] if not grounding_reused else [],
+        (
+            [grounding_dir / "grounding.raw_interaction.json"]
+            if not grounding_reused
+            else []
+        )
+        + identity_execution_interactions,
         relative_to=geometry_dir,
     )
     result = {
@@ -2207,7 +2436,27 @@ def run_full_event_geometry(
             if identity_checkpoint_plan_path is not None
             else None
         ),
-        "identity_checkpoint_model_calls_made": 0,
+        "identity_checkpoint_execution_path": (
+            str(identity_checkpoint_execution_path.resolve())
+            if identity_checkpoint_execution_path is not None
+            else None
+        ),
+        "identity_checkpoint_status": (
+            identity_checkpoint_execution.semantic_checkpoint_status
+            if identity_checkpoint_execution is not None
+            else None
+        ),
+        "identity_checkpoint_execution_reused": (
+            identity_checkpoint_execution_reused
+        ),
+        "identity_checkpoint_model_calls_made": (
+            identity_checkpoint_execution.model_calls_made
+            if identity_checkpoint_execution is not None
+            else 0
+        ),
+        "identity_checkpoint_new_model_calls_made": len(
+            identity_execution_interactions
+        ),
         "pricing": pricing,
         "execution_pricing": execution_pricing,
     }

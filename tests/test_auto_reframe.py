@@ -6,6 +6,7 @@ from jascue_video_lab.auto_reframe import (
     FailureCode,
     RecoveryAction,
     RegionAssessment,
+    SemanticCheckpointStatus,
     audit_auto_bounded_clip,
     choose_recovery,
     failure_codes_for_preflight,
@@ -24,7 +25,7 @@ def preflight(*, rank: int = 1, soft_visible: float = 0.8) -> CandidatePreflight
         semantic_status="matched",
         tracking_confidence_gate_passed=True,
         tracking_coverage_passed=True,
-        semantic_checkpoints_passed=True,
+        semantic_checkpoint_status=SemanticCheckpointStatus.PASSED,
         regions=[
             RegionAssessment(
                 region_id="core",
@@ -107,3 +108,42 @@ def test_ranked_candidates_put_geometry_pass_before_model_rank() -> None:
     ranked = rank_preflights([first, second], AutoReframePolicy())
 
     assert [item.candidate_id for item in ranked] == ["candidate-2", "candidate-1"]
+
+
+def test_tracked_crop_without_completed_identity_verification_fails_closed() -> None:
+    candidate = preflight().model_copy(
+        update={
+            "semantic_checkpoint_status": (
+                SemanticCheckpointStatus.REQUIRED_PENDING
+            )
+        }
+    )
+
+    failures = failure_codes_for_preflight(candidate, AutoReframePolicy())
+
+    assert FailureCode.IDENTITY_VERIFICATION_PENDING in failures
+    assert FailureCode.IDENTITY_SWITCH_DETECTED not in failures
+
+
+def test_ambiguous_identity_is_not_misreported_as_a_confirmed_switch() -> None:
+    candidate = preflight().model_copy(
+        update={"semantic_checkpoint_status": SemanticCheckpointStatus.AMBIGUOUS}
+    )
+
+    failures = failure_codes_for_preflight(candidate, AutoReframePolicy())
+
+    assert FailureCode.IDENTITY_VERIFICATION_AMBIGUOUS in failures
+    assert FailureCode.IDENTITY_SWITCH_DETECTED not in failures
+
+
+def test_static_presentation_can_explicitly_record_not_required() -> None:
+    candidate = preflight().model_copy(
+        update={
+            "presentation": "static_anchor",
+            "semantic_checkpoint_status": (
+                SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY
+            ),
+        }
+    )
+
+    assert failure_codes_for_preflight(candidate, AutoReframePolicy()) == []

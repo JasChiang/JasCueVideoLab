@@ -28,6 +28,8 @@ class FailureCode(StrEnum):
     TARGET_AMBIGUITY_ABOVE_MAXIMUM = "target_ambiguity_above_maximum"
     TRACK_CONFIDENCE_BELOW_MINIMUM = "track_confidence_below_minimum"
     TRACK_COVERAGE_BELOW_MINIMUM = "track_coverage_below_minimum"
+    IDENTITY_VERIFICATION_PENDING = "identity_verification_pending"
+    IDENTITY_VERIFICATION_AMBIGUOUS = "identity_verification_ambiguous"
     IDENTITY_SWITCH_DETECTED = "identity_switch_detected"
     HARD_CORE_NOT_FULLY_RETAINED = "hard_core_not_fully_retained"
     ATOMIC_REGION_CLIPPED = "atomic_region_clipped"
@@ -48,6 +50,21 @@ class RecoveryAction(StrEnum):
     TRY_NEXT_CANDIDATE = "try_next_candidate"
     FIT_WITH_BACKGROUND = "fit_with_background"
     REVIEW_REQUIRED = "review_required"
+
+
+class SemanticCheckpointStatus(StrEnum):
+    """Auditable semantic verification state for a propagated track.
+
+    Geometry propagation does not establish semantic identity.  The explicit
+    ``required_pending`` value prevents a missing verifier result from being
+    silently interpreted as success.
+    """
+
+    NOT_REQUIRED_BY_POLICY = "not_required_by_policy"
+    REQUIRED_PENDING = "required_pending"
+    PASSED = "passed"
+    FAILED = "failed"
+    AMBIGUOUS = "ambiguous"
 
 
 class RegionAssessment(StrictModel):
@@ -91,7 +108,7 @@ class CandidatePreflight(StrictModel):
     ]
     tracking_confidence_gate_passed: bool
     tracking_coverage_passed: bool
-    semantic_checkpoints_passed: bool | None = None
+    semantic_checkpoint_status: SemanticCheckpointStatus
     regions: list[RegionAssessment] = Field(default_factory=list)
     max_crop_speed_pixels_per_second: float = Field(default=0.0, ge=0.0)
     max_crop_acceleration_pixels_per_second_squared: float = Field(
@@ -129,7 +146,7 @@ class AutoReframePolicy(StrictModel):
     max_crop_jerk_pixels_per_second_cubed: float = Field(
         default=7200.0, gt=0.0
     )
-    require_semantic_checkpoints: bool = False
+    require_semantic_checkpoints_for_tracked_crop: bool = True
     # A center crop is not safe merely because it is deterministic.  Automatic
     # routing may only use it when a caller explicitly opts in *and* supplies
     # the same region/track preflight as any other presentation.
@@ -194,13 +211,22 @@ def failure_codes_for_preflight(
         failures.append(FailureCode.TRACK_CONFIDENCE_BELOW_MINIMUM)
     if not preflight.tracking_coverage_passed:
         failures.append(FailureCode.TRACK_COVERAGE_BELOW_MINIMUM)
-    if preflight.semantic_checkpoints_passed is False:
+    checkpoint_status = preflight.semantic_checkpoint_status
+    checkpoint_required = (
+        policy.require_semantic_checkpoints_for_tracked_crop
+        and preflight.presentation == "tracked_crop"
+    )
+    if checkpoint_status == SemanticCheckpointStatus.FAILED:
         failures.append(FailureCode.IDENTITY_SWITCH_DETECTED)
+    elif checkpoint_status == SemanticCheckpointStatus.AMBIGUOUS:
+        failures.append(FailureCode.IDENTITY_VERIFICATION_AMBIGUOUS)
+    elif checkpoint_status == SemanticCheckpointStatus.REQUIRED_PENDING:
+        failures.append(FailureCode.IDENTITY_VERIFICATION_PENDING)
     elif (
-        policy.require_semantic_checkpoints
-        and preflight.semantic_checkpoints_passed is not True
+        checkpoint_required
+        and checkpoint_status != SemanticCheckpointStatus.PASSED
     ):
-        failures.append(FailureCode.IDENTITY_SWITCH_DETECTED)
+        failures.append(FailureCode.IDENTITY_VERIFICATION_PENDING)
     for region in preflight.regions:
         if not region.assessed:
             if region.role == "hard_core" or region.atomic:
@@ -309,6 +335,8 @@ def choose_recovery(
         FailureCode.SEMANTIC_MATCH_BELOW_MINIMUM,
         FailureCode.TARGET_AMBIGUITY_ABOVE_MAXIMUM,
         FailureCode.IDENTITY_SWITCH_DETECTED,
+        FailureCode.IDENTITY_VERIFICATION_PENDING,
+        FailureCode.IDENTITY_VERIFICATION_AMBIGUOUS,
         FailureCode.SOURCE_LINEAGE_INVALID,
     }:
         return RecoveryAction.REVIEW_REQUIRED

@@ -20,6 +20,7 @@ from .auto_reframe import (
     CandidatePreflight,
     FailureCode,
     RegionAssessment,
+    SemanticCheckpointStatus,
     audit_auto_bounded_clip,
     choose_recovery,
 )
@@ -4472,7 +4473,11 @@ def _vertical_candidate_preflight(
             geometry.get("tracking_confidence_gate_passed", True)
         ),
         tracking_coverage_passed=bool(geometry.get("coverage_passed", True)),
-        semantic_checkpoints_passed=None,
+        semantic_checkpoint_status=(
+            SemanticCheckpointStatus.REQUIRED_PENDING
+            if geometry.get("applied_strategy") == "tracked_crop"
+            else SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY
+        ),
         regions=assessed_regions,
         max_crop_speed_pixels_per_second=float(
             geometry.get("max_crop_speed_pixels_per_second", 0.0)

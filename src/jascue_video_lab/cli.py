@@ -53,6 +53,7 @@ from .sam_tracking import (
 )
 from .shots import detect_shots_ffmpeg
 from .storage import append_error, read_json, write_json
+from .temporal_risk import scan_temporal_risk_windows
 from .timeline import render_direct_moment_timeline, render_temporal_timeline, render_timeline
 from .tracking import track_bbox_csrt
 from .trim_intent import review_trim_decision, run_trim_intent_event
@@ -550,6 +551,32 @@ def command_compare_trackers(args: argparse.Namespace) -> int:
 def command_detect_shots(args: argparse.Namespace) -> int:
     result = detect_shots_ffmpeg(
         args.video, threshold=args.threshold, output_path=args.output
+    )
+    print(result.model_dump_json(indent=2))
+    return 0
+
+
+def command_scan_temporal_risk(args: argparse.Namespace) -> int:
+    media = probe_video(args.video)
+    shot_manifest = (
+        detect_shots_ffmpeg(args.video, threshold=args.shot_threshold)
+        if args.use_shot_boundaries
+        else None
+    )
+    result = scan_temporal_risk_windows(
+        args.video,
+        duration_ms=media.duration_ms,
+        sampling_fps=args.sampling_fps,
+        analysis_width=args.analysis_width,
+        analysis_height=args.analysis_height,
+        mean_delta_threshold=args.mean_delta_threshold,
+        changed_fraction_threshold=args.changed_fraction_threshold,
+        pixel_delta_threshold=args.pixel_delta_threshold,
+        include_shot_boundaries=args.include_shot_boundaries,
+        padding_ms=args.padding_ms,
+        merge_gap_ms=args.merge_gap_ms,
+        shot_manifest=shot_manifest,
+        output_path=args.output,
     )
     print(result.model_dump_json(indent=2))
     return 0
@@ -1644,6 +1671,39 @@ def build_parser() -> argparse.ArgumentParser:
     shot_parser.add_argument("--output", type=Path, required=True)
     shot_parser.set_defaults(handler=command_detect_shots)
 
+    risk_parser = subparsers.add_parser(
+        "scan-temporal-risk",
+        help=(
+            "Find recall-only local visual-change windows independently of "
+            "Gemini Clip Card events"
+        ),
+    )
+    risk_parser.add_argument("video", type=Path)
+    risk_parser.add_argument("--sampling-fps", type=float, default=4.0)
+    risk_parser.add_argument("--analysis-width", type=int, default=256)
+    risk_parser.add_argument("--analysis-height", type=int, default=256)
+    risk_parser.add_argument("--mean-delta-threshold", type=float, default=0.04)
+    risk_parser.add_argument(
+        "--changed-fraction-threshold", type=float, default=0.08
+    )
+    risk_parser.add_argument("--pixel-delta-threshold", type=int, default=20)
+    risk_parser.add_argument("--padding-ms", type=int, default=500)
+    risk_parser.add_argument("--merge-gap-ms", type=int, default=500)
+    risk_parser.add_argument(
+        "--use-shot-boundaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run FFmpeg scdet so known cuts can be excluded from transient windows",
+    )
+    risk_parser.add_argument("--shot-threshold", type=float, default=4.0)
+    risk_parser.add_argument(
+        "--include-shot-boundaries",
+        action="store_true",
+        help="Include known shot-boundary changes in the recall windows",
+    )
+    risk_parser.add_argument("--output", type=Path, required=True)
+    risk_parser.set_defaults(handler=command_scan_temporal_risk)
+
     catalog_parser = subparsers.add_parser(
         "catalog-rushes", help="Build a labeled immutable-frame-ID catalog reel from rushes"
     )
@@ -1907,8 +1967,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help=(
-            "Plan at most this many risk-triggered semantic revalidation frames (0..8). "
-            "Planning is local and makes no model calls."
+            "Verify at most this many risk-triggered exact frames (0..8). "
+            "Planning is local; each selected frame may make one Gemini image call."
         ),
     )
     full_ground_parser.set_defaults(handler=command_full_ground_event)

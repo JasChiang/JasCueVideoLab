@@ -15,6 +15,7 @@ from jascue_video_lab.gemini import (
     EDITORIAL_SYSTEM_INSTRUCTION,
     GroundingIdentityReference,
     MODEL_ID,
+    SEMANTIC_IDENTITY_GENERATION_CONFIG,
     VISUAL_EVIDENCE_SYSTEM_INSTRUCTION,
     GeminiLabClient,
 )
@@ -428,3 +429,60 @@ def test_ground_frame_rejects_reference_for_another_requested_target(
             ),
         )
     assert interactions.request is None
+
+
+def test_identity_checkpoint_is_exact_frame_verify_only_request(
+    tmp_path: Path,
+) -> None:
+    frame_path = tmp_path / "verify-frame.png"
+    frame_path.write_bytes(b"frame to verify")
+    reference_path = tmp_path / "verify-reference.png"
+    reference_path.write_bytes(b"locked reference")
+    frame_hash = hashlib.sha256(frame_path.read_bytes()).hexdigest()
+    reference_hash = hashlib.sha256(reference_path.read_bytes()).hexdigest()
+
+    api_request, saved_request = _capture_request(
+        tmp_path,
+        "identity-checkpoint",
+        "identity_checkpoint.request.json",
+        lambda client, run_dir: client.verify_identity_checkpoint(
+            frame=SimpleNamespace(
+                path=str(frame_path),
+                frame_time_ms=2250,
+                frame_pts=54,
+                frame_hash=frame_hash,
+            ),
+            target_id="subject.primary",
+            target_description="the reviewer-locked foreground instance",
+            run_id="identity-checkpoint-run",
+            output_dir=run_dir,
+            identity_references=(
+                GroundingIdentityReference(
+                    reference_id="positive-anchor",
+                    role="positive",
+                    target_id="subject.primary",
+                    description="same locked instance",
+                    path=reference_path,
+                    sha256=reference_hash,
+                ),
+            ),
+        ),
+    )
+
+    assert api_request["system_instruction"] == VISUAL_EVIDENCE_SYSTEM_INSTRUCTION
+    assert api_request["generation_config"] == SEMANTIC_IDENTITY_GENERATION_CONFIG
+    assert api_request["response_format"]["schema"]["properties"].keys() >= {
+        "verdict",
+        "evidence",
+    }
+    texts = [
+        item["text"] for item in api_request["input"] if item["type"] == "text"
+    ]
+    assert texts[0].startswith("## Mode: VERIFY_IDENTITY")
+    assert "不得輸出或修改 bounding box" in texts[0]
+    assert texts[-1].startswith("FRAME_TO_VERIFY")
+    assert all(
+        "data" not in item
+        for item in saved_request["input"]
+        if item["type"] == "image"
+    )

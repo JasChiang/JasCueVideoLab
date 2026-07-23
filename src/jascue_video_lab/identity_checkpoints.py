@@ -3,17 +3,22 @@ from __future__ import annotations
 import math
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from enum import StrEnum
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, model_validator
 
+from .auto_reframe import SemanticCheckpointStatus
 from .models import (
+    ExtractedFrame,
     SegmentationSample,
     SemanticIdentityStatus,
     StrictModel,
     TrackingState,
 )
+from .storage import utc_now, write_json
 
 
 CheckpointReason = Literal[
@@ -31,6 +36,7 @@ CheckpointReason = Literal[
 ]
 
 IDENTITY_CHECKPOINT_PLANNER_VERSION = "identity-checkpoint-planner-v2"
+IDENTITY_CHECKPOINT_EXECUTOR_VERSION = "identity-checkpoint-executor-v1"
 
 
 def _request_sha256(value: object) -> str:
@@ -99,6 +105,224 @@ class IdentityCheckpointPlan(StrictModel):
         if self.planning_request_sha256 != expected_request_sha256:
             raise ValueError("identity checkpoint planning request hash mismatch")
         return self
+
+
+class IdentityCheckpointVerdict(StrEnum):
+    MATCHED = "matched"
+    TARGET_MISMATCH = "target_mismatch"
+    AMBIGUOUS = "ambiguous"
+    NOT_VISIBLE = "not_visible"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    VERIFIER_ERROR = "verifier_error"
+
+
+class IdentityCheckpointModelDecision(StrictModel):
+    """Small verifier response that cannot mutate geometry or the target lock."""
+
+    verdict: Literal[
+        "matched",
+        "target_mismatch",
+        "ambiguous",
+        "not_visible",
+        "insufficient_evidence",
+    ]
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    evidence: str = Field(min_length=1)
+    uncertainty: str | None = None
+
+
+class IdentityCheckpointResult(StrictModel):
+    sample_index: int = Field(ge=0)
+    analysis_sample_time_ms: int = Field(ge=0)
+    source_pts: int | None
+    frame_time_ms: int = Field(ge=0)
+    frame_pts: int
+    frame_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reasons: tuple[CheckpointReason, ...] = Field(min_length=1)
+    verdict: IdentityCheckpointVerdict
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    evidence: str = Field(min_length=1)
+    uncertainty: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+    @model_validator(mode="after")
+    def validate_error(self) -> "IdentityCheckpointResult":
+        if self.verdict == IdentityCheckpointVerdict.VERIFIER_ERROR:
+            if not self.error_type or not self.error_message:
+                raise ValueError("verifier errors must preserve type and message")
+        elif self.error_type is not None or self.error_message is not None:
+            raise ValueError("only verifier_error results may contain error details")
+        return self
+
+
+class IdentityCheckpointExecution(StrictModel):
+    artifact_type: Literal["identity_checkpoint_execution_v1"] = (
+        "identity_checkpoint_execution_v1"
+    )
+    executor_version: Literal["identity-checkpoint-executor-v1"] = (
+        IDENTITY_CHECKPOINT_EXECUTOR_VERSION
+    )
+    asset_id: str = Field(min_length=1)
+    track_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    identity_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    planning_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verifier_id: str = Field(min_length=1)
+    planned_count: int = Field(ge=0, le=8)
+    model_calls_made: int = Field(ge=0, le=8)
+    semantic_checkpoint_status: SemanticCheckpointStatus
+    results: tuple[IdentityCheckpointResult, ...]
+    generated_at: str = Field(min_length=1)
+    warning: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_execution(self) -> "IdentityCheckpointExecution":
+        if self.model_calls_made != len(self.results):
+            raise ValueError("model_calls_made must match recorded results")
+        if self.model_calls_made > self.planned_count:
+            raise ValueError("executor exceeded the checkpoint plan budget")
+        indexes = [result.sample_index for result in self.results]
+        if len(indexes) != len(set(indexes)):
+            raise ValueError("identity checkpoint results must be unique")
+        return self
+
+
+IdentityCheckpointVerifier = Callable[
+    [IdentityCheckpointCandidate, ExtractedFrame],
+    IdentityCheckpointModelDecision,
+]
+
+
+def _execution_status(
+    *,
+    plan: IdentityCheckpointPlan,
+    results: Sequence[IdentityCheckpointResult],
+) -> SemanticCheckpointStatus:
+    if plan.selected_count == 0:
+        return (
+            SemanticCheckpointStatus.NOT_REQUIRED_BY_POLICY
+            if not plan.candidates
+            else SemanticCheckpointStatus.REQUIRED_PENDING
+        )
+    if len(results) != plan.selected_count:
+        return SemanticCheckpointStatus.REQUIRED_PENDING
+    verdicts = {result.verdict for result in results}
+    if IdentityCheckpointVerdict.TARGET_MISMATCH in verdicts:
+        return SemanticCheckpointStatus.FAILED
+    if verdicts == {IdentityCheckpointVerdict.MATCHED}:
+        return SemanticCheckpointStatus.PASSED
+    return SemanticCheckpointStatus.AMBIGUOUS
+
+
+def execute_identity_checkpoints(
+    plan: IdentityCheckpointPlan,
+    *,
+    frames_by_sample_index: Mapping[int, ExtractedFrame],
+    verifier: IdentityCheckpointVerifier,
+    verifier_id: str,
+    abort_on_error: Callable[[Exception], bool] | None = None,
+    output_path: Path | None = None,
+) -> IdentityCheckpointExecution:
+    """Run the bounded exact-frame checks selected by ``plan``.
+
+    Missing frames are contract errors. Verifier failures and inconclusive
+    observations are preserved and never converted into semantic success.
+    """
+
+    if not verifier_id.strip():
+        raise ValueError("verifier_id must be non-empty")
+    selected = [
+        candidate
+        for candidate in plan.candidates
+        if candidate.selected_for_verification
+    ]
+    results: list[IdentityCheckpointResult] = []
+    request_frames: list[dict[str, object]] = []
+    for candidate in selected:
+        frame = frames_by_sample_index.get(candidate.sample_index)
+        if frame is None:
+            raise ValueError(
+                f"missing exact frame for checkpoint sample {candidate.sample_index}"
+            )
+        if candidate.source_pts is not None and frame.frame_pts != candidate.source_pts:
+            raise ValueError(
+                f"checkpoint frame PTS mismatch for sample {candidate.sample_index}"
+            )
+        request_frames.append(
+            {
+                "sample_index": candidate.sample_index,
+                "frame_pts": frame.frame_pts,
+                "frame_time_ms": frame.frame_time_ms,
+                "frame_hash": frame.frame_hash,
+            }
+        )
+        try:
+            decision = verifier(candidate, frame)
+            result = IdentityCheckpointResult(
+                sample_index=candidate.sample_index,
+                analysis_sample_time_ms=candidate.analysis_sample_time_ms,
+                source_pts=candidate.source_pts,
+                frame_time_ms=frame.frame_time_ms,
+                frame_pts=frame.frame_pts,
+                frame_hash=frame.frame_hash,
+                reasons=candidate.reasons,
+                verdict=decision.verdict,
+                confidence=decision.confidence,
+                evidence=decision.evidence,
+                uncertainty=decision.uncertainty,
+            )
+        except Exception as error:
+            if abort_on_error is not None and abort_on_error(error):
+                raise
+            result = IdentityCheckpointResult(
+                sample_index=candidate.sample_index,
+                analysis_sample_time_ms=candidate.analysis_sample_time_ms,
+                source_pts=candidate.source_pts,
+                frame_time_ms=frame.frame_time_ms,
+                frame_pts=frame.frame_pts,
+                frame_hash=frame.frame_hash,
+                reasons=candidate.reasons,
+                verdict=IdentityCheckpointVerdict.VERIFIER_ERROR,
+                confidence=None,
+                evidence="The semantic identity verifier did not produce a usable result.",
+                uncertainty="Identity remains unverified.",
+                error_type=type(error).__name__,
+                error_message=str(error),
+            )
+        results.append(result)
+
+    execution_request_sha256 = _request_sha256(
+        {
+            "executor_version": IDENTITY_CHECKPOINT_EXECUTOR_VERSION,
+            "asset_id": plan.asset_id,
+            "track_fingerprint": plan.track_fingerprint,
+            "identity_sha256": plan.identity_sha256,
+            "planning_request_sha256": plan.planning_request_sha256,
+            "verifier_id": verifier_id,
+            "frames": request_frames,
+        }
+    )
+    execution = IdentityCheckpointExecution(
+        asset_id=plan.asset_id,
+        track_fingerprint=plan.track_fingerprint,
+        identity_sha256=plan.identity_sha256,
+        planning_request_sha256=plan.planning_request_sha256,
+        execution_request_sha256=execution_request_sha256,
+        verifier_id=verifier_id,
+        planned_count=plan.selected_count,
+        model_calls_made=len(results),
+        semantic_checkpoint_status=_execution_status(plan=plan, results=results),
+        results=tuple(results),
+        generated_at=utc_now(),
+        warning=(
+            "A passed result confirms only the locked target identity on the "
+            "selected exact frames. It does not prove every propagated frame."
+        ),
+    )
+    if output_path is not None:
+        write_json(output_path, execution)
+    return execution
 
 
 def _add_reason(

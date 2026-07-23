@@ -31,6 +31,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 | --- | --- | --- |
 | Python 3.12＋`uv` | 執行整套實驗程式、管理套件與可重現的環境 | 不分析影片內容 |
 | FFmpeg／ffprobe | 讀取片長、尺寸、旋轉與影格時間；製作 proxy、偵測切鏡、抽原始影格及輸出 review cut | 不理解人物、物件或故事 |
+| Temporal Risk Window scanner | 以本機低解析影格差異找出可能被約 1 FPS 粗取樣漏掉的短暫視覺變化，提出需要加密檢查的時間窗 | 不宣稱時間窗內一定有語意事件，也不產生剪點 |
 | Gemini File API | 上傳並暫存可重用的影片或圖片，避免同一檔案在有效期內重複上傳 | 不執行內容判斷 |
 | Gemini 3.6 Flash＋Interactions API | 看完整 proxy、建立 Clip Cards、提出選片與敘事候選；在指定的單張影格中找出目標 bbox | 影片時間只適合語意搜尋，不提供 frame-accurate 剪點；單張 bbox 也不是逐幀追蹤 |
 | Pydantic Structured Output | 限制模型輸出欄位與型別，拒絕超界時間、非法 bbox 或不存在的 frame ID | Schema 合法不代表模型的內容判斷一定正確 |
@@ -38,6 +39,7 @@ Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主
 | Evidence Proposal／QueryLock | 先讓真人確認目標身分、動作條件與構圖需求，再把這份決定鎖定供後續步驟引用 | 不自動創造新目標，也不取代人工核准 |
 | Gemini image Grounding | 在 FFmpeg 抽出的原始單張影格上，找出指定人物或物件的 0–1000 normalized bbox | 不跨影格追蹤，也不能把不可見目標的位置猜出來 |
 | SAM 2.1（選配） | 以人工或 Gemini bbox 作為 seed，在同一個 shot 內產生 mask 並向前、向後追蹤 | 不理解剪輯 brief，也不應跨切鏡自行延續物件身分 |
+| Identity checkpoint | 在固定預算內挑出追蹤起點／終點、遮擋後重現或幾何異常的 exact frames，再驗證是否仍為鎖定實例 | 不修改 SAM geometry，也不能用未執行的檢查冒充通過 |
 | 本機 crop solver | 根據整段 tracking、required regions 與畫面邊界計算 9:16 安全裁切路徑 | 不自行決定哪個人物或物件最重要 |
 | Pillow | 把 bbox 或 mask 畫回原始影格，產生方便人工檢查的 debug 圖 | 不參與辨識或追蹤 |
 | 本機 HTML／JavaScript review page | 播放事件、候選片段、debug 圖與裁切結果，供真人核准或退回 | 不會因頁面能正常開啟就宣告模型結果正確 |
@@ -107,7 +109,8 @@ Full v1 不會把整支毛片切成數百張圖片送入模型。每支影片先
   → SAM 2.1 bbox-only、shot-local mask propagation
 
 只有快速 UI／短暫狀態不確定時：
-  → 事件內 1–5 秒局部 4／8 FPS frame-ID contact sheet
+  → 本機 Temporal Risk Window scanner 可先獨立於 Clip Card 找出視覺變化窗口
+  → 已知事件內再建立 1–5 秒局部 4／8 FPS frame-ID contact sheet
   → Gemini 只選既有 ID；時間仍由本機映射
 
 只有入選片段需要精修頭尾時：
@@ -155,6 +158,11 @@ uv run jascue-video-lab full-clip VIDEO.mp4 \
   --dense-event EVENT_ID --dense-fps 8 --dense-window-ms 4000 \
   --output-dir artifacts/full-v1-clip
 
+# 不依賴既有 Clip Card event，先在本機找可能值得加密檢查的視覺變化窗口
+uv run jascue-video-lab scan-temporal-risk VIDEO.mp4 \
+  --sampling-fps 4 \
+  --output artifacts/temporal-risk.json
+
 # 入選事件的 trim intent；只產生待審 proposal，不會自動核准
 uv run jascue-video-lab trim-event \
   artifacts/full-v1-library/clips/ASSET_PREFIX EVENT_ID \
@@ -172,7 +180,7 @@ uv run jascue-video-lab review-trim \
 
 Trim Intent 不把「畫面變靜」直接等同廢尾或刻意留白。模型只能依畫面提出 `natural_pause`、`intentional_hold`、`title_safe_hold`、`clean_plate`、`reset_or_false_end` 或 `uncertain`，並保存可見證據與不確定性；它不能宣稱知道導演意圖。預設流程讓 Gemini 直接觀看完整 proxy，在指定 Clip Card event／shot 內回傳 coarse `MM:SS` 代表性 select；FFmpeg 只抽入點與 exclusive-out 邊界，將其解析到原始影片的 decoded PTS。Gemini proposal 永遠是 `requires_human_review=true`，因此 schema 通過也不會直接改動正式成片。
 
-4／8 FPS dense DF contact sheet 現在是局部升級手段，不是預設 Trim Intent：只有快速手勢、短暫 UI 或真人對 coarse 邊界有疑義時，才在小視窗內讓模型從既有 exact frame ID 選擇。不得把整支毛片拆成大量圖片來取代影片理解。若 Gemini 只回傳 hold 的單側端點，系統不會推測另一端，而會捨棄不完整 hold interval 並把 contract normalization 寫入 uncertainties；若 exclusive out 位於片尾且沒有下一張 decoded frame，則保存明確的 end-of-stream time boundary，而不偽造 frame hash。
+4／8 FPS dense DF contact sheet 現在是局部升級手段，不是預設 Trim Intent：只有快速手勢、短暫 UI、本機 risk window 或真人對 coarse 邊界有疑義時，才在小視窗內讓模型從既有 exact frame ID 選擇。`scan-temporal-risk` 只輸出 recall-only 視覺變化窗口，會排除已知硬切鏡且不把畫面差異冒充語意事件；目前仍需由後續流程或真人把該窗口配對到事件，尚未自動改寫 Clip Card。不得把整支毛片拆成大量圖片來取代影片理解。若 Gemini 只回傳 hold 的單側端點，系統不會推測另一端，而會捨棄不完整 hold interval 並把 contract normalization 寫入 uncertainties；若 exclusive out 位於片尾且沒有下一張 decoded frame，則保存明確的 end-of-stream time boundary，而不偽造 frame hash。
 
 `--audio-mode auto` 是預設值：有音軌就保留，無音軌也正常完成；`off` 明確移除音訊；`required` 只適合音訊證據不可缺少的實驗，來源沒有音軌時會保存錯誤並停止該片。artifact 會記錄 `source_has_audio` 與 `proxy_has_audio`，Clip Card 不得為 silent source 捏造 audio evidence。
 
@@ -198,7 +206,7 @@ uv run jascue-video-lab full-library /path/to/rushes \
 1. **已完成核心 contract**：SAM predictor 的實際輸入只含 `允許區間 ∩ seed shot`，不跨切鏡傳播。
 2. **已完成核心 contract**：多候選不取最高 model confidence；自動 seed 只接受唯一 `matched` candidate，其餘必須人工指定。
 3. **部分完成**：QueryLock v2 已把 temporal（identity＋predicate＋catalog）、Grounding（identity＋exact frame）、SAM（identity＋seed／interval）與 framing lineage 分開；較早的 proxy、shot 與部分 dense cache 仍要補齊全鏈路 fingerprint。
-4. **部分完成**：每個新 SAM sample 可回映原始 decoded source PTS，並會以零 API 成本規劃 bounded identity checkpoints；實際 checkpoint Gemini verifier、遮擋後 re-identification 與完整 renderer 核准狀態尚未完成。`planned_not_executed` 不得解讀成已驗證。
+4. **部分完成且已 fail closed**：每個新 SAM sample 可回映原始 decoded source PTS，並會以零 API 成本規劃 bounded identity checkpoints；exact-frame Gemini verifier 與有界 executor contract 已存在，錯誤、不可見與歧義會保存成明確狀態。Renderer 尚未自動解析 checkpoint frames 並執行 verifier，因此 tracked crop 目前記為 `required_pending`，不能再把未執行的 `None` 當成通過。遮擋後自動 re-identification 與完整 renderer 核准仍未完成。
 5. **已完成效率／一致性 contract**：同一 shot 內的多個 bbox target 可共用一次 decoded-frame catalog、predictor 與 SAM inference state；每個 target 仍保存獨立 seed、mask、狀態與 provenance。共享與獨立執行可用逐格 mask agreement 自動比較，但 agreement 不是 ground truth。
 
 另外，silent source 不得生成 audio evidence、失敗但已有 usage 的 API response 仍必須計價、公開匯出需採 allowlist sanitizer。完整測試還要加入 non-zero PTS、VFR、B-frame、rotation/edit-list、快速 UI 命中，以及相似物件跨鏡 identity-switch 等 fixture。
@@ -252,7 +260,7 @@ v3 不再要求 Gemini 重抄 rank-1 asset/event/frame、target description 或 
 
 429／quota failure 不屬於候選內容問題。為了避免隱藏成本，SDK 明確設成每個 Gemini operation 只嘗試一次；若上游回傳真正的 HTTP 429、`RESOURCE_EXHAUSTED` 或 spending-cap error，geometry executor 會立即寫出 `geometry-model-circuit-breaker.json` 並中止整次 render，不再換候選、不再繼續輸出看似完成但沒有 Gemini geometry 證據的 fallback 成片。一般的 target 不可見、tracking coverage 或構圖不可行才會繼續嘗試下一個候選。
 
-Full Auto v2 目前仍有清楚限制：已有風險導向、固定預算的 identity checkpoint **規劃器**，但尚未在 candidate preflight 執行其 Gemini 驗證、遮擋後自動 re-identification 或自動圖卡避讓；`overlay_keepout` 在有字卡但沒有 layout solver 時會 fail closed。獨立的成片 QA 可以提出語意 review，但不會替 preflight 補造證據或覆蓋 geometry gate。Safe-fit 只是方便人工觀看的預覽，不是核准構圖；模型 rank、confidence、SAM mask 與 schema validation 也都不是 human ground truth。
+Full Auto v2 目前仍有清楚限制：已有風險導向、固定預算的 identity checkpoint 規劃器、exact-frame Gemini verifier 與 executor artifact，但尚未把 frame extraction／verifier execution 自動接入每個 candidate preflight；因此 tracked crop 會保持 `required_pending` 並要求人工處理，而不會自動通過。遮擋後自動 re-identification 與自動圖卡避讓也尚未完成；`overlay_keepout` 在有字卡但沒有 layout solver 時會 fail closed。獨立的成片 QA 可以提出語意 review，但不會替 preflight 補造證據或覆蓋 geometry gate。Safe-fit 只是方便人工觀看的預覽，不是核准構圖；模型 rank、confidence、SAM mask 與 schema validation 也都不是 human ground truth。
 
 每個 tracked 9:16 segment 現在保存 renderer 真正使用的 crop keyframes、required-region union、逐時刻合法 crop interval、containment、可見寬度比例、首尾／中段 tracking coverage、crop speed 與 acceleration。裁切器不再先平滑 target 中心後直接裁切，而是先由每一個 required bbox 算出合法範圍，再把平滑路徑投影回該範圍；這可避免平滑延遲把快速移動主體推出畫面。`primary_center` 只會放寬 target 外圍的 8% safety margin，不暗中授權裁掉 target。
 
@@ -384,7 +392,7 @@ export GEMINI_API_KEY='...'
 
 若執行環境不會繼承 terminal export，可在專案根目錄建立已被 `.gitignore` 排除的 `.env.local`，內容只放 `GEMINI_API_KEY=...`，執行前先 `source .env.local`。不要把 key 貼進 issue、artifact 或 commit。
 
-只使用官方 `google-genai` SDK；預設模型是穩定版 `gemini-3.6-flash`，需要可重現歷史 A/B 時才以 `JASCUE_GEMINI_MODEL` 明確覆寫。3.6 請求不送出已淘汰的 `temperature`、`top_p` 或 `top_k`，thinking level 只使用目前 Interactions endpoint 驗證過的 `low`／`high`。模型 ID 會進入 request、cache identity、provenance 與逐模型計價；切換模型不會誤用舊 response cache，但仍可重用相同 File API 上傳。程式不依賴已淘汰的 `google-generativeai`，也沒有舊 Gemini 1.5／2.0 model ID。
+只使用官方 `google-genai` SDK；預設模型是穩定版 `gemini-3.6-flash`，需要可重現歷史 A/B 時才以 `JASCUE_GEMINI_MODEL` 明確覆寫。3.6 請求不送出已淘汰的 `temperature`、`top_p` 或 `top_k`；純 geometry 目前維持 `low`，exact-frame semantic identity checkpoint 使用 `medium`，較複雜的少數規劃實驗才使用 `high`。不同 task profile 必須進入 request 與 cache fingerprint，且不能假設較高 thinking 一定改善 bbox。模型 ID 會進入 request、cache identity、provenance 與逐模型計價；切換模型不會誤用舊 response cache，但仍可重用相同 File API 上傳。程式不依賴已淘汰的 `google-generativeai`，也沒有舊 Gemini 1.5／2.0 model ID。
 
 ## 本機 Blind Review Web App
 
