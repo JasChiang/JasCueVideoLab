@@ -18,11 +18,16 @@ from jascue_video_lab.music import (
     review_music_map,
 )
 from jascue_video_lab.music_cues import (
+    CueAlignment,
+    CuePlanLock,
     CuePlanProposal,
+    CuePlanReview,
     MusicSectionInterpretation,
     SemanticCuePairing,
     SemanticMusicPairingProposal,
     VisualSyncMap,
+    apply_music_first_cue_lock,
+    derive_brief_visual_sync_map,
     derive_visual_sync_map,
     plan_music_cues,
     review_cue_plan,
@@ -31,6 +36,8 @@ from jascue_video_lab.models import ModelProvenance
 from jascue_video_lab.models import (
     DenseFrame,
     DenseFrameCatalog,
+    FeatureChapterBrief,
+    FeatureEditBrief,
     TrimFrameEvidence,
     TrimHumanReview,
     TrimIntentDecision,
@@ -361,6 +368,100 @@ def test_global_cue_plan_only_uses_authorized_windows(tmp_path: Path) -> None:
     assert alignment.status == "aligned"
     assert alignment.proposed_project_time_ms in {2000, 2500}
     assert abs(alignment.delta_ms or 0) <= 300
+
+
+def test_music_first_cue_lock_changes_brief_before_selection(tmp_path: Path) -> None:
+    brief = FeatureEditBrief(
+        project_id="music-first-generic",
+        title="Generic product story",
+        target_duration_seconds=60,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id=f"chapter-{index}",
+                title=f"Editorial idea {index}",
+                detail_lines=["Use only observed evidence."],
+                target_duration_seconds=7.5,
+            )
+            for index in range(8)
+        ],
+    )
+    brief_path = tmp_path / "brief.json"
+    write_json(brief_path, brief)
+    visual = derive_brief_visual_sync_map(
+        brief_path, aspect_ratio="9:16", default_flex_ms=3_000
+    )
+    assert visual.source_kind == "editorial_brief"
+    assert visual.timing_basis == "editorial_brief_target_duration_ms"
+    visual_path = tmp_path / "brief-sync-map.json"
+    write_json(visual_path, visual)
+
+    shifted = [0, 7_000, 15_000, 22_000, 30_000, 37_000, 45_000, 52_000, 60_000]
+    alignments = []
+    boundary_points = [
+        point
+        for point in visual.points
+        if point.phase in {"timeline_start", "chapter_start", "ending_pose"}
+    ]
+    for point, proposed in zip(boundary_points, shifted, strict=True):
+        alignments.append(
+            CueAlignment(
+                visual_event_id=point.visual_event_id,
+                status="aligned",
+                sync_mode=point.sync_mode,
+                original_project_time_ms=point.project_time_ms,
+                proposed_project_time_ms=proposed,
+                delta_ms=proposed - point.project_time_ms,
+                music_cue_id="locked-cue-00001",
+                music_cue_kind="downbeat",
+                music_sample_index=proposed * 48,
+                alignment_score=1.0,
+                within_authorized_window=True,
+                reason="Reviewed music-first boundary.",
+            )
+        )
+    plan = CuePlanProposal(
+        plan_id=f"cue-plan-{'a' * 12}",
+        preset="balanced",
+        music_lock_path=str(tmp_path / "music.lock.json"),
+        music_lock_sha256="b" * 64,
+        music_definition_sha256="c" * 64,
+        visual_sync_map_path=str(visual_path),
+        visual_sync_map_sha256=sha256_file(visual_path),
+        project_duration_ms=60_000,
+        music_duration_ms=60_000,
+        alignments=alignments,
+        aligned_count=len(alignments),
+        unmatched_count=0,
+        hard_unmatched_count=0,
+        uncertainties=[],
+        generated_at="2026-07-23T00:00:00+00:00",
+    )
+    plan_path = tmp_path / "cue-plan.json"
+    write_json(plan_path, plan)
+    review = CuePlanReview(
+        cue_plan_sha256=sha256_file(plan_path),
+        reviewer="editor",
+        reviewed_at="2026-07-23T00:00:00+00:00",
+        decision="approved",
+    )
+    lock = CuePlanLock(
+        cue_plan_path=str(plan_path),
+        cue_plan_sha256=sha256_file(plan_path),
+        review=review,
+        plan=plan,
+        definition_sha256="d" * 64,
+    )
+    guided = apply_music_first_cue_lock(brief, visual_map=visual, cue_lock=lock)
+    assert [chapter.target_duration_seconds for chapter in guided.chapters] == [
+        7.0,
+        8.0,
+        7.0,
+        8.0,
+        7.0,
+        8.0,
+        7.0,
+        8.0,
+    ]
 
 
 def test_cue_plan_lock_is_hash_bound_and_human_approved(tmp_path: Path) -> None:

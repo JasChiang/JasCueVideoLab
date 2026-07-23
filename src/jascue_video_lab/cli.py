@@ -28,9 +28,12 @@ from .grounding_selection import require_tracking_seed_candidate
 from .media import extract_frame, probe_video, sha256_file
 from .music import MusicMapLock, MusicMapProposal, analyze_music, review_music_map
 from .music_cues import (
+    CuePlanLock,
     CuePlanProposal,
     SemanticMusicPairingProposal,
     VisualSyncMap,
+    apply_music_first_cue_lock,
+    derive_brief_visual_sync_map,
     derive_visual_sync_map,
     plan_music_cues,
     render_cue_review,
@@ -39,6 +42,7 @@ from .music_cues import (
 from .models import (
     ContentMap,
     ExtractedFrame,
+    FeatureEditBrief,
     GroundingProposal,
     MediaInfo,
     TargetCandidateMap,
@@ -643,12 +647,67 @@ def command_render_rushes(args: argparse.Namespace) -> int:
 
 
 def command_feature_cut(args: argparse.Namespace) -> int:
+    brief_path = args.brief_json
+    plan_prompt = _load_prompt("feature_cut_selects_zh-TW.txt")
+    if args.music_first_cue_lock is not None:
+        cue_lock_path = args.music_first_cue_lock.expanduser().resolve(strict=True)
+        cue_lock = CuePlanLock.model_validate(read_json(cue_lock_path))
+        visual_path = Path(cue_lock.plan.visual_sync_map_path).expanduser().resolve(
+            strict=True
+        )
+        visual_map = VisualSyncMap.model_validate(read_json(visual_path))
+        original_brief = FeatureEditBrief.model_validate(read_json(args.brief_json))
+        guided_brief = apply_music_first_cue_lock(
+            original_brief,
+            visual_map=visual_map,
+            cue_lock=cue_lock,
+        )
+        input_dir = args.output_dir / "music-first-input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        brief_path = input_dir / "brief.music-first.json"
+        write_json(brief_path, guided_brief)
+        context = {
+            "contract_version": "music-first-feature-context-v1",
+            "original_brief_path": str(args.brief_json.expanduser().resolve(strict=True)),
+            "original_brief_sha256": sha256_file(args.brief_json),
+            "music_lock_sha256": cue_lock.plan.music_lock_sha256,
+            "cue_plan_lock_path": str(cue_lock_path),
+            "cue_plan_lock_sha256": sha256_file(cue_lock_path),
+            "global_music_strategy": None,
+            "chapter_slots": [
+                {
+                    "feature_id": chapter.feature_id,
+                    "target_duration_seconds": chapter.target_duration_seconds,
+                }
+                for chapter in guided_brief.chapters
+            ],
+        }
+        if cue_lock.plan.semantic_pairing_used:
+            semantic_path = Path(
+                cue_lock.plan.semantic_pairing_path or ""
+            ).expanduser().resolve(strict=True)
+            semantic = SemanticMusicPairingProposal.model_validate(
+                read_json(semantic_path)
+            )
+            context["global_music_strategy"] = semantic.global_strategy
+            context["section_interpretations"] = [
+                row.model_dump(mode="json")
+                for row in semantic.section_interpretations
+            ]
+        write_json(input_dir / "music-first-context.json", context)
+        plan_prompt += (
+            "\n\n## 已核准的 music-first 剪輯約束\n"
+            "下列資料在選片前建立。請選擇能配合各音樂段落角色、動作完整性"
+            "與指定長度的素材；不得為了卡點捏造畫面證據。精確節拍已由本機"
+            " CuePlan 鎖定，不得自行改寫時間。\n"
+            + json.dumps(context, ensure_ascii=False, indent=2)
+        )
     result = run_feature_cut_experiment(
         catalog_path=args.catalog_json,
-        brief_path=args.brief_json,
+        brief_path=brief_path,
         checkpoint_path=args.sam_checkpoint,
         output_dir=args.output_dir,
-        plan_prompt=_load_prompt("feature_cut_selects_zh-TW.txt"),
+        plan_prompt=plan_prompt,
         grounding_prompt=_load_prompt("grounding_native_yxyx_zh-TW.txt"),
         scdet_threshold=args.scdet_threshold,
         sam_analysis_fps=args.sam_analysis_fps,
@@ -658,6 +717,29 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         aspect=args.aspect,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_build_brief_sync_map(args: argparse.Namespace) -> int:
+    visual_map = derive_brief_visual_sync_map(
+        args.brief_json,
+        aspect_ratio=args.aspect,
+        default_flex_ms=args.default_flex_ms,
+    )
+    write_json(args.output, visual_map)
+    print(
+        json.dumps(
+            {
+                "visual_sync_map_path": str(args.output.resolve()),
+                "source_kind": visual_map.source_kind,
+                "point_count": len(visual_map.points),
+                "project_duration_ms": visual_map.project_duration_ms,
+                "next_step": "plan-semantic-music",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -2024,6 +2106,15 @@ def build_parser() -> argparse.ArgumentParser:
             "The manifest remains marked as requiring review; rejected trims are never accepted."
         ),
     )
+    feature_cut_parser.add_argument(
+        "--music-first-cue-lock",
+        type=Path,
+        help=(
+            "Approved pre-selection CuePlan lock. Its music-aware chapter slots "
+            "are applied before Gemini selects media; post-render cue planning "
+            "remains a QC/refinement stage."
+        ),
+    )
     feature_cut_parser.add_argument("--output-dir", type=Path, required=True)
     feature_cut_parser.set_defaults(handler=command_feature_cut)
 
@@ -2060,6 +2151,26 @@ def build_parser() -> argparse.ArgumentParser:
     review_music_parser.add_argument("--meter", type=int)
     review_music_parser.add_argument("--output-dir", type=Path, required=True)
     review_music_parser.set_defaults(handler=command_review_music_map)
+
+    brief_sync_parser = subparsers.add_parser(
+        "build-brief-sync-map",
+        help=(
+            "Build pre-selection visual intents from an editorial brief so Gemini "
+            "can interpret and pair the music before media selection"
+        ),
+    )
+    brief_sync_parser.add_argument("brief_json", type=Path)
+    brief_sync_parser.add_argument(
+        "--aspect", choices=["16:9", "9:16"], default="16:9"
+    )
+    brief_sync_parser.add_argument(
+        "--default-flex-ms",
+        type=int,
+        default=3_000,
+        help="Maximum reviewed timing movement around provisional chapter boundaries",
+    )
+    brief_sync_parser.add_argument("--output", type=Path, required=True)
+    brief_sync_parser.set_defaults(handler=command_build_brief_sync_map)
 
     visual_sync_parser = subparsers.add_parser(
         "build-visual-sync-map",

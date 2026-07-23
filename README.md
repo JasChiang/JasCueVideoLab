@@ -8,19 +8,20 @@
 
 1. **整理素材**：程式先讀取每支影片的長度、尺寸與切鏡等基本資訊，並建立較輕量的分析版本，不必反覆處理原始 4K 檔案。
 2. **AI 看帶**：Gemini 逐支理解影片，整理成可重用的 Clip Card，記錄拍到了什麼、有哪些人物或物件、動作是否完整，以及可能適合放在哪一段。
-3. **提出選片建議**：有剪輯 brief 時，AI 依指定主題、功能與片長挑選素材；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。
-4. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
-5. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。
-6. **需要時再規劃音樂卡點**：本機先分析音樂的節拍、重音、能量與段落變化；真人確認 BPM、第一個強拍與拍號後，程式才提出畫面事件和音樂 cue 的對齊建議。
-7. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
+3. **有指定音樂就先規劃音樂**：本機先找精確節拍、重音、能量與段落；Gemini 可選擇性先聽音樂，判斷 opening、build、peak、留白與 closing 適合承接什麼畫面。真人核准 CuePlan 後，選片才開始。
+4. **提出選片建議**：有剪輯 brief 時，AI 會同時依主題、功能、音樂角色與各段長度挑選素材；沒有 brief 時，則先根據素材內容提出一版故事方向與候選片段。
+5. **真人確認目標**：如果畫面裡有多個相似人物或物件，系統先提出候選，讓使用者確認真正要保留或追蹤的是哪一個，不讓 AI 在後續步驟自行換成相似目標。
+6. **需要時才追蹤與重構**：一般接片不需要物件座標。只有要把橫式影片改成 9:16、跟隨人物或產品、避讓圖卡時，才從原片抽出清楚影格取得 bbox，再由 SAM 追蹤同一個鏡頭內的目標。
+7. **輸出人工審核版**：程式產生 16:9／9:16 review cut、構圖紀錄、卡點建議與失敗原因。成片後的 VisualSyncMap／CuePlan 仍會再做一次節奏 QC，但不再是第一次考慮音樂。真人看過選片、頭尾、裁切及節奏結果並核准後，才適合進一步完成正式剪輯。
 
 ```text
 一批毛片
   → AI 看帶並建立 Clip Cards
+  → 有指定音樂時先建立 MusicMap、Gemini 語意配對與 CuePlan Lock
   → 有 brief 就照需求挑片；沒有 brief 就先提出故事候選
   → 真人確認選片與重要目標
   → 只有需要直式重構或圖卡避讓時才做 bbox／SAM tracking
-  → 有音樂時建立 MusicMap，真人鎖定音樂網格後再提出 CuePlan
+  → 成片後再用 exact visual events 做 CuePlan QC
   → 輸出可播放的人工審核版
   → 真人修改或核准
 ```
@@ -368,7 +369,7 @@ Gemini 的成片 `pass` 不可覆蓋本機幾何證據。QA validator 會把 req
 
 ## 音樂卡點 MVP
 
-音樂卡點採獨立 evidence chain，不讓音樂分析器或 renderer 直接改寫已核准的選片、Identity、Trim 或 geometry：
+音樂卡點採獨立 evidence chain。有指定音樂時，正式順序是 **music-first**：先建立經核准的音樂網格與暫定敘事節點，再選片；成片後的 visual-event 對齊只負責 QC 與局部 refinement，不再用來補救一條完全沒按音樂規劃的固定時間軸。
 
 ```text
 本機音樂檔
@@ -377,7 +378,15 @@ Gemini 的成片 `pass` 不可覆蓋本機幾何證據。QA validator 會把 req
   → 真人核准 BPM、第一個 downbeat、meter
   → immutable MusicMap Lock
 
-既有 feature-cut render manifest
+editorial brief（尚未選片）
+  → Brief VisualSyncMap：章節意圖與可調整時間窗，不冒充影片證據
+  → 選配：Gemini 先聽音樂並配對既有 visual intent ID 與 music cue ID
+  → 全局 CuePlan scheduler
+  → 真人核准成 immutable CuePlan Lock
+  → CuePlan 的章節長度與音樂策略進入 feature-cut
+  → Gemini 才從 catalog 選擇符合內容、動作與節奏的素材
+
+完成 feature-cut 後的 render manifest
   → VisualSyncMap：目前 cut／chapter start／ending pose
   → 可另外加入經證據確認的 reveal／action apex／UI change
   → 選配：Gemini 聽音樂並把既有 visual ID 配對既有 cue ID
@@ -405,7 +414,23 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab review-music-map \
   --meter 4 \
   --output-dir artifacts/music-demo/reviewed
 
-# 3. 從既有成片 manifest 建立視覺事件。預設 flex=0，因此只做唯讀稽核。
+# 3. music-first：尚未選片前，先從 brief 建立 provisional visual intents
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab build-brief-sync-map \
+  FEATURE_BRIEF.json \
+  --aspect 9:16 \
+  --default-flex-ms 3000 \
+  --output artifacts/music-demo/brief-sync-map.json
+
+# 接著以既有 plan-semantic-music → plan-music-cues → review-cue-plan
+# 建立 approved CuePlan Lock，再把它放在 feature-cut 的選片之前：
+UV_CACHE_DIR=.uv-cache uv run jascue-video-lab feature-cut \
+  CATALOG.json FEATURE_BRIEF.json \
+  --sam-checkpoint SAM_CHECKPOINT.pt \
+  --music-first-cue-lock artifacts/music-demo/preselection/reviewed/cue-plan.lock.json \
+  --output-dir FEATURE_OUTPUT
+
+# 4. 成片後 QC：從 render manifest 建立 exact visual events。
+# 預設 flex=0，因此只做唯讀稽核。
 UV_CACHE_DIR=.uv-cache uv run jascue-video-lab build-visual-sync-map \
   FEATURE_OUTPUT/render-manifest.json \
   --aspect 9:16 \
@@ -418,7 +443,7 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab build-visual-sync-map \
   --default-flex-ms 250 \
   --output artifacts/music-demo/visual-sync-map.flex-250.json
 
-# 4. 產生全局 CuePlan 與可播放的 HTML review；尚未修改影片
+# 5. 產生成片後 CuePlan 與可播放的 HTML review；尚未修改影片
 # 選配：先讓 Gemini 做一次音樂—畫面語意配對
 UV_CACHE_DIR=.uv-cache uv run jascue-video-lab plan-semantic-music \
   MUSIC.wav \
@@ -435,7 +460,7 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab plan-music-cues \
   --video FEATURE_OUTPUT/renders/feature-cut-9x16-clean.mp4 \
   --output-dir artifacts/music-demo/cue-plan
 
-# 5. 真人核准 hash-bound CuePlan
+# 6. 真人核准 hash-bound CuePlan
 UV_CACHE_DIR=.uv-cache uv run jascue-video-lab review-cue-plan \
   artifacts/music-demo/cue-plan/cue-plan.proposal.json \
   --reviewer "human-editor" \

@@ -13,6 +13,7 @@ from pydantic import Field, model_validator
 from .media import sha256_file
 from .models import (
     DenseFrameCatalog,
+    FeatureEditBrief,
     FrozenStrictModel,
     ModelProvenance,
     StrictModel,
@@ -86,8 +87,12 @@ class VisualSyncMap(StrictModel):
     aspect_ratio: Literal["16:9", "9:16"]
     render_manifest_path: str
     render_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_kind: Literal["render_manifest", "editorial_brief"] = "render_manifest"
     project_duration_ms: int = Field(gt=0)
-    timing_basis: Literal["rendered_segment_duration_ms"] = (
+    timing_basis: Literal[
+        "rendered_segment_duration_ms",
+        "editorial_brief_target_duration_ms",
+    ] = (
         "rendered_segment_duration_ms"
     )
     flexibility_authorization: Literal[
@@ -114,6 +119,158 @@ class VisualSyncMap(StrictModel):
         ):
             raise ValueError("read-only visual boundaries cannot carry edit flexibility")
         return self
+
+
+def derive_brief_visual_sync_map(
+    brief_path: Path,
+    *,
+    aspect_ratio: Literal["16:9", "9:16"],
+    default_flex_ms: int = 3_000,
+) -> VisualSyncMap:
+    """Create pre-selection visual intents so music can be planned first.
+
+    These are editorial targets, not claims about observed media. Gemini may
+    pair them with musical roles before candidate selection, while exact
+    source evidence remains the responsibility of the later feature planner.
+    """
+    if not 0 <= default_flex_ms <= 10_000:
+        raise ValueError("default_flex_ms must be between 0 and 10000")
+    path = brief_path.expanduser().resolve(strict=True)
+    brief = FeatureEditBrief.model_validate(read_json(path))
+    elapsed = 0
+    points: list[VisualSyncPoint] = []
+    for index, chapter in enumerate(brief.chapters):
+        phase: Literal["timeline_start", "chapter_start"] = (
+            "timeline_start" if index == 0 else "chapter_start"
+        )
+        points.append(
+            VisualSyncPoint(
+                visual_event_id=f"vs-{len(points) + 1:04d}",
+                feature_id=chapter.feature_id,
+                phase=phase,
+                sync_mode="structural" if index == 0 else "soft",
+                project_time_ms=elapsed,
+                flex_before_ms=0 if index == 0 else default_flex_ms,
+                flex_after_ms=0 if index == 0 else default_flex_ms,
+                priority=(
+                    VisualSyncPriority.HARD
+                    if index == 0
+                    else VisualSyncPriority.PREFERRED
+                ),
+                allowed_cue_kinds=(
+                    ("section_boundary", "downbeat", "accent")
+                    if index == 0
+                    else ("section_boundary", "downbeat", "accent", "beat")
+                ),
+                evidence_refs=(f"editorial-brief:{sha256_file(path)}",),
+                semantic_description=(
+                    chapter.title
+                    + (
+                        " — " + "; ".join(chapter.detail_lines)
+                        if chapter.detail_lines
+                        else ""
+                    )
+                ),
+                editorial_note=(
+                    "Pre-selection editorial intent only; it is not observed "
+                    "visual evidence and cannot authorize source geometry."
+                ),
+            )
+        )
+        elapsed += round(chapter.target_duration_seconds * 1000)
+    points.append(
+        VisualSyncPoint(
+            visual_event_id=f"vs-{len(points) + 1:04d}",
+            feature_id=brief.chapters[-1].feature_id,
+            phase="ending_pose",
+            sync_mode="hard",
+            project_time_ms=elapsed,
+            flex_before_ms=default_flex_ms,
+            flex_after_ms=default_flex_ms,
+            priority=VisualSyncPriority.HARD,
+            allowed_cue_kinds=(
+                "ending_hit",
+                "section_boundary",
+                "downbeat",
+                "accent",
+            ),
+            evidence_refs=(f"editorial-brief:{sha256_file(path)}",),
+            semantic_description="Resolve the editorial arc and preserve a closing hold.",
+            editorial_note="Pre-selection desired ending; source evidence is resolved later.",
+        )
+    )
+    return VisualSyncMap(
+        project_id=brief.project_id,
+        aspect_ratio=aspect_ratio,
+        render_manifest_path=str(path),
+        render_manifest_sha256=sha256_file(path),
+        source_kind="editorial_brief",
+        project_duration_ms=elapsed,
+        timing_basis="editorial_brief_target_duration_ms",
+        flexibility_authorization=(
+            "operator_authorized_default_flex"
+            if default_flex_ms
+            else "read_only_boundaries"
+        ),
+        points=points,
+        uncertainties=[
+            "This map precedes media selection; every selected clip still requires "
+            "independent visual evidence, trim, and geometry validation."
+        ],
+        generated_at=utc_now(),
+    )
+
+
+def apply_music_first_cue_lock(
+    brief: FeatureEditBrief,
+    *,
+    visual_map: VisualSyncMap,
+    cue_lock: CuePlanLock,
+) -> FeatureEditBrief:
+    """Project an approved pre-selection cue schedule into chapter durations."""
+    if visual_map.source_kind != "editorial_brief":
+        raise ValueError("music-first feature planning requires an editorial-brief sync map")
+    bound_brief_path = Path(visual_map.render_manifest_path).expanduser().resolve(
+        strict=True
+    )
+    if visual_map.render_manifest_sha256 != sha256_file(bound_brief_path):
+        raise ValueError("music-first editorial brief lineage no longer matches disk")
+    if FeatureEditBrief.model_validate(read_json(bound_brief_path)) != brief:
+        raise ValueError("music-first cue plan is bound to a different editorial brief")
+    if cue_lock.plan.visual_sync_map_sha256 != sha256_file(
+        Path(cue_lock.plan.visual_sync_map_path).expanduser().resolve(strict=True)
+    ):
+        raise ValueError("CuePlan visual map lineage no longer matches disk")
+    if visual_map.project_id != brief.project_id:
+        raise ValueError("music-first visual map belongs to another project")
+    aligned = {
+        row.visual_event_id: row.proposed_project_time_ms
+        for row in cue_lock.plan.alignments
+        if row.status == "aligned" and row.proposed_project_time_ms is not None
+    }
+    boundaries: list[int] = []
+    for point in visual_map.points:
+        if point.phase in {"timeline_start", "chapter_start", "ending_pose"}:
+            boundaries.append(aligned.get(point.visual_event_id, point.project_time_ms))
+    if len(boundaries) != len(brief.chapters) + 1:
+        raise ValueError("music-first cue plan does not cover all editorial boundaries")
+    if boundaries[0] != 0 or boundaries != sorted(boundaries):
+        raise ValueError("music-first cue boundaries must be chronological from zero")
+    durations = [
+        (end - start) / 1000
+        for start, end in zip(boundaries, boundaries[1:])
+    ]
+    if any(not 3.0 <= duration <= 10.0 for duration in durations):
+        raise ValueError("music-first cue schedule violates 3-10 second chapter limits")
+    return brief.model_copy(
+        update={
+            "target_duration_seconds": sum(durations),
+            "chapters": [
+                chapter.model_copy(update={"target_duration_seconds": duration})
+                for chapter, duration in zip(brief.chapters, durations, strict=True)
+            ],
+        }
+    )
 
 
 class CueAlignment(FrozenStrictModel):
