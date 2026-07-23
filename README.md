@@ -419,6 +419,7 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab build-brief-sync-map \
   FEATURE_BRIEF.json \
   --aspect 9:16 \
   --default-flex-ms 3000 \
+  --target-duration-ms 81150 \
   --output artifacts/music-demo/brief-sync-map.json
 
 # 接著以既有 plan-semantic-music → plan-music-cues → review-cue-plan

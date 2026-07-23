@@ -725,6 +725,7 @@ def command_build_brief_sync_map(args: argparse.Namespace) -> int:
         args.brief_json,
         aspect_ratio=args.aspect,
         default_flex_ms=args.default_flex_ms,
+        target_duration_ms=args.target_duration_ms,
     )
     write_json(args.output, visual_map)
     print(
@@ -2168,6 +2169,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3_000,
         help="Maximum reviewed timing movement around provisional chapter boundaries",
+    )
+    brief_sync_parser.add_argument(
+        "--target-duration-ms",
+        type=int,
+        help=(
+            "Scale provisional chapter positions to the reviewed music edit "
+            "duration before semantic pairing"
+        ),
     )
     brief_sync_parser.add_argument("--output", type=Path, required=True)
     brief_sync_parser.set_defaults(handler=command_build_brief_sync_map)

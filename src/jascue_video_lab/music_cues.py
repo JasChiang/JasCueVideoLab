@@ -126,6 +126,7 @@ def derive_brief_visual_sync_map(
     *,
     aspect_ratio: Literal["16:9", "9:16"],
     default_flex_ms: int = 3_000,
+    target_duration_ms: int | None = None,
 ) -> VisualSyncMap:
     """Create pre-selection visual intents so music can be planned first.
 
@@ -137,6 +138,17 @@ def derive_brief_visual_sync_map(
         raise ValueError("default_flex_ms must be between 0 and 10000")
     path = brief_path.expanduser().resolve(strict=True)
     brief = FeatureEditBrief.model_validate(read_json(path))
+    original_duration_ms = round(
+        sum(chapter.target_duration_seconds for chapter in brief.chapters) * 1000
+    )
+    project_duration_ms = target_duration_ms or original_duration_ms
+    if not 60_000 <= project_duration_ms <= 90_000:
+        raise ValueError("music-first project duration must remain between 60 and 90 seconds")
+    minimum = len(brief.chapters) * 3_000
+    maximum = len(brief.chapters) * 10_000
+    if not minimum <= project_duration_ms <= maximum:
+        raise ValueError("music-first duration cannot satisfy per-chapter duration limits")
+    duration_scale = project_duration_ms / original_duration_ms
     elapsed = 0
     points: list[VisualSyncPoint] = []
     for index, chapter in enumerate(brief.chapters):
@@ -177,7 +189,8 @@ def derive_brief_visual_sync_map(
                 ),
             )
         )
-        elapsed += round(chapter.target_duration_seconds * 1000)
+        elapsed += round(chapter.target_duration_seconds * 1000 * duration_scale)
+    elapsed = project_duration_ms
     points.append(
         VisualSyncPoint(
             visual_event_id=f"vs-{len(points) + 1:04d}",

@@ -81,6 +81,40 @@ EDITORIAL_SYSTEM_INSTRUCTION = """你是 evidence-constrained 剪輯規劃系統
 SEMANTIC_IDENTITY_GENERATION_CONFIG = {"thinking_level": "medium"}
 
 
+def canonicalize_feature_edit_plan_output(
+    output_text: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Normalize representation-only Top-K errors without changing selections."""
+    payload = json.loads(output_text)
+    if not isinstance(payload, dict):
+        raise ValueError("Feature Edit Plan output must be a JSON object")
+    changes: list[dict[str, Any]] = []
+    chapters = payload.get("chapters")
+    if not isinstance(chapters, list):
+        return output_text, changes
+    for chapter_index, chapter in enumerate(chapters):
+        if not isinstance(chapter, dict):
+            continue
+        for field in ("horizontal_candidates", "vertical_candidates"):
+            candidates = chapter.get(field)
+            if isinstance(candidates, list) and len(candidates) == 1:
+                chapter[field] = []
+                changes.append(
+                    {
+                        "json_path": f"$.chapters[{chapter_index}].{field}",
+                        "before_count": 1,
+                        "after_count": 0,
+                        "rule": (
+                            "single_candidate_is_already_projected_by_legacy_rank1_fields"
+                        ),
+                    }
+                )
+    return (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        changes,
+    )
+
+
 class GeminiContractError(RuntimeError):
     pass
 
@@ -2192,6 +2226,12 @@ model_provenance (return it unchanged with interaction_id=null):
             + f"project_id 必須原樣回傳：{brief.project_id}\n"
             + f"catalog_id 必須原樣回傳：{catalog.catalog_id}\n"
             + f"合法 frame ID 數量：{len(catalog.frames)}\n"
+            + "合法 frame IDs（只能逐字選用，不得推算、補號或創造）：\n"
+            + json.dumps(
+                [frame.frame_id for frame in catalog.frames],
+                ensure_ascii=False,
+            )
+            + "\n"
             + "chapters 必須依 brief 順序完整回傳，一個 feature_id 恰好一次。\n"
             + "\n## 使用者提供的 editorial brief（文字可用，但不等於影片證據）\n"
             + brief.model_dump_json(indent=2)
@@ -2226,7 +2266,22 @@ model_provenance (return it unchanged with interaction_id=null):
                 run_dir / "feature_edit_plan.raw_output.json",
                 {"output_text": interaction.output_text},
             )
-            parsed = FeatureEditPlan.model_validate_json(interaction.output_text)
+            canonical_text, normalization_changes = (
+                canonicalize_feature_edit_plan_output(interaction.output_text)
+            )
+            write_json(
+                run_dir / "feature_edit_plan.canonical_output.json",
+                {"output_text": canonical_text},
+            )
+            write_json(
+                run_dir / "feature_edit_plan.normalization_audit.json",
+                {
+                    "contract_version": "feature-edit-plan-normalization-v1",
+                    "changes": normalization_changes,
+                    "editorial_selection_changed": False,
+                },
+            )
+            parsed = FeatureEditPlan.model_validate_json(canonical_text)
             expected_ids = [chapter.feature_id for chapter in brief.chapters]
             actual_ids = [chapter.feature_id for chapter in parsed.chapters]
             if parsed.project_id != brief.project_id or parsed.catalog_id != catalog.catalog_id:

@@ -388,7 +388,10 @@ def test_music_first_cue_lock_changes_brief_before_selection(tmp_path: Path) -> 
     brief_path = tmp_path / "brief.json"
     write_json(brief_path, brief)
     visual = derive_brief_visual_sync_map(
-        brief_path, aspect_ratio="9:16", default_flex_ms=3_000
+        brief_path,
+        aspect_ratio="9:16",
+        default_flex_ms=3_000,
+        target_duration_ms=60_000,
     )
     assert visual.source_kind == "editorial_brief"
     assert visual.timing_basis == "editorial_brief_target_duration_ms"
