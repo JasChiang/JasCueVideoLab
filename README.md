@@ -25,6 +25,26 @@
 
 Clip Cards 建立後可以重複使用。同一批素材之後要剪成不同主題、長度或比例時，可以先查既有資料，只重新分析真正入選且需要精確畫面座標的片段。AI 的選片、時間、bbox、mask 與 confidence 都只是待審建議，不會因為 schema 合法就自動成為正式剪輯資料。
 
+### 用到哪些技術
+
+| 技術 | 在這個流程裡負責什麼 | 不負責什麼 |
+| --- | --- | --- |
+| Python 3.12＋`uv` | 執行整套實驗程式、管理套件與可重現的環境 | 不分析影片內容 |
+| FFmpeg／ffprobe | 讀取片長、尺寸、旋轉與影格時間；製作 proxy、偵測切鏡、抽原始影格及輸出 review cut | 不理解人物、物件或故事 |
+| Gemini File API | 上傳並暫存可重用的影片或圖片，避免同一檔案在有效期內重複上傳 | 不執行內容判斷 |
+| Gemini 3.6 Flash＋Interactions API | 看完整 proxy、建立 Clip Cards、提出選片與敘事候選；在指定的單張影格中找出目標 bbox | 影片時間只適合語意搜尋，不提供 frame-accurate 剪點；單張 bbox 也不是逐幀追蹤 |
+| Pydantic Structured Output | 限制模型輸出欄位與型別，拒絕超界時間、非法 bbox 或不存在的 frame ID | Schema 合法不代表模型的內容判斷一定正確 |
+| SHA-256＋不可變 frame ID | 確認素材、proxy、影格與模型結果的來源，並把 AI 選中的畫面映射回原片 | 不判斷畫面好不好 |
+| Evidence Proposal／QueryLock | 先讓真人確認目標身分、動作條件與構圖需求，再把這份決定鎖定供後續步驟引用 | 不自動創造新目標，也不取代人工核准 |
+| Gemini image Grounding | 在 FFmpeg 抽出的原始單張影格上，找出指定人物或物件的 0–1000 normalized bbox | 不跨影格追蹤，也不能把不可見目標的位置猜出來 |
+| SAM 2.1（選配） | 以人工或 Gemini bbox 作為 seed，在同一個 shot 內產生 mask 並向前、向後追蹤 | 不理解剪輯 brief，也不應跨切鏡自行延續物件身分 |
+| 本機 crop solver | 根據整段 tracking、required regions 與畫面邊界計算 9:16 安全裁切路徑 | 不自行決定哪個人物或物件最重要 |
+| Pillow | 把 bbox 或 mask 畫回原始影格，產生方便人工檢查的 debug 圖 | 不參與辨識或追蹤 |
+| 本機 HTML／JavaScript review page | 播放事件、候選片段、debug 圖與裁切結果，供真人核准或退回 | 不會因頁面能正常開啟就宣告模型結果正確 |
+| pytest | 驗證 schema contract、時間邊界、座標轉換、cache 與 geometry 規則 | 不取代對真實影片的人工觀看 |
+
+簡單來說，Gemini 負責「理解內容與選對目標」，FFmpeg 負責「精確回到原始媒體時間」，SAM 負責「在同一鏡頭裡延續空間位置」，本機規則負責「檢查與裁切」，最後仍由真人決定結果能不能採用。
+
 ### 技術上的對應
 
 最新方法採用「先鎖定證據，再驗證 geometry」：未指定 target 時先提出候選，使用者先審核 `EvidenceQueryProposalV2`，再明確核准成不可變的 `EvidenceQueryLockV2`。V2 把持續物件身分（Identity）、只在特定時刻成立的動作／狀態（Predicate）與構圖義務（Framing）分成三份 contract 與 hash；時間 refinement、單幀 bbox、SAM seed 與 layout 因此可各自重用正確層級的證據。自動直式構圖則在一份 planner response 內保留 Top-K 素材候選，只有實際嘗試的候選才由具名自動政策建立 QueryLock 並進入 exact-frame geometry preflight。完整說明見 [METHODOLOGY.md](METHODOLOGY.md)，毛片 coarse-to-fine 全量流程見 [FULL-VERSION-PLAN.md](FULL-VERSION-PLAN.md)。Gemini polygon 與 bbox seed 的舊 A/B 僅保留為唯讀歷史資料；目前支援路徑只使用 Gemini／人工 bbox → SAM。
