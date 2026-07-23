@@ -92,6 +92,61 @@ def _render_contact_sheets(frame_paths: list[Path], output_dir: Path) -> None:
         canvas.save(output_dir / f"page-{page_index:03d}.jpg", quality=88)
 
 
+def _extract_catalog_frames(
+    clip: RushClip,
+    raw_dir: Path,
+    *,
+    sample_interval_ms: int,
+    max_width: int,
+) -> list[Path]:
+    """Extract RGB PNGs so short clips and limited-range YUV remain catalogable."""
+    fps_value = 1000 / sample_interval_ms
+    output_pattern = raw_dir / "%06d.png"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            clip.path,
+            "-vf",
+            f"fps={fps_value},scale={max_width}:-2,format=rgb24",
+            "-start_number",
+            "0",
+            str(output_pattern),
+        ],
+        check=True,
+    )
+    raw_paths = sorted(raw_dir.glob("*.png"), key=lambda path: int(path.stem))
+    if raw_paths:
+        return raw_paths
+
+    # Some sub-interval clips contain fewer decoded frames than the sampling
+    # filter can emit. They still need one auditable RF frame rather than being
+    # silently absent from the library.
+    first_frame = raw_dir / "000000.png"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            clip.path,
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={max_width}:-2,format=rgb24",
+            str(first_frame),
+        ],
+        check=True,
+    )
+    return [first_frame] if first_frame.exists() else []
+
+
 def create_rushes_catalog(
     source_directory: Path,
     output_dir: Path,
@@ -128,27 +183,12 @@ def create_rushes_catalog(
     for clip in clips:
         raw_dir = output_dir / "catalog-raw" / clip.clip_id
         raw_dir.mkdir(parents=True, exist_ok=True)
-        fps_value = 1000 / sample_interval_ms
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                clip.path,
-                "-vf",
-                f"fps={fps_value},scale={max_width}:-2",
-                "-q:v",
-                "2",
-                "-start_number",
-                "0",
-                str(raw_dir / "%06d.jpg"),
-            ],
-            check=True,
+        raw_paths = _extract_catalog_frames(
+            clip,
+            raw_dir,
+            sample_interval_ms=sample_interval_ms,
+            max_width=max_width,
         )
-        raw_paths = sorted(raw_dir.glob("*.jpg"), key=lambda path: int(path.stem))
         for local_index, raw_path in enumerate(raw_paths):
             requested_time_ms = local_index * sample_interval_ms
             if requested_time_ms >= clip.duration_ms:

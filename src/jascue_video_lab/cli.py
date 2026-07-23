@@ -729,6 +729,11 @@ def command_review_music_map(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_MUSIC_FILE_CACHE_ROOT = (
+    Path(__file__).resolve().parents[2] / "artifacts" / "music-file-cache"
+)
+
+
 def command_build_visual_sync_map(args: argparse.Namespace) -> int:
     visual_map = derive_visual_sync_map(
         args.render_manifest,
@@ -760,12 +765,28 @@ def command_plan_semantic_music(args: argparse.Namespace) -> int:
         raise ValueError("music file does not match the approved MusicMap lock")
     visual_digest = sha256_file(args.visual_sync_map.expanduser().resolve(strict=True))
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    music_sha256 = sha256_file(music_source)
+    file_cache_root = (
+        args.file_cache_root.expanduser().resolve()
+        if args.file_cache_root is not None
+        else DEFAULT_MUSIC_FILE_CACHE_ROOT
+    )
+    upload_dir = file_cache_root / music_sha256 / "upload"
     client = GeminiLabClient()
     try:
         uploaded, reused = client.ensure_video_upload(
             music_source,
-            args.output_dir / "upload",
+            upload_dir,
             force_reupload=args.force_reupload,
+        )
+        write_json(
+            args.output_dir / "upload-cache-binding.json",
+            {
+                "contract_version": "music-file-cache-binding-v1",
+                "music_sha256": music_sha256,
+                "cache_directory": str(upload_dir.resolve()),
+                "file_api_reused": reused,
+            },
         )
         proposal = client.plan_music_semantic_pairing(
             music_lock=music_lock,
@@ -775,6 +796,7 @@ def command_plan_semantic_music(args: argparse.Namespace) -> int:
             prompt_template=_load_prompt("music_semantic_pairing_zh-TW.txt"),
             run_id=f"music-semantic-{uuid.uuid4().hex[:12]}",
             run_dir=args.output_dir,
+            reuse_raw_output=args.reuse_raw_output,
         )
     finally:
         client.close()
@@ -2076,6 +2098,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-reupload",
         action="store_true",
         help="Ignore an ACTIVE saved File API object and upload the music again",
+    )
+    semantic_music_parser.add_argument(
+        "--reuse-raw-output",
+        action="store_true",
+        help=(
+            "Canonicalize and revalidate the saved paid response without "
+            "creating another Gemini interaction"
+        ),
+    )
+    semantic_music_parser.add_argument(
+        "--file-cache-root",
+        type=Path,
+        help=(
+            "Shared SHA-256 keyed File API cache. Defaults to "
+            "artifacts/music-file-cache so multiple aspect ratios reuse one upload."
+        ),
     )
     semantic_music_parser.add_argument("--output-dir", type=Path, required=True)
     semantic_music_parser.set_defaults(handler=command_plan_semantic_music)

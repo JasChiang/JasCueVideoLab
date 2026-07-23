@@ -1397,7 +1397,9 @@ model_provenance (return it unchanged with interaction_id=null):
         run_dir.mkdir(parents=True, exist_ok=True)
         provenance = _provenance(run_id, model_id=self.model_id)
         last_start_second = max(0, (source_media.duration_ms - 1) // 1000)
-        last_end_second = source_media.duration_ms // 1000
+        last_end_second = (
+            1 if source_media.duration_ms < 1000 else source_media.duration_ms // 1000
+        )
         prompt = (
             prompt_template
             + "\n\n## 本次不可變 metadata\n"
@@ -1409,6 +1411,14 @@ model_provenance (return it unchanged with interaction_id=null):
             + f"{last_start_second // 60:02d}:{last_start_second % 60:02d}\n"
             + "end 最後允許整秒："
             + f"{last_end_second // 60:02d}:{last_end_second % 60:02d}\n"
+            + (
+                "本片短於一秒；唯一事件必須使用 start_mmss=00:00、"
+                "end_mmss=00:01、recommended_keyframe_mmss=00:00。"
+                "00:01 只是 MM:SS 非空區間的顯示上限，程式仍以真實"
+                "duration 與 decoded PTS 為準。\n"
+                if source_media.duration_ms < 1000
+                else ""
+            )
             + "model_provenance 必須原樣回傳以下內容（interaction_id 先回傳 null）：\n"
             + provenance.model_dump_json()
         )
@@ -2267,12 +2277,32 @@ model_provenance (return it unchanged with interaction_id=null):
         prompt_template: str,
         run_id: str,
         run_dir: Path,
+        reuse_raw_output: bool = False,
     ) -> SemanticMusicPairingProposal:
         """Pair audible structure with known edit events without inventing timing."""
 
         provenance = _provenance(run_id, model_id=self.model_id)
+        eligible_cue_ids = {
+            cue.cue_id
+            for point in visual_map.points
+            for cue in music_lock.cues
+            if (
+                point.project_time_ms - point.flex_before_ms
+                <= cue.time_ms
+                <= point.project_time_ms + point.flex_after_ms
+            )
+        }
+        eligible_cues = [
+            cue
+            for cue in music_lock.cues
+            if cue.cue_id in eligible_cue_ids
+        ]
         prompt = (
             prompt_template
+            + "\n\n只有下列 eligible cues 位於至少一個 visual event "
+            "已授權的 timing window；preferred_cue_ids 只能引用這些 cue。"
+            "其餘 locked cues 雖仍屬 MusicMap，但不可能被本次 scheduler 套用，"
+            "因此不傳給模型。\n"
             + "\n\n## Immutable MusicMap Lock\n"
             + json.dumps(
                 {
@@ -2285,8 +2315,8 @@ model_provenance (return it unchanged with interaction_id=null):
                         section.model_dump(mode="json")
                         for section in music_lock.sections
                     ],
-                    "cues": [
-                        cue.model_dump(mode="json") for cue in music_lock.cues
+                    "eligible_cues": [
+                        cue.model_dump(mode="json") for cue in eligible_cues
                     ],
                 },
                 ensure_ascii=False,
@@ -2332,21 +2362,82 @@ model_provenance (return it unchanged with interaction_id=null):
             },
         }
         run_dir.mkdir(parents=True, exist_ok=True)
-        write_json(run_dir / "semantic_music_pairing.request.json", request_record)
+        request_path = run_dir / "semantic_music_pairing.request.json"
+        raw_interaction_path = run_dir / "semantic_music_pairing.raw_interaction.json"
+        raw_output_path = run_dir / "semantic_music_pairing.raw_output.json"
+        if reuse_raw_output:
+            if not all(
+                path.exists()
+                for path in (request_path, raw_interaction_path, raw_output_path)
+            ):
+                raise FileNotFoundError(
+                    "--reuse-raw-output requires the saved request, raw interaction, "
+                    "and raw output from one completed paid response"
+                )
+            saved_request = json.loads(request_path.read_text())
+            if saved_request.get("model") != self.model_id:
+                raise ValueError(
+                    "saved semantic music request used a different model"
+                )
+            # The freshly generated provenance contains a new run_id, so the
+            # full request text is not byte-identical on reuse.  Immutable
+            # MusicMap and VisualSyncMap hashes are verified against the
+            # parsed response below; the paid saved request remains untouched.
+            request_record = saved_request
+        else:
+            if any(
+                path.exists()
+                for path in (raw_interaction_path, raw_output_path)
+            ):
+                raise FileExistsError(
+                    "semantic music paid artifacts already exist; use "
+                    "--reuse-raw-output or a new output directory"
+                )
+            write_json(request_path, request_record)
         try:
-            interaction = self.client.interactions.create(**request_record)
-            _record_interaction_attempt(
-                run_dir=run_dir,
-                operation="semantic_music_pairing",
-                canonical_filename="semantic_music_pairing.raw_interaction.json",
-                interaction=interaction,
+            if reuse_raw_output:
+                saved_interaction = json.loads(raw_interaction_path.read_text())
+                raw_payload = json.loads(raw_output_path.read_text())
+                output_text = str(raw_payload["output_text"])
+                interaction_id = str(saved_interaction.get("id") or "")
+            else:
+                if uploaded_audio is None:
+                    raise ValueError("uploaded audio is required for a paid request")
+                interaction = self.client.interactions.create(**request_record)
+                _record_interaction_attempt(
+                    run_dir=run_dir,
+                    operation="semantic_music_pairing",
+                    canonical_filename="semantic_music_pairing.raw_interaction.json",
+                    interaction=interaction,
+                )
+                output_text = interaction.output_text
+                interaction_id = interaction.id
+                write_json(raw_output_path, {"output_text": output_text})
+
+            payload = json.loads(output_text)
+            before_review = payload.get("requires_human_review")
+            payload["requires_human_review"] = True
+            canonical_text = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")
             )
             write_json(
-                run_dir / "semantic_music_pairing.raw_output.json",
-                {"output_text": interaction.output_text},
+                run_dir / "semantic_music_pairing.canonical_output.json",
+                {"output_text": canonical_text},
+            )
+            write_json(
+                run_dir / "semantic_music_pairing.normalization_audit.json",
+                {
+                    "contract_version": "semantic-music-pairing-normalization-v1",
+                    "rule": "local_governance_always_requires_human_review",
+                    "before": before_review,
+                    "after": True,
+                    "changed": before_review is not True,
+                    "reused_paid_response": reuse_raw_output,
+                    "created_at": utc_now(),
+                },
             )
             parsed = SemanticMusicPairingProposal.model_validate_json(
-                interaction.output_text
+                canonical_text
             )
             if (
                 parsed.music_id != music_lock.music_id
@@ -2360,7 +2451,7 @@ model_provenance (return it unchanged with interaction_id=null):
             known_sections = {
                 section.section_id for section in music_lock.sections
             }
-            known_cues = {cue.cue_id for cue in music_lock.cues}
+            known_cues = {cue.cue_id for cue in eligible_cues}
             known_visual = {
                 point.visual_event_id for point in visual_map.points
             }
@@ -2395,7 +2486,7 @@ model_provenance (return it unchanged with interaction_id=null):
             final = parsed.model_copy(
                 update={
                     "model_provenance": parsed.model_provenance.model_copy(
-                        update={"interaction_id": interaction.id}
+                        update={"interaction_id": interaction_id}
                     )
                 }
             )

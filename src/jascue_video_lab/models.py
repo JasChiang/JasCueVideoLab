@@ -1165,6 +1165,17 @@ class FullClipEvent(StrictModel):
                 raise ValueError("recommended MM:SS keyframe must be inside [start, end)")
         return self
 
+    def resolved_end_ms(self, duration_ms: int) -> int:
+        """Resolve the only MM:SS interval that can represent a sub-second clip."""
+        labeled_end_ms = _mmss_to_ms(self.end_mmss)
+        if (
+            duration_ms < 1000
+            and _mmss_to_ms(self.start_mmss) == 0
+            and labeled_end_ms == 1000
+        ):
+            return duration_ms
+        return labeled_end_ms
+
 
 class FullClipCard(StrictModel):
     """Complete per-clip semantic record produced from a full analysis proxy."""
@@ -1196,9 +1207,19 @@ class FullClipCard(StrictModel):
         previous_end = 0
         for event in self.events:
             start_ms = _mmss_to_ms(event.start_mmss)
-            end_ms = _mmss_to_ms(event.end_mmss)
+            end_ms = event.resolved_end_ms(self.duration_ms)
             if end_ms > self.duration_ms:
                 raise ValueError(f"event {event.event_id} MM:SS exceeds duration")
+            if end_ms <= start_ms:
+                raise ValueError(
+                    f"event {event.event_id} resolved interval must be non-empty"
+                )
+            if event.recommended_keyframe_mmss is not None:
+                keyframe_ms = _mmss_to_ms(event.recommended_keyframe_mmss)
+                if not start_ms <= keyframe_ms < end_ms:
+                    raise ValueError(
+                        f"event {event.event_id} keyframe exceeds resolved interval"
+                    )
             if start_ms < previous_end:
                 raise ValueError(f"event {event.event_id} overlaps or is out of order")
             previous_end = end_ms
@@ -1243,15 +1264,29 @@ class DerivedClipEvent(StrictModel):
     end_ms: int = Field(gt=0)
     recommended_keyframe_ms: int | None = Field(default=None, ge=0)
     shot_ids: list[str]
-    boundary_source: Literal["gemini_mmss_local_conversion"]
+    boundary_source: Literal[
+        "gemini_mmss_local_conversion",
+        "gemini_mmss_subsecond_clip_end_conversion",
+    ]
     exact_frame_required: bool
 
     @model_validator(mode="after")
     def validate_derived_interval(self) -> "DerivedClipEvent":
         if self.start_ms != _mmss_to_ms(self.start_mmss):
             raise ValueError("start_ms must be locally derived from start_mmss")
-        if self.end_ms != _mmss_to_ms(self.end_mmss):
-            raise ValueError("end_ms must be locally derived from end_mmss")
+        labeled_end_ms = _mmss_to_ms(self.end_mmss)
+        if self.boundary_source == "gemini_mmss_local_conversion":
+            if self.end_ms != labeled_end_ms:
+                raise ValueError("end_ms must be locally derived from end_mmss")
+        elif not (
+            self.start_ms == 0
+            and labeled_end_ms == 1000
+            and 0 < self.end_ms < 1000
+        ):
+            raise ValueError(
+                "sub-second clip-end conversion requires 00:00–00:01 display "
+                "labels and an authoritative end below 1000 ms"
+            )
         expected_keyframe = (
             _mmss_to_ms(self.recommended_keyframe_mmss)
             if self.recommended_keyframe_mmss is not None

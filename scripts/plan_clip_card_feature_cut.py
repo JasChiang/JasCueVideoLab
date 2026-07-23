@@ -19,9 +19,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 from google import genai
+from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from jascue_video_lab.billing import summarize_usage_files
+from jascue_video_lab.clip_card_retrieval import (
+    FeatureShortlistPlan,
+    validate_feature_shortlist,
+)
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
 from jascue_video_lab.media import sha256_file
@@ -404,8 +409,12 @@ class ClipCardFeatureSelectV3(StrictModel):
             if self.candidates or self.horizontal_candidate_id or self.vertical_candidate_id:
                 raise ValueError("not_found chapters cannot reference candidates")
             return self
-        if not 2 <= len(self.candidates) <= 4:
-            raise ValueError("v3 chapters must preserve Top-K 2-4 candidates")
+        minimum = 2 if self.evidence_status == "supported" else 1
+        if not minimum <= len(self.candidates) <= 4:
+            raise ValueError(
+                f"v3 {self.evidence_status} chapters must preserve "
+                f"Top-K {minimum}-4 candidates"
+            )
         candidate_ids = [candidate.candidate_id for candidate in self.candidates]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError("candidate IDs must be unique within a chapter")
@@ -466,16 +475,19 @@ class SelectedClipCardEvidence(StrictModel):
     events: list[SelectedEvidenceEvent]
 
 
-FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v1"
+FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v2"
 
 
 def canonicalize_feature_plan_output(
     output_text: str,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Canonicalize only two explicitly ordered schema contradictions.
+    """Canonicalize narrow, deterministic representation errors.
 
     The function is deliberately narrow and deterministic.  It never changes
-    editorial selections or evidence references.  Explicit
+    editorial selections.  Short RF identifiers are zero-padded only to the
+    contract's fixed width; downstream catalog lineage validation must still
+    prove that the resulting identifier exists and belongs to the selected
+    event.  Explicit
     ``horizontal_strategy=original`` has conservative precedence: local
     normalization disables contradictory zoom and tracking focus rather than
     promoting a non-tracking choice into executable tracking.
@@ -497,10 +509,27 @@ def canonicalize_feature_plan_output(
         for candidate_index, candidate in enumerate(candidates):
             if not isinstance(candidate, dict):
                 continue
+            base = f"$.chapters[{chapter_index}].candidates[{candidate_index}]"
+            frame_id = candidate.get("frame_id")
+            if (
+                isinstance(frame_id, str)
+                and frame_id.startswith("RF")
+                and frame_id[2:].isdigit()
+                and 1 <= len(frame_id[2:]) < 6
+            ):
+                normalized_frame_id = f"RF{int(frame_id[2:]):06d}"
+                candidate["frame_id"] = normalized_frame_id
+                changes.append(
+                    {
+                        "json_path": f"{base}.frame_id",
+                        "before": frame_id,
+                        "after": normalized_frame_id,
+                        "rule": "fixed_width_rf_identifier_zero_padding",
+                    }
+                )
             strategy = candidate.get("horizontal_strategy")
             zoom = candidate.get("horizontal_zoom_intent")
             focus = candidate.get("horizontal_focus_entity_id")
-            base = f"$.chapters[{chapter_index}].candidates[{candidate_index}]"
             if strategy == "original" and zoom in {"subtle", "detail"}:
                 candidate["horizontal_zoom_intent"] = "none"
                 changes.append(
@@ -947,20 +976,12 @@ def validate_plan_contract_v3(
                     f"candidate focus entities are not backed by its event: "
                     f"{candidate.candidate_id}/{unknown}"
                 )
-            classified = set(
-                candidate.required_entity_ids
-                + candidate.preferred_entity_ids
-                + candidate.sacrificable_entity_ids
-            )
-            unclassified = sorted(
-                (set(event.primary_entity_ids) | set(event.required_entity_ids))
-                - classified
-            )
-            if unclassified:
-                raise ValueError(
-                    f"candidate did not classify important event entities: "
-                    f"{candidate.candidate_id}/{unclassified}"
-                )
+            # Clip Card primary/required roles describe the source event, not
+            # an immutable crop contract for every downstream brief.  A
+            # brief-specific candidate may intentionally focus on a subset.
+            # Only explicitly classified entities become geometry contracts;
+            # omitted event entities are neither silently required nor
+            # silently marked sacrificable.
 
 
 def build_selected_clip_card_evidence(
@@ -1580,6 +1601,15 @@ def main() -> int:
             "without creating another API request"
         ),
     )
+    parser.add_argument(
+        "--shortlist",
+        type=Path,
+        help=(
+            "Optional validated high-recall FeatureShortlistPlan. When present, "
+            "only shortlisted events and their RF frames are sent to this "
+            "geometry-aware planner."
+        ),
+    )
     args = parser.parse_args()
     if args.repair_attempts < 0:
         parser.error("--repair-attempts must be zero or greater")
@@ -1611,6 +1641,42 @@ def main() -> int:
             raise ValueError(f"Clip Card asset mismatch for {clip.clip_id}")
         cards[expected_asset] = card
 
+    shortlist: FeatureShortlistPlan | None = None
+    shortlist_path: Path | None = None
+    shortlist_allowed: dict[str, set[tuple[str, str]]] = {}
+    if args.shortlist is not None:
+        shortlist_path = args.shortlist.expanduser().resolve(strict=True)
+        shortlist = FeatureShortlistPlan.model_validate(read_json(shortlist_path))
+        validate_feature_shortlist(
+            shortlist,
+            brief=brief,
+            catalog=catalog,
+            cards=cards,
+        )
+        shortlist_allowed = {
+            chapter.feature_id: {
+                (candidate.source_asset_id, candidate.event_id)
+                for candidate in chapter.candidates
+            }
+            for chapter in shortlist.chapters
+        }
+
+    def validate_shortlist_membership(plan: ClipCardFeaturePlanV3) -> None:
+        if shortlist is None:
+            return
+        for chapter in plan.chapters:
+            unknown = sorted(
+                {
+                    (candidate.source_asset_id, candidate.event_id)
+                    for candidate in chapter.candidates
+                }
+                - shortlist_allowed[chapter.feature_id]
+            )
+            if unknown:
+                raise ValueError(
+                    f"plan escaped shortlist for {chapter.feature_id}: {unknown}"
+                )
+
     frame_map: dict[str, list[dict[str, object]]] = {}
     for frame in catalog.frames:
         clip = clips[frame.clip_id]
@@ -1631,27 +1697,77 @@ def main() -> int:
         generated_at=utc_now(),
         interaction_id=None,
     )
-    evidence = [
-        {
-            "clip_id": asset_to_clip[asset_id].clip_id,
-            "clip_card": compact_card_v3(card),
-            "available_catalog_frames": frame_map[asset_id],
-        }
-        for asset_id, card in cards.items()
-    ]
+    if shortlist is None:
+        evidence: list[dict[str, object]] = [
+            {
+                "clip_id": asset_to_clip[asset_id].clip_id,
+                "clip_card": compact_card_v3(card),
+                "available_catalog_frames": frame_map[asset_id],
+            }
+            for asset_id, card in cards.items()
+        ]
+        evidence_heading = "完整 Clip Card evidence 與可選 RF frame IDs"
+        evidence_scope_rule = (
+            "你可從下方完整 library 選擇任一合法 asset/event/frame。"
+        )
+    else:
+        evidence = []
+        for chapter in shortlist.chapters:
+            candidate_events: list[dict[str, object]] = []
+            for candidate in chapter.candidates:
+                card = cards[candidate.source_asset_id]
+                compact = compact_card_v3(card)
+                compact["events"] = [
+                    event
+                    for event in compact["events"]  # type: ignore[index]
+                    if event["event_id"] == candidate.event_id  # type: ignore[index]
+                ]
+                event = next(
+                    item
+                    for item in card.events
+                    if item.event_id == candidate.event_id
+                )
+                candidate_events.append(
+                    {
+                        "retrieval_reason": candidate.retrieval_reason,
+                        "clip_id": asset_to_clip[candidate.source_asset_id].clip_id,
+                        "clip_card": compact,
+                        "available_catalog_frames": [
+                            frame
+                            for frame in frame_map[candidate.source_asset_id]
+                            if event.start_mmss
+                            <= str(frame["local_mmss"])
+                            < event.end_mmss
+                        ],
+                    }
+                )
+            evidence.append(
+                {
+                    "feature_id": chapter.feature_id,
+                    "retrieval_status": chapter.evidence_status,
+                    "retrieval_uncertainty": chapter.uncertainty,
+                    "candidate_events": candidate_events,
+                }
+            )
+        evidence_heading = "已驗證 shortlist 的 Clip Card evidence 與可選 RF frame IDs"
+        evidence_scope_rule = (
+            "每章只能從該 feature_id 下列出的 candidate_events 選擇；"
+            "不得跨章引用未召回的 asset/event。"
+        )
     prompt = f"""
 你是 evidence-bound 的資深短影音挑帶剪輯師。請使用完整 Clip Card library，為使用者 brief 的每個 chapter 保留有排序的候選 take，再分別選出橫式與直式代表。你只能引用輸入列出的 source_asset_id、event_id、entity_id 與 RF frame_id。
 
 規則：
 1. brief 是允許使用的產品 claim，不是畫面證據；observed_visual_evidence 只能寫 Clip Card 直接支持的內容。
-2. 每個 brief feature_id 必須依原順序恰好回傳一次。supported／partial chapter 必須保留 2–4 個依品質排序、evidence frame 不重複的 candidates；優先完整動作、清楚結果、低遮擋、低反光與不同 take。not_found 不得虛構候選。
+2. 每個 brief feature_id 必須依原順序恰好回傳一次。supported chapter 必須保留 2–4 個、partial chapter 保留 1–4 個依品質排序且 evidence frame 不重複的 candidates；優先完整動作、清楚結果、低遮擋、低反光與不同 take。not_found 不得虛構候選。
+2a. {evidence_scope_rule}
 3. selected frame 的 local_mmss 必須位於所引用 event 的 [start_mmss,end_mmss)；不得自行創造 frame ID 或 timestamp。RF frame_id 必須從 available_catalog_frames 逐字複製並保留全部六位數與前導零，例如 RF000204 不可縮成 RF00204。
 4. 若可見型號、文字、數字或物件身分與 brief 衝突，優先改選沒有衝突的 take；沒有可靠 take 時用 partial 或 not_found 並保存風險。
 5. 每個 candidate 都必須保存可直接重試的 16:9 strategy／zoom／horizontal_focus_entity_id，以及 9:16 strategy、framing_intent 和 brief-specific entity priorities。橫式與直式可以從同一候選組選不同來源；horizontal_candidate_id／vertical_candidate_id 必須指向 candidates。不要重複輸出 rank-1 asset/event/frame mirror、target description 或 resolved crop regions；程式會從所選 candidate 與 hash-bound Clip Card evidence 確定性補出。
    - horizontal_strategy=original 時，horizontal_zoom_intent 必須是 none，而且 horizontal_focus_entity_id 必須是 null；原始構圖不需要追蹤焦點。
    - horizontal_strategy=tracked_reframe 時，horizontal_zoom_intent 必須是 subtle 或 detail，而且 horizontal_focus_entity_id 必須引用該 event 中一個可見 entity。
 6. 9:16 應把 brief 的 vertical_primary_target_description 視為內容優先序，不是強制演算法。只有需要動態跟隨且存在可靠 target 時才用 tracked_crop；若穩定構圖已可保留內容，或窄裁切無法安全包含必要範圍，可以使用 fit_with_background。不得只因 brief 有 primary target 就強制 tracked_crop。
-7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。每個 event 的 primary_entity_ids 與 required_entity_ids 都必須被歸入三組之一；不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
+7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。只分類與這次構圖決策直接相關的 entity；未列入者不會被程式偷偷視為 required 或 sacrificable。不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
 8. framing_intent 只需簡潔描述本候選的構圖取捨；不得輸出座標、bbox、mask、target description 或 verbose region contract。程式會把這些 entity priority ID 與 Clip Card entity/grounding target 資料轉成 domain-neutral hard-core、soft-extent 與 overlay keepout regions。
 9. bbox、mask、crop 座標與精確 cut point 均由後續 Grounding／tracker／FFmpeg 處理；本階段不得輸出座標。
 10. confidence 是 proposal，不是人工真值；候選排序仍須由可見 evidence 與風險說明支持。
@@ -1665,7 +1781,7 @@ model_provenance 必須先原樣回傳：
 ## 使用者 brief
 {brief.model_dump_json(indent=2)}
 
-## 完整 Clip Card evidence 與可選 RF frame IDs
+## {evidence_heading}
 {json.dumps(evidence, ensure_ascii=False, indent=2)}
 """.strip()
 
@@ -1769,6 +1885,7 @@ model_provenance 必須先原樣回傳：
         interaction_id = str(raw_interaction.get("id") or "")
         plan = ClipCardFeaturePlanV3.model_validate_json(output_text)
         validate_plan_contract_v3(plan, brief=brief, catalog=catalog, cards=cards)
+        validate_shortlist_membership(plan)
         if plan.model_provenance.model_id != MODEL_ID:
             raise ValueError(
                 "--reuse-raw-output model provenance mismatch: "
@@ -1781,7 +1898,12 @@ model_provenance 必須先原樣回傳：
         }
     else:
         _assert_fresh_feature_namespace_empty(args.output_dir)
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1)
+            ),
+        )
         try:
             previous_error = ""
             for attempt in range(1, args.repair_attempts + 2):
@@ -1826,6 +1948,7 @@ model_provenance 必須先原樣回傳：
                         catalog=catalog,
                         cards=cards,
                     )
+                    validate_shortlist_membership(plan)
                     interaction_id = getattr(current, "id", None) or ""
                     source_request_path = args.output_dir / "clip-card-feature-plan.request.json"
                     source_raw_interaction_path = (
@@ -1892,6 +2015,8 @@ model_provenance 必須先原樣回傳：
         args.output_dir / "clip-card-feature-plan.schema-validation.json",
         {"ok": True, "clip_card_count": len(cards), "frame_count": len(frames)},
     )
+    if shortlist_path is not None:
+        extra_projection_artifacts["feature_shortlist"] = shortlist_path
     projection_pointer = write_external_feature_plan_projection(
         plan_dir=args.output_dir,
         projection_contract_id="clip-card-feature-cut-v3",

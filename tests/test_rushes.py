@@ -159,6 +159,17 @@ def test_catalog_uses_immutable_frame_ids_without_model_timestamps(tmp_path: Pat
     assert all((tmp_path / "catalog" / frame.image_path).exists() for frame in catalog.frames)
 
 
+def test_catalog_keeps_one_frame_for_sub_interval_clip(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    _make_color_video(source / "SHORT.MP4", "green", duration=0.4)
+    catalog = create_rushes_catalog(source, tmp_path / "catalog", sample_interval_ms=2000)
+    assert len(catalog.clips) == 1
+    assert [frame.frame_id for frame in catalog.frames] == ["RF000001"]
+    assert catalog.frames[0].requested_time_ms == 0
+    assert (tmp_path / "catalog" / catalog.frames[0].image_path).exists()
+
+
 def test_segment_handles_are_clamped_to_ffmpeg_shot() -> None:
     shot = ShotSegment(
         shot_id="shot-0002",

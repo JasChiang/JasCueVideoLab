@@ -403,6 +403,18 @@ def test_feature_output_canonicalization_is_narrow_ordered_and_auditable() -> No
     ClipCardFeaturePlanV3.model_validate_json(canonical_text)
 
 
+def test_feature_output_canonicalization_zero_pads_short_rf_identifier() -> None:
+    payload = _v3_plan().model_dump(mode="json")
+    payload["chapters"][0]["candidates"][0]["frame_id"] = "RF00030"
+
+    canonical_text, changes = canonicalize_feature_plan_output(json.dumps(payload))
+    canonical = json.loads(canonical_text)
+
+    assert canonical["chapters"][0]["candidates"][0]["frame_id"] == "RF000030"
+    assert changes[0]["rule"] == "fixed_width_rf_identifier_zero_padding"
+    ClipCardFeaturePlanV3.model_validate_json(canonical_text)
+
+
 def test_feature_reuse_rejects_mismatched_raw_response_copies() -> None:
     with pytest.raises(ValueError, match="does not exactly match"):
         _verified_feature_raw_output_text(
@@ -972,7 +984,7 @@ def test_v3_projection_is_reproducible_from_hash_bound_evidence(
     ) == evidence
 
 
-def test_v3_rejects_unbacked_or_unclassified_entity_decisions() -> None:
+def test_v3_rejects_unbacked_but_allows_brief_specific_entity_subset() -> None:
     payload = _v3_plan().model_dump(mode="json")
     payload["chapters"][0]["candidates"][0]["required_entity_ids"] = [
         "missing-entity"
@@ -989,10 +1001,9 @@ def test_v3_rejects_unbacked_or_unclassified_entity_decisions() -> None:
     payload = _v3_plan().model_dump(mode="json")
     payload["chapters"][0]["candidates"][0]["preferred_entity_ids"] = []
     plan = ClipCardFeaturePlanV3.model_validate(payload)
-    with pytest.raises(ValueError, match="did not classify important event entities"):
-        validate_plan_contract_v3(
-            plan,
-            brief=_brief(),
-            catalog=_catalog(),
-            cards={ASSET_ID: _card()},
-        )
+    validate_plan_contract_v3(
+        plan,
+        brief=_brief(),
+        catalog=_catalog(),
+        cards={ASSET_ID: _card()},
+    )

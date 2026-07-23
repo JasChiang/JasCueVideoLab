@@ -348,6 +348,8 @@ Feature renderer 同樣接受無音軌來源：有原音時保留並淡入淡出
 
 `scripts/plan_clip_card_feature_cut.py` 將這個方法延伸到完整 feature cut：模型可閱讀整個已驗證 Clip Card library，但只能選 catalog 中既有的 asset／event／entity／RF frame ID；本機會再次驗證影格確實屬於該素材、位在事件區間，且每個 brief-specific entity priority 都能回溯到 event，再以 hash-bound Clip Card evidence 投影出 `feature-cut` 可使用的 target 與 region contract。選片階段不產生 bbox 或剪點，只有真正入選、需要動態構圖的區間才執行 exact-frame Grounding 與 SAM。新版保留每章 2–4 個候選，9:16 renderer 會先試可驗證的 tracked candidates，再考慮 planner 明列的 safe-fit；所有候選均失敗時只輸出待審 preview，不會把中心裁切冒充成成功追蹤。
 
+當素材庫大到無法在單次 narrative planner request 中穩定放入所有 Clip Card 時，先以 `scripts/shortlist_clip_card_feature_candidates.py` 做一次 text-only 階層召回：每個 brief chapter 只保留可回溯至原始 Clip Card 的少量候選，再交給完整 planner 決定順序、framing intent 與 Top-K。這不是只取 rank 1 的捷徑，也不會跳過後續 evidence／geometry gate；它把「高召回找素材」和「跨章節敘事與構圖決策」拆成兩個可稽核任務，避免一個超大回應失敗後整批重送。
+
 Clip Card plan 轉成 renderer plan 時會另寫不可變的 external-projection sidecar，保存來源 catalog、brief、模型 request／raw response、projection contract 與輸出 plan 的 hash。candidate override 也必須接續並驗證這條 provenance；任一上游內容改變就 fail closed。早於此 contract 的舊 artifact 不可手動複製 plan 冒充可重用結果，必須從仍保存的原始 artifact 重新投影。
 
 `scripts/plan_clip_card_open_edit.py` 是沒有內容 brief 的對照實驗：只給 60–90 秒與雙比例等操作限制，讓 Gemini 從完整 Clip Card library 自行推論主題、時間軸位置與每格 2–4 個候選。新版 evidence payload 也保留 Entity kind、required／optional／avoid-overlay 關係，讓模型可產生泛用 `vertical_regions`，而不是把多個獨立主體合寫成一個 bbox target。局部 Trim Intent 可能為保留完整動作而使成片超過模型原先配置的秒數，因此 `scripts/reconcile_open_edit_budget.py` 另讀實際 segment durations，只以 keep／drop／reorder 完整片段把全片拉回 duration contract；它不會在動作中間靜默截短。
@@ -386,7 +388,7 @@ Gemini 的成片 `pass` 不可覆蓋本機幾何證據。QA validator 會把 req
 
 零成本 baseline 全部在本機執行，不呼叫 Gemini。分析器只提出聲學候選，不把 `section_001` 冒充為 verse、chorus 或 drop；human review 之前，beat grid 不具執行權限。`narrative`、`balanced`、`montage` 三種 preset 只改變 section／downbeat／accent／一般 beat 的排序權重，不改變素材語意。
 
-若要減少規則式卡點的機械感，可選擇再執行一次 `gemini-3.6-flash` 音樂語意配對。Gemini 會同時取得音樂、已核准的 MusicMap cue IDs，以及 Clip Card／render manifest 衍生的視覺事件語意；它只能回答「哪個 visual event 適合哪些既有 cue IDs」，不能自己發明秒數。這是每支音樂一次、可由 File API 重用的選配請求，不會對每個鏡頭重送音樂。最終 sample-accurate 位置、合法 timing window、全局順序與 hard gate 仍由本機決定。
+若要減少規則式卡點的機械感，可選擇再執行一次 `gemini-3.6-flash` 音樂語意配對。Gemini 會同時取得音樂、已核准的 MusicMap cue IDs，以及 Clip Card／render manifest 衍生的視覺事件語意；它只能回答「哪個 visual event 適合哪些既有 cue IDs」，不能自己發明秒數。程式只傳送至少落在一個 visual event 合法 timing window 內的 cue，避免把數百個永遠不可能採用的拍點塞入 prompt。這是每支音樂一次、以音樂 SHA-256 跨比例共用 File API cache 的選配請求，不會對每個鏡頭重送音樂。最終 sample-accurate 位置、合法 timing window、全局順序與 hard gate 仍由本機決定。
 
 ```bash
 # 1. 本機分析音樂；輸出 proposal，不會自動核准
@@ -441,7 +443,9 @@ UV_CACHE_DIR=.uv-cache uv run jascue-video-lab review-cue-plan \
   --output-dir artifacts/music-demo/cue-plan/reviewed
 ```
 
-目前 MVP **只完成卡點分析、排程、稽核與 lock，尚未自動重剪或混音**。這是刻意的 fail-closed 邊界：render manifest 只有既有 segment duration，不能證明把 cut 移動 250 ms 仍保留完整 setup／action／result、合法 source handle、同一 shot、可用構圖與片尾 hold。下一階段必須讓經核准的 Trim Intent 提供 action-safe timing window，通過 geometry preflight 後才可將 CuePlan 套入新的 RenderPlan；不會直接用 `setpts` 變速或裁掉動作來製造「有卡拍」的假象。
+目前 MVP 的正式路徑完成卡點分析、排程、稽核與 lock；`scripts/render_music_cue_preview.py` 另可產生清楚標示為 **unapproved review preview** 的 A/B 影片，方便真人直接聽看 Gemini 語意配對是否改善節奏。preview 只在已授權的小窗口內對既有 segment 做有限 retime 並替換音樂，audit 會保存每個邊界的目標 cue、實際位移與變速比例；它不是 production RenderPlan，也不得冒充經 source-handle-aware re-trim 的正式成片。
+
+這是刻意的 fail-closed 邊界：render manifest 只有既有 segment duration，不能證明把 cut 移動 250 ms 仍保留完整 setup／action／result、合法 source handle、同一 shot、可用構圖與片尾 hold。正式下一階段必須讓經核准的 Trim Intent 提供 action-safe timing window，通過 geometry preflight 後才可將 CuePlan 套入新的 RenderPlan；不會直接用 `setpts` 變速或裁掉動作來製造「有卡拍」的假象。
 
 ## 重要界線
 

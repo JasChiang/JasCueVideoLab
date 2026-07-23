@@ -113,7 +113,7 @@ def derive_clip_timeline(card: FullClipCard, shots: ShotManifest) -> DerivedClip
     events: list[DerivedClipEvent] = []
     for event in card.events:
         start_ms = mmss_to_ms(event.start_mmss)
-        end_ms = mmss_to_ms(event.end_mmss)
+        end_ms = event.resolved_end_ms(card.duration_ms)
         keyframe_ms = (
             mmss_to_ms(event.recommended_keyframe_mmss)
             if event.recommended_keyframe_mmss is not None
@@ -136,7 +136,13 @@ def derive_clip_timeline(card: FullClipCard, shots: ShotManifest) -> DerivedClip
                 end_ms=end_ms,
                 recommended_keyframe_ms=keyframe_ms,
                 shot_ids=shot_ids,
-                boundary_source="gemini_mmss_local_conversion",
+                boundary_source=(
+                    "gemini_mmss_subsecond_clip_end_conversion"
+                    if card.duration_ms < 1000
+                    and event.start_mmss == "00:00"
+                    and event.end_mmss == "00:01"
+                    else "gemini_mmss_local_conversion"
+                ),
                 exact_frame_required=(
                     event.dense_refinement != "not_needed" or keyframe_ms is None
                 ),
@@ -246,7 +252,7 @@ def create_dense_event_catalog(
     if source_media.asset_id != source_asset_id:
         raise ValueError("dense source identity differs from Clip Card")
     event_start_ms = mmss_to_ms(event.start_mmss)
-    event_end_ms = mmss_to_ms(event.end_mmss)
+    event_end_ms = event.resolved_end_ms(source_media.duration_ms)
     start_ms = event_start_ms if window_start_ms is None else window_start_ms
     end_ms = event_end_ms if window_end_ms is None else window_end_ms
     if not event_start_ms <= start_ms < end_ms <= event_end_ms:
@@ -330,7 +336,7 @@ def dense_window_for_event(
     if window_ms < 1000 or window_ms > 5000:
         raise ValueError("dense refinement window must be between 1000 and 5000 ms")
     event_start = mmss_to_ms(event.start_mmss)
-    event_end = mmss_to_ms(event.end_mmss)
+    event_end = event.resolved_end_ms(shots.duration_ms)
     center = (
         mmss_to_ms(event.recommended_keyframe_mmss)
         if event.recommended_keyframe_mmss is not None

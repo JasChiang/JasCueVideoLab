@@ -377,6 +377,20 @@ def _event(**updates) -> FullClipEvent:
     return FullClipEvent.model_validate(payload)
 
 
+def test_subsecond_clip_uses_mmss_ceiling_with_exact_clip_end_resolution() -> None:
+    card = _card(
+        duration_ms=500,
+        events=[
+            _event(
+                start_mmss="00:00",
+                end_mmss="00:01",
+                recommended_keyframe_mmss="00:00",
+            )
+        ],
+    )
+    assert card.events[0].resolved_end_ms(card.duration_ms) == 500
+
+
 def _card(**updates) -> FullClipCard:
     payload = {
         "source_asset_id": "sha256:" + "1" * 64,

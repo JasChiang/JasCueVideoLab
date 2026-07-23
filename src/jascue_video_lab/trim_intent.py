@@ -259,7 +259,7 @@ def run_trim_intent_event(
         raise ValueError("private source identity differs from Clip Card")
     shots = ShotManifest.model_validate(read_json(shots_path))
     event_start_ms = mmss_to_ms(event.start_mmss)
-    event_end_ms = mmss_to_ms(event.end_mmss)
+    event_end_ms = event.resolved_end_ms(card.duration_ms)
     center_ms = (
         mmss_to_ms(event.recommended_keyframe_mmss)
         if event.recommended_keyframe_mmss is not None
@@ -455,7 +455,7 @@ def run_video_trim_intent_event(
     if shot is None:
         raise ValueError("selected catalog anchor does not belong to a decoded shot")
     event_start_ms = mmss_to_ms(event.start_mmss)
-    event_end_ms = mmss_to_ms(event.end_mmss)
+    event_end_ms = event.resolved_end_ms(card.duration_ms)
     allowed_start_ms = max(event_start_ms, shot.start_time_ms)
     allowed_end_ms = min(event_end_ms, shot.end_time_ms, source_media.duration_ms)
     allowed_start_second = (allowed_start_ms + 999) // 1000
