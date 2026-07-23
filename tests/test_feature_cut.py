@@ -8,11 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+import jascue_video_lab.feature_cut as feature_cut_module
 
 from scripts.plan_clip_card_open_edit import (
     OpenEditCandidate,
     OpenEditPlan,
     OpenEditShot,
+    _assert_fresh_open_edit_namespace_empty,
+    _verified_open_edit_raw_output_text,
+    _write_open_edit_normalization_artifacts,
+    canonicalize_open_edit_output,
     project_feature_contracts,
 )
 
@@ -31,6 +36,7 @@ from jascue_video_lab.feature_cut import (
     _concat_segments,
     _render_source_segment,
     _render_text_layer,
+    _requested_render_aspects,
     _required_track_union,
     _resolve_vertical_candidate_intent,
     _segment_variant_fingerprint,
@@ -48,8 +54,444 @@ from jascue_video_lab.feature_cut import (
     _vertical_runtime_candidate_options,
     _vertical_target_fits_crop,
     _write_incremental_pricing,
+    run_feature_cut_experiment,
     write_external_feature_plan_projection,
 )
+from jascue_video_lab.cli import build_parser
+
+
+def test_feature_cut_aspect_gate_and_cli_defaults() -> None:
+    assert _requested_render_aspects("both") == (True, True)
+    assert _requested_render_aspects("16x9") == (True, False)
+    assert _requested_render_aspects("9x16") == (False, True)
+    with pytest.raises(ValueError, match="aspect must be one of"):
+        _requested_render_aspects("square")
+
+    defaults = build_parser().parse_args(
+        [
+            "feature-cut",
+            "catalog.json",
+            "brief.json",
+            "--sam-checkpoint",
+            "sam.pt",
+            "--output-dir",
+            "output",
+        ]
+    )
+    assert defaults.aspect == "both"
+    vertical = build_parser().parse_args(
+        [
+            "feature-cut",
+            "catalog.json",
+            "brief.json",
+            "--sam-checkpoint",
+            "sam.pt",
+            "--aspect",
+            "9x16",
+            "--output-dir",
+            "output",
+        ]
+    )
+    assert vertical.aspect == "9x16"
+
+
+@pytest.mark.parametrize(
+    ("aspect", "expected_dimensions", "requested_key", "skipped_key"),
+    [
+        ("9x16", (1080, 1920), "vertical", "horizontal"),
+        ("16x9", (1920, 1080), "horizontal", "vertical"),
+    ],
+)
+def test_feature_cut_single_aspect_skips_unrequested_segments_and_concat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    aspect: str,
+    expected_dimensions: tuple[int, int],
+    requested_key: str,
+    skipped_key: str,
+) -> None:
+    catalog_path = tmp_path / "catalog.json"
+    brief_path = tmp_path / "brief.json"
+    output_dir = tmp_path / "output"
+    plan_dir = output_dir / "gemini-plan"
+    plan_path = plan_dir / "feature_edit_plan.json"
+    request_path = plan_dir / "feature_edit_plan.request.json"
+    catalog = RushesCatalog(
+        catalog_id="generic-catalog",
+        source_directory="/generic-source",
+        sample_interval_ms=2000,
+        total_duration_ms=60000,
+        clips=[],
+        frames=[],
+        analysis_reel_path=str(tmp_path / "analysis-reel.mp4"),
+        generated_at="test",
+    )
+    brief = FeatureEditBrief(
+        project_id="generic-project",
+        title="Generic edit",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id="missing-scene",
+                title="Missing scene",
+                detail_lines=[],
+                target_duration_seconds=3,
+            )
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id=catalog.catalog_id,
+        title=brief.title,
+        chapters=[
+            FeatureChapterSelect(
+                feature_id="missing-scene",
+                evidence_status="not_found",
+                observed_visual_evidence="No direct evidence.",
+                selection_reason="No matching catalog evidence.",
+                horizontal_strategy="original",
+                horizontal_zoom_intent="none",
+                horizontal_target_description=None,
+                vertical_strategy="fit_with_background",
+                vertical_target_description=None,
+                quality_risks=["missing evidence"],
+                confidence=0.0,
+            )
+        ],
+        uncertainties=["missing evidence"],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    write_json(catalog_path, catalog)
+    write_json(brief_path, brief)
+    write_json(plan_path, plan)
+    write_json(request_path, {"request": "bound test request"})
+    write_json(
+        plan_dir / "feature-plan.binding.json",
+        _current_feature_plan_binding(
+            catalog_path=catalog_path,
+            brief_path=brief_path,
+            plan_path=plan_path,
+            plan_prompt="plan",
+            request_path=request_path,
+            created_at="test",
+            origin="generated",
+        ),
+    )
+
+    rendered_dimensions: list[tuple[int, int]] = []
+    concat_outputs: list[Path] = []
+
+    class FakeClient:
+        def close(self) -> None:
+            return None
+
+    def fake_render_missing(
+        chapter: FeatureChapterBrief,
+        output_path: Path,
+        overlay_path: Path,
+        dimensions: tuple[int, int],
+    ) -> None:
+        del chapter, overlay_path
+        rendered_dimensions.append(dimensions)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"segment")
+
+    def fake_concat(segments: list[Path], output_path: Path) -> None:
+        assert len(segments) == 1
+        concat_outputs.append(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"render")
+
+    monkeypatch.setattr(feature_cut_module, "GeminiLabClient", FakeClient)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "probe_video",
+        lambda _path: SimpleNamespace(sha256="a" * 64),
+    )
+    monkeypatch.setattr(feature_cut_module, "_segment_is_valid", lambda *a, **k: False)
+    monkeypatch.setattr(feature_cut_module, "_render_missing_segment", fake_render_missing)
+    monkeypatch.setattr(feature_cut_module, "_concat_segments", fake_concat)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_output_media_metadata",
+        lambda _path: {"duration_ms": 3000},
+    )
+
+    result = run_feature_cut_experiment(
+        catalog_path=catalog_path,
+        brief_path=brief_path,
+        checkpoint_path=tmp_path / "unused.pt",
+        output_dir=output_dir,
+        plan_prompt="plan",
+        grounding_prompt="ground",
+        reuse_feature_plan=True,
+        aspect=aspect,
+    )
+
+    manifest = read_json(output_dir / "render-manifest.json")
+    assert rendered_dimensions == [expected_dimensions]
+    assert len(concat_outputs) == 1
+    assert manifest[requested_key]["status"] == "rendered"
+    assert len(manifest[requested_key]["chapters"]) == 1
+    assert manifest[skipped_key] == {
+        "requested": False,
+        "status": "not_requested",
+        "chapters": [],
+    }
+    assert result[f"{requested_key}_output"] is not None
+    assert result[f"{skipped_key}_output"] is None
+
+
+@pytest.mark.parametrize(
+    ("aspect", "expected_build_track_calls", "expected_vertical_geometry_calls"),
+    [
+        ("9x16", 0, 1),
+        ("16x9", 1, 0),
+    ],
+)
+def test_feature_cut_single_aspect_found_evidence_never_runs_other_geometry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    aspect: str,
+    expected_build_track_calls: int,
+    expected_vertical_geometry_calls: int,
+) -> None:
+    catalog_path = tmp_path / "catalog.json"
+    brief_path = tmp_path / "brief.json"
+    output_dir = tmp_path / "output"
+    plan_dir = output_dir / "gemini-plan"
+    plan_path = plan_dir / "feature_edit_plan.json"
+    request_path = plan_dir / "feature_edit_plan.request.json"
+    source_path = tmp_path / "source.mp4"
+    clip = RushClip(
+        clip_id="clip-1",
+        path=str(source_path),
+        sha256="b" * 64,
+        duration_ms=10_000,
+        width=1920,
+        height=1080,
+        frame_rate="30/1",
+        size_bytes=1,
+    )
+    frame = RushFrame(
+        frame_id="RF000001",
+        clip_id=clip.clip_id,
+        requested_time_ms=5000,
+        image_path=str(tmp_path / "frame.jpg"),
+    )
+    catalog = RushesCatalog(
+        catalog_id="generic-catalog",
+        source_directory=str(tmp_path),
+        sample_interval_ms=2000,
+        total_duration_ms=clip.duration_ms,
+        clips=[clip],
+        frames=[frame],
+        analysis_reel_path=str(tmp_path / "analysis-reel.mp4"),
+        generated_at="test",
+    )
+    brief = FeatureEditBrief(
+        project_id="generic-project",
+        title="Generic edit",
+        target_duration_seconds=60,
+        render_title_overlays=False,
+        chapters=[
+            FeatureChapterBrief(
+                feature_id="visible-scene",
+                title="Visible scene",
+                detail_lines=[],
+                target_duration_seconds=3,
+            )
+        ],
+    )
+    plan = FeatureEditPlan(
+        project_id=brief.project_id,
+        catalog_id=catalog.catalog_id,
+        title=brief.title,
+        chapters=[
+            FeatureChapterSelect(
+                feature_id="visible-scene",
+                evidence_status="supported",
+                horizontal_frame_id=frame.frame_id,
+                vertical_frame_id=frame.frame_id,
+                observed_visual_evidence="One directly visible subject.",
+                selection_reason="Representative evidence frame.",
+                horizontal_strategy="tracked_reframe",
+                horizontal_zoom_intent="subtle",
+                horizontal_target_description="the directly visible subject",
+                vertical_strategy="tracked_crop",
+                vertical_target_description="the directly visible subject",
+                quality_risks=[],
+                confidence=0.9,
+            )
+        ],
+        uncertainties=[],
+        model_provenance=ModelProvenance(
+            model_id=MODEL_ID,
+            api="gemini_interactions",
+            sdk="google-genai",
+            sdk_version="test",
+            run_id="test",
+            generated_at="test",
+        ),
+    )
+    write_json(catalog_path, catalog)
+    write_json(brief_path, brief)
+    write_json(plan_path, plan)
+    write_json(request_path, {"request": "bound test request"})
+    write_json(
+        plan_dir / "feature-plan.binding.json",
+        _current_feature_plan_binding(
+            catalog_path=catalog_path,
+            brief_path=brief_path,
+            plan_path=plan_path,
+            plan_prompt="plan",
+            request_path=request_path,
+            created_at="test",
+            origin="generated",
+        ),
+    )
+
+    build_track_calls = 0
+    vertical_geometry_calls = 0
+    concat_outputs: list[Path] = []
+
+    class FakeClient:
+        def close(self) -> None:
+            return None
+
+    class FakeRatio:
+        numerator = 1
+        denominator = 1
+
+        def model_dump(self, *, mode: str) -> dict[str, int]:
+            assert mode == "json"
+            return {"numerator": 1, "denominator": 1}
+
+    class FakeTrack:
+        def model_dump(self, *, mode: str) -> dict[str, str]:
+            assert mode == "json"
+            return {"track": "test"}
+
+    source_media = SimpleNamespace(
+        video=SimpleNamespace(
+            sample_aspect_ratio=FakeRatio(),
+            display_sample_aspect_ratio=FakeRatio(),
+        )
+    )
+
+    def fake_probe(path: Path) -> object:
+        if Path(path) == Path(catalog.analysis_reel_path):
+            return SimpleNamespace(sha256="a" * 64)
+        assert Path(path) == source_path
+        return source_media
+
+    def fake_build_track(**kwargs: object) -> tuple[object, FakeTrack]:
+        nonlocal build_track_calls
+        build_track_calls += 1
+        assert kwargs["clip"] == clip
+        return object(), FakeTrack()
+
+    def fake_vertical_candidate_geometry(
+        **kwargs: object,
+    ) -> tuple[str, dict[str, object], list[Path], str]:
+        nonlocal vertical_geometry_calls
+        vertical_geometry_calls += 1
+        assert kwargs["clip"] == clip
+        return (
+            "test-vertical-filter",
+            {
+                "applied_strategy": "tracked_crop",
+                "fallback_reason": None,
+                "source_geometry_lineage_passed": True,
+                "tracking_confidence_gate_passed": True,
+                "coverage_passed": True,
+            },
+            [],
+            "c" * 64,
+        )
+
+    def fake_render_source_segment(**kwargs: object) -> None:
+        output_path = Path(str(kwargs["output_path"]))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"segment")
+
+    def fake_concat(segments: list[Path], output_path: Path) -> None:
+        assert len(segments) == 1
+        concat_outputs.append(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"render")
+
+    monkeypatch.setattr(feature_cut_module, "GeminiLabClient", FakeClient)
+    monkeypatch.setattr(feature_cut_module, "probe_video", fake_probe)
+    monkeypatch.setattr(feature_cut_module, "has_audio_stream", lambda _path: False)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_chapter_bounds_with_approved_trim",
+        lambda *args, **kwargs: (
+            3500,
+            6500,
+            "shot-1",
+            {"trim_method": "test_bounds"},
+        ),
+    )
+    monkeypatch.setattr(feature_cut_module, "_build_track", fake_build_track)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_horizontal_filter_from_track",
+        lambda *args, **kwargs: (
+            "test-horizontal-filter",
+            {
+                "applied_zoom": 1.1,
+                "fallback_reason": None,
+                "risk_codes": [],
+                "requires_gemini_review": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_vertical_candidate_geometry",
+        fake_vertical_candidate_geometry,
+    )
+    monkeypatch.setattr(feature_cut_module, "_segment_is_valid", lambda *a, **k: False)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_render_source_segment",
+        fake_render_source_segment,
+    )
+    monkeypatch.setattr(feature_cut_module, "_concat_segments", fake_concat)
+    monkeypatch.setattr(
+        feature_cut_module,
+        "_output_media_metadata",
+        lambda _path: {"duration_ms": 3000},
+    )
+
+    result = run_feature_cut_experiment(
+        catalog_path=catalog_path,
+        brief_path=brief_path,
+        checkpoint_path=tmp_path / "unused.pt",
+        output_dir=output_dir,
+        plan_prompt="plan",
+        grounding_prompt="ground",
+        reuse_feature_plan=True,
+        aspect=aspect,
+    )
+
+    assert build_track_calls == expected_build_track_calls
+    assert vertical_geometry_calls == expected_vertical_geometry_calls
+    assert len(concat_outputs) == 1
+    expected_output_key = "vertical_output" if aspect == "9x16" else "horizontal_output"
+    skipped_output_key = "horizontal_output" if aspect == "9x16" else "vertical_output"
+    assert result[expected_output_key] is not None
+    assert result[skipped_output_key] is None
 
 
 def test_no_brief_topk_rejects_candidate_aliases_of_same_evidence_frame() -> None:
@@ -121,6 +563,101 @@ from jascue_video_lab.sam_tracking import (
 from jascue_video_lab.schema import gemini_response_schema
 from jascue_video_lab.shots import ShotManifest, ShotSegment
 from jascue_video_lab.storage import read_json, write_json
+
+
+def test_open_edit_hard_region_canonicalization_preserves_soft_visibility() -> None:
+    payload = {
+        "shots": [
+            {
+                "candidates": [
+                    {
+                        "vertical_regions": [
+                            {
+                                "role": "required",
+                                "atomic": False,
+                                "minimum_visible_fraction": 0.8,
+                            },
+                            {
+                                "role": "preferred",
+                                "atomic": True,
+                                "minimum_visible_fraction": 0.7,
+                            },
+                            {
+                                "role": "preferred",
+                                "atomic": False,
+                                "minimum_visible_fraction": 0.6,
+                            },
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    original = json.dumps(payload)
+
+    canonical_text, changes = canonicalize_open_edit_output(original)
+    regions = json.loads(canonical_text)["shots"][0]["candidates"][0][
+        "vertical_regions"
+    ]
+
+    assert [region["minimum_visible_fraction"] for region in regions] == [1.0, 1.0, 0.6]
+    assert len(changes) == 2
+    assert all(
+        change["rule"] == "required_or_atomic_region_is_fully_visible"
+        for change in changes
+    )
+
+
+def test_open_edit_normalization_audit_does_not_overwrite_raw_output(
+    tmp_path: Path,
+) -> None:
+    raw_path = tmp_path / "open-edit.raw_output.json"
+    raw_text = json.dumps(
+        {
+            "shots": [
+                {
+                    "candidates": [
+                        {
+                            "vertical_regions": [
+                                {
+                                    "role": "required",
+                                    "minimum_visible_fraction": 0.75,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    write_json(raw_path, {"output_text": raw_text})
+    original = raw_path.read_bytes()
+
+    _, canonical_path, audit_path = _write_open_edit_normalization_artifacts(
+        output_dir=tmp_path,
+        raw_output_path=raw_path,
+        raw_output_text=raw_text,
+    )
+
+    assert raw_path.read_bytes() == original
+    assert canonical_path.exists()
+    audit = read_json(audit_path)
+    assert audit["change_count"] == 1
+    assert audit["raw_output_artifact_sha256"] == hashlib.sha256(original).hexdigest()
+
+
+def test_open_edit_reuse_rejects_mismatched_raw_response_copies() -> None:
+    with pytest.raises(ValueError, match="does not exactly match"):
+        _verified_open_edit_raw_output_text(
+            raw_output={"output_text": "first"},
+            raw_interaction={"output_text": "second"},
+        )
+
+
+def test_fresh_open_edit_run_refuses_existing_paid_namespace(tmp_path: Path) -> None:
+    write_json(tmp_path / "open-edit.raw_output.json", {"output_text": "already paid"})
+    with pytest.raises(FileExistsError, match="new output directory"):
+        _assert_fresh_open_edit_namespace_empty(tmp_path)
 
 
 def test_feature_plan_binding_rejects_changed_causal_inputs(tmp_path: Path) -> None:

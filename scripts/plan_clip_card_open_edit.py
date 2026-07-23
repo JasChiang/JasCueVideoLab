@@ -9,13 +9,14 @@ slot before selecting the horizontal and vertical representatives.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import importlib.metadata
 import json
 import os
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from google import genai
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -182,6 +183,125 @@ class OpenEditPlan(StrictModel):
             if len(selected) != len(set(selected)):
                 raise ValueError(f"duplicate selected frame in {aspect} timeline")
         return self
+
+
+OPEN_EDIT_NORMALIZATION_VERSION = "clip-card-open-edit-normalization-v1"
+
+
+def canonicalize_open_edit_output(
+    output_text: str,
+) -> tuple[str, list[dict[str, object]]]:
+    """Make hard visibility intent explicit without changing editorial choices."""
+
+    payload = json.loads(output_text)
+    if not isinstance(payload, dict):
+        raise ValueError("open-edit planner output must be a JSON object")
+    changes: list[dict[str, object]] = []
+    shots = payload.get("shots")
+    if not isinstance(shots, list):
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), changes
+    for shot_index, shot in enumerate(shots):
+        if not isinstance(shot, dict):
+            continue
+        candidates = shot.get("candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            regions = candidate.get("vertical_regions")
+            if not isinstance(regions, list):
+                continue
+            for region_index, region in enumerate(regions):
+                if not isinstance(region, dict):
+                    continue
+                supplied = region.get("minimum_visible_fraction")
+                hard_visibility = region.get("role") == "required" or region.get("atomic") is True
+                if hard_visibility and supplied not in (None, 1.0):
+                    region["minimum_visible_fraction"] = 1.0
+                    changes.append(
+                        {
+                            "json_path": (
+                                f"$.shots[{shot_index}].candidates[{candidate_index}]"
+                                f".vertical_regions[{region_index}].minimum_visible_fraction"
+                            ),
+                            "before": supplied,
+                            "after": 1.0,
+                            "rule": "required_or_atomic_region_is_fully_visible",
+                        }
+                    )
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), changes
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _write_open_edit_normalization_artifacts(
+    *, output_dir: Path, raw_output_path: Path, raw_output_text: str
+) -> tuple[str, Path, Path]:
+    canonical_text, changes = canonicalize_open_edit_output(raw_output_text)
+    canonical_path = output_dir / "open-edit.canonical_output.json"
+    audit_path = output_dir / "open-edit.normalization-audit.json"
+    write_json(canonical_path, {"output_text": canonical_text})
+    write_json(
+        audit_path,
+        {
+            "contract_version": OPEN_EDIT_NORMALIZATION_VERSION,
+            "interpretation": "conditional_schema_contradictions_only",
+            "raw_output_path": str(raw_output_path.resolve()),
+            "raw_output_artifact_sha256": sha256_file(raw_output_path),
+            "input_output_text_sha256": _text_sha256(raw_output_text),
+            "canonical_output_path": str(canonical_path.resolve()),
+            "canonical_output_artifact_sha256": sha256_file(canonical_path),
+            "canonical_output_text_sha256": _text_sha256(canonical_text),
+            "changes": changes,
+            "change_count": len(changes),
+            "created_at": utc_now(),
+        },
+    )
+    return canonical_text, canonical_path, audit_path
+
+
+def _verified_open_edit_raw_output_text(
+    *, raw_output: dict[str, Any], raw_interaction: dict[str, Any]
+) -> str:
+    """Return a paid response only when both independently saved copies agree."""
+
+    output_text = raw_output.get("output_text")
+    interaction_text = raw_interaction.get("output_text")
+    if not isinstance(output_text, str) or not isinstance(interaction_text, str):
+        raise ValueError(
+            "--reuse-raw-output requires string output_text in both raw artifacts"
+        )
+    if output_text != interaction_text:
+        raise ValueError(
+            "--reuse-raw-output artifact mismatch: raw interaction output_text "
+            "does not exactly match raw output output_text"
+        )
+    return output_text
+
+
+def _assert_fresh_open_edit_namespace_empty(output_dir: Path) -> None:
+    existing = sorted(output_dir.glob("open-edit*"))
+    if existing:
+        raise FileExistsError(
+            "fresh open-edit planning refuses an existing paid artifact namespace; "
+            "use --reuse-raw-output or a new output directory: "
+            + ", ".join(path.name for path in existing[:8])
+        )
+
+
+def _assert_projection_request_hash(
+    *, pointer_path: Path, plan_dir: Path, expected_request_path: Path
+) -> None:
+    pointer = read_json(pointer_path)
+    record = read_json(plan_dir / str(pointer["record_path"]))
+    expected = sha256_file(expected_request_path)
+    if record.get("source_request_sha256") != expected:
+        raise RuntimeError(
+            "external projection source request does not match the original paid request"
+        )
 
 
 def compact_card(card: FullClipCard) -> dict[str, object]:
@@ -616,10 +736,12 @@ def main() -> int:
 2. 第一段必須是 hook，最後一段必須是 closing。中間應有視覺節奏、資訊推進與畫面變化，不能只是依素材檔案順序排列。
 3. 每個位置保留 2–4 個依品質排序的候選。候選必須引用存在的 source_asset_id、event_id 與 RF frame_id，並說明為何入選及風險。
 4. 16:9 與 9:16 可從同一候選組選不同 take；若同一 take 足夠，優先共用。不得輸出 bbox、mask、crop 座標或自行發明 timestamp。
+   - horizontal_strategy=original 時，horizontal_zoom_intent 必須是 none，而且 horizontal_target_description 必須是 null。
+   - horizontal_strategy=tracked_reframe 時，horizontal_zoom_intent 必須是 subtle 或 detail，而且 horizontal_target_description 必須明確指出本畫面中要跟隨的可見實例。
 5. 可以讓同一語意主題使用多個鏡頭，例如 setup、action、result、beauty，但不得重複使用完全相同的代表 frame。
 6. 只使用 Clip Card 記錄的可見證據。品牌、型號、規格與功能名稱若不清楚，使用泛稱並保存 uncertainty；不得用模型記憶補完。
 7. 不要假裝知道導演意圖。疑似失焦、拍攝準備、重複 take、無意義停頓或不適合直式的畫面，只能根據保存的 evidence 提出排除或風險。
-8. geometry intent 必須可泛化到任何可見內容。單一主體可沿用 vertical_target_description；若人物、物件、文字、UI 等多個區域都必須保留，請逐一建立 vertical_regions，不得把兩個獨立實例合寫成一個模糊 target。region kind 只按可見證據選 subject、text_region、ui_region、graphic 或 other。vertical_regions 是實際 crop constraints，因此有 regions 時 vertical_strategy 必須是 tracked_crop；fit_with_background 不得同時宣告 regions。
+8. geometry intent 必須可泛化到任何可見內容。單一主體可沿用 vertical_target_description；若人物、物件、文字、UI 等多個區域都必須保留，請逐一建立 vertical_regions，不得把兩個獨立實例合寫成一個模糊 target。region kind 只按可見證據選 subject、text_region、ui_region、graphic 或 other。vertical_regions 是實際 crop constraints，因此有 regions 時 vertical_strategy 必須是 tracked_crop；fit_with_background 不得同時宣告 regions。role=required 或 atomic=true 的 region 若填 minimum_visible_fraction，只能是 1.0；非 atomic 的 preferred region 才可填小於 1.0 的比例；avoid_overlay 必須省略該欄位或回傳 null。
 9. vertical_overflow_policy 必須固定為 preserve_all，vertical_edge_priority 必須固定為 balanced；你沒有權限授權 renderer 裁掉 required union。若依畫面證據判斷有限裁切可能值得由真人考慮，只能填 vertical_overflow_proposal，說明 proposed_edge_priority 與 rationale。proposal 不會直接執行，也不得被描述成已核准。若 required union 可能無法容納，仍應優先改選較適合直式的候選。
 
 project_id 必須原樣回傳：{args.project_id}
@@ -637,7 +759,10 @@ model_provenance 必須先原樣回傳：
             "No content brief exists. Never use model memory, filenames, likely product knowledge, "
             "or unstated marketing claims to fill gaps. Preserve ambiguity and alternatives. "
             "You may propose but never authorize required-region clipping; executable overflow "
-            "policy must remain preserve_all."
+            "policy must remain preserve_all. For original horizontal framing, zoom must be "
+            "none and target description must be null; only tracked_reframe may name a target. "
+            "Required or atomic regions are fully visible (minimum_visible_fraction 1.0); "
+            "avoid-overlay regions do not declare a visible fraction."
         ),
         "store": False,
         "input": [{"type": "text", "text": prompt}],
@@ -652,6 +777,7 @@ model_provenance 必須先原樣回傳：
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     interaction_id = ""
+    reuse_record: dict[str, object] | None = None
     if args.reuse_raw_output:
         original_request_path = args.output_dir / "open-edit.request.json"
         raw_output_path = args.output_dir / "open-edit.raw_output.json"
@@ -687,29 +813,31 @@ model_provenance 必須先原樣回傳：
             args.output_dir / "open-edit.reprojection-request.json"
         )
         write_json(reprojection_request_path, request)
-        write_json(
-            args.output_dir / "open-edit.raw-output-reuse.json",
-            {
-                "interpretation": (
-                    "saved_model_response_revalidated_and_projected_no_new_model_call"
-                ),
-                "original_request_path": str(original_request_path.resolve()),
-                "original_request_sha256": sha256_file(original_request_path),
-                "raw_output_path": str(raw_output_path.resolve()),
-                "raw_output_sha256": sha256_file(raw_output_path),
-                "current_reprojection_request_path": str(
-                    reprojection_request_path.resolve()
-                ),
-                "current_reprojection_request_sha256": sha256_file(
-                    reprojection_request_path
-                ),
-                "reused_at": utc_now(),
-            },
-        )
+        reuse_record = {
+            "interpretation": (
+                "saved_model_response_canonicalized_revalidated_and_projected_"
+                "with_no_new_model_call"
+            ),
+            "original_request_path": str(original_request_path.resolve()),
+            "original_request_sha256": sha256_file(original_request_path),
+            "raw_output_path": str(raw_output_path.resolve()),
+            "raw_output_sha256": sha256_file(raw_output_path),
+            "current_reprojection_request_path": str(
+                reprojection_request_path.resolve()
+            ),
+            "current_reprojection_request_sha256": sha256_file(
+                reprojection_request_path
+            ),
+            "reused_at": utc_now(),
+        }
         raw_output = read_json(raw_output_path)
-        output_text = str(raw_output["output_text"])
+        output_text = _verified_open_edit_raw_output_text(
+            raw_output=raw_output,
+            raw_interaction=raw_interaction,
+        )
         interaction_id = str(raw_interaction.get("id") or "")
     else:
+        _assert_fresh_open_edit_namespace_empty(args.output_dir)
         write_json(args.output_dir / "open-edit.request.json", request)
         client = genai.Client(api_key=api_key)
         try:
@@ -724,8 +852,29 @@ model_provenance 必須先原樣回傳：
             args.output_dir / "open-edit.raw_output.json",
             {"output_text": output_text},
         )
+    raw_output_path = args.output_dir / "open-edit.raw_output.json"
+    output_text, canonical_output_path, normalization_audit_path = (
+        _write_open_edit_normalization_artifacts(
+            output_dir=args.output_dir,
+            raw_output_path=raw_output_path,
+            raw_output_text=output_text,
+        )
+    )
+    if reuse_record is not None:
+        reuse_record.update(
+            {
+                "normalization_audit_path": str(normalization_audit_path.resolve()),
+                "normalization_audit_sha256": sha256_file(normalization_audit_path),
+            }
+        )
+        write_json(args.output_dir / "open-edit.raw-output-reuse.json", reuse_record)
     plan = OpenEditPlan.model_validate_json(output_text)
     validate_evidence(plan, project_id=args.project_id, catalog=catalog, cards=cards)
+    if args.reuse_raw_output and plan.model_provenance.model_id != MODEL_ID:
+        raise ValueError(
+            "--reuse-raw-output model provenance mismatch: "
+            f"expected {MODEL_ID!r}, got {plan.model_provenance.model_id!r}"
+        )
     plan = plan.model_copy(
         update={
             "model_provenance": plan.model_provenance.model_copy(
@@ -753,7 +902,12 @@ model_provenance 必須先原樣回傳：
     )
     projection_artifacts = {
         "source_raw_interaction": args.output_dir / "open-edit.raw_interaction.json",
-        "source_raw_output": args.output_dir / "open-edit.raw_output.json",
+        # Projection semantics are checked against the canonical source while
+        # the paid response remains immutable and independently hash-bound.
+        "source_raw_output": canonical_output_path,
+        "original_raw_output": args.output_dir / "open-edit.raw_output.json",
+        "canonicalized_output": canonical_output_path,
+        "normalization_audit": normalization_audit_path,
     }
     for role, path in (
         (
@@ -772,11 +926,9 @@ model_provenance 必須先原樣回傳：
         if args.reuse_raw_output and path.exists():
             projection_artifacts[role] = path
     projection_request_path = (
-        args.output_dir / "open-edit.reprojection-request.json"
-        if args.reuse_raw_output
-        else args.output_dir / "open-edit.request.json"
+        args.output_dir / "open-edit.request.json"
     )
-    write_external_feature_plan_projection(
+    projection_pointer = write_external_feature_plan_projection(
         plan_dir=plan_dir,
         projection_contract_id="clip-card-open-edit-v2",
         catalog_path=args.catalog_json,
@@ -786,6 +938,12 @@ model_provenance 必須先原樣回傳：
         source_request_path=projection_request_path,
         source_artifacts=projection_artifacts,
     )
+    if args.reuse_raw_output:
+        _assert_projection_request_hash(
+            pointer_path=projection_pointer,
+            plan_dir=plan_dir,
+            expected_request_path=original_request_path,
+        )
     write_json(
         args.output_dir / "pricing.json",
         summarize_usage_files(

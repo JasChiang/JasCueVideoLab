@@ -9,6 +9,7 @@ FeatureEditPlan consumed by the existing Grounding and tracking renderer.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -23,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from jascue_video_lab.billing import summarize_usage_files
 from jascue_video_lab.feature_cut import write_external_feature_plan_projection
 from jascue_video_lab.gemini import MODEL_ID, _raw_dump
+from jascue_video_lab.media import sha256_file
 from jascue_video_lab.models import (
     FeatureChapterSelect,
     FeatureEditBrief,
@@ -462,6 +464,172 @@ class SelectedClipCardEvidence(StrictModel):
 
     contract_version: Literal["clip-card-feature-cut-selected-evidence-v1"]
     events: list[SelectedEvidenceEvent]
+
+
+FEATURE_PLAN_NORMALIZATION_VERSION = "clip-card-feature-plan-normalization-v1"
+
+
+def canonicalize_feature_plan_output(
+    output_text: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Canonicalize only two explicitly ordered schema contradictions.
+
+    The function is deliberately narrow and deterministic.  It never changes
+    editorial selections or evidence references.  Explicit
+    ``horizontal_strategy=original`` has conservative precedence: local
+    normalization disables contradictory zoom and tracking focus rather than
+    promoting a non-tracking choice into executable tracking.
+    """
+
+    payload = json.loads(output_text)
+    if not isinstance(payload, dict):
+        raise ValueError("feature planner output must be a JSON object")
+    changes: list[dict[str, Any]] = []
+    chapters = payload.get("chapters")
+    if not isinstance(chapters, list):
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), changes
+    for chapter_index, chapter in enumerate(chapters):
+        if not isinstance(chapter, dict):
+            continue
+        candidates = chapter.get("candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            strategy = candidate.get("horizontal_strategy")
+            zoom = candidate.get("horizontal_zoom_intent")
+            focus = candidate.get("horizontal_focus_entity_id")
+            base = f"$.chapters[{chapter_index}].candidates[{candidate_index}]"
+            if strategy == "original" and zoom in {"subtle", "detail"}:
+                candidate["horizontal_zoom_intent"] = "none"
+                changes.append(
+                    {
+                        "json_path": f"{base}.horizontal_zoom_intent",
+                        "before": zoom,
+                        "after": "none",
+                        "rule": "explicit_original_strategy_disables_zoom",
+                    }
+                )
+            if strategy == "original" and focus is not None:
+                candidate["horizontal_focus_entity_id"] = None
+                changes.append(
+                    {
+                        "json_path": f"{base}.horizontal_focus_entity_id",
+                        "before": focus,
+                        "after": None,
+                        "rule": "explicit_original_strategy_has_no_focus_entity",
+                    }
+                )
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), changes
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _write_feature_normalization_artifacts(
+    *,
+    output_dir: Path,
+    artifact_stem: str,
+    raw_output_path: Path,
+    raw_output_text: str,
+) -> tuple[str, Path, Path]:
+    canonical_text, changes = canonicalize_feature_plan_output(raw_output_text)
+    canonical_path = output_dir / f"{artifact_stem}.canonical_output.json"
+    audit_path = output_dir / f"{artifact_stem}.normalization-audit.json"
+    write_json(canonical_path, {"output_text": canonical_text})
+    write_json(
+        audit_path,
+        {
+            "contract_version": FEATURE_PLAN_NORMALIZATION_VERSION,
+            "interpretation": "conditional_schema_contradictions_only",
+            "raw_output_path": str(raw_output_path.resolve()),
+            "raw_output_artifact_sha256": sha256_file(raw_output_path),
+            "input_output_text_sha256": _text_sha256(raw_output_text),
+            "canonical_output_path": str(canonical_path.resolve()),
+            "canonical_output_artifact_sha256": sha256_file(canonical_path),
+            "canonical_output_text_sha256": _text_sha256(canonical_text),
+            "changes": changes,
+            "change_count": len(changes),
+            "created_at": utc_now(),
+        },
+    )
+    return canonical_text, canonical_path, audit_path
+
+
+def _resolve_feature_reuse_artifacts(output_dir: Path) -> dict[str, Any]:
+    """Resolve one complete, non-mixed paid-response artifact set."""
+
+    sets = (
+        {
+            "kind": "canonical",
+            "request": output_dir / "clip-card-feature-plan.request.json",
+            "raw_output": output_dir / "clip-card-feature-plan.raw_output.json",
+            "raw_interaction": output_dir / "clip-card-feature-plan.raw_interaction.json",
+        },
+        {
+            "kind": "attempt-01",
+            "request": output_dir / "clip-card-feature-plan.attempt-01.request.json",
+            "raw_output": output_dir / "clip-card-feature-plan.attempt-01.raw_output.json",
+            "raw_interaction": output_dir
+            / "clip-card-feature-plan.attempt-01.raw_interaction.json",
+        },
+    )
+    incomplete: list[str] = []
+    for artifact_set in sets:
+        paths = [artifact_set[key] for key in ("request", "raw_output", "raw_interaction")]
+        present = [path.exists() for path in paths]
+        if all(present):
+            return artifact_set
+        if any(present):
+            incomplete.append(str(artifact_set["kind"]))
+    detail = f"; incomplete sets: {incomplete}" if incomplete else ""
+    raise FileNotFoundError(
+        "--reuse-raw-output requires one complete canonical or attempt-01 "
+        f"request/raw-output/raw-interaction set{detail}"
+    )
+
+
+def _verified_feature_raw_output_text(
+    *, raw_output: dict[str, Any], raw_interaction: dict[str, Any]
+) -> str:
+    """Return a paid response only when both independently saved copies agree."""
+
+    output_text = raw_output.get("output_text")
+    interaction_text = raw_interaction.get("output_text")
+    if not isinstance(output_text, str) or not isinstance(interaction_text, str):
+        raise ValueError(
+            "--reuse-raw-output requires string output_text in both raw artifacts"
+        )
+    if output_text != interaction_text:
+        raise ValueError(
+            "--reuse-raw-output artifact mismatch: raw interaction output_text "
+            "does not exactly match raw output output_text"
+        )
+    return output_text
+
+
+def _assert_fresh_feature_namespace_empty(output_dir: Path) -> None:
+    existing = sorted(output_dir.glob("clip-card-feature-plan*"))
+    if existing:
+        raise FileExistsError(
+            "fresh feature planning refuses an existing paid artifact namespace; "
+            "use --reuse-raw-output or a new output directory: "
+            + ", ".join(path.name for path in existing[:8])
+        )
+
+
+def _assert_projection_request_hash(
+    *, pointer_path: Path, plan_dir: Path, expected_request_path: Path
+) -> None:
+    pointer = read_json(pointer_path)
+    record = read_json(plan_dir / str(pointer["record_path"]))
+    expected = sha256_file(expected_request_path)
+    if record.get("source_request_sha256") != expected:
+        raise RuntimeError(
+            "external projection source request does not match the original paid request"
+        )
 
 
 def mmss(milliseconds: int) -> str:
@@ -1404,12 +1572,20 @@ def main() -> int:
         choices=["low", "high"],
         default="high",
     )
+    parser.add_argument(
+        "--reuse-raw-output",
+        action="store_true",
+        help=(
+            "Canonicalize, revalidate, and project an existing paid response "
+            "without creating another API request"
+        ),
+    )
     args = parser.parse_args()
     if args.repair_attempts < 0:
         parser.error("--repair-attempts must be zero or greater")
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
+    if not args.reuse_raw_output and not api_key:
         raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required")
     catalog = RushesCatalog.model_validate(read_json(args.catalog_json))
     brief = FeatureEditBrief.model_validate(read_json(args.brief_json))
@@ -1472,6 +1648,8 @@ def main() -> int:
 3. selected frame 的 local_mmss 必須位於所引用 event 的 [start_mmss,end_mmss)；不得自行創造 frame ID 或 timestamp。RF frame_id 必須從 available_catalog_frames 逐字複製並保留全部六位數與前導零，例如 RF000204 不可縮成 RF00204。
 4. 若可見型號、文字、數字或物件身分與 brief 衝突，優先改選沒有衝突的 take；沒有可靠 take 時用 partial 或 not_found 並保存風險。
 5. 每個 candidate 都必須保存可直接重試的 16:9 strategy／zoom／horizontal_focus_entity_id，以及 9:16 strategy、framing_intent 和 brief-specific entity priorities。橫式與直式可以從同一候選組選不同來源；horizontal_candidate_id／vertical_candidate_id 必須指向 candidates。不要重複輸出 rank-1 asset/event/frame mirror、target description 或 resolved crop regions；程式會從所選 candidate 與 hash-bound Clip Card evidence 確定性補出。
+   - horizontal_strategy=original 時，horizontal_zoom_intent 必須是 none，而且 horizontal_focus_entity_id 必須是 null；原始構圖不需要追蹤焦點。
+   - horizontal_strategy=tracked_reframe 時，horizontal_zoom_intent 必須是 subtle 或 detail，而且 horizontal_focus_entity_id 必須引用該 event 中一個可見 entity。
 6. 9:16 應把 brief 的 vertical_primary_target_description 視為內容優先序，不是強制演算法。只有需要動態跟隨且存在可靠 target 時才用 tracked_crop；若穩定構圖已可保留內容，或窄裁切無法安全包含必要範圍，可以使用 fit_with_background。不得只因 brief 有 primary target 就強制 tracked_crop。
 7. required_entity_ids、preferred_entity_ids、sacrificable_entity_ids 是針對本 brief 與本 aspect 的編輯決定，三組必須互斥，清單順序代表優先序，且只能引用該 event 已列出的 entity。每個 event 的 primary_entity_ids 與 required_entity_ids 都必須被歸入三組之一；不得把未觀察到的 entity 加入。tracked_crop 至少要有一個 required entity。
 8. framing_intent 只需簡潔描述本候選的構圖取捨；不得輸出座標、bbox、mask、target description 或 verbose region contract。程式會把這些 entity priority ID 與 Clip Card entity/grounding target 資料轉成 domain-neutral hard-core、soft-extent 與 overlay keepout regions。
@@ -1500,7 +1678,9 @@ model_provenance 必須先原樣回傳：
             "Preserve 2-4 auditable alternatives for every supported chapter. Return concise "
             "brief-specific entity priorities, but never duplicate descriptions, rank-one "
             "mirror fields, or verbose crop regions that local Clip Cards can derive. A brief "
-            "target is editorial intent, not authorization to force a tracked crop."
+            "target is editorial intent, not authorization to force a tracked crop. "
+            "For original horizontal framing, zoom must be none and focus entity must be null; "
+            "only tracked_reframe may name a horizontal focus entity."
         ),
         "store": False,
         "input": [{"type": "text", "text": prompt}],
@@ -1513,77 +1693,182 @@ model_provenance 必須先原樣回傳：
             "schema": gemini_response_schema(ClipCardFeaturePlanV3),
         },
     }
-    client = genai.Client(api_key=api_key)
-    try:
-        interaction = None
-        plan = None
-        previous_error = ""
-        for attempt in range(1, args.repair_attempts + 2):
-            attempt_request = request
-            if attempt > 1:
-                repair_prompt = (
-                    prompt
-                    + "\n\n## 前次輸出未通過本機 contract\n"
-                    + previous_error[:6000]
-                    + "\n請重新產生完整結果，不得只回傳修補片段。完整 evidence 已在上方，"
-                    "不要重複沿用前次不合法輸出。"
-                )
-                attempt_request = {
-                    **request,
-                    "input": [{"type": "text", "text": repair_prompt}],
-                    # Contract repair is format/reference correction, not a new
-                    # editorial search.  Lower reasoning keeps retries bounded.
-                    "generation_config": {"thinking_level": "low"},
-                }
-            write_json(
-                args.output_dir / f"clip-card-feature-plan.attempt-{attempt:02d}.request.json",
-                attempt_request,
-            )
-            current = client.interactions.create(**attempt_request)
-            raw = _raw_dump(current)
-            write_json(
-                args.output_dir
-                / f"clip-card-feature-plan.attempt-{attempt:02d}.raw_interaction.json",
-                raw,
-            )
-            write_json(
-                args.output_dir / f"clip-card-feature-plan.attempt-{attempt:02d}.raw_output.json",
-                {"output_text": current.output_text},
-            )
-            try:
-                plan = ClipCardFeaturePlanV3.model_validate_json(current.output_text)
-                validate_plan_contract_v3(
-                    plan,
-                    brief=brief,
-                    catalog=catalog,
-                    cards=cards,
-                )
-                interaction = current
-                write_json(args.output_dir / "clip-card-feature-plan.request.json", attempt_request)
-                write_json(args.output_dir / "clip-card-feature-plan.raw_interaction.json", raw)
-                write_json(
-                    args.output_dir / "clip-card-feature-plan.raw_output.json",
-                    {"output_text": current.output_text},
-                )
-                break
-            except (ValidationError, ValueError) as error:
-                previous_error = str(error)
-                write_json(
-                    args.output_dir
-                    / f"clip-card-feature-plan.attempt-{attempt:02d}.schema-validation.json",
-                    {"ok": False, "error_type": type(error).__name__, "error": str(error)},
-                )
-        if interaction is None or plan is None:
+    plan: ClipCardFeaturePlanV3 | None = None
+    interaction_id = ""
+    source_request_path: Path
+    source_raw_output_path: Path
+    source_raw_interaction_path: Path
+    canonical_output_path: Path
+    normalization_audit_path: Path
+    extra_projection_artifacts: dict[str, Path] = {}
+    if args.reuse_raw_output:
+        artifacts = _resolve_feature_reuse_artifacts(args.output_dir)
+        source_request_path = artifacts["request"]
+        source_raw_output_path = artifacts["raw_output"]
+        source_raw_interaction_path = artifacts["raw_interaction"]
+        original_request = read_json(source_request_path)
+        raw_interaction = read_json(source_raw_interaction_path)
+        artifact_models = {
+            "original_request": str(original_request.get("model") or ""),
+            "raw_interaction": str(raw_interaction.get("model") or ""),
+        }
+        mismatched_models = {
+            source: model
+            for source, model in artifact_models.items()
+            if model != MODEL_ID
+        }
+        if mismatched_models:
             raise ValueError(
-                f"Clip Card feature plan failed after {args.repair_attempts + 1} attempts: "
-                f"{previous_error}"
+                "--reuse-raw-output model mismatch: "
+                f"expected {MODEL_ID!r}, got {mismatched_models}. "
+                "Run with the artifact's original JASCUE_GEMINI_MODEL instead."
             )
-    finally:
-        client.close()
+        reprojection_request_path = (
+            args.output_dir / "clip-card-feature-plan.reprojection-request.json"
+        )
+        write_json(reprojection_request_path, request)
+        raw_output = read_json(source_raw_output_path)
+        output_text = _verified_feature_raw_output_text(
+            raw_output=raw_output,
+            raw_interaction=raw_interaction,
+        )
+        output_text, canonical_output_path, normalization_audit_path = (
+            _write_feature_normalization_artifacts(
+                output_dir=args.output_dir,
+                artifact_stem="clip-card-feature-plan",
+                raw_output_path=source_raw_output_path,
+                raw_output_text=output_text,
+            )
+        )
+        reuse_record_path = args.output_dir / "clip-card-feature-plan.raw-output-reuse.json"
+        write_json(
+            reuse_record_path,
+            {
+                "interpretation": (
+                    "saved_model_response_canonicalized_revalidated_and_projected_"
+                    "with_no_new_model_call"
+                ),
+                "artifact_set": artifacts["kind"],
+                "original_request_path": str(artifacts["request"].resolve()),
+                "original_request_sha256": sha256_file(artifacts["request"]),
+                "raw_output_path": str(source_raw_output_path.resolve()),
+                "raw_output_sha256": sha256_file(source_raw_output_path),
+                "raw_interaction_path": str(source_raw_interaction_path.resolve()),
+                "raw_interaction_sha256": sha256_file(source_raw_interaction_path),
+                "current_reprojection_request_path": str(
+                    reprojection_request_path.resolve()
+                ),
+                "current_reprojection_request_sha256": sha256_file(
+                    reprojection_request_path
+                ),
+                "normalization_audit_path": str(normalization_audit_path.resolve()),
+                "normalization_audit_sha256": sha256_file(normalization_audit_path),
+                "reused_at": utc_now(),
+            },
+        )
+        interaction_id = str(raw_interaction.get("id") or "")
+        plan = ClipCardFeaturePlanV3.model_validate_json(output_text)
+        validate_plan_contract_v3(plan, brief=brief, catalog=catalog, cards=cards)
+        if plan.model_provenance.model_id != MODEL_ID:
+            raise ValueError(
+                "--reuse-raw-output model provenance mismatch: "
+                f"expected {MODEL_ID!r}, got {plan.model_provenance.model_id!r}"
+            )
+        extra_projection_artifacts = {
+            "original_request": artifacts["request"],
+            "current_reprojection_request": reprojection_request_path,
+            "raw_output_reuse_record": reuse_record_path,
+        }
+    else:
+        _assert_fresh_feature_namespace_empty(args.output_dir)
+        client = genai.Client(api_key=api_key)
+        try:
+            previous_error = ""
+            for attempt in range(1, args.repair_attempts + 2):
+                attempt_request = request
+                if attempt > 1:
+                    repair_prompt = (
+                        prompt
+                        + "\n\n## 前次輸出未通過本機 contract\n"
+                        + previous_error[:6000]
+                        + "\n請重新產生完整結果，不得只回傳修補片段。完整 evidence 已在上方，"
+                        "不要重複沿用前次不合法輸出。"
+                    )
+                    attempt_request = {
+                        **request,
+                        "input": [{"type": "text", "text": repair_prompt}],
+                        "generation_config": {"thinking_level": "low"},
+                    }
+                attempt_stem = f"clip-card-feature-plan.attempt-{attempt:02d}"
+                attempt_request_path = args.output_dir / f"{attempt_stem}.request.json"
+                attempt_raw_interaction_path = (
+                    args.output_dir / f"{attempt_stem}.raw_interaction.json"
+                )
+                attempt_raw_output_path = args.output_dir / f"{attempt_stem}.raw_output.json"
+                write_json(attempt_request_path, attempt_request)
+                current = client.interactions.create(**attempt_request)
+                raw = _raw_dump(current)
+                write_json(attempt_raw_interaction_path, raw)
+                write_json(attempt_raw_output_path, {"output_text": current.output_text})
+                try:
+                    canonical_text, attempt_canonical_path, attempt_audit_path = (
+                        _write_feature_normalization_artifacts(
+                            output_dir=args.output_dir,
+                            artifact_stem=attempt_stem,
+                            raw_output_path=attempt_raw_output_path,
+                            raw_output_text=current.output_text,
+                        )
+                    )
+                    plan = ClipCardFeaturePlanV3.model_validate_json(canonical_text)
+                    validate_plan_contract_v3(
+                        plan,
+                        brief=brief,
+                        catalog=catalog,
+                        cards=cards,
+                    )
+                    interaction_id = getattr(current, "id", None) or ""
+                    source_request_path = args.output_dir / "clip-card-feature-plan.request.json"
+                    source_raw_interaction_path = (
+                        args.output_dir / "clip-card-feature-plan.raw_interaction.json"
+                    )
+                    source_raw_output_path = (
+                        args.output_dir / "clip-card-feature-plan.raw_output.json"
+                    )
+                    write_json(source_request_path, attempt_request)
+                    write_json(source_raw_interaction_path, raw)
+                    write_json(source_raw_output_path, {"output_text": current.output_text})
+                    canonical_text, canonical_output_path, normalization_audit_path = (
+                        _write_feature_normalization_artifacts(
+                            output_dir=args.output_dir,
+                            artifact_stem="clip-card-feature-plan",
+                            raw_output_path=source_raw_output_path,
+                            raw_output_text=current.output_text,
+                        )
+                    )
+                    break
+                except (ValidationError, ValueError) as error:
+                    plan = None
+                    previous_error = str(error)
+                    write_json(
+                        args.output_dir / f"{attempt_stem}.schema-validation.json",
+                        {
+                            "ok": False,
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                        },
+                    )
+            if plan is None:
+                raise ValueError(
+                    f"Clip Card feature plan failed after {args.repair_attempts + 1} "
+                    f"attempts: {previous_error}"
+                )
+        finally:
+            client.close()
+    assert plan is not None
     final_audit = plan.model_copy(
         update={
             "model_provenance": plan.model_provenance.model_copy(
-                update={"interaction_id": getattr(interaction, "id", None) or ""}
+                update={"interaction_id": interaction_id}
             )
         }
     )
@@ -1607,28 +1892,42 @@ model_provenance 必須先原樣回傳：
         args.output_dir / "clip-card-feature-plan.schema-validation.json",
         {"ok": True, "clip_card_count": len(cards), "frame_count": len(frames)},
     )
-    write_external_feature_plan_projection(
+    projection_pointer = write_external_feature_plan_projection(
         plan_dir=args.output_dir,
         projection_contract_id="clip-card-feature-cut-v3",
         catalog_path=args.catalog_json,
         brief_path=args.brief_json,
         feature_plan_path=args.output_dir / "feature_edit_plan.json",
         source_plan_path=args.output_dir / "clip-card-feature-plan.json",
-        source_request_path=args.output_dir / "clip-card-feature-plan.request.json",
+        source_request_path=source_request_path,
         source_artifacts={
-            "source_raw_interaction": (
-                args.output_dir / "clip-card-feature-plan.raw_interaction.json"
-            ),
-            "source_raw_output": (
-                args.output_dir / "clip-card-feature-plan.raw_output.json"
-            ),
+            "source_raw_interaction": source_raw_interaction_path,
+            # The projection validator must parse the exact canonical source
+            # used to build the saved plan.  The immutable paid response stays
+            # separately hash-bound for audit and replay.
+            "source_raw_output": canonical_output_path,
+            "original_raw_output": source_raw_output_path,
+            "canonicalized_output": canonical_output_path,
+            "normalization_audit": normalization_audit_path,
             "selected_clip_card_evidence": (
                 args.output_dir / "selected-clip-card-evidence.json"
             ),
+            **extra_projection_artifacts,
         },
     )
+    if args.reuse_raw_output:
+        _assert_projection_request_hash(
+            pointer_path=projection_pointer,
+            plan_dir=args.output_dir,
+            expected_request_path=artifacts["request"],
+        )
+    usage_paths = sorted(
+        args.output_dir.glob("clip-card-feature-plan.attempt-*.raw_interaction.json")
+    )
+    if not usage_paths:
+        usage_paths = [source_raw_interaction_path]
     pricing = summarize_usage_files(
-        sorted(args.output_dir.glob("clip-card-feature-plan.attempt-*.raw_interaction.json")),
+        usage_paths,
         relative_to=args.output_dir,
     )
     write_json(args.output_dir / "pricing.json", pricing)

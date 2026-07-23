@@ -95,6 +95,7 @@ _FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
 )
 _RENDER_PIPELINE_VERSION = "feature-cut-v10-full-auto-v2"
+RenderAspect = Literal["both", "9x16", "16x9"]
 _TRACKING_MAX_SIDE = 960
 _TRACKING_DEVICE = "cpu"
 _TRACKING_SEED_BOX_PADDING_RATIO = 0.04
@@ -4652,6 +4653,68 @@ def _summarize_automatic_reframe(
     return {**body, "summary_sha256": _stable_fingerprint(body)}
 
 
+def _requested_render_aspects(aspect: str) -> tuple[bool, bool]:
+    """Return horizontal/vertical render gates and reject unknown API values."""
+
+    if aspect not in {"both", "9x16", "16x9"}:
+        raise ValueError("aspect must be one of: both, 9x16, 16x9")
+    return aspect in {"both", "16x9"}, aspect in {"both", "9x16"}
+
+
+def _horizontal_manifest_entry(
+    *,
+    selected: FeatureChapterSelect,
+    brief_chapter: FeatureChapterBrief,
+    frame: RushFrame,
+    clip: RushClip,
+    start_ms: int,
+    end_ms: int,
+    shot_id: str,
+    segment_fingerprint: str,
+    track_fingerprint: str | None,
+    segment: Path,
+    source_has_audio: bool,
+    source_media: MediaInfo,
+    grounding_debug: Path | None,
+    trim: Mapping[str, Any],
+    geometry: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "feature_id": selected.feature_id,
+        "semantic_intent": (
+            brief_chapter.title
+            + (
+                " — " + "; ".join(brief_chapter.detail_lines)
+                if brief_chapter.detail_lines
+                else ""
+            )
+        ),
+        "observed_visual_evidence": selected.observed_visual_evidence,
+        "selection_reason": selected.selection_reason,
+        "source_frame_id": frame.frame_id,
+        "source_clip_id": clip.clip_id,
+        "source_in_ms": start_ms,
+        "source_out_ms": end_ms,
+        "duration_ms": end_ms - start_ms,
+        "source_shot_id": shot_id,
+        "segment_render_fingerprint": segment_fingerprint,
+        "track_geometry_fingerprint": track_fingerprint,
+        "segment_path": str(segment.resolve()),
+        "audio_origin": "source" if source_has_audio else "synthetic_silence",
+        "source_sample_aspect_ratio": (
+            source_media.video.sample_aspect_ratio.model_dump(mode="json")
+        ),
+        "source_display_sample_aspect_ratio": (
+            source_media.video.display_sample_aspect_ratio.model_dump(mode="json")
+        ),
+        "grounding_debug": (
+            str(grounding_debug.resolve()) if grounding_debug else None
+        ),
+        **trim,
+        **geometry,
+    }
+
+
 def _render_review_html(
     output_dir: Path,
     brief: FeatureEditBrief,
@@ -4663,15 +4726,27 @@ def _render_review_html(
         if not brief.render_title_overlays
         else "成片字卡來自使用者 editorial brief。"
     )
+    render_horizontal = bool(manifest["horizontal"].get("requested", True))
+    render_vertical = bool(manifest["vertical"].get("requested", True))
     rows: list[str] = []
     by_id = {chapter.feature_id: chapter for chapter in plan.chapters}
     for brief_chapter in brief.chapters:
         selected = by_id[brief_chapter.feature_id]
         vertical = next(
-            item for item in manifest["vertical"]["chapters"] if item["feature_id"] == brief_chapter.feature_id
+            (
+                item
+                for item in manifest["vertical"]["chapters"]
+                if item["feature_id"] == brief_chapter.feature_id
+            ),
+            {},
         )
         horizontal = next(
-            item for item in manifest["horizontal"]["chapters"] if item["feature_id"] == brief_chapter.feature_id
+            (
+                item
+                for item in manifest["horizontal"]["chapters"]
+                if item["feature_id"] == brief_chapter.feature_id
+            ),
+            {},
         )
         debug_paths = list(vertical.get("grounding_debugs") or [])
         if not debug_paths and vertical.get("grounding_debug"):
@@ -4687,16 +4762,31 @@ def _render_review_html(
             "<tr>"
             f"<td>{html.escape(brief_chapter.title)}</td>"
             f"<td>{html.escape(selected.evidence_status)}</td>"
-            f"<td>{html.escape(str(selected.horizontal_frame_id))}</td>"
-            f"<td>{html.escape(str(horizontal.get('applied_zoom', 1.0)))}</td>"
-            f"<td>{html.escape(str(horizontal.get('trim_method', 'not_applicable')))}</td>"
-            f"<td>{html.escape(str(selected.vertical_frame_id))}</td>"
-            f"<td>{html.escape(vertical['applied_strategy'])}</td>"
-            f"<td>{html.escape(str(vertical.get('trim_method', 'not_applicable')))}</td>"
+            f"<td>{html.escape(str(selected.horizontal_frame_id) if render_horizontal else 'not requested')}</td>"
+            f"<td>{html.escape(str(horizontal.get('applied_zoom', 1.0)) if render_horizontal else 'not requested')}</td>"
+            f"<td>{html.escape(str(horizontal.get('trim_method', 'not_applicable')) if render_horizontal else 'not requested')}</td>"
+            f"<td>{html.escape(str(selected.vertical_frame_id) if render_vertical else 'not requested')}</td>"
+            f"<td>{html.escape(str(vertical.get('applied_strategy', 'not requested')))}</td>"
+            f"<td>{html.escape(str(vertical.get('trim_method', 'not_applicable')) if render_vertical else 'not requested')}</td>"
             f"<td>{debug_link}</td>"
             f"<td>{html.escape(selected.observed_visual_evidence)}</td>"
             f"<td>{html.escape('; '.join(selected.quality_risks) or 'none')}</td>"
             "</tr>"
+        )
+    video_sections: list[str] = []
+    if render_horizontal:
+        horizontal_path = Path(manifest["horizontal"]["output_path"]).relative_to(
+            output_dir.resolve()
+        )
+        video_sections.append(
+            f'<section><h2>16:9</h2><video controls src="{html.escape(str(horizontal_path))}"></video></section>'
+        )
+    if render_vertical:
+        vertical_path = Path(manifest["vertical"]["output_path"]).relative_to(
+            output_dir.resolve()
+        )
+        video_sections.append(
+            f'<section><h2>9:16</h2><video controls src="{html.escape(str(vertical_path))}"></video></section>'
         )
     (output_dir / "index.html").write_text(
         """<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><title>Feature cut review</title>
@@ -4704,8 +4794,7 @@ def _render_review_html(
 <h1>Feature cut review</h1><p>"""
         + html.escape(overlay_note)
         + " 畫面證據、frame ID、Gemini bbox、SAM tracking 與 fallback 分開保存。</p>"
-        + f"<section><h2>16:9</h2><video controls src=\"{html.escape(str(Path(manifest['horizontal']['output_path']).relative_to(output_dir.resolve())))}\"></video></section>"
-        + f"<section><h2>9:16</h2><video controls src=\"{html.escape(str(Path(manifest['vertical']['output_path']).relative_to(output_dir.resolve())))}\"></video></section>"
+        + "".join(video_sections)
         + "<table><thead><tr><th>chapter</th><th>evidence</th><th>16:9 frame</th><th>zoom</th><th>16:9 trim</th><th>9:16 frame</th><th>vertical</th><th>9:16 trim</th><th>debug</th><th>observed evidence</th><th>risks</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table></html>",
@@ -4726,7 +4815,9 @@ def run_feature_cut_experiment(
     trim_decision_paths: Sequence[Path] = (),
     allow_proposed_trim_preview: bool = False,
     reuse_feature_plan: bool = False,
+    aspect: RenderAspect = "both",
 ) -> dict[str, Any]:
+    render_horizontal, render_vertical = _requested_render_aspects(aspect)
     output_dir.mkdir(parents=True, exist_ok=True)
     prior_interaction_hashes = {
         str(path.relative_to(output_dir)): sha256_file(path)
@@ -4738,11 +4829,13 @@ def run_feature_cut_experiment(
     }
     catalog = RushesCatalog.model_validate(read_json(catalog_path))
     brief = FeatureEditBrief.model_validate(read_json(brief_path))
-    controlled_reframe_requested = any(
+    controlled_reframe_requested = render_vertical and any(
         chapter.vertical_overflow_policy == "controlled_clip"
         for chapter in brief.chapters
     )
-    human_reframe_policy_requested = brief.reframe_policy_binding is not None
+    human_reframe_policy_requested = (
+        render_vertical and brief.reframe_policy_binding is not None
+    )
     if controlled_reframe_requested and brief.reframe_policy_binding is None:
         raise ValueError(
             "controlled_clip requires an immutable human reframe policy sidecar"
@@ -5015,6 +5108,7 @@ def run_feature_cut_experiment(
         vertical_segments: list[Path] = []
         render_config = {
             "pipeline_version": _RENDER_PIPELINE_VERSION,
+            "aspect": aspect,
             "brief": brief.model_dump(mode="json"),
             "plan": plan.model_dump(mode="json"),
             "sam_analysis_fps": sam_analysis_fps,
@@ -5042,6 +5136,7 @@ def run_feature_cut_experiment(
             "render_title_overlays": brief.render_title_overlays,
             "render_pipeline_version": _RENDER_PIPELINE_VERSION,
             "render_cache_key": render_key,
+            "requested_aspect": aspect,
             "feature_plan_reused": plan_reused,
             "feature_plan_binding": str(plan_binding_path.resolve()),
             "feature_plan_reuse_record": (
@@ -5074,8 +5169,16 @@ def run_feature_cut_experiment(
                 }
                 for path, decision in trim_decisions
             ],
-            "horizontal": {"chapters": []},
-            "vertical": {"chapters": []},
+            "horizontal": {
+                "requested": render_horizontal,
+                "status": "pending" if render_horizontal else "not_requested",
+                "chapters": [],
+            },
+            "vertical": {
+                "requested": render_vertical,
+                "status": "pending" if render_vertical else "not_requested",
+                "chapters": [],
+            },
         }
         track_cache: dict[tuple[str, str, int, int], tuple[GroundingProposal, SegmentationTrack, Path]] = {}
         source_audio_cache: dict[str, bool] = {}
@@ -5092,173 +5195,230 @@ def run_feature_cut_experiment(
                 output_dir / "segments" / render_variant / "9x16" / f"{index:02d}.mp4"
             )
             if selected.evidence_status == "not_found":
-                if not _segment_is_valid(
-                    horizontal_segment,
-                    expected_duration=brief_chapter.target_duration_seconds,
-                    dimensions=(1920, 1080),
-                ):
-                    _render_missing_segment(
-                        brief_chapter, horizontal_segment, horizontal_overlay, (1920, 1080)
-                    )
-                if not _segment_is_valid(
-                    vertical_segment,
-                    expected_duration=brief_chapter.target_duration_seconds,
-                    dimensions=(1080, 1920),
-                ):
-                    _render_missing_segment(
-                        brief_chapter, vertical_segment, vertical_overlay, (1080, 1920)
-                    )
-                horizontal_entry = {
-                    "feature_id": selected.feature_id,
-                    "source_frame_id": None,
-                    "semantic_intent": brief_chapter.title,
-                    "observed_visual_evidence": selected.observed_visual_evidence,
-                    "selection_reason": selected.selection_reason,
-                    "duration_ms": round(brief_chapter.target_duration_seconds * 1000),
-                    "source_clip_id": None,
-                    "source_in_ms": None,
-                    "source_out_ms": None,
-                    "segment_render_fingerprint": sha256_file(horizontal_segment),
-                    "segment_path": str(horizontal_segment.resolve()),
-                    "applied_zoom": 1.0,
-                    "fallback_reason": "catalog_evidence_not_found",
-                    "audio_origin": "synthetic_silence",
-                }
-                vertical_entry = {
-                    "feature_id": selected.feature_id,
-                    "source_frame_id": None,
-                    "semantic_intent": brief_chapter.title,
-                    "observed_visual_evidence": selected.observed_visual_evidence,
-                    "selection_reason": selected.selection_reason,
-                    "duration_ms": round(brief_chapter.target_duration_seconds * 1000),
-                    "source_clip_id": None,
-                    "source_in_ms": None,
-                    "source_out_ms": None,
-                    "segment_render_fingerprint": sha256_file(vertical_segment),
-                    "segment_path": str(vertical_segment.resolve()),
-                    "applied_strategy": "graphic_missing_evidence_card",
-                    "fallback_reason": "catalog_evidence_not_found",
-                    "audio_origin": "synthetic_silence",
-                }
+                if render_horizontal:
+                    if not _segment_is_valid(
+                        horizontal_segment,
+                        expected_duration=brief_chapter.target_duration_seconds,
+                        dimensions=(1920, 1080),
+                    ):
+                        _render_missing_segment(
+                            brief_chapter,
+                            horizontal_segment,
+                            horizontal_overlay,
+                            (1920, 1080),
+                        )
+                    horizontal_entry = {
+                        "feature_id": selected.feature_id,
+                        "source_frame_id": None,
+                        "semantic_intent": brief_chapter.title,
+                        "observed_visual_evidence": selected.observed_visual_evidence,
+                        "selection_reason": selected.selection_reason,
+                        "duration_ms": round(
+                            brief_chapter.target_duration_seconds * 1000
+                        ),
+                        "source_clip_id": None,
+                        "source_in_ms": None,
+                        "source_out_ms": None,
+                        "segment_render_fingerprint": sha256_file(horizontal_segment),
+                        "segment_path": str(horizontal_segment.resolve()),
+                        "applied_zoom": 1.0,
+                        "fallback_reason": "catalog_evidence_not_found",
+                        "audio_origin": "synthetic_silence",
+                    }
+                if render_vertical:
+                    if not _segment_is_valid(
+                        vertical_segment,
+                        expected_duration=brief_chapter.target_duration_seconds,
+                        dimensions=(1080, 1920),
+                    ):
+                        _render_missing_segment(
+                            brief_chapter,
+                            vertical_segment,
+                            vertical_overlay,
+                            (1080, 1920),
+                        )
+                    vertical_entry = {
+                        "feature_id": selected.feature_id,
+                        "source_frame_id": None,
+                        "semantic_intent": brief_chapter.title,
+                        "observed_visual_evidence": selected.observed_visual_evidence,
+                        "selection_reason": selected.selection_reason,
+                        "duration_ms": round(
+                            brief_chapter.target_duration_seconds * 1000
+                        ),
+                        "source_clip_id": None,
+                        "source_in_ms": None,
+                        "source_out_ms": None,
+                        "segment_render_fingerprint": sha256_file(vertical_segment),
+                        "segment_path": str(vertical_segment.resolve()),
+                        "applied_strategy": "graphic_missing_evidence_card",
+                        "fallback_reason": "catalog_evidence_not_found",
+                        "audio_origin": "synthetic_silence",
+                    }
             else:
-                horizontal_frame = frames[selected.horizontal_frame_id or ""]
-                horizontal_clip = clips[horizontal_frame.clip_id]
-                h_start, h_end, h_shot, horizontal_trim = _chapter_bounds_with_approved_trim(
-                    horizontal_frame,
-                    horizontal_clip,
-                    brief_chapter.target_duration_seconds,
-                    shot_cache,
-                    shots_dir,
-                    scdet_threshold,
-                    trim_decisions,
-                )
-                for source_clip in (horizontal_clip,):
-                    if source_clip.sha256 not in source_audio_cache:
-                        source_audio_cache[source_clip.sha256] = has_audio_stream(
-                            Path(source_clip.path)
-                        )
-                    if source_clip.sha256 not in source_media_cache:
-                        source_media_cache[source_clip.sha256] = probe_video(
-                            Path(source_clip.path)
-                        )
-                horizontal_source_has_audio = source_audio_cache[horizontal_clip.sha256]
-                horizontal_source_media = source_media_cache[horizontal_clip.sha256]
-                horizontal_display_sar = (
-                    horizontal_source_media.video.display_sample_aspect_ratio.numerator
-                    / horizontal_source_media.video.display_sample_aspect_ratio.denominator
-                )
                 if brief.render_title_overlays:
-                    _render_text_layer(
-                        brief_chapter, horizontal_overlay, dimensions=(1920, 1080)
+                    if render_horizontal:
+                        _render_text_layer(
+                            brief_chapter, horizontal_overlay, dimensions=(1920, 1080)
+                        )
+                    if render_vertical:
+                        _render_text_layer(
+                            brief_chapter, vertical_overlay, dimensions=(1080, 1920)
+                        )
+                if render_horizontal:
+                    horizontal_frame = frames[selected.horizontal_frame_id or ""]
+                    horizontal_clip = clips[horizontal_frame.clip_id]
+                    h_start, h_end, h_shot, horizontal_trim = (
+                        _chapter_bounds_with_approved_trim(
+                            horizontal_frame,
+                            horizontal_clip,
+                            brief_chapter.target_duration_seconds,
+                            shot_cache,
+                            shots_dir,
+                            scdet_threshold,
+                            trim_decisions,
+                        )
                     )
-                    _render_text_layer(
-                        brief_chapter, vertical_overlay, dimensions=(1080, 1920)
+                    if horizontal_clip.sha256 not in source_audio_cache:
+                        source_audio_cache[horizontal_clip.sha256] = has_audio_stream(
+                            Path(horizontal_clip.path)
+                        )
+                    if horizontal_clip.sha256 not in source_media_cache:
+                        source_media_cache[horizontal_clip.sha256] = probe_video(
+                            Path(horizontal_clip.path)
+                        )
+                    horizontal_source_has_audio = source_audio_cache[
+                        horizontal_clip.sha256
+                    ]
+                    horizontal_source_media = source_media_cache[
+                        horizontal_clip.sha256
+                    ]
+                    horizontal_display_sar = (
+                        horizontal_source_media.video.display_sample_aspect_ratio.numerator
+                        / horizontal_source_media.video.display_sample_aspect_ratio.denominator
                     )
-                horizontal_filter = _horizontal_original_filter()
-                horizontal_geometry = {
-                    "requested_zoom": None,
-                    "geometry_safe_max_zoom": None,
-                    "applied_zoom": 1.0,
-                    "fallback_reason": None,
-                    "risk_codes": [],
-                    "requires_gemini_review": False,
-                }
-                horizontal_debug: Path | None = None
-                horizontal_track_fingerprint: str | None = None
-                if selected.horizontal_strategy == "tracked_reframe":
-                    target = selected.horizontal_target_description or ""
-                    cache_key = (horizontal_frame.frame_id, target, h_start, h_end)
-                    track_root = output_dir / "geometry" / selected.feature_id / "horizontal"
-                    try:
-                        if cache_key not in track_cache:
-                            proposal, track = _build_track(
-                                client=client,
-                                clip=horizontal_clip,
-                                frame=horizontal_frame,
-                                start_ms=h_start,
-                                end_ms=h_end,
-                                feature_id=selected.feature_id,
-                                event_description=(
-                                    brief_chapter.title + "；" + selected.observed_visual_evidence
-                                ),
-                                target_description=target,
-                                checkpoint_path=checkpoint_path,
-                                grounding_prompt=grounding_prompt,
-                                output_dir=track_root,
-                                run_id=f"feature-h-{uuid.uuid4().hex[:8]}",
-                                analysis_fps=sam_analysis_fps,
-                                scdet_threshold=scdet_threshold,
-                                model_request_block_reason=(
-                                    gemini_geometry_block_reason
-                                ),
+                    horizontal_filter = _horizontal_original_filter()
+                    horizontal_geometry = {
+                        "requested_zoom": None,
+                        "geometry_safe_max_zoom": None,
+                        "applied_zoom": 1.0,
+                        "fallback_reason": None,
+                        "risk_codes": [],
+                        "requires_gemini_review": False,
+                    }
+                    horizontal_debug: Path | None = None
+                    horizontal_track_fingerprint: str | None = None
+                    if selected.horizontal_strategy == "tracked_reframe":
+                        target = selected.horizontal_target_description or ""
+                        cache_key = (horizontal_frame.frame_id, target, h_start, h_end)
+                        track_root = (
+                            output_dir
+                            / "geometry"
+                            / selected.feature_id
+                            / "horizontal"
+                        )
+                        try:
+                            if cache_key not in track_cache:
+                                proposal, track = _build_track(
+                                    client=client,
+                                    clip=horizontal_clip,
+                                    frame=horizontal_frame,
+                                    start_ms=h_start,
+                                    end_ms=h_end,
+                                    feature_id=selected.feature_id,
+                                    event_description=(
+                                        brief_chapter.title
+                                        + "；"
+                                        + selected.observed_visual_evidence
+                                    ),
+                                    target_description=target,
+                                    checkpoint_path=checkpoint_path,
+                                    grounding_prompt=grounding_prompt,
+                                    output_dir=track_root,
+                                    run_id=f"feature-h-{uuid.uuid4().hex[:8]}",
+                                    analysis_fps=sam_analysis_fps,
+                                    scdet_threshold=scdet_threshold,
+                                    model_request_block_reason=(
+                                        gemini_geometry_block_reason
+                                    ),
+                                )
+                                track_cache[cache_key] = (proposal, track, track_root)
+                            _, track, track_root = track_cache[cache_key]
+                            horizontal_track_fingerprint = (
+                                _track_geometry_fingerprint(track)
                             )
-                            track_cache[cache_key] = (proposal, track, track_root)
-                        _, track, track_root = track_cache[cache_key]
-                        horizontal_track_fingerprint = _track_geometry_fingerprint(track)
-                        horizontal_filter, horizontal_geometry = _horizontal_filter_from_track(
-                            track,
-                            selected.horizontal_zoom_intent,
-                            display_sample_aspect_ratio=horizontal_display_sar,
-                        )
-                        horizontal_debug = track_root / "grounding-debug.png"
-                    except Exception as error:
-                        abort_for_geometry_quota(error)
-                        horizontal_geometry = _horizontal_reframe_failure_geometry(
-                            selected.horizontal_zoom_intent,
-                            fallback_reason=(
-                                f"tracking_or_grounding_failed:{type(error).__name__}:{error}"
-                            ),
-                            risk_code="tracking_or_grounding_failed",
-                        )
-                horizontal_segment_fingerprint = _segment_variant_fingerprint(
-                    source_sha256=horizontal_clip.sha256,
-                    start_ms=h_start,
-                    end_ms=h_end,
-                    filter_graph=horizontal_filter,
-                    geometry=horizontal_geometry,
-                    track_fingerprint=horizontal_track_fingerprint,
-                )
-                horizontal_segment = (
-                    output_dir
-                    / "segments"
-                    / render_variant
-                    / "16x9"
-                    / f"{index:02d}-{horizontal_segment_fingerprint[:12]}.mp4"
-                )
-                if not _segment_is_valid(
-                    horizontal_segment,
-                    expected_duration=(h_end - h_start) / 1000,
-                    dimensions=(1920, 1080),
-                ):
-                    _render_source_segment(
-                        source_path=Path(horizontal_clip.path),
+                            horizontal_filter, horizontal_geometry = (
+                                _horizontal_filter_from_track(
+                                    track,
+                                    selected.horizontal_zoom_intent,
+                                    display_sample_aspect_ratio=horizontal_display_sar,
+                                )
+                            )
+                            horizontal_debug = track_root / "grounding-debug.png"
+                        except Exception as error:
+                            abort_for_geometry_quota(error)
+                            horizontal_geometry = _horizontal_reframe_failure_geometry(
+                                selected.horizontal_zoom_intent,
+                                fallback_reason=(
+                                    "tracking_or_grounding_failed:"
+                                    f"{type(error).__name__}:{error}"
+                                ),
+                                risk_code="tracking_or_grounding_failed",
+                            )
+                    horizontal_segment_fingerprint = _segment_variant_fingerprint(
+                        source_sha256=horizontal_clip.sha256,
                         start_ms=h_start,
                         end_ms=h_end,
-                        overlay_path=(horizontal_overlay if brief.render_title_overlays else None),
-                        base_filter=horizontal_filter,
-                        output_path=horizontal_segment,
-                        source_has_audio=horizontal_source_has_audio,
+                        filter_graph=horizontal_filter,
+                        geometry=horizontal_geometry,
+                        track_fingerprint=horizontal_track_fingerprint,
                     )
+                    horizontal_segment = (
+                        output_dir
+                        / "segments"
+                        / render_variant
+                        / "16x9"
+                        / f"{index:02d}-{horizontal_segment_fingerprint[:12]}.mp4"
+                    )
+                    if not _segment_is_valid(
+                        horizontal_segment,
+                        expected_duration=(h_end - h_start) / 1000,
+                        dimensions=(1920, 1080),
+                    ):
+                        _render_source_segment(
+                            source_path=Path(horizontal_clip.path),
+                            start_ms=h_start,
+                            end_ms=h_end,
+                            overlay_path=(
+                                horizontal_overlay
+                                if brief.render_title_overlays
+                                else None
+                            ),
+                            base_filter=horizontal_filter,
+                            output_path=horizontal_segment,
+                            source_has_audio=horizontal_source_has_audio,
+                        )
+                if not render_vertical:
+                    horizontal_entry = _horizontal_manifest_entry(
+                        selected=selected,
+                        brief_chapter=brief_chapter,
+                        frame=horizontal_frame,
+                        clip=horizontal_clip,
+                        start_ms=h_start,
+                        end_ms=h_end,
+                        shot_id=h_shot,
+                        segment_fingerprint=horizontal_segment_fingerprint,
+                        track_fingerprint=horizontal_track_fingerprint,
+                        segment=horizontal_segment,
+                        source_has_audio=horizontal_source_has_audio,
+                        source_media=horizontal_source_media,
+                        grounding_debug=horizontal_debug,
+                        trim=horizontal_trim,
+                        geometry=horizontal_geometry,
+                    )
+                    horizontal_segments.append(horizontal_segment)
+                    manifest["horizontal"]["chapters"].append(horizontal_entry)
+                    continue
                 # Candidate alternatives are already hash-bound inside the saved
                 # FeatureEditPlan. Geometry may select among them at runtime, but
                 # never rewrites the editorial plan. A human policy binding disables
@@ -5539,7 +5699,11 @@ def run_feature_cut_experiment(
                                 "recovery_action": (
                                     recovery.value if recovery is not None else None
                                 ),
-                                "geometry": candidate_geometry,
+                                # Preserve the attempt as a value snapshot. The
+                                # selected geometry later receives the complete
+                                # attempts list; retaining this same dict here
+                                # would make that audit payload self-referential.
+                                "geometry": dict(candidate_geometry),
                                 "track_fingerprint": candidate_track_fingerprint,
                             }
                         )
@@ -5736,40 +5900,24 @@ def run_feature_cut_experiment(
                         output_path=vertical_segment,
                         source_has_audio=vertical_source_has_audio,
                     )
-                horizontal_entry = {
-                    "feature_id": selected.feature_id,
-                    "semantic_intent": (
-                        brief_chapter.title
-                        + (" — " + "; ".join(brief_chapter.detail_lines) if brief_chapter.detail_lines else "")
-                    ),
-                    "observed_visual_evidence": selected.observed_visual_evidence,
-                    "selection_reason": selected.selection_reason,
-                    "source_frame_id": horizontal_frame.frame_id,
-                    "source_clip_id": horizontal_clip.clip_id,
-                    "source_in_ms": h_start,
-                    "source_out_ms": h_end,
-                    "duration_ms": h_end - h_start,
-                    "source_shot_id": h_shot,
-                    "segment_render_fingerprint": horizontal_segment_fingerprint,
-                    "track_geometry_fingerprint": horizontal_track_fingerprint,
-                    "segment_path": str(horizontal_segment.resolve()),
-                    "audio_origin": (
-                        "source" if horizontal_source_has_audio else "synthetic_silence"
-                    ),
-                    "source_sample_aspect_ratio": (
-                        horizontal_source_media.video.sample_aspect_ratio.model_dump(
-                            mode="json"
-                        )
-                    ),
-                    "source_display_sample_aspect_ratio": (
-                        horizontal_source_media.video.display_sample_aspect_ratio.model_dump(
-                            mode="json"
-                        )
-                    ),
-                    "grounding_debug": str(horizontal_debug.resolve()) if horizontal_debug else None,
-                    **horizontal_trim,
-                    **horizontal_geometry,
-                }
+                if render_horizontal:
+                    horizontal_entry = _horizontal_manifest_entry(
+                        selected=selected,
+                        brief_chapter=brief_chapter,
+                        frame=horizontal_frame,
+                        clip=horizontal_clip,
+                        start_ms=h_start,
+                        end_ms=h_end,
+                        shot_id=h_shot,
+                        segment_fingerprint=horizontal_segment_fingerprint,
+                        track_fingerprint=horizontal_track_fingerprint,
+                        segment=horizontal_segment,
+                        source_has_audio=horizontal_source_has_audio,
+                        source_media=horizontal_source_media,
+                        grounding_debug=horizontal_debug,
+                        trim=horizontal_trim,
+                        geometry=horizontal_geometry,
+                    )
                 vertical_entry = {
                     "feature_id": selected.feature_id,
                     "semantic_intent": (
@@ -5815,10 +5963,12 @@ def run_feature_cut_experiment(
                     **vertical_trim,
                     **vertical_geometry,
                 }
-            horizontal_segments.append(horizontal_segment)
-            vertical_segments.append(vertical_segment)
-            manifest["horizontal"]["chapters"].append(horizontal_entry)
-            manifest["vertical"]["chapters"].append(vertical_entry)
+            if render_horizontal:
+                horizontal_segments.append(horizontal_segment)
+                manifest["horizontal"]["chapters"].append(horizontal_entry)
+            if render_vertical:
+                vertical_segments.append(vertical_segment)
+                manifest["vertical"]["chapters"].append(vertical_entry)
         timings["geometry_and_segment_render_seconds"] = round(monotonic() - stage, 3)
     finally:
         try:
@@ -5831,25 +5981,49 @@ def run_feature_cut_experiment(
             )
     try:
         output_suffix = "" if brief.render_title_overlays else "-clean"
+        renders_dir = output_dir / "renders"
+        renders_dir.mkdir(parents=True, exist_ok=True)
         horizontal_output = (
-            output_dir / "renders" / f"feature-cut-16x9{output_suffix}.mp4"
+            renders_dir / f"feature-cut-16x9{output_suffix}.mp4"
+            if render_horizontal
+            else None
         )
         vertical_output = (
-            output_dir / "renders" / f"feature-cut-9x16{output_suffix}.mp4"
+            renders_dir / f"feature-cut-9x16{output_suffix}.mp4"
+            if render_vertical
+            else None
         )
-        horizontal_output.parent.mkdir(parents=True, exist_ok=True)
         stage = monotonic()
-        _concat_segments(horizontal_segments, horizontal_output)
-        _concat_segments(vertical_segments, vertical_output)
+        if horizontal_output is not None:
+            _concat_segments(horizontal_segments, horizontal_output)
+        if vertical_output is not None:
+            _concat_segments(vertical_segments, vertical_output)
         timings["concat_seconds"] = round(monotonic() - stage, 3)
         timings["total_seconds"] = round(monotonic() - started, 3)
-        manifest["horizontal"]["output_path"] = str(horizontal_output.resolve())
-        manifest["vertical"]["output_path"] = str(vertical_output.resolve())
-        manifest["horizontal"]["media"] = _output_media_metadata(horizontal_output)
-        manifest["vertical"]["media"] = _output_media_metadata(vertical_output)
-        manifest["automatic_reframe_summary"] = _summarize_automatic_reframe(
-            manifest["vertical"]["chapters"]
-        )
+        if horizontal_output is not None:
+            manifest["horizontal"].update(
+                {
+                    "status": "rendered",
+                    "output_path": str(horizontal_output.resolve()),
+                    "media": _output_media_metadata(horizontal_output),
+                }
+            )
+        if vertical_output is not None:
+            manifest["vertical"].update(
+                {
+                    "status": "rendered",
+                    "output_path": str(vertical_output.resolve()),
+                    "media": _output_media_metadata(vertical_output),
+                }
+            )
+            manifest["automatic_reframe_summary"] = _summarize_automatic_reframe(
+                manifest["vertical"]["chapters"]
+            )
+        else:
+            manifest["automatic_reframe_summary"] = {
+                "status": "not_requested",
+                "chapter_count": 0,
+            }
         manifest["generated_at"] = utc_now()
         write_json(output_dir / "render-manifest.json", manifest)
         pricing = summarize_usage_and_list_price(output_dir)
@@ -5871,8 +6045,13 @@ def run_feature_cut_experiment(
         )
         _render_review_html(output_dir, brief, plan, manifest)
         result = {
-            "horizontal_output": str(horizontal_output.resolve()),
-            "vertical_output": str(vertical_output.resolve()),
+            "requested_aspect": aspect,
+            "horizontal_output": (
+                str(horizontal_output.resolve()) if horizontal_output is not None else None
+            ),
+            "vertical_output": (
+                str(vertical_output.resolve()) if vertical_output is not None else None
+            ),
             "review_path": str((output_dir / "index.html").resolve()),
             "plan_path": str((plan_dir / "feature_edit_plan.json").resolve()),
             "manifest_path": str((output_dir / "render-manifest.json").resolve()),

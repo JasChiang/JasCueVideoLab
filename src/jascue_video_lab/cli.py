@@ -618,6 +618,7 @@ def command_feature_cut(args: argparse.Namespace) -> int:
         trim_decision_paths=args.trim_decision,
         allow_proposed_trim_preview=args.allow_proposed_trim_preview,
         reuse_feature_plan=args.reuse_feature_plan,
+        aspect=args.aspect,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1679,6 +1680,15 @@ def build_parser() -> argparse.ArgumentParser:
     feature_cut_parser.add_argument("--sam-checkpoint", type=Path, required=True)
     feature_cut_parser.add_argument("--sam-analysis-fps", type=float, default=2.0)
     feature_cut_parser.add_argument("--scdet-threshold", type=float, default=4.0)
+    feature_cut_parser.add_argument(
+        "--aspect",
+        choices=["both", "9x16", "16x9"],
+        default="both",
+        help=(
+            "Render both aspect ratios (default), only the vertical 9:16 cut, "
+            "or only the horizontal 16:9 cut. Unrequested geometry is not computed."
+        ),
+    )
     feature_cut_parser.add_argument(
         "--trim-decision",
         type=Path,

@@ -260,6 +260,11 @@ uv run jascue-video-lab feature-cut \
   --output-dir artifacts/my-feature-cut
 ```
 
+預設 `--aspect both` 會輸出兩種比例。只需要 Shorts 時可傳
+`--aspect 9x16`，只需要橫式時則傳 `--aspect 16x9`；未要求的比例不會執行
+Grounding、SAM geometry、segment render 或 concat，manifest 會明確標成
+`not_requested`，避免把不存在的輸出或未發生的模型成本記成成功。
+
 若同一個 output directory 已保存 feature plan，renderer 不會再因檔案存在就自動假設它仍符合目前 prompt／brief。要做只比較裁切器的 controlled A/B，必須明示 `--reuse-feature-plan`；程式會保存舊 plan、目前 catalog／brief／prompt 的 hash，並只重算 geometry 與成片。想重新選片時則使用新的 output directory，不加此旗標。
 
 若某章已有真人核准的 Trim Intent，可重複傳入 `--trim-decision PATH`。Renderer 只接受 `approval_status=approved` 且帶有人類 review record 的 decision，並再次驗證 source SHA-256 與目前 FFmpeg shot；代表性 select 可以位於同一 source shot 中但不包含較早的 coarse RF anchor。proposed、rejected、跨鏡或同 source shot 多筆造成歧義的 decision 會被拒絕。沒有匹配 decision 的章節仍使用原本「keyframe 中心 ± brief duration、限制在 shot」的粗剪方式，manifest 會分別標示 `human_approved_frame_id_pts` 或 `keyframe_centered_requested_duration`，不會把 fallback 冒充成精修結果。
@@ -288,6 +293,8 @@ Feature renderer 同樣接受無音軌來源：有原音時保留並淡入淡出
 Clip Card plan 轉成 renderer plan 時會另寫不可變的 external-projection sidecar，保存來源 catalog、brief、模型 request／raw response、projection contract 與輸出 plan 的 hash。candidate override 也必須接續並驗證這條 provenance；任一上游內容改變就 fail closed。早於此 contract 的舊 artifact 不可手動複製 plan 冒充可重用結果，必須從仍保存的原始 artifact 重新投影。
 
 `scripts/plan_clip_card_open_edit.py` 是沒有內容 brief 的對照實驗：只給 60–90 秒與雙比例等操作限制，讓 Gemini 從完整 Clip Card library 自行推論主題、時間軸位置與每格 2–4 個候選。新版 evidence payload 也保留 Entity kind、required／optional／avoid-overlay 關係，讓模型可產生泛用 `vertical_regions`，而不是把多個獨立主體合寫成一個 bbox target。局部 Trim Intent 可能為保留完整動作而使成片超過模型原先配置的秒數，因此 `scripts/reconcile_open_edit_budget.py` 另讀實際 segment durations，只以 keep／drop／reorder 完整片段把全片拉回 duration contract；它不會在動作中間靜默截短。
+
+Planner 的 JSON Schema 無法完整表達所有跨欄位 invariant；模型若同時填入互斥但可保守消解的欄位，本機只允許不增加執行權限的 canonicalization，例如明示 `original` 時清除 zoom／focus，或將 required／atomic region 收緊成完整可見。原始付費 response 與原始 request 永遠保持不變，逐 JSON path 的 before／after／rule、canonical output 與兩邊 hash 另存；無法安全消解的矛盾仍 fail closed。`--reuse-raw-output` 只會重投影完全配對的 request／interaction／raw-output，fresh paid run 也拒絕覆寫既有 artifact namespace。
 
 當 9:16 audit 證明 hard-core union 不可容納或 tracking coverage 不足時，自動路徑會先換同一 chapter 的下一個 evidence-bound candidate，而不是立刻套背景補邊。`scripts/apply_open_edit_candidate_overrides.py` 仍可接受人工審查過的 `feature_id + aspect + candidate_id + reason` patch，保留原始 OpenEditPlan 與兩邊 hash，再重新投影 brief／feature plan／trim plan；候選不存在或同一 aspect 重複覆寫會 fail closed。人工 override 與自動 candidate routing 是不同權限層，不能互相冒充。
 

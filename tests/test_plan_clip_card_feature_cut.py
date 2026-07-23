@@ -39,7 +39,12 @@ from scripts.plan_clip_card_feature_cut import (
     ResolvedEntityRef,
     ResolvedFramingRegion,
     SelectedClipCardEvidence,
+    _assert_fresh_feature_namespace_empty,
+    _resolve_feature_reuse_artifacts,
+    _verified_feature_raw_output_text,
+    _write_feature_normalization_artifacts,
     build_selected_clip_card_evidence,
+    canonicalize_feature_plan_output,
     compact_card,
     compact_card_v3,
     project_feature_contracts,
@@ -49,6 +54,7 @@ from scripts.plan_clip_card_feature_cut import (
     reproject_external_feature_plan_v3,
     validate_plan_contract,
     validate_plan_contract_v3,
+    main as feature_planner_main,
 )
 
 
@@ -356,6 +362,201 @@ def _v3_plan() -> ClipCardFeaturePlanV3:
         uncertainties=[],
         model_provenance=_provenance(),
     )
+
+
+def test_feature_output_canonicalization_is_narrow_ordered_and_auditable() -> None:
+    payload = _v3_plan().model_dump(mode="json")
+    first, second = payload["chapters"][0]["candidates"]
+    first.update(
+        {
+            "horizontal_strategy": "original",
+            "horizontal_zoom_intent": "detail",
+            "horizontal_focus_entity_id": "subject-1",
+        }
+    )
+    second.update(
+        {
+            "horizontal_strategy": "original",
+            "horizontal_zoom_intent": "none",
+            "horizontal_focus_entity_id": "subject-1",
+        }
+    )
+    original = json.dumps(payload)
+
+    canonical_text, changes = canonicalize_feature_plan_output(original)
+    canonical = json.loads(canonical_text)
+
+    assert original == json.dumps(payload)
+    assert canonical["chapters"][0]["candidates"][0]["horizontal_strategy"] == "original"
+    assert canonical["chapters"][0]["candidates"][0]["horizontal_zoom_intent"] == "none"
+    assert canonical["chapters"][0]["candidates"][0][
+        "horizontal_focus_entity_id"
+    ] is None
+    assert canonical["chapters"][0]["candidates"][1][
+        "horizontal_focus_entity_id"
+    ] is None
+    assert [change["rule"] for change in changes] == [
+        "explicit_original_strategy_disables_zoom",
+        "explicit_original_strategy_has_no_focus_entity",
+        "explicit_original_strategy_has_no_focus_entity",
+    ]
+    ClipCardFeaturePlanV3.model_validate_json(canonical_text)
+
+
+def test_feature_reuse_rejects_mismatched_raw_response_copies() -> None:
+    with pytest.raises(ValueError, match="does not exactly match"):
+        _verified_feature_raw_output_text(
+            raw_output={"output_text": "first"},
+            raw_interaction={"output_text": "second"},
+        )
+
+
+def test_fresh_feature_run_refuses_existing_paid_namespace(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "clip-card-feature-plan.attempt-01.raw_output.json",
+        {"output_text": "already paid"},
+    )
+    with pytest.raises(FileExistsError, match="new output directory"):
+        _assert_fresh_feature_namespace_empty(tmp_path)
+
+
+def test_feature_raw_reuse_resolves_complete_set_and_preserves_paid_artifact(
+    tmp_path: Path,
+) -> None:
+    stem = "clip-card-feature-plan.attempt-01"
+    paths = {
+        "request": tmp_path / f"{stem}.request.json",
+        "raw_output": tmp_path / f"{stem}.raw_output.json",
+        "raw_interaction": tmp_path / f"{stem}.raw_interaction.json",
+    }
+    write_json(paths["request"], {"model": MODEL_ID})
+    raw_payload = _v3_plan().model_dump(mode="json")
+    raw_payload["chapters"][0]["candidates"][0].update(
+        {
+            "horizontal_strategy": "original",
+            "horizontal_zoom_intent": "subtle",
+            "horizontal_focus_entity_id": "subject-1",
+        }
+    )
+    write_json(paths["raw_output"], {"output_text": json.dumps(raw_payload)})
+    write_json(paths["raw_interaction"], {"model": MODEL_ID, "id": "paid-1"})
+    original_bytes = paths["raw_output"].read_bytes()
+
+    resolved = _resolve_feature_reuse_artifacts(tmp_path)
+    canonical_text, canonical_path, audit_path = _write_feature_normalization_artifacts(
+        output_dir=tmp_path,
+        artifact_stem="clip-card-feature-plan",
+        raw_output_path=resolved["raw_output"],
+        raw_output_text=json.loads(original_bytes)["output_text"],
+    )
+
+    assert resolved["kind"] == "attempt-01"
+    assert paths["raw_output"].read_bytes() == original_bytes
+    assert canonical_path.exists() and audit_path.exists()
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["change_count"] == 2
+    assert audit["raw_output_artifact_sha256"] == hashlib.sha256(
+        original_bytes
+    ).hexdigest()
+    ClipCardFeaturePlanV3.model_validate_json(canonical_text)
+
+
+def test_feature_reuse_binding_keeps_original_paid_request_as_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_path = tmp_path / "catalog.json"
+    brief_path = tmp_path / "brief.json"
+    library = tmp_path / "library"
+    output_dir = tmp_path / "plan"
+    card_path = (
+        library / "clips" / ("a" * 16) / "gemini" / "clip-card" / "clip_card.json"
+    )
+    write_json(catalog_path, _catalog())
+    write_json(brief_path, _brief())
+    write_json(card_path, _card())
+    output_dir.mkdir()
+
+    payload = _v3_plan().model_dump(mode="json")
+    payload["chapters"][0]["candidates"][0].update(
+        {
+            "horizontal_strategy": "original",
+            "horizontal_zoom_intent": "subtle",
+            "horizontal_focus_entity_id": "subject-1",
+        }
+    )
+    output_text = json.dumps(payload)
+    stem = output_dir / "clip-card-feature-plan.attempt-01"
+    paid_request_path = Path(f"{stem}.request.json")
+    paid_raw_output_path = Path(f"{stem}.raw_output.json")
+    paid_raw_interaction_path = Path(f"{stem}.raw_interaction.json")
+    write_json(
+        paid_request_path,
+        {
+            "model": MODEL_ID,
+            "system_instruction": "Use only supplied evidence.",
+            "input": [{"type": "text", "text": "Paid request."}],
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": gemini_response_schema(ClipCardFeaturePlanV3),
+            },
+        },
+    )
+    write_json(paid_raw_output_path, {"output_text": output_text})
+    write_json(
+        paid_raw_interaction_path,
+        {
+            "model": MODEL_ID,
+            "id": "interaction-1",
+            "output_text": output_text,
+        },
+    )
+    original_request_hash = hashlib.sha256(paid_request_path.read_bytes()).hexdigest()
+    original_raw_bytes = paid_raw_output_path.read_bytes()
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plan_clip_card_feature_cut.py",
+            str(catalog_path),
+            str(brief_path),
+            str(library),
+            str(output_dir),
+            "--reuse-raw-output",
+        ],
+    )
+
+    assert feature_planner_main() == 0
+
+    pointer = json.loads(
+        (output_dir / "feature-plan.external-projection.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    record = json.loads(
+        (output_dir / pointer["record_path"]).read_text(encoding="utf-8")
+    )
+    assert record["source_request_sha256"] == original_request_hash
+    assert paid_raw_output_path.read_bytes() == original_raw_bytes
+
+    monkeypatch.setenv("GEMINI_API_KEY", "must-not-be-used")
+    monkeypatch.setattr(
+        "scripts.plan_clip_card_feature_cut.genai.Client",
+        lambda **_: pytest.fail("fresh rerun must fail before constructing an API client"),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plan_clip_card_feature_cut.py",
+            str(catalog_path),
+            str(brief_path),
+            str(library),
+            str(output_dir),
+        ],
+    )
+    with pytest.raises(FileExistsError, match="new output directory"):
+        feature_planner_main()
 def test_compact_card_preserves_entities_roles_and_relations() -> None:
     compact = compact_card(_card())
 
