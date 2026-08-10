@@ -1143,6 +1143,86 @@ def test_one_subject_looked_at_twice_is_measured_once(monkeypatch):
     assert stops[1][3] < stops[0][3]
 
 
+def test_multi_look_uses_sam_track_at_the_gemini_seed_time(monkeypatch, tmp_path):
+    """A push used to bypass SAM, and its seed time was hard-coded."""
+
+    from montagewright import pipeline
+    from montagewright.executor import Source
+    from montagewright.reframe import Observation
+    from montagewright.schema import Look
+
+    frames = [tmp_path / f"{index}.jpg" for index in range(5)]
+    times = [10.5, 11.5, 12.5, 13.5, 14.5]
+    monkeypatch.setattr(
+        pipeline, "_sample_frames", lambda *a, **k: (frames, times)
+    )
+    monkeypatch.setattr(pipeline, "_may_ask", lambda client: True)
+
+    class Used:
+        input_tokens = output_tokens = thought_tokens = 0
+
+    def located(frames, description, *, client):
+        return [
+            {"present": False, "frame_index": 0},
+            {
+                "present": True, "frame_index": 1,
+                "centre_x": 0.4, "centre_y": 0.5,
+                "width": 0.1, "height": 0.3,
+            },
+        ], Used()
+
+    monkeypatch.setattr(pipeline, "locate_subject", located)
+    asked = {}
+
+    def tracked(*args, **kwargs):
+        asked.update(kwargs)
+        return [
+            Observation(0.0, 0.2, 0.5, 0.1, 0.3),
+            Observation(5.0, 0.8, 0.5, 0.1, 0.3),
+        ], {"tracked": 2}
+
+    monkeypatch.setattr(pipeline, "_track_subject", tracked)
+
+    class Clip:
+        clip_id = "k11"
+        approx_in_seconds, approx_out_seconds = 10.0, 15.0
+
+    _, _, tracks = pipeline._measure_looks(
+        [Look(at="coin", framing="thirds"),
+         Look(at="coin", framing="fill")],
+        Source(source_id="s", path=tmp_path / "source.mp4",
+               duration_seconds=20.0, width=3840, height=2160),
+        Clip(), tmp_path, pipeline.Report(), object(), 1080 / 1920,
+        tmp_path / "sam.pt",
+    )
+
+    assert asked["seed_time_seconds"] == 11.5
+    assert tracks[0][0][:2] == (0.0, 0.2)
+    assert tracks[0][-1][:2] == (5.0, 0.8)
+    assert [(at, x) for at, x, _ in tracks[1]] == [
+        (at, x) for at, x, _ in tracks[0]
+    ]
+
+
+def test_sam_checkpoint_is_discovered_by_default(tmp_path):
+    from montagewright.cli import SAM_CHECKPOINT_NAME, _default_sam_checkpoint
+
+    checkpoint = tmp_path / "artifacts" / "models" / SAM_CHECKPOINT_NAME
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+
+    assert _default_sam_checkpoint((tmp_path,)) == checkpoint.resolve()
+
+
+def test_sam_can_be_explicitly_disabled():
+    from types import SimpleNamespace
+    from montagewright.cli import _sam_checkpoint_for
+
+    assert _sam_checkpoint_for(SimpleNamespace(
+        sam_checkpoint=None, no_sam_tracking=True,
+    )) is None
+
+
 def test_a_subject_nobody_can_find_is_named_rather_than_guessed(monkeypatch):
     from montagewright import pipeline
     from montagewright.executor import Source

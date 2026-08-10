@@ -60,11 +60,58 @@ from montagewright.uploads import (
 )
 
 ASPECTS = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:5": 4 / 5}
+SAM_CHECKPOINT_NAME = "sam2.1_hiera_tiny.pt"
 
 # Long enough that it is worth asking whether this is one take or many. Under
 # it, scene detection costs more than it can save.
 SPLIT_ABOVE_SECONDS = 90.0
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV"}
+
+
+def _default_sam_checkpoint(
+    search_roots: tuple[Path, ...] | None = None,
+) -> Path | None:
+    """Find the bundled SAM model without making callers know the repo layout."""
+
+    roots = search_roots or (
+        Path.cwd(),
+        Path(__file__).resolve().parents[2],
+    )
+    for root in roots:
+        candidate = root / "artifacts" / "models" / SAM_CHECKPOINT_NAME
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _sam_checkpoint_for(args: argparse.Namespace) -> Path | None:
+    """SAM is the default; falling back must be explicit in the run log."""
+
+    requested = getattr(args, "sam_checkpoint", None)
+    disabled = bool(getattr(args, "no_sam_tracking", False))
+    if requested is not None and disabled:
+        raise SystemExit("choose either --sam-checkpoint or --no-sam-tracking")
+    if disabled:
+        print("SAM tracking disabled by --no-sam-tracking", flush=True)
+        return None
+    if requested is not None:
+        checkpoint = requested.expanduser().resolve()
+        if not checkpoint.is_file():
+            raise SystemExit(f"SAM checkpoint is not there: {checkpoint}")
+        print(f"SAM tracking: {checkpoint}", flush=True)
+        return checkpoint
+    checkpoint = _default_sam_checkpoint()
+    if checkpoint is not None:
+        print(f"SAM tracking: {checkpoint} (auto)", flush=True)
+        return checkpoint
+    print(
+        "WARNING: SAM tracking is unavailable because "
+        f"artifacts/models/{SAM_CHECKPOINT_NAME} was not found; moving "
+        "subjects will use sparse Gemini samples. Pass --no-sam-tracking "
+        "to acknowledge this fallback explicitly.",
+        flush=True,
+    )
+    return None
 
 
 def _client():
@@ -314,9 +361,18 @@ def command_render(args: argparse.Namespace) -> int:
     # rather than as unfinished.
     _tee_output(output / "run.log")
 
+    # The tracker was opt-in even when the model was already in this repo.
+    # That made CLI renders silently less accurate than Web UI renders. Keep
+    # one resolved value for the command record and every review round.
+    args.sam_checkpoint = _sam_checkpoint_for(args)
+
     (output / "command.json").write_text(
         json.dumps({
             "source": str(rushes),
+            "sam_tracking": bool(args.sam_checkpoint),
+            "sam_checkpoint": (
+                str(args.sam_checkpoint) if args.sam_checkpoint else None
+            ),
             "command": [sys.executable, "-u", "-m", "montagewright.cli"]
             + sys.argv[1:],
         }, ensure_ascii=False),
@@ -877,27 +933,11 @@ def command_render(args: argparse.Namespace) -> int:
               # could not pan -- the far end of the sweep is six seconds
               # past where this shot cuts away -- was on stdout and nowhere
               # the planner could read.
-              said = {}
-              for note in report.plan_disagreements:
-                  clip_id = note.split(" ", 1)[0]
-                  said.setdefault(clip_id, []).append(note)
-              # And what was measured about the shot, which is the half the
-              # reviewer cannot supply. Told only "the text is cropped", the
-              # planner answered with the same hold three rounds running; the
-              # number it was never shown said at most 63% of that wordmark
-              # can appear in this delivery from this source, which rules out
-              # every hold rather than this one.
-              for step in report.degradations:
-                  if step.clip_id is None:
-                      continue
-                  measured = ", ".join(
-                      f"{name} {value}"
-                      for name, value in (step.measured or {}).items()
-                  )
-                  said.setdefault(f"{step.clip_id}", []).append(
-                      f"本機量到：{step.trigger}"
-                      + (f"（{measured}）" if measured else "")
-                  )
+              said, mandatory = _replan_diagnostics(
+                  report.plan_disagreements,
+                  report.degradations,
+                  shot_verdicts,
+              )
               failing = [
                   (
                       index,
@@ -908,12 +948,7 @@ def command_render(args: argparse.Namespace) -> int:
                       ),
                   )
                   for index, shot in enumerate(selection["shots"])
-                  if (
-                      not shot_verdicts.get(f"k{index:02d}", {}).get(
-                          "delivered", True
-                      )
-                      or bool(said.get(f"k{index:02d}"))
-                  )
+                  if f"k{index:02d}" in mandatory
               ]
               # A whole-cut fault the per-shot pass did not raise still names
               # a shot: the reviewer's timecode maps to whatever is on screen
@@ -1292,6 +1327,51 @@ def _shot_at_second(seconds: float, rhythm: dict[str, dict]) -> str | None:
     # Past the last cut -- rounding, or a note on the final frame -- belongs
     # to the last shot rather than to nothing.
     return max(rhythm)
+
+
+def _replan_diagnostics(
+    plan_disagreements: list[str],
+    degradations: list,
+    shot_verdicts: dict[str, dict],
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Separate evidence for a replan from reasons to start one.
+
+    Measurements are context, not failures.  A crop showing 90% of a subject
+    can be worth mentioning to the shot reviewer and still exceed the 85%
+    contract.  Treating every degradation as mandatory replaced most of a
+    cut twice.  Structural contradictions remain mandatory, as do a shot
+    reviewer saying the plan was not delivered or explicitly adjudicating a
+    fallback as needing a replan.
+    """
+
+    said: dict[str, list[str]] = {}
+    mandatory: set[str] = set()
+    for note in plan_disagreements:
+        clip_id = note.split(" ", 1)[0]
+        if not clip_id.startswith("k"):
+            continue
+        said.setdefault(clip_id, []).append(note)
+        mandatory.add(clip_id)
+    for step in degradations:
+        clip_id = str(step.clip_id or "")
+        if not clip_id:
+            continue
+        measured = ", ".join(
+            f"{name} {value}" for name, value in (step.measured or {}).items()
+        )
+        said.setdefault(clip_id, []).append(
+            f"本機量到：{step.trigger}"
+            + (f"（{measured}）" if measured else "")
+        )
+        if getattr(step, "adjudication", "unadjudicated") == "replan":
+            mandatory.add(clip_id)
+    for clip_id, verdict in shot_verdicts.items():
+        if (
+            not verdict.get("delivered", True)
+            or verdict.get("degradation_verdict") == "replan"
+        ):
+            mandatory.add(clip_id)
+    return said, mandatory
 
 
 def _duration(path: Path) -> float:
@@ -1820,7 +1900,15 @@ def main(argv: list[str] | None = None) -> int:
              "than taken off the front, so the cards stay cached between "
              "runs and the sample is not all one setup.",
     )
-    render.add_argument("--sam-checkpoint", type=Path)
+    render.add_argument(
+        "--sam-checkpoint", type=Path,
+        help="SAM 2.1 checkpoint. By default Montagewright discovers "
+             "artifacts/models/sam2.1_hiera_tiny.pt and uses it.",
+    )
+    render.add_argument(
+        "--no-sam-tracking", action="store_true",
+        help="Explicitly disable SAM and use sparse Gemini positions.",
+    )
     render.add_argument(
         "--budget",
         type=float,

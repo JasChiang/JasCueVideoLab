@@ -271,6 +271,12 @@ SETTLE_SECONDS = 0.35
 # not all settling and no move.
 SETTLE_SHARE = 0.25
 
+# A movement smaller than this share of the delivered frame is not worth
+# chasing.  Source-space deadbands are insufficient once a crop zooms in: a
+# coin drifting 0.012 of a 16:9 source moves almost 0.06 of a 9:16 crop after
+# a push.  The viewer sees the latter number.
+SCREEN_DEADBAND = 0.02
+
 
 def _with_rest(
     keyframes: list[Keyframe],
@@ -478,8 +484,20 @@ def build_look_path(
             )
 
     boxes = [box(cx, cy, w) for _, cx, cy, w in stops]
+    def track_matters(
+        track: list[tuple[float, float, float]] | None, width: float,
+    ) -> bool:
+        if not track or len(track) < 2:
+            return False
+        spread = max(
+            max(one[axis] for one in track) - min(one[axis] for one in track)
+            for axis in (1, 2)
+        )
+        return spread / max(width, 1e-9) >= SCREEN_DEADBAND
+
     walking = [
-        one for one in (tracks or []) if one and len(one) > 1
+        one for one in (tracks or [])
+        if track_matters(one, min(box.width for box in boxes))
     ]
     if len(boxes) == 1 and not walking:
         return CropPath([Keyframe(0.0, boxes[0])])
@@ -588,6 +606,8 @@ def build_look_path(
     at = 0.0
     for index, crop in enumerate(boxes):
         seen = tracks[index] if tracks and index < len(tracks) else None
+        if not track_matters(seen, crop.width):
+            seen = None
         # Resting on a subject that is walking is not the same as resting on
         # a place. Where a stop has a track, the frame stays on the subject
         # for as long as it is looking at it; where it has none -- a static
@@ -603,7 +623,62 @@ def build_look_path(
             keyframes.append(Keyframe(round(at + rests[index], 4), crop))
         at += rests[index]
         if index < len(legs):
-            at += legs[index]
+            leg_start = at
+            leg_end = at + legs[index]
+            next_crop = boxes[index + 1]
+            from_track = (
+                tracks[index]
+                if tracks and index < len(tracks)
+                and track_matters(tracks[index], min(crop.width, next_crop.width))
+                else None
+            )
+            to_track = (
+                tracks[index + 1]
+                if tracks and index + 1 < len(tracks)
+                and track_matters(
+                    tracks[index + 1], min(crop.width, next_crop.width)
+                )
+                else None
+            )
+            # The old path jumped from two mean positions.  That follows a
+            # track while resting, then ignores it during the one interval in
+            # which a push makes every source-space error larger.  Route the
+            # leg through the subjects' positions at the same moments.  For
+            # two framings of one subject the tracks are identical, so this
+            # becomes a zoom whose optical centre follows the subject.  For a
+            # handoff it interpolates between two moving subjects.
+            moments = {leg_start, leg_end}
+            for track in (from_track, to_track):
+                if track:
+                    moments.update(
+                        when for when, _, _ in track
+                        if leg_start < when < leg_end
+                    )
+            from_static = (
+                crop.x + crop.width / 2.0,
+                crop.y + crop.height / 2.0,
+            )
+            to_static = (
+                next_crop.x + next_crop.width / 2.0,
+                next_crop.y + next_crop.height / 2.0,
+            )
+            for when in sorted(moments):
+                share = (
+                    (when - leg_start) / max(leg_end - leg_start, 1e-9)
+                )
+                from_x, from_y = (
+                    _track_at(from_track, when) if from_track else from_static
+                )
+                to_x, to_y = (
+                    _track_at(to_track, when) if to_track else to_static
+                )
+                centre_x = from_x + (to_x - from_x) * share
+                centre_y = from_y + (to_y - from_y) * share
+                width = crop.width + (next_crop.width - crop.width) * share
+                keyframes.append(
+                    Keyframe(round(when, 4), box(centre_x, centre_y, width))
+                )
+            at = leg_end
     limited, _ = _limit_speed(keyframes, ENERGY_LIMITS[energy])
     return CropPath(_dedupe(limited))
 
@@ -623,26 +698,31 @@ def _across(
     if end <= start:
         return [(start, track[0][1], track[0][2])]
 
-    def at(when: float) -> tuple[float, float]:
-        if when <= track[0][0]:
-            return track[0][1], track[0][2]
-        if when >= track[-1][0]:
-            return track[-1][1], track[-1][2]
-        for before, after in zip(track, track[1:]):
-            if before[0] <= when <= after[0]:
-                span = max(after[0] - before[0], 1e-9)
-                share = (when - before[0]) / span
-                return (
-                    before[1] + (after[1] - before[1]) * share,
-                    before[2] + (after[2] - before[2]) * share,
-                )
-        return track[-1][1], track[-1][2]
-
     moments = sorted(
         {start, end}
         | {one[0] for one in track if start < one[0] < end}
     )
-    return [(when, *at(when)) for when in moments]
+    return [(when, *_track_at(track, when)) for when in moments]
+
+
+def _track_at(
+    track: list[tuple[float, float, float]], when: float,
+) -> tuple[float, float]:
+    """Interpolate a measured subject track in shot time."""
+
+    if when <= track[0][0]:
+        return track[0][1], track[0][2]
+    if when >= track[-1][0]:
+        return track[-1][1], track[-1][2]
+    for before, after in zip(track, track[1:]):
+        if before[0] <= when <= after[0]:
+            span = max(after[0] - before[0], 1e-9)
+            share = (when - before[0]) / span
+            return (
+                before[1] + (after[1] - before[1]) * share,
+                before[2] + (after[2] - before[2]) * share,
+            )
+    return track[-1][1], track[-1][2]
 
 
 def _dedupe(keyframes: list[Keyframe]) -> list[Keyframe]:

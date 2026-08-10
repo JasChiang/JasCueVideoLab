@@ -365,6 +365,9 @@ def _track_subject(
     seed_box: list[int],
     checkpoint: Path,
     work: Path,
+    *,
+    seed_time_seconds: float | None = None,
+    track_name: str | None = None,
 ) -> tuple[list[Observation], dict[str, int]]:
     """Propagate a Gemini seed across every analysed frame of the shot."""
 
@@ -373,10 +376,17 @@ def _track_subject(
     track = track_bbox_sam21(
         video_path=source.path,
         checkpoint_path=checkpoint,
-        seed_time_ms=int(clip.approx_in_seconds * 1000) + 100,
+        seed_time_ms=int(
+            (seed_time_seconds
+             if seed_time_seconds is not None
+             else clip.approx_in_seconds + 0.1) * 1000
+        ),
         seed_box_2d=seed_box,
         target_description=subject_description,
-        output_dir=work / f"sam-{clip.clip_id}",
+        output_dir=work / (
+            f"sam-{clip.clip_id}-{track_name}"
+            if track_name else f"sam-{clip.clip_id}"
+        ),
         seed_source="gemini_frame_grounding",
         analysis_fps=TRACK_FPS,
         max_side=960,
@@ -389,7 +399,8 @@ def _track_subject(
 
 
 def _measure_looks(
-    looks, source, clip, work: Path, report, client, target_aspect: float
+    looks, source, clip, work: Path, report, client, target_aspect: float,
+    checkpoint: Path | None = None,
 ) -> tuple[
     list[tuple[float, float, float, float]],
     str,
@@ -440,7 +451,7 @@ def _measure_looks(
     stops: list[tuple[float, float, float, float]] = []
     tracks: list[list[tuple[float, float, float]]] = []
     missing: list[str] = []
-    for look in looks:
+    for look_index, look in enumerate(looks):
         if look.at not in seen:
             _afford(report)
             boxes, usage = _locate_subject(
@@ -473,6 +484,64 @@ def _measure_looks(
                 for one in found
                 if 0 <= int(one.get("frame_index", -1)) < len(moments)
             )
+            # Gemini identifies which object the edit means; SAM turns that
+            # semantic seed into the dense trajectory used by the crop. This
+            # used to happen only in the single-look branch, so a push or a
+            # handoff bypassed SAM precisely when a tight crop made small
+            # tracking errors most visible.
+            if checkpoint is not None:
+                seed = found[0]
+                frame_index = int(seed.get("frame_index", -1))
+                seed_time = (
+                    times[frame_index]
+                    if 0 <= frame_index < len(times)
+                    else clip.approx_in_seconds + 0.1
+                )
+                try:
+                    tracked, states = _track_subject(
+                        source,
+                        clip,
+                        look.at,
+                        _seed_box(seed),
+                        checkpoint,
+                        work,
+                        seed_time_seconds=seed_time,
+                        track_name=str(look_index),
+                    )
+                except Exception as error:  # sampled positions remain valid
+                    report.subject_notes[clip.clip_id] = (
+                        "SAM unavailable for a multi-look subject; using "
+                        f"sampled positions ({type(error).__name__})"
+                    )
+                else:
+                    total = sum(states.values()) or 1
+                    kept = states.get("tracked", 0)
+                    report.subject_notes[clip.clip_id] = (
+                        f"SAM tracked {look.at}: {states}"
+                    )
+                    if kept / total >= TRACK_QUORUM and tracked:
+                        walked[look.at] = [
+                            (one.seconds, one.centre_x, one.centre_y)
+                            for one in tracked
+                        ]
+                    else:
+                        report.degradations.append(
+                            DegradationStep(
+                                clip_id=clip.clip_id,
+                                ladder="other",
+                                ladder_other="tracking_lost_most_frames",
+                                trigger=(
+                                    "SAM held the multi-look subject in "
+                                    f"{kept} of {total} analysed frames; "
+                                    "using sampled positions"
+                                ),
+                                measured={
+                                    "tracked_frames": float(kept),
+                                    "analysed_frames": float(total),
+                                    "kept_fraction": round(kept / total, 3),
+                                },
+                            )
+                        )
         if look.at not in seen:
             continue
         centre_x, centre_y, tall = seen[look.at]
@@ -489,18 +558,12 @@ def _measure_looks(
             centre_y + lift,
             width,
         ))
-        # A subject that barely moved is not worth chasing: below the
-        # deadband the frame would only jitter, and a held frame is what it
-        # should look like anyway.
+        # Keep the measured path.  Whether it matters is a property of the
+        # delivered crop, not of the full source: a tiny source-space drift
+        # can become a visible reversal during a tight push.  The path builder
+        # applies its deadband after it knows the crop width.
         path = walked.get(look.at) or []
-        spread = max(
-            (max(one[axis] for one in path) - min(one[axis] for one in path))
-            for axis in (1, 2)
-        ) if len(path) > 1 else 0.0
-        tracks.append(
-            [(when, x, y + lift) for when, x, y in path]
-            if spread > DEADBAND else []
-        )
+        tracks.append([(when, x, y + lift) for when, x, y in path])
     return stops, "、".join(missing), tracks
 
 
@@ -822,7 +885,7 @@ def follow_subjects(
             if len(reframe.looks) >= 2 and _may_ask(client):
                 stops, missing, tracks = _measure_looks(
                     reframe.looks, source, clip, work, report, client,
-                    target_aspect,
+                    target_aspect, checkpoint,
                 )
                 if missing:
                     report.subject_notes[clip.clip_id] = (
@@ -1207,6 +1270,11 @@ def follow_subjects(
                             _seed_box(seed),
                             checkpoint,
                             work,
+                            seed_time_seconds=(
+                                times[int(seed.get("frame_index", -1))]
+                                if 0 <= int(seed.get("frame_index", -1)) < len(times)
+                                else None
+                            ),
                         )
                     except Exception as error:  # tracking is an optimisation
                         report.subject_notes[clip.clip_id] = (

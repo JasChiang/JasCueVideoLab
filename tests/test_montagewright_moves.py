@@ -3515,6 +3515,44 @@ def test_the_shot_verdicts_are_collected_before_the_gate_that_reads_them():
     assert source.count("undelivered=undelivered") == 2
 
 
+def test_an_informational_degradation_does_not_replan_a_delivered_shot():
+    """Measurements inform review; they do not all declare failure."""
+
+    from montagewright.cli import _replan_diagnostics
+    from montagewright.schema import DegradationStep
+
+    mild = DegradationStep(
+        clip_id="k04",
+        ladder="other",
+        ladder_other="subject_wider_than_delivery",
+        trigger="the crop can show 90.4% of the subject",
+        measured={"most_visible_fraction": 0.904,
+                  "requested_min_visible": 0.85},
+    )
+    said, mandatory = _replan_diagnostics(
+        [], [mild], {
+            "k04": {
+                "delivered": True,
+                "degradation_verdict": "acceptable",
+                "note": "the intended detail is readable",
+            }
+        },
+    )
+    assert "k04" in said
+    assert "k04" not in mandatory
+
+
+def test_shot_failure_and_structural_faults_still_require_replan():
+    from montagewright.cli import _replan_diagnostics
+
+    _, mandatory = _replan_diagnostics(
+        ["k02 static hold exceeds the maximum"],
+        [],
+        {"k07": {"delivered": False, "degradation_verdict": "none_recorded"}},
+    )
+    assert mandatory == {"k02", "k07"}
+
+
 def test_silence_about_cropping_does_not_read_as_permission():
     """An optional boolean whose absent value is the permissive one.
 
@@ -4593,6 +4631,53 @@ def test_two_looks_that_landed_in_the_same_place_are_reported():
     held: list = []
     build_look_path([(1.0, 0.5, 0.5, 0.3164)], degradations=held, **common)
     assert held == []
+
+
+def test_a_zoom_leg_follows_the_subject_in_delivered_screen_space():
+    """A small source drift must not reverse when a crop closes around it.
+
+    Two looks at one subject are how the planner expresses a push.  The
+    multi-look path used to follow the measured track only during the rests,
+    then aim the whole zoom leg at the track's mean.  A subject that moved a
+    little to the right before the push was consequently magnified to the
+    left: both motions were individually smooth and their composite visibly
+    reversed.
+    """
+
+    from montagewright.reframe import build_look_path
+
+    track = [
+        (0.0, 0.552, 0.50),
+        (0.8, 0.564, 0.50),
+        (1.6, 0.565, 0.50),
+        (2.4, 0.560, 0.50),
+        (3.2, 0.558, 0.50),
+        (4.0, 0.558, 0.50),
+    ]
+    path = build_look_path(
+        [(0.35, 0.5595, 0.50, 0.3164),
+         (0.35, 0.5595, 0.50, 0.2083)],
+        source_aspect=16 / 9,
+        target_aspect=9 / 16,
+        duration_seconds=4.0,
+        energy="active",
+        tracks=[track, track],
+    )
+
+    def subject_at(when: float) -> float:
+        for before, after in zip(track, track[1:]):
+            if before[0] <= when <= after[0]:
+                share = (when - before[0]) / (after[0] - before[0])
+                return before[1] + (after[1] - before[1]) * share
+        return track[-1][1]
+
+    positions = [
+        (subject_at(frame.seconds) - frame.crop.x) / frame.crop.width
+        for frame in path.keyframes
+        if 0.7 <= frame.seconds <= 3.3
+    ]
+    assert len(positions) >= 4
+    assert max(positions) - min(positions) < 0.02
 
 
 def test_a_named_music_point_is_actually_resolved():
