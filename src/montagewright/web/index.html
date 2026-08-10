@@ -321,7 +321,6 @@
   .graphic-preview {
     position: absolute; z-index: 3; pointer-events: none; box-sizing: border-box;
     max-width: 72%; color: white; line-height: 1.05;
-    filter: drop-shadow(0 2px 8px rgba(0,0,0,.45));
   }
   .graphic-preview.plate {
     background: rgba(17,19,24,.82); border-radius: 10px; padding: 10px 14px;
@@ -1609,10 +1608,13 @@ function showBurnt() {
 
 // Editorial graphics are not subtitles. They have their own copy provenance,
 // templates, motion and approval state, but use the same editing gestures.
-let graphicsPlan = { version: 'montagewright-graphics-v1', brand: {}, facts: [], cues: [] };
+let graphicsPlan = { version: 'montagewright-graphics-v1', revision: 0, brand: {}, facts: [], cues: [] };
 let graphics = [], graphicTemplates = [], graphicPicked = -1;
 let graphicResolvedLayout = {};
 let briefCandidates = [], briefInstructions = [], briefDigest = '';
+let compiledGraphicPreview = null, graphicPreviewTimer = null;
+let graphicPreviewRequest = 0;
+let graphicPreviewPending = '';
 
 function graphicText(cue, which = 'primary') {
   const id = which === 'primary' ? cue.primary_fact_id : cue.secondary_fact_id;
@@ -1626,7 +1628,7 @@ async function loadGraphics() {
     if (!got.ok) throw new Error('no graphics track');
     const data = await got.json();
     graphicsPlan = {
-      version: data.version,
+      version: data.version, revision: data.revision || 0,
       brand: data.brand || {}, facts: data.facts || [], cues: data.cues || [],
     };
     graphics = data.resolved || [];
@@ -1636,7 +1638,7 @@ async function loadGraphics() {
     briefInstructions = data.brief_instructions || [];
     briefDigest = data.brief_sha256 || '';
   } catch (error) {
-    graphicsPlan = { version: 'montagewright-graphics-v1', brand: {}, facts: [], cues: [] };
+    graphicsPlan = { version: 'montagewright-graphics-v1', revision: 0, brand: {}, facts: [], cues: [] };
     graphics = []; graphicTemplates = []; graphicResolvedLayout = {};
     briefCandidates = []; briefInstructions = []; briefDigest = '';
   }
@@ -1736,12 +1738,22 @@ function paintGraphicList() {
 function selectGraphic(i) {
   if (!(i >= 0 && i < graphics.length)) return;
   graphicPicked = i; cue = -1;
-  $('video').currentTime = graphics[i].at_seconds + 0.01;
+  const target = graphics[i].at_seconds + 0.01;
+  let elapsed = 0;
+  for (let shot = 0; shot < blocks.length; shot++) {
+    if (target >= elapsed && target < elapsed + blocks[shot].seconds) {
+      picked = shot; break;
+    }
+    elapsed += blocks[shot].seconds;
+  }
+  $('video').currentTime = target;
+  markPicked(); markShot(picked);
   $('inspector').classList.add('hide');
   $('cue-inspector').classList.add('hide');
   $('graphic-inspector').classList.remove('hide');
   $('ins-head').querySelector('.who').textContent = '字卡';
   paintGraphics(); paintGraphicList(); inspectGraphic();
+  scheduleGraphicPreview();
   movePlayhead(); showGraphicPreview();
 }
 
@@ -1751,9 +1763,54 @@ function graphicOptions(values, selected) {
   ).join('');
 }
 
+const graphicStyleDefaults = {
+  preset: 'custom', primary_color: '', secondary_color: '', accent_color: '',
+  plate_color: '', plate_alpha: null, align: 'auto', primary_scale: 1,
+  secondary_scale: 1, line_spacing: 1, max_width_scale: 1,
+  padding_x: 28, padding_y: 19, corner_radius: null,
+  stroke_width: 0, stroke_color: '#000000', shadow_color: '#000000',
+  shadow_opacity: 0, shadow_blur: 0, shadow_offset_x: 0, shadow_offset_y: 0,
+  plate_border_width: 0, plate_border_color: '#FFFFFF',
+  emphasis_text: '', emphasis_color: '', entrance_seconds: null,
+  exit_seconds: null, motion_distance: null,
+};
+
+const graphicStylePresets = {
+  clean: {stroke_width: 0, shadow_opacity: 0, shadow_blur: 0,
+    plate_border_width: 0, background: 'none'},
+  outlined: {stroke_width: 5, stroke_color: '#000000', shadow_opacity: 0,
+    plate_border_width: 0, background: 'none'},
+  soft_shadow: {stroke_width: 1, stroke_color: '#000000', shadow_opacity: 185,
+    shadow_blur: 9, shadow_offset_x: 3, shadow_offset_y: 5,
+    plate_border_width: 0, background: 'none'},
+  colour_label: {stroke_width: 0, shadow_opacity: 0, plate_border_width: 0,
+    plate_alpha: 232, corner_radius: 18, padding_x: 32, padding_y: 20,
+    background: 'plate'},
+  tech_frame: {stroke_width: 2, stroke_color: '#07101F', shadow_opacity: 140,
+    shadow_blur: 8, shadow_offset_y: 4, plate_alpha: 128,
+    plate_border_width: 2, corner_radius: 8, background: 'plate'},
+  bold_pop: {stroke_width: 7, stroke_color: '#111111', shadow_opacity: 210,
+    shadow_blur: 0, shadow_offset_x: 6, shadow_offset_y: 7,
+    primary_scale: 1.18, plate_border_width: 0, background: 'none'},
+};
+
+const graphicPresetReset = {
+  primary_scale: 1, secondary_scale: 1, line_spacing: 1,
+  max_width_scale: 1, padding_x: 28, padding_y: 19,
+  corner_radius: null, stroke_width: 0, shadow_opacity: 0,
+  shadow_blur: 0, shadow_offset_x: 0, shadow_offset_y: 0,
+  plate_border_width: 0, entrance_seconds: null, exit_seconds: null,
+  motion_distance: null,
+};
+
+function styleOfGraphic(one) {
+  return {...graphicStyleDefaults, ...(one?.style || {})};
+}
+
 function inspectGraphic() {
   const one = graphics[graphicPicked], box = $('graphic-inspector');
   if (!one || !box) return;
+  const style = styleOfGraphic(one);
   const templates = graphicTemplates
     .filter(t => (t.kinds || []).includes(one.kind))
     .map(t => [t.template_id, t.label]);
@@ -1774,6 +1831,11 @@ function inspectGraphic() {
     </div></section>
     <section class="ins-part"><h4>設計</h4><div class="pairs">
       <span>模板</span><select id="graphic-template" class="wide">${graphicOptions(templates, one.template)}</select>
+      <span>快速樣式</span><select id="graphic-style-preset" class="wide">${graphicOptions([
+        ['custom','自訂'],['clean','純字'],['outlined','台灣 YouTube 描邊'],
+        ['soft_shadow','柔陰影'],['colour_label','彩色標籤'],
+        ['tech_frame','科技細框'],['bold_pop','粗框立體字']
+      ], style.preset)}</select>
       <span>位置</span><select id="graphic-position" class="wide">${graphicOptions([
         ['auto','多幀自動'],['top','上方'],['upper_left','左上'],['upper_right','右上'],
         ['lower_left','左下'],['lower_right','右下'],['center','中央']
@@ -1789,22 +1851,60 @@ function inspectGraphic() {
         ['none','直接出現'],['fade','淡入淡出'],['rise','向上進場'],
         ['slide_left','向左進場'],['slide_right','向右進場']
       ], one.motion)}</select>
+      <span>對齊</span><select id="graphic-align" class="wide">${graphicOptions([
+        ['auto','依模板'],['left','靠左'],['center','置中'],['right','靠右']
+      ], style.align)}</select>
+      <span>主字大小</span><input id="graphic-primary-scale" type="range" min="0.55" max="1.8" step="0.05" value="${style.primary_scale}">
+      <span>輔字大小</span><input id="graphic-secondary-scale" type="range" min="0.55" max="1.8" step="0.05" value="${style.secondary_scale}">
+      <span>行距</span><input id="graphic-line-spacing" type="range" min="0.65" max="2" step="0.05" value="${style.line_spacing}">
+      <span>字卡寬度</span><input id="graphic-width-scale" type="range" min="0.45" max="1.25" step="0.05" value="${style.max_width_scale}">
+      <span>水平內距</span><input id="graphic-padding-x" type="number" min="0" max="160" value="${style.padding_x}">
+      <span>垂直內距</span><input id="graphic-padding-y" type="number" min="0" max="120" value="${style.padding_y}">
     </div></section>
-    <section class="ins-part"><h4>品牌樣式</h4><div class="pairs">
-      <span>主文字</span><input id="graphic-fg" type="color" value="${esc(graphicsPlan.brand.foreground || '#FFFFFF')}">
-      <span>輔文字</span><input id="graphic-secondary-colour" type="color" value="${esc(graphicsPlan.brand.secondary || '#D9DCE3')}">
-      <span>強調色</span><input id="graphic-accent" type="color" value="${esc(graphicsPlan.brand.accent || '#FFD65A')}">
-      <span>底板色</span><input id="graphic-plate" type="color" value="${esc(graphicsPlan.brand.plate || '#111318')}">
-      <span>底板透明度</span><input id="graphic-plate-alpha" type="range" min="0" max="255" value="${graphicsPlan.brand.plate_alpha ?? 205}">
+    <section class="ins-part"><h4>文字外觀</h4><div class="pairs">
+      <span>主文字</span><input id="graphic-fg" type="color" value="${esc(style.primary_color || graphicsPlan.brand.foreground || '#FFFFFF')}">
+      <span>輔文字</span><input id="graphic-secondary-colour" type="color" value="${esc(style.secondary_color || graphicsPlan.brand.secondary || '#D9DCE3')}">
+      <span>強調文字</span><input id="graphic-emphasis-text" value="${esc(style.emphasis_text)}" placeholder="例如 4.1mm">
+      <span>強調色</span><input id="graphic-accent" type="color" value="${esc(style.emphasis_color || style.accent_color || graphicsPlan.brand.accent || '#FFFFFF')}">
+      <span>描邊粗細</span><input id="graphic-stroke-width" type="range" min="0" max="24" step="1" value="${style.stroke_width}">
+      <span>描邊色</span><input id="graphic-stroke-colour" type="color" value="${esc(style.stroke_color)}">
+      <span>陰影透明度</span><input id="graphic-shadow-opacity" type="range" min="0" max="255" value="${style.shadow_opacity}">
+      <span>陰影色</span><input id="graphic-shadow-colour" type="color" value="${esc(style.shadow_color)}">
+      <span>陰影模糊</span><input id="graphic-shadow-blur" type="range" min="0" max="40" value="${style.shadow_blur}">
+      <span>陰影水平</span><input id="graphic-shadow-x" type="number" min="-40" max="40" value="${style.shadow_offset_x}">
+      <span>陰影垂直</span><input id="graphic-shadow-y" type="number" min="-40" max="40" value="${style.shadow_offset_y}">
+    </div></section>
+    <section class="ins-part"><h4>底板與外框</h4><div class="pairs">
+      <span>底板色</span><input id="graphic-plate" type="color" value="${esc(style.plate_color || graphicsPlan.brand.plate || '#111318')}">
+      <span>底板透明度</span><input id="graphic-plate-alpha" type="range" min="0" max="255" value="${style.plate_alpha ?? graphicsPlan.brand.plate_alpha ?? 205}">
+      <span>圓角</span><input id="graphic-corner-radius" type="range" min="0" max="160" value="${style.corner_radius ?? Math.round((graphicsPlan.brand.corner_radius || .18) * 100)}">
+      <span>外框粗細</span><input id="graphic-border-width" type="range" min="0" max="24" value="${style.plate_border_width}">
+      <span>外框色</span><input id="graphic-border-colour" type="color" value="${esc(style.plate_border_color)}">
+    </div></section>
+    <section class="ins-part"><h4>動畫細節</h4><div class="pairs">
+      <span>進場秒數</span><input id="graphic-enter" type="number" min="0.05" max="2" step="0.05" value="${style.entrance_seconds ?? .35}">
+      <span>退場秒數</span><input id="graphic-exit" type="number" min="0.05" max="2" step="0.05" value="${style.exit_seconds ?? .25}">
+      <span>移動距離</span><input id="graphic-motion-distance" type="range" min="0" max="240" value="${style.motion_distance ?? 28}">
     </div></section>
     <section class="ins-part"><button id="graphic-burn">輸出字卡版</button>
       <p class="why">輸出為另一支影片，乾淨母版保留。草稿不會被燒入。</p></section>`;
   for (const id of ['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
     'graphic-until','graphic-status','graphic-note','graphic-template','graphic-position',
-    'graphic-composition','graphic-background','graphic-motion','graphic-fg',
-    'graphic-secondary-colour','graphic-accent','graphic-plate','graphic-plate-alpha']) {
-    $(id).onchange = updateGraphicFromInspector;
-    $(id).onkeydown = (e) => e.stopPropagation();
+    'graphic-composition','graphic-background','graphic-motion','graphic-style-preset',
+    'graphic-align','graphic-primary-scale','graphic-secondary-scale',
+    'graphic-line-spacing','graphic-width-scale','graphic-padding-x','graphic-padding-y',
+    'graphic-fg','graphic-secondary-colour','graphic-emphasis-text','graphic-accent',
+    'graphic-stroke-width','graphic-stroke-colour','graphic-shadow-opacity',
+    'graphic-shadow-colour','graphic-shadow-blur','graphic-shadow-x','graphic-shadow-y',
+    'graphic-plate','graphic-plate-alpha','graphic-corner-radius',
+    'graphic-border-width','graphic-border-colour','graphic-enter','graphic-exit',
+    'graphic-motion-distance']) {
+    const control = $(id);
+    control.onchange = updateGraphicFromInspector;
+    if (control.type === 'range' || control.type === 'color') {
+      control.oninput = updateGraphicFromInspector;
+    }
+    control.onkeydown = (e) => e.stopPropagation();
   }
   $('graphic-burn').onclick = burnGraphics;
 }
@@ -1826,7 +1926,7 @@ function editableGraphicFact(cue, which) {
   return fact;
 }
 
-function updateGraphicFromInspector(event) {
+async function updateGraphicFromInspector(event) {
   const cue = graphicsPlan.cues[graphicPicked];
   if (!cue) return;
   delete graphicResolvedLayout[cue.graphic_id];
@@ -1837,19 +1937,29 @@ function updateGraphicFromInspector(event) {
     const primary = editableGraphicFact(cue, 'primary');
     if (primary) {
       primary.exact_text = primaryText; primary.approved = false;
-      primary.approved_by = null; textChanged = true;
+      primary.approved_by = null; primary.text_sha256 = ''; textChanged = true;
     }
   }
   const secondaryText = $('graphic-secondary').value.trim();
   if (secondaryText) {
     if (!cue.secondary_fact_id) {
       cue.secondary_fact_id = `user.${cue.graphic_id}.secondary`;
-      graphicsPlan.facts.push({
-        fact_id: cue.secondary_fact_id, exact_text: secondaryText,
-        source_kind: 'user', source_reference: 'web-ui', confidence: 'certain',
-        approved: false, approved_by: null, allowed_kinds: [],
-        source_sha256: '', text_sha256: '',
-      });
+      let secondary = graphicsPlan.facts.find(
+        fact => fact.fact_id === cue.secondary_fact_id
+      );
+      if (!secondary) {
+        secondary = {
+          fact_id: cue.secondary_fact_id, exact_text: secondaryText,
+          source_kind: 'user', source_reference: 'web-ui', confidence: 'certain',
+          approved: false, approved_by: null, allowed_kinds: [],
+          source_sha256: '', text_sha256: '',
+        };
+        graphicsPlan.facts.push(secondary);
+      } else {
+        secondary.exact_text = secondaryText;
+        secondary.approved = false; secondary.approved_by = null;
+        secondary.text_sha256 = '';
+      }
       textChanged = true;
     } else {
       const currentSecondary = graphicsPlan.facts.find(f => f.fact_id === cue.secondary_fact_id);
@@ -1857,55 +1967,144 @@ function updateGraphicFromInspector(event) {
         const secondary = editableGraphicFact(cue, 'secondary');
         if (secondary) {
           secondary.exact_text = secondaryText; secondary.approved = false;
-          secondary.approved_by = null; textChanged = true;
+          secondary.approved_by = null; secondary.text_sha256 = '';
+          textChanged = true;
         }
       }
     }
-  } else cue.secondary_fact_id = '';
+  } else if (cue.secondary_fact_id) {
+    const removed = cue.secondary_fact_id;
+    cue.secondary_fact_id = '';
+    const usedElsewhere = graphicsPlan.cues.some(
+      other => other !== cue
+        && (other.primary_fact_id === removed || other.secondary_fact_id === removed)
+    );
+    const old = graphicsPlan.facts.find(fact => fact.fact_id === removed);
+    if (!usedElsewhere && old?.source_kind === 'user') {
+      graphicsPlan.facts = graphicsPlan.facts.filter(
+        fact => fact.fact_id !== removed
+      );
+    }
+    textChanged = true;
+  }
   const at = unstamp($('graphic-at').value, cue.at_seconds);
   const until = unstamp($('graphic-until').value, at + cue.duration_seconds);
   const kind = $('graphic-kind').value;
-  const status = textChanged ? 'draft' : $('graphic-status').value;
+  const requestedStatus = $('graphic-status').value;
+  const explicitApproval = !textChanged
+    && event?.target?.id === 'graphic-status'
+    && requestedStatus === 'approved' && cue.status !== 'approved';
+  const status = textChanged || explicitApproval ? 'draft' : requestedStatus;
   if (textChanged) $('graphic-status').value = 'draft';
-  if (status === 'approved') {
-    for (const which of ['primary', 'secondary']) {
-      const key = which === 'primary' ? 'primary_fact_id' : 'secondary_fact_id';
-      let fact = graphicsPlan.facts.find(one => one.fact_id === cue[key]);
-      if (fact && !fact.approved && fact.source_kind !== 'user') {
-        fact = editableGraphicFact(cue, which);
-      }
-      if (fact?.source_kind === 'user') {
-        fact.approved = true; fact.approved_by = 'human_review';
-      }
-    }
-  }
   let template = $('graphic-template').value;
   if (!graphicTemplates.some(t => t.template_id === template && (t.kinds || []).includes(kind))) {
     template = graphicTemplates.find(t => (t.kinds || []).includes(kind))?.template_id || template;
+  }
+  const selectedPreset = $('graphic-style-preset').value;
+  const priorStyle = cue.style || {};
+  const styleControl = event?.target?.id?.startsWith('graphic-')
+    && !['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
+      'graphic-until','graphic-status','graphic-note','graphic-template',
+      'graphic-position','graphic-composition','graphic-background',
+      'graphic-motion','graphic-style-preset'].includes(event.target.id);
+  if (styleControl) $('graphic-style-preset').value = 'custom';
+  let style = {
+    ...graphicStyleDefaults, ...(cue.style || {}),
+    preset: styleControl ? 'custom' : selectedPreset,
+    align: $('graphic-align').value,
+    primary_scale: +$('graphic-primary-scale').value,
+    secondary_scale: +$('graphic-secondary-scale').value,
+    line_spacing: +$('graphic-line-spacing').value,
+    max_width_scale: +$('graphic-width-scale').value,
+    padding_x: +$('graphic-padding-x').value,
+    padding_y: +$('graphic-padding-y').value,
+    primary_color: !priorStyle.primary_color
+      && event?.target?.id !== 'graphic-fg'
+      ? '' : $('graphic-fg').value.toUpperCase(),
+    secondary_color: !priorStyle.secondary_color
+      && event?.target?.id !== 'graphic-secondary-colour'
+      ? '' : $('graphic-secondary-colour').value.toUpperCase(),
+    emphasis_text: $('graphic-emphasis-text').value.trim(),
+    accent_color: !priorStyle.accent_color
+      && event?.target?.id !== 'graphic-accent'
+      ? '' : $('graphic-accent').value.toUpperCase(),
+    emphasis_color: !priorStyle.emphasis_color
+      && event?.target?.id !== 'graphic-accent'
+      ? '' : $('graphic-accent').value.toUpperCase(),
+    stroke_width: +$('graphic-stroke-width').value,
+    stroke_color: $('graphic-stroke-colour').value.toUpperCase(),
+    shadow_opacity: +$('graphic-shadow-opacity').value,
+    shadow_color: $('graphic-shadow-colour').value.toUpperCase(),
+    shadow_blur: +$('graphic-shadow-blur').value,
+    shadow_offset_x: +$('graphic-shadow-x').value,
+    shadow_offset_y: +$('graphic-shadow-y').value,
+    plate_color: !priorStyle.plate_color
+      && event?.target?.id !== 'graphic-plate'
+      ? '' : $('graphic-plate').value.toUpperCase(),
+    plate_alpha: priorStyle.plate_alpha == null
+      && event?.target?.id !== 'graphic-plate-alpha'
+      ? null : +$('graphic-plate-alpha').value,
+    corner_radius: priorStyle.corner_radius == null
+      && event?.target?.id !== 'graphic-corner-radius'
+      ? null : +$('graphic-corner-radius').value,
+    plate_border_width: +$('graphic-border-width').value,
+    plate_border_color: $('graphic-border-colour').value.toUpperCase(),
+    entrance_seconds: priorStyle.entrance_seconds == null
+      && event?.target?.id !== 'graphic-enter'
+      ? null : +$('graphic-enter').value,
+    exit_seconds: priorStyle.exit_seconds == null
+      && event?.target?.id !== 'graphic-exit'
+      ? null : +$('graphic-exit').value,
+    motion_distance: priorStyle.motion_distance == null
+      && event?.target?.id !== 'graphic-motion-distance'
+      ? null : +$('graphic-motion-distance').value,
+  };
+  let background = $('graphic-background').value;
+  if (event?.target?.id === 'graphic-style-preset' && selectedPreset !== 'custom') {
+    const preset = graphicStylePresets[selectedPreset] || {};
+    background = preset.background || background;
+    style = {
+      ...style, ...graphicPresetReset, ...preset, preset: selectedPreset,
+    };
+    delete style.background;
   }
   Object.assign(cue, {
     kind, at_seconds: at,
     duration_seconds: Math.max(.2, until - at), status,
     template, position: $('graphic-position').value,
     composition: $('graphic-composition').value,
-    background: $('graphic-background').value, motion: $('graphic-motion').value,
+    background, motion: $('graphic-motion').value,
     editor_note: $('graphic-note').value.trim(),
-  });
-  Object.assign(graphicsPlan.brand, {
-    foreground: $('graphic-fg').value.toUpperCase(),
-    secondary: $('graphic-secondary-colour').value.toUpperCase(),
-    accent: $('graphic-accent').value.toUpperCase(),
-    plate: $('graphic-plate').value.toUpperCase(),
-    plate_alpha: +$('graphic-plate-alpha').value,
+    style,
   });
   refreshGraphicsFromPlan(); saveGraphics();
-  if (event?.target?.id === 'graphic-kind') inspectGraphic();
+  if (event?.target?.id === 'graphic-kind'
+      || event?.target?.id === 'graphic-style-preset') inspectGraphic();
+  if (explicitApproval) {
+    const saved = await saveGraphicsNow();
+    if (!saved) { $('graphic-status').value = 'draft'; return; }
+    const got = await fetch(
+      `/api/runs/${runId}/approve-graphic/${encodeURIComponent(cue.graphic_id)}`,
+      {method: 'POST', headers: {'Content-Type': 'application/json'},
+       body: JSON.stringify({revision: graphicsPlan.revision})},
+    );
+    const answer = await got.json();
+    if (!got.ok) {
+      $('graphic-status').value = 'draft';
+      $('strip-note').textContent = `字卡核准失敗：${answer.detail || '請重新整理'}`;
+      return;
+    }
+    graphicsPlan = answer;
+    refreshGraphicsFromPlan(); inspectGraphic();
+    $('strip-note').textContent = '字卡已明確核准';
+  }
 }
 
 function refreshGraphicsFromPlan() {
   graphics = graphicsPlan.cues.map(cue => ({
     ...cue, primary_text: graphicText(cue), secondary_text: graphicText(cue, 'secondary'),
   }));
+  scheduleGraphicPreview();
   paintGraphics(); paintGraphicList(); showGraphicPreview();
 }
 
@@ -1913,13 +2112,18 @@ let graphicsSaving = null, graphicsSavePromise = Promise.resolve(true);
 async function saveGraphicsNow() {
   clearTimeout(graphicsSaving);
   graphicsSaving = null;
-  graphicsSavePromise = (async () => {
+  const previousSave = graphicsSavePromise;
+  graphicsSavePromise = previousSave.catch(() => false).then(async () => {
     try {
+      const payload = JSON.stringify(graphicsPlan);
       const got = await fetch(`/api/runs/${runId}/graphics-track`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(graphicsPlan),
+        body: payload,
       });
       const answer = await got.json();
+      if (got.ok && Number.isInteger(answer.revision)) {
+        graphicsPlan.revision = answer.revision;
+      }
       $('strip-note').textContent = got.ok
         ? (answer.warnings?.length ? `字卡已存；${answer.warnings[0]}` : '字卡已存')
         : `字卡存不了：${answer.detail || '格式錯誤'}`;
@@ -1928,13 +2132,49 @@ async function saveGraphicsNow() {
       $('strip-note').textContent = `字卡存不了：${error.message}`;
       return false;
     }
-  })();
+  });
   return graphicsSavePromise;
 }
 
 function saveGraphics() {
   clearTimeout(graphicsSaving);
   graphicsSaving = setTimeout(saveGraphicsNow, 350);
+}
+
+function graphicEmphasisMarkup(text, needle, colour) {
+  if (!needle) return esc(text);
+  const at = text.indexOf(needle);
+  if (at < 0) return esc(text);
+  return `${esc(text.slice(0, at))}<span style="color:${esc(colour)}">${esc(needle)}</span>${esc(text.slice(at + needle.length))}`;
+}
+
+function scheduleGraphicPreview() {
+  clearTimeout(graphicPreviewTimer);
+  compiledGraphicPreview = null;
+  graphicPreviewPending = '';
+  if (!(graphicPicked >= 0 && graphicPicked < graphicsPlan.cues.length)) return;
+  const cue = graphicsPlan.cues[graphicPicked];
+  graphicPreviewPending = cue.graphic_id;
+  const requestNumber = ++graphicPreviewRequest;
+  graphicPreviewTimer = setTimeout(async () => {
+    try {
+      const got = await fetch(`/api/runs/${runId}/graphics-preview/${encodeURIComponent(cue.graphic_id)}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(graphicsPlan),
+      });
+      const answer = await got.json();
+      if (!got.ok) throw new Error(answer.detail || '無法編譯字卡預覽');
+      if (requestNumber !== graphicPreviewRequest) return;
+      compiledGraphicPreview = {...answer, graphic_id: cue.graphic_id};
+      graphicPreviewPending = '';
+      showGraphicPreview();
+    } catch (error) {
+      if (requestNumber === graphicPreviewRequest) {
+        graphicPreviewPending = '';
+        $('strip-note').textContent = `字卡預覽失敗：${error.message}`;
+      }
+    }
+  }, 140);
 }
 
 function showGraphicPreview() {
@@ -1954,19 +2194,68 @@ function showGraphicPreview() {
     lower_left: [.08,.72], lower_right: [.92,.72], center: [.5,.48],
   };
   const template = graphicTemplates.find(t => t.template_id === one.template) || {};
+  const style = styleOfGraphic(one);
   const resolved = graphicResolvedLayout[one.graphic_id];
+  if (graphicPreviewPending === one.graphic_id) {
+    box.classList.add('hide');
+    return;
+  }
+  if (compiledGraphicPreview?.graphic_id === one.graphic_id) {
+    const made = compiledGraphicPreview;
+    const left = made.resolved_left ?? made.left;
+    const top = made.resolved_top ?? made.top;
+    box.className = 'graphic-preview';
+    box.style.left = `${shown.left - holder.left + shown.width * left / made.frame_width}px`;
+    box.style.top = `${shown.top - holder.top + shown.height * top / made.frame_height}px`;
+    box.style.width = `${shown.width * made.card_width / made.frame_width}px`;
+    box.style.height = `${shown.height * made.card_height / made.frame_height}px`;
+    box.style.maxWidth = 'none'; box.style.padding = '0';
+    box.style.border = 'none'; box.style.background = 'transparent';
+    box.style.transform = 'none'; box.style.textShadow = 'none';
+    box.innerHTML = `<img src="${esc(made.url)}" alt="" style="display:block;width:100%;height:100%">`;
+    box.classList.remove('hide');
+    return;
+  }
   const position = one.position === 'auto' ? (template.default_position || 'upper_left') : one.position;
   const [x,y] = positions[position] || positions.upper_left;
-  box.className = `graphic-preview ${template.plate || resolved?.fallback_plate || one.background === 'plate' || one.composition === 'foreground_plate' ? 'plate' : ''} ${position === 'center' || position === 'top' ? 'center' : ''}`;
-  box.style.color = graphicsPlan.brand.foreground || '#FFFFFF';
-  box.style.backgroundColor = (one.background === 'plate'
-    || template.plate || resolved?.fallback_plate || one.composition === 'foreground_plate')
-    ? `${graphicsPlan.brand.plate || '#111318'}${Math.round((graphicsPlan.brand.plate_alpha ?? 205) / 17).toString(16).repeat(2)}`
+  const hasPlate = one.background === 'plate' || resolved?.fallback_plate
+    || one.composition === 'foreground_plate'
+    || (one.background === 'auto' && template.plate);
+  const align = style.align === 'auto' ? (template.align || 'left') : style.align;
+  box.className = `graphic-preview ${hasPlate ? 'plate' : ''} ${align === 'center' ? 'center' : ''}`;
+  box.style.textAlign = align;
+  box.style.color = style.primary_color || graphicsPlan.brand.foreground || '#FFFFFF';
+  const plateAlpha = style.plate_alpha ?? graphicsPlan.brand.plate_alpha ?? 205;
+  box.style.backgroundColor = hasPlate
+    ? `${style.plate_color || graphicsPlan.brand.plate || '#111318'}${Math.round(plateAlpha / 17).toString(16).repeat(2)}`
     : 'transparent';
-  box.innerHTML = `${one.template === 'editorial_rule' ? `<div class="gp-rule" style="background:${esc(graphicsPlan.brand.accent || '#FFD65A')}"></div>` : ''}
-    <div class="gp-primary">${esc(one.primary_text)}</div>${one.secondary_text
-      ? `<div class="gp-secondary" style="color:${esc(graphicsPlan.brand.secondary || '#D9DCE3')}">${esc(one.secondary_text)}</div>` : ''}`;
-  box.style.fontSize = `${shown.height * (one.template === 'hero_center' ? .07 : .046)}px`;
+  const px = shown.height / 1080;
+  box.style.padding = hasPlate ? `${style.padding_y * px}px ${style.padding_x * px}px` : '0';
+  box.style.borderRadius = `${(style.corner_radius ?? (graphicsPlan.brand.corner_radius || .18) * 100) * px}px`;
+  box.style.border = hasPlate && style.plate_border_width
+    ? `${style.plate_border_width * px}px solid ${style.plate_border_color}` : 'none';
+  const shadows = [];
+  if (style.stroke_width) {
+    const s = Math.max(.5, style.stroke_width * px);
+    for (const [sx,sy] of [[-s,-s],[0,-s],[s,-s],[-s,0],[s,0],[-s,s],[0,s],[s,s]])
+      shadows.push(`${sx}px ${sy}px 0 ${style.stroke_color}`);
+  }
+  if (style.shadow_opacity) {
+    const alpha = (style.shadow_opacity / 255).toFixed(3);
+    const [r,g,b] = (style.shadow_color.match(/[A-Fa-f0-9]{2}/g) || ['00','00','00']).map(v => parseInt(v,16));
+    shadows.push(`${style.shadow_offset_x * px}px ${style.shadow_offset_y * px}px ${style.shadow_blur * px}px rgba(${r},${g},${b},${alpha})`);
+  }
+  box.style.textShadow = shadows.join(',');
+  const accent = style.emphasis_color || style.accent_color || graphicsPlan.brand.accent || '#FFFFFF';
+  box.innerHTML = `${one.template === 'editorial_rule' ? `<div class="gp-rule" style="background:${esc(style.accent_color || graphicsPlan.brand.accent || '#FFFFFF')}"></div>` : ''}
+    <div class="gp-primary">${graphicEmphasisMarkup(one.primary_text, style.emphasis_text, accent)}</div>${one.secondary_text
+      ? `<div class="gp-secondary" style="color:${esc(style.secondary_color || graphicsPlan.brand.secondary || '#D9DCE3')}">${graphicEmphasisMarkup(one.secondary_text, style.emphasis_text, accent)}</div>` : ''}`;
+  box.style.lineHeight = `${1.05 * style.line_spacing}`;
+  box.style.maxWidth = `${Math.min(.96, (template.width || .72) * style.max_width_scale) * 100}%`;
+  box.style.fontSize = `${shown.height * (template.title_height || .046) * style.primary_scale}px`;
+  const secondaryRatio = ((template.secondary_height || .023) * style.secondary_scale)
+    / ((template.title_height || .046) * style.primary_scale);
+  box.querySelector('.gp-secondary')?.style.setProperty('font-size', `${secondaryRatio}em`);
   if (resolved?.frame_width && resolved?.frame_height) {
     box.style.left = `${shown.left - holder.left + shown.width * resolved.resolved_left / resolved.frame_width}px`;
     box.style.top = `${shown.top - holder.top + shown.height * resolved.resolved_top / resolved.frame_height}px`;
@@ -2022,7 +2311,8 @@ function addGraphicAtPlayhead(approvedFactId = '') {
     anchor_offset_seconds: Math.max(0, now - (anchor?.at || now)), at_seconds: now,
     duration_seconds: 2.5, template, position: 'auto',
     composition: 'auto', background: 'auto', motion: 'rise',
-    music_sync: 'none', status: approvedFactId ? 'approved' : 'draft',
+    music_sync: 'none', style: {...graphicStyleDefaults},
+    status: approvedFactId ? 'approved' : 'draft',
   });
   refreshGraphicsFromPlan(); graphicPicked = graphics.length - 1;
   saveGraphics(); selectGraphic(graphicPicked);

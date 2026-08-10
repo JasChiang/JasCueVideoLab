@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 import shutil
 import subprocess
@@ -1405,6 +1406,38 @@ def create_app() -> FastAPI:
             plan = GraphicsPlan.model_validate(await request.json())
         except ValueError as error:
             raise HTTPException(422, str(error))
+        destination = run.output / "work" / "graphics.json"
+        stored_plan = GraphicsPlan()
+        if destination.exists():
+            try:
+                stored_plan = GraphicsPlan.model_validate_json(
+                    destination.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as error:
+                raise HTTPException(422, f"stored graphics are unreadable: {error}")
+            if plan.revision != stored_plan.revision:
+                raise HTTPException(
+                    409,
+                    "字卡已在另一個視窗更新；請重新整理後再修改",
+                )
+        trusted_human = {
+            fact.fact_id: fact for fact in stored_plan.facts
+            if fact.approved_by == "human_review"
+        }
+        untrusted_human = [
+            fact.fact_id for fact in plan.facts
+            if fact.approved_by == "human_review"
+            and (
+                fact.fact_id not in trusted_human
+                or fact.model_dump() != trusted_human[fact.fact_id].model_dump()
+            )
+        ]
+        if untrusted_human:
+            raise HTTPException(
+                422,
+                "人工核准必須經由明確的核准動作，不能在一般存檔中宣稱："
+                + ", ".join(untrusted_human),
+            )
         approved_copy = run.output / "work" / "approved-copy.json"
         try:
             authority = (
@@ -1432,15 +1465,88 @@ def create_app() -> FastAPI:
             validate_for_render(plan, duration_seconds=duration)
             if duration else []
         )
-        destination = run.output / "work" / "graphics.json"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            plan.model_dump_json(indent=2), encoding="utf-8"
-        )
+        plan = plan.model_copy(update={"revision": plan.revision + 1})
+        from montagewright.measure.storage import write_json
+
+        write_json(destination, plan)
         return JSONResponse({
             "facts": len(plan.facts), "cues": len(plan.cues),
-            "warnings": warnings,
+            "warnings": warnings, "revision": plan.revision,
         })
+
+    @app.post("/api/runs/{run_id}/approve-graphic/{graphic_id}")
+    async def approve_graphic(
+        run_id: str, graphic_id: str, request: Request
+    ) -> JSONResponse:
+        """Record an explicit human copy-review action on one saved cue."""
+
+        import hashlib
+        from montagewright.graphics import GraphicsPlan
+        from montagewright.measure.storage import write_json
+
+        run = _run(run_id)
+        destination = run.output / "work" / "graphics.json"
+        if not destination.exists():
+            raise HTTPException(404, "save the graphics draft before approval")
+        try:
+            wanted_revision = int((await request.json()).get("revision", -1))
+            plan = GraphicsPlan.model_validate_json(
+                destination.read_text(encoding="utf-8")
+            )
+            cue = next(
+                cue for cue in plan.cues if cue.graphic_id == graphic_id
+            )
+        except (OSError, ValueError, StopIteration) as error:
+            raise HTTPException(422, f"cannot approve graphic: {error}")
+        if wanted_revision != plan.revision:
+            raise HTTPException(
+                409, "字卡已在另一個視窗更新；請重新整理後再核准"
+            )
+        facts = list(plan.facts)
+        updates: dict[str, str] = {}
+        for which, fact_id in (
+            ("primary", cue.primary_fact_id),
+            ("secondary", cue.secondary_fact_id),
+        ):
+            if not fact_id:
+                continue
+            fact = plan.fact(fact_id)
+            approved_id = fact_id
+            if fact.source_kind != "user":
+                approved_id = f"user.{cue.graphic_id}.{which}"
+                facts = [item for item in facts if item.fact_id != approved_id]
+            approved = fact.model_copy(update={
+                "fact_id": approved_id,
+                "source_kind": "user",
+                "source_reference": "web-ui-explicit-review",
+                "source_sha256": "",
+                "text_sha256": hashlib.sha256(
+                    fact.exact_text.encode("utf-8")
+                ).hexdigest(),
+                "allowed_kinds": [],
+                "approved": True,
+                "approved_by": "human_review",
+            })
+            facts = [
+                approved if item.fact_id == fact_id else item for item in facts
+            ] if approved_id == fact_id else [*facts, approved]
+            updates[f"{which}_fact_id"] = approved_id
+        approved_cue = cue.model_copy(update={**updates, "status": "approved"})
+        cues = [
+            approved_cue if item.graphic_id == graphic_id else item
+            for item in plan.cues
+        ]
+        try:
+            plan = GraphicsPlan.model_validate({
+                **plan.model_dump(mode="json"),
+                "revision": plan.revision + 1,
+                "facts": [fact.model_dump(mode="json") for fact in facts],
+                "cues": [item.model_dump(mode="json") for item in cues],
+            })
+        except ValueError as error:
+            raise HTTPException(422, f"cannot approve graphic: {error}")
+        write_json(destination, plan)
+        return JSONResponse(plan.model_dump(mode="json"))
 
     @app.post("/api/runs/{run_id}/burn-graphics")
     def burn_graphics_track(run_id: str) -> JSONResponse:
@@ -1508,6 +1614,122 @@ def create_app() -> FastAPI:
                 .read_text(encoding="utf-8")
             ),
         })
+
+    @app.post("/api/runs/{run_id}/graphics-preview/{graphic_id}")
+    async def compile_graphic_preview(
+        run_id: str, graphic_id: str, request: Request
+    ) -> JSONResponse:
+        """Compile one card with the production Pillow renderer for the UI."""
+
+        import hashlib
+        from montagewright.graphics import (
+            GRAPHICS_RENDERER_VERSION, GraphicsPlan, _layout_frames,
+            compile_graphic,
+        )
+        from montagewright.measure.media import probe_video
+
+        run = _run(run_id)
+        try:
+            plan = GraphicsPlan.model_validate(await request.json())
+            cue = next(
+                cue for cue in plan.cues if cue.graphic_id == graphic_id
+            )
+        except (ValueError, StopIteration) as error:
+            raise HTTPException(422, f"graphic preview is invalid: {error}")
+        picture = next(
+            (
+                run.output / name
+                for name in ("deliverable.mp4", "picture.mp4")
+                if (run.output / name).exists()
+            ),
+            None,
+        )
+        if picture is None:
+            raise HTTPException(404, "no picture available for graphics preview")
+        shape = probe_video(picture).video
+        width, height = int(shape.display_width), int(shape.display_height)
+        picture_stat = picture.stat()
+        subtitles = [
+            (line.starts_seconds, line.ends_seconds)
+            for line in _subtitle_lines(run)
+        ]
+        overlaps_subtitles = any(
+            cue.at_seconds < sub_end
+            and cue.at_seconds + cue.duration_seconds > sub_start
+            for sub_start, sub_end in subtitles
+        )
+        evidence = _graphics_layout_evidence(run, plan).get(graphic_id)
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "cue": cue.model_dump(mode="json"),
+                    "brand": plan.brand.model_dump(mode="json"),
+                    "facts": [
+                        plan.fact(cue.primary_fact_id).model_dump(mode="json"),
+                        *(
+                            [plan.fact(cue.secondary_fact_id).model_dump(mode="json")]
+                            if cue.secondary_fact_id else []
+                        ),
+                    ],
+                    "width": width, "height": height,
+                    "picture": {
+                        "size": picture_stat.st_size,
+                        "mtime_ns": picture_stat.st_mtime_ns,
+                    },
+                    "renderer_version": GRAPHICS_RENDERER_VERSION,
+                    "subtitle_keepout": overlaps_subtitles,
+                    "evidence": {
+                        "subject_boxes": evidence.subject_boxes,
+                        "source": evidence.source,
+                    } if evidence else None,
+                },
+                ensure_ascii=False, sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        preview_dir = run.output / "work" / "graphics-preview"
+        preview_path = preview_dir / f"{digest}.png"
+        metadata_path = preview_dir / f"{digest}.json"
+        try:
+            metadata = (
+                json.loads(metadata_path.read_text(encoding="utf-8"))
+                if preview_path.exists() and metadata_path.exists() else None
+            )
+        except (OSError, ValueError, TypeError):
+            metadata = None
+        if metadata is None:
+            card, metadata = compile_graphic(
+                cue, plan, width=width, height=height, into=preview_path,
+                frames=(
+                    _layout_frames(picture, cue)
+                    if cue.position == "auto" else None
+                ),
+                evidence=evidence,
+                forbidden_positions=(
+                    {"lower_left", "lower_right"}
+                    if overlaps_subtitles else set()
+                ),
+            )
+            from montagewright.measure.storage import write_json
+
+            metadata.update({
+                "card_width": card.width, "card_height": card.height,
+                "left": card.left, "top": card.top,
+            })
+            write_json(metadata_path, metadata)
+        return JSONResponse({
+            "url": f"/api/runs/{run_id}/graphics-preview-file/{digest}.png",
+            "frame_width": width, "frame_height": height,
+            **metadata,
+        })
+
+    @app.get("/api/runs/{run_id}/graphics-preview-file/{filename}")
+    def graphic_preview_file(run_id: str, filename: str):
+        if not re.fullmatch(r"[0-9a-f]{64}\.png", filename):
+            raise HTTPException(404, "no such graphics preview")
+        path = _run(run_id).output / "work" / "graphics-preview" / filename
+        if not path.exists():
+            raise HTTPException(404, "no such graphics preview")
+        return FileResponse(path, media_type="image/png")
 
     @app.get("/api/runs/{run_id}/graphics-burned")
     def graphics_burned(run_id: str):

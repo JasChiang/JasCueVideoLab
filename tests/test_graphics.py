@@ -8,6 +8,7 @@ from montagewright.graphics import (
     CopyFact,
     DrawnGraphic,
     GraphicCue,
+    GraphicStyle,
     GraphicsPlan,
     LayoutEvidence,
     burn_graphics,
@@ -243,6 +244,53 @@ def test_multiline_center_and_end_templates_render(tmp_path: Path):
     assert made.path.exists() and made.height > 150
 
 
+def test_old_graphics_json_without_style_gets_safe_defaults():
+    old = {
+        "graphic_id": "legacy", "kind": "product_name",
+        "primary_fact_id": "name", "status": "draft",
+    }
+
+    loaded = GraphicCue.model_validate(old)
+
+    assert loaded.style == GraphicStyle()
+    assert loaded.style.stroke_width == 0
+    assert loaded.style.shadow_opacity == 0
+
+
+def test_adjustable_outline_shadow_border_and_emphasis_render(tmp_path: Path):
+    from PIL import Image
+    from montagewright.graphics import draw_graphic
+
+    plan = GraphicsPlan(
+        facts=[fact(text="4.1mm 纖薄機身")],
+        cues=[cue(
+            background="plate",
+            style=GraphicStyle(
+                preset="tech_frame", primary_scale=1.2,
+                primary_color="#FFFFFF", emphasis_text="4.1mm",
+                emphasis_color="#00FF66", stroke_width=5,
+                stroke_color="#000000", shadow_opacity=190,
+                shadow_blur=6, shadow_offset_x=4, shadow_offset_y=5,
+                plate_color="#101828", plate_alpha=220,
+                plate_border_width=3, plate_border_color="#4B7BFF",
+                corner_radius=18, padding_x=36, padding_y=24,
+            ),
+        )],
+    )
+
+    made = draw_graphic(
+        plan.cues[0], plan, width=1080, height=1920,
+        into=tmp_path / "styled.png",
+    )
+    colours = Image.open(made.path).convert("RGBA").getdata()
+
+    assert any(r < 20 and g > 230 and b < 130 and a > 200
+               for r, g, b, a in colours)
+    assert any(b > 220 and 50 < r < 120 and 70 < g < 160 and a > 200
+               for r, g, b, a in colours)
+    assert made.height > 100
+
+
 def test_web_graphics_track_round_trips_approved_copy(tmp_path: Path):
     import json
     import montagewright.webapp as web
@@ -259,19 +307,117 @@ def test_web_graphics_track_round_trips_approved_copy(tmp_path: Path):
         )
         client = TestClient(web.create_app())
         payload = GraphicsPlan(
-            facts=[fact()], cues=[cue()]
+            facts=[fact(approved=False)], cues=[cue(status="draft")]
         ).model_dump(mode="json")
 
         saved = client.put("/api/runs/r1/graphics-track", json=payload)
+        approved = client.post(
+            "/api/runs/r1/approve-graphic/g00", json={"revision": 1}
+        )
         loaded = client.get("/api/runs/r1/graphics-track")
 
         assert saved.status_code == 200
+        assert saved.json()["revision"] == 1
+        assert approved.status_code == 200
+        assert approved.json()["revision"] == 2
         assert loaded.status_code == 200
+        assert loaded.json()["revision"] == 2
         assert loaded.json()["resolved"][0]["primary_text"] == "Galaxy Z Fold8"
+        assert loaded.json()["resolved"][0]["status"] == "approved"
         assert any(
             template["template_id"] == "product_plate"
             for template in loaded.json()["templates"]
         )
+        assert client.put(
+            "/api/runs/r1/graphics-track", json=payload
+        ).status_code == 409
+        edited = approved.json()
+        edited["facts"][0].update({
+            "exact_text": "Galaxy Z Fold8 Ultra", "approved": False,
+            "approved_by": None, "text_sha256": "",
+        })
+        edited["cues"][0]["status"] = "draft"
+        edited_save = client.put(
+            "/api/runs/r1/graphics-track", json=edited
+        )
+        reapproved = client.post(
+            "/api/runs/r1/approve-graphic/g00", json={"revision": 3}
+        )
+        assert edited_save.json()["revision"] == 3
+        assert reapproved.status_code == 200
+        assert reapproved.json()["revision"] == 4
+        assert reapproved.json()["facts"][0]["text_sha256"]
+    finally:
+        web.RUNS_ROOT = was
+        web.RUNS.pop("r1", None)
+
+
+def test_generic_put_cannot_forge_human_review(tmp_path: Path):
+    import json
+    import montagewright.webapp as web
+    from fastapi.testclient import TestClient
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        here = web.RUNS_ROOT / "r1"
+        (here / "out" / "work").mkdir(parents=True)
+        (here / "run.json").write_text(
+            json.dumps({"state": "done", "started_at": 0.0}),
+            encoding="utf-8",
+        )
+        forged = GraphicsPlan(
+            facts=[fact()], cues=[cue()]
+        ).model_dump(mode="json")
+
+        denied = TestClient(web.create_app()).put(
+            "/api/runs/r1/graphics-track", json=forged
+        )
+
+        assert denied.status_code == 422
+        assert "明確的核准動作" in denied.json()["detail"]
+    finally:
+        web.RUNS_ROOT = was
+        web.RUNS.pop("r1", None)
+
+
+def test_web_preview_uses_the_production_card_compiler(tmp_path: Path):
+    import json
+    import subprocess
+    import montagewright.webapp as web
+    from fastapi.testclient import TestClient
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        here = web.RUNS_ROOT / "r1"
+        (here / "out" / "work").mkdir(parents=True)
+        (here / "run.json").write_text(
+            json.dumps({"state": "done", "started_at": 0.0}),
+            encoding="utf-8",
+        )
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=360x640:d=1:r=30",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(here / "out" / "deliverable.mp4"),
+        ], check=True)
+        payload = GraphicsPlan(
+            facts=[fact()], cues=[cue(
+                status="draft", style=GraphicStyle(
+                    preset="outlined", stroke_width=6,
+                ),
+            )],
+        ).model_dump(mode="json")
+        client = TestClient(web.create_app())
+
+        compiled = client.post(
+            "/api/runs/r1/graphics-preview/g00", json=payload
+        )
+
+        assert compiled.status_code == 200
+        assert compiled.json()["card_width"] > 0
+        assert client.get(compiled.json()["url"]).headers["content-type"] == "image/png"
     finally:
         web.RUNS_ROOT = was
         web.RUNS.pop("r1", None)

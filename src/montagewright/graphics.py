@@ -44,8 +44,14 @@ CompositionIntent = Literal[
 ]
 BackgroundTreatment = Literal["auto", "none", "plate"]
 CueStatus = Literal["draft", "approved"]
+TextAlignment = Literal["auto", "left", "center", "right"]
+StylePreset = Literal[
+    "custom", "clean", "outlined", "soft_shadow", "colour_label",
+    "tech_frame", "bold_pop",
+]
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
+GRAPHICS_RENDERER_VERSION = 2
 
 
 class CopyFact(Local):
@@ -78,13 +84,13 @@ class CopyFact(Local):
 
 
 class BrandKit(Local):
-    """A small design-token surface, not arbitrary CSS from the planner."""
+    """Legacy name for optional project defaults, never inferred branding."""
 
     font_path: str = ""
     display_font_path: str = ""
     foreground: str = "#FFFFFF"
     secondary: str = "#D9DCE3"
-    accent: str = "#FFD65A"
+    accent: str = "#FFFFFF"
     plate: str = "#111318"
     plate_alpha: int = Field(default=205, ge=0, le=255)
     corner_radius: float = Field(default=0.18, ge=0.0, le=0.5)
@@ -92,6 +98,59 @@ class BrandKit(Local):
     @model_validator(mode="after")
     def colours_are_six_digit_hex(self) -> "BrandKit":
         for field in ("foreground", "secondary", "accent", "plate"):
+            if not HEX.match(getattr(self, field)):
+                raise ValueError(f"{field} must be #RRGGBB")
+        return self
+
+
+class GraphicStyle(Local):
+    """Per-cue visual overrides expressed in renderer-safe units.
+
+    Pixel values are authored against a 1080px-tall frame and scaled for the
+    actual output. Empty colours inherit the brand kit. Keeping these values
+    on the cue makes a Web adjustment deterministic at render time instead of
+    relying on browser-only CSS.
+    """
+
+    preset: StylePreset = "custom"
+    primary_color: str = ""
+    secondary_color: str = ""
+    accent_color: str = ""
+    plate_color: str = ""
+    plate_alpha: int | None = Field(default=None, ge=0, le=255)
+    align: TextAlignment = "auto"
+    primary_scale: float = Field(default=1.0, ge=0.55, le=1.8)
+    secondary_scale: float = Field(default=1.0, ge=0.55, le=1.8)
+    line_spacing: float = Field(default=1.0, ge=0.65, le=2.0)
+    max_width_scale: float = Field(default=1.0, ge=0.45, le=1.25)
+    padding_x: float = Field(default=28.0, ge=0.0, le=160.0)
+    padding_y: float = Field(default=19.0, ge=0.0, le=120.0)
+    corner_radius: float | None = Field(default=None, ge=0.0, le=160.0)
+    stroke_width: float = Field(default=0.0, ge=0.0, le=24.0)
+    stroke_color: str = "#000000"
+    shadow_color: str = "#000000"
+    shadow_opacity: int = Field(default=0, ge=0, le=255)
+    shadow_blur: float = Field(default=0.0, ge=0.0, le=40.0)
+    shadow_offset_x: float = Field(default=0.0, ge=-40.0, le=40.0)
+    shadow_offset_y: float = Field(default=0.0, ge=-40.0, le=40.0)
+    plate_border_width: float = Field(default=0.0, ge=0.0, le=24.0)
+    plate_border_color: str = "#FFFFFF"
+    emphasis_text: str = Field(default="", max_length=80)
+    emphasis_color: str = ""
+    entrance_seconds: float | None = Field(default=None, ge=0.05, le=2.0)
+    exit_seconds: float | None = Field(default=None, ge=0.05, le=2.0)
+    motion_distance: float | None = Field(default=None, ge=0.0, le=240.0)
+
+    @model_validator(mode="after")
+    def colours_are_empty_or_hex(self) -> "GraphicStyle":
+        for field in (
+            "primary_color", "secondary_color", "accent_color",
+            "plate_color", "emphasis_color",
+        ):
+            value = getattr(self, field)
+            if value and not HEX.match(value):
+                raise ValueError(f"{field} must be empty or #RRGGBB")
+        for field in ("stroke_color", "shadow_color", "plate_border_color"):
             if not HEX.match(getattr(self, field)):
                 raise ValueError(f"{field} must be #RRGGBB")
         return self
@@ -116,11 +175,13 @@ class GraphicCue(Local):
     motion: MotionPreset = "rise"
     music_sync: Literal["none", "accent", "downbeat"] = "none"
     editor_note: str = Field(default="", max_length=500)
+    style: GraphicStyle = Field(default_factory=GraphicStyle)
     status: CueStatus = "draft"
 
 
 class GraphicsPlan(Local):
     version: Literal["montagewright-graphics-v1"] = "montagewright-graphics-v1"
+    revision: int = Field(default=0, ge=0)
     brand: BrandKit = Field(default_factory=BrandKit)
     facts: list[CopyFact] = Field(default_factory=list)
     cues: list[GraphicCue] = Field(default_factory=list)
@@ -239,6 +300,9 @@ def templates_for_editor() -> list[dict]:
             "default_position": spec.default_position,
             "plate": spec.plate,
             "width": spec.width,
+            "title_height": spec.title_height,
+            "secondary_height": spec.secondary_height,
+            "align": spec.align,
         }
         for spec in TEMPLATES.values()
     ]
@@ -514,12 +578,20 @@ def draw_graphic(
 ) -> DrawnGraphic:
     """Lay out the fully visible hero frame before any motion is applied."""
 
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFilter
     from montagewright.subtitles import cannot_spell
 
     spec = TEMPLATES.get(cue.template)
     if spec is None:
         raise ValueError(f"unknown graphic template: {cue.template}")
+    style = cue.style
+    align = spec.align if style.align == "auto" else style.align
+    unit = height / 1080.0
+    foreground = style.primary_color or plan.brand.foreground
+    secondary_colour = style.secondary_color or plan.brand.secondary
+    accent = style.accent_color or plan.brand.accent
+    plate_colour = style.plate_color or plan.brand.plate
+    emphasis_colour = style.emphasis_color or accent
     primary = plan.fact(cue.primary_fact_id).exact_text.strip()
     secondary = (
         plan.fact(cue.secondary_fact_id).exact_text.strip()
@@ -529,43 +601,61 @@ def draw_graphic(
     if unknown:
         raise ValueError(f"no glyph for {unknown}")
 
-    card_width = round(width * spec.width)
-    pad_x = round(height * 0.026)
-    pad_y = round(height * 0.018)
+    card_width = min(
+        round(width * 0.96),
+        round(width * spec.width * style.max_width_scale),
+    )
+    pad_x = round(style.padding_x * unit)
+    pad_y = round(style.padding_y * unit)
+    stroke_width = round(style.stroke_width * unit)
+    shadow_blur = round(style.shadow_blur * unit)
+    shadow_x = round(style.shadow_offset_x * unit)
+    shadow_y = round(style.shadow_offset_y * unit)
+    shadow_room = (
+        shadow_blur * 2 + max(abs(shadow_x), abs(shadow_y))
+        if style.shadow_opacity else 0
+    )
+    text_room = card_width - (pad_x + stroke_width + shadow_room) * 2
     title = _fit(
-        primary, asked=round(height * spec.title_height),
-        room=card_width - pad_x * 2,
+        primary, asked=round(height * spec.title_height * style.primary_scale),
+        room=text_room,
         font_path=plan.brand.display_font_path or plan.brand.font_path,
     )
     secondary_face = (
         _fit(
-            secondary, asked=round(height * spec.secondary_height),
-            room=card_width - pad_x * 2, font_path=plan.brand.font_path,
+            secondary,
+            asked=round(height * spec.secondary_height * style.secondary_scale),
+            room=text_room, font_path=plan.brand.font_path,
         )
         if secondary else None
     )
-    title_spacing = round(height * 0.009)
-    secondary_spacing = round(height * 0.007)
+    title_spacing = round(height * 0.009 * style.line_spacing)
+    secondary_spacing = round(height * 0.007 * style.line_spacing)
     measure = ImageDraw.Draw(Image.new("L", (1, 1)))
     title_box = measure.multiline_textbbox(
         (0, 0), primary, font=title, spacing=title_spacing,
-        align=spec.align,
+        align=align, stroke_width=stroke_width,
     )
     title_height = title_box[3] - title_box[1]
     secondary_height = (
         measure.multiline_textbbox(
             (0, 0), secondary, font=secondary_face,
-            spacing=secondary_spacing, align=spec.align,
+            spacing=secondary_spacing, align=align,
+            stroke_width=stroke_width,
         )[3]
         - measure.multiline_textbbox(
             (0, 0), secondary, font=secondary_face,
-            spacing=secondary_spacing, align=spec.align,
+            spacing=secondary_spacing, align=align,
+            stroke_width=stroke_width,
         )[1]
         if secondary_face else 0
     )
     gap = round(height * 0.010) if secondary else 0
     rule = round(height * 0.005) if spec.rule else 0
-    card_height = pad_y * 2 + title_height + secondary_height + gap + rule
+    card_height = (
+        pad_y * 2 + title_height + secondary_height + gap + rule
+        + shadow_room * 2 + stroke_width * 2
+    )
     canvas = Image.new("RGBA", (card_width, card_height), (0, 0, 0, 0))
     pen = ImageDraw.Draw(canvas)
 
@@ -573,40 +663,117 @@ def draw_graphic(
     if cue.composition == "foreground_plate":
         plate = True
     if plate:
-        radius = round(card_height * plan.brand.corner_radius)
+        radius = (
+            round(style.corner_radius * unit)
+            if style.corner_radius is not None
+            else round(card_height * plan.brand.corner_radius)
+        )
+        border_width = round(style.plate_border_width * unit)
         pen.rounded_rectangle(
             (0, 0, card_width - 1, card_height - 1),
             radius=radius,
-            fill=(*_rgb(plan.brand.plate), plan.brand.plate_alpha),
+            fill=(*_rgb(plate_colour), (
+                style.plate_alpha
+                if style.plate_alpha is not None else plan.brand.plate_alpha
+            )),
+            outline=(*_rgb(style.plate_border_color), 255)
+            if border_width else None,
+            width=border_width,
         )
     if spec.rule:
         pen.rectangle(
             (pad_x, pad_y, pad_x + round(card_width * 0.13), pad_y + rule),
-            fill=(*_rgb(plan.brand.accent), 255),
+            fill=(*_rgb(accent), 255),
         )
-    y = pad_y + rule + (round(height * 0.010) if rule else 0)
+    y = (
+        pad_y + shadow_room + stroke_width + rule
+        + (round(height * 0.010) if rule else 0)
+    )
     title_width = title_box[2] - title_box[0]
-    x = (card_width - title_width) // 2 if spec.align == "center" else pad_x
-    pen.multiline_text(
-        (x - title_box[0], y - title_box[1]), primary, font=title,
-        spacing=title_spacing, align=spec.align,
-        fill=(*_rgb(plan.brand.foreground), 255),
+    if align == "center":
+        x = (card_width - title_width) // 2
+    elif align == "right":
+        x = card_width - pad_x - shadow_room - stroke_width - title_width
+    else:
+        x = pad_x + shadow_room + stroke_width
+
+    def paint_text(
+        text: str, face, *, at_x: int, at_y: int, spacing: int,
+        colour: str, emphasis: str = "", layout_width: int,
+    ) -> None:
+        target = (at_x, at_y)
+        if style.shadow_opacity:
+            shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+            shadow_pen = ImageDraw.Draw(shadow)
+            shadow_pen.multiline_text(
+                (at_x + shadow_x, at_y + shadow_y), text, font=face,
+                spacing=spacing, align=align,
+                fill=(*_rgb(style.shadow_color), style.shadow_opacity),
+                stroke_width=stroke_width,
+                stroke_fill=(*_rgb(style.shadow_color), style.shadow_opacity),
+            )
+            if shadow_blur:
+                shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
+            canvas.alpha_composite(shadow)
+        pen.multiline_text(
+            target, text, font=face, spacing=spacing, align=align,
+            fill=(*_rgb(colour), 255), stroke_width=stroke_width,
+            stroke_fill=(*_rgb(style.stroke_color), 255),
+        )
+        if emphasis:
+            line_y = at_y
+            for line in text.splitlines() or [text]:
+                box = pen.textbbox(
+                    (0, 0), line, font=face, stroke_width=stroke_width
+                )
+                line_width = box[2] - box[0]
+                if align == "center":
+                    line_x = at_x + (layout_width - line_width) / 2
+                elif align == "right":
+                    line_x = at_x + layout_width - line_width
+                else:
+                    line_x = at_x
+                start = line.find(emphasis)
+                if start >= 0:
+                    prefix = line[:start]
+                    pen.text(
+                        (line_x + pen.textlength(prefix, font=face), line_y),
+                        emphasis, font=face, fill=(*_rgb(emphasis_colour), 255),
+                        stroke_width=stroke_width,
+                        stroke_fill=(*_rgb(style.stroke_color), 255),
+                    )
+                line_box = pen.textbbox(
+                    (0, 0), line or " ", font=face,
+                    stroke_width=stroke_width,
+                )
+                line_y += line_box[3] - line_box[1] + spacing
+
+    paint_text(
+        primary, title, at_x=x - title_box[0], at_y=y - title_box[1],
+        spacing=title_spacing, colour=foreground,
+        emphasis=style.emphasis_text, layout_width=title_width,
     )
     y += title_height + gap
     if secondary_face:
         secondary_box = pen.multiline_textbbox(
             (0, 0), secondary, font=secondary_face,
-            spacing=secondary_spacing, align=spec.align,
+            spacing=secondary_spacing, align=align,
+            stroke_width=stroke_width,
         )
         secondary_width = secondary_box[2] - secondary_box[0]
         x = (
             (card_width - secondary_width) // 2
-            if spec.align == "center" else pad_x
+            if align == "center" else (
+                card_width - pad_x - shadow_room - stroke_width
+                - secondary_width if align == "right"
+                else pad_x + shadow_room + stroke_width
+            )
         )
-        pen.multiline_text(
-            (x - secondary_box[0], y - secondary_box[1]), secondary,
-            font=secondary_face, spacing=secondary_spacing, align=spec.align,
-            fill=(*_rgb(plan.brand.secondary), 255),
+        paint_text(
+            secondary, secondary_face,
+            at_x=x - secondary_box[0], at_y=y - secondary_box[1],
+            spacing=secondary_spacing, colour=secondary_colour,
+            emphasis=style.emphasis_text, layout_width=secondary_width,
         )
 
     position = cue.position if cue.position != "auto" else spec.default_position
@@ -615,6 +782,59 @@ def draw_graphic(
     into.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(into)
     return DrawnGraphic(into, max(0, left), max(0, top), card_width, card_height)
+
+
+def compile_graphic(
+    cue: GraphicCue,
+    plan: GraphicsPlan,
+    *,
+    width: int,
+    height: int,
+    into: Path,
+    frames: list | None = None,
+    evidence: LayoutEvidence | None = None,
+    forbidden_positions: set[str] | None = None,
+) -> tuple[DrawnGraphic, dict]:
+    """Compile pixels and placement once for both preview and delivery."""
+
+    card = draw_graphic(
+        cue, plan, width=width, height=height, into=into
+    )
+    report = {
+        "resolved_left": card.left, "resolved_top": card.top,
+        "resolved_position": (
+            cue.position if cue.position != "auto"
+            else TEMPLATES[cue.template].default_position
+        ),
+        "frame_width": width, "frame_height": height,
+        "card_width": card.width, "card_height": card.height,
+        "scores": {}, "fallback_plate": False,
+        "evidence": evidence.source if evidence else "visual_complexity_proxy",
+    }
+    if cue.position != "auto":
+        return card, report
+    card, scores = resolve_auto_position(
+        cue, card, frames or [], frame_width=width, frame_height=height,
+        evidence=evidence, forbidden_positions=forbidden_positions or set(),
+    )
+    fallback_plate = (
+        min(scores.values()) > 55.0
+        and cue.background == "auto"
+        and not TEMPLATES[cue.template].plate
+    )
+    if fallback_plate:
+        plated = draw_graphic(
+            cue.model_copy(update={"background": "plate"}), plan,
+            width=width, height=height, into=into,
+        )
+        card = replace(plated, left=card.left, top=card.top)
+    report.update({
+        "resolved_left": card.left, "resolved_top": card.top,
+        "resolved_position": min(scores, key=lambda name: scores[name]),
+        "card_width": card.width, "card_height": card.height,
+        "scores": scores, "fallback_plate": fallback_plate,
+    })
+    return card, report
 
 
 def burn_graphics(
@@ -646,52 +866,24 @@ def burn_graphics(
     drawn = []
     layout_report: dict[str, dict] = {}
     for cue in cues:
-        card = draw_graphic(
+        overlaps_subtitles = bool(subtitle_windows and any(
+            cue.at_seconds < sub_end
+            and cue.at_seconds + cue.duration_seconds > sub_start
+            for sub_start, sub_end in subtitle_windows
+        ))
+        evidence = (layout_evidence or {}).get(cue.graphic_id)
+        card, compiled = compile_graphic(
             cue, plan, width=width, height=height,
             into=work / f"{cue.graphic_id}.png",
+            frames=_layout_frames(picture, cue) if cue.position == "auto" else None,
+            evidence=evidence,
+            forbidden_positions=(
+                {"lower_left", "lower_right"}
+                if overlaps_subtitles else set()
+            ),
         )
         if cue.position == "auto":
-            overlaps_subtitles = bool(subtitle_windows and any(
-                cue.at_seconds < sub_end
-                and cue.at_seconds + cue.duration_seconds > sub_start
-                for sub_start, sub_end in subtitle_windows
-            ))
-            card, scores = resolve_auto_position(
-                cue, card, _layout_frames(picture, cue),
-                frame_width=width, frame_height=height,
-                evidence=(layout_evidence or {}).get(cue.graphic_id),
-                forbidden_positions=(
-                    {"lower_left", "lower_right"}
-                    if overlaps_subtitles else set()
-                ),
-            )
-            fallback_plate = (
-                min(scores.values()) > 55.0
-                and cue.background == "auto"
-                and not TEMPLATES[cue.template].plate
-            )
-            if fallback_plate:
-                plated = draw_graphic(
-                    cue.model_copy(update={"background": "plate"}), plan,
-                    width=width, height=height,
-                    into=work / f"{cue.graphic_id}.png",
-                )
-                card = replace(plated, left=card.left, top=card.top)
-            layout_report[cue.graphic_id] = {
-                "resolved_left": card.left, "resolved_top": card.top,
-                "resolved_position": min(
-                    scores, key=lambda name: scores[name]
-                ),
-                "frame_width": width, "frame_height": height,
-                "card_width": card.width, "card_height": card.height,
-                "scores": scores,
-                "fallback_plate": fallback_plate,
-                "evidence": (
-                    (layout_evidence or {}).get(cue.graphic_id).source
-                    if (layout_evidence or {}).get(cue.graphic_id)
-                    else "visual_complexity_proxy"
-                ),
-            }
+            layout_report[cue.graphic_id] = compiled
         drawn.append((cue, card))
     work.mkdir(parents=True, exist_ok=True)
     (work / "layout.json").write_text(
@@ -708,8 +900,16 @@ def burn_graphics(
     for index, (cue, card) in enumerate(drawn):
         since = cue.at_seconds
         until = cue.at_seconds + cue.duration_seconds
-        enter = min(0.45, max(0.16, cue.duration_seconds * 0.12))
-        leave = min(0.32, max(0.12, cue.duration_seconds * 0.08))
+        enter = (
+            min(cue.style.entrance_seconds, cue.duration_seconds * 0.4)
+            if cue.style.entrance_seconds is not None
+            else min(0.45, max(0.16, cue.duration_seconds * 0.12))
+        )
+        leave = (
+            min(cue.style.exit_seconds, cue.duration_seconds * 0.3)
+            if cue.style.exit_seconds is not None
+            else min(0.32, max(0.12, cue.duration_seconds * 0.08))
+        )
         overlay_tag = f"g{index}"
         if cue.motion == "none":
             filters.append(f"[{index + 1}:v]format=rgba[{overlay_tag}]")
@@ -724,12 +924,19 @@ def burn_graphics(
             f"min(max((t-{since:.3f})/{enter:.3f},0),1)"
         )
         x, y = str(card.left), str(card.top)
+        distance = (
+            round(cue.style.motion_distance * height / 1080.0)
+            if cue.style.motion_distance is not None else None
+        )
         if cue.motion == "rise":
-            y = f"{card.top}+{round(height * .025)}*(1-{progress})"
+            travel = distance if distance is not None else round(height * .025)
+            y = f"{card.top}+{travel}*(1-{progress})"
         elif cue.motion == "slide_left":
-            x = f"{card.left}+{round(width * .06)}*(1-{progress})"
+            travel = distance if distance is not None else round(width * .06)
+            x = f"{card.left}+{travel}*(1-{progress})"
         elif cue.motion == "slide_right":
-            x = f"{card.left}-{round(width * .06)}*(1-{progress})"
+            travel = distance if distance is not None else round(width * .06)
+            x = f"{card.left}-{travel}*(1-{progress})"
         next_tag = f"v{index}"
         filters.append(
             f"[{tag}][{overlay_tag}]overlay=x='{x}':y='{y}':"
