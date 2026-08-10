@@ -92,7 +92,10 @@ PAIRED = [
     ("direction_zh-TW.txt", lambda: planner._direction_schema()),
     ("selection_zh-TW.txt", lambda: planner._selection_schema(["A"])),
     ("rhythm_zh-TW.txt", lambda: planner._rhythm_schema(["k00"])),
-    ("replan_zh-TW.txt", lambda: planner._selection_schema(["A"])),
+    (
+        "replan_zh-TW.txt",
+        lambda: planner._selection_schema(["A"], replace_clip_ids=["k00"]),
+    ),
     ("review_zh-TW.txt", lambda: review._verdict_schema()),
     ("shotreview_zh-TW.txt", lambda: review._shot_schema(["k00"])),
     ("transcript_zh-TW.txt", lambda: transcript._schema()),

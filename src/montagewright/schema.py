@@ -300,6 +300,9 @@ class Reframe(ModelFacing):
     # the real one wins because it is real. Nothing downstream held this, so
     # the warning was advice with no way to check it.
     source_motion_role: str = "locked"
+    source_motion_description: str = ""
+    pacing_exception: bool = False
+    pacing_exception_reason: str = ""
     camera_energy: CameraEnergy = Field(
         default="calm",
         description=(
@@ -691,12 +694,56 @@ def must_be_whole_of(shot: dict) -> bool:
 
 
 def move_of_shot(shot: dict) -> str:
-    """The old move name for a shot, read off its looks."""
+    """The physical label shown to people, including explicit follows.
 
+    One look cannot geometrically reveal a follow, so reading only `looks`
+    made the planner, replan log and browser call an explicit follow a hold.
+    The intent owns that distinction; multi-point paths are still measured
+    from their looks.
+    """
+
+    intent = camera_intent_of(shot)
+    explicit = {
+        "hold": "hold",
+        "use_source_motion": "source_motion",
+        "follow_subject": "follow_subject",
+        "push_in": "push_in",
+        "pull_out": "pull_out",
+    }.get(intent)
+    if explicit is not None:
+        return explicit
     looks = looks_of(shot)
     if looks:
         return move_of(looks)
     return str(shot.get("camera_move", "hold") or "hold")
+
+
+def camera_intent_of(shot: dict) -> str:
+    """The editorial motion choice, including legacy plans.
+
+    Looks say where the crop goes; this says why.  Keeping the reader here
+    lets old cached selections survive while new ones distinguish a fixed
+    crop over authored source motion from a genuinely static shot.
+    """
+
+    named = str(shot.get("camera_intent", "") or "").strip()
+    if named:
+        return named
+    legacy_move = str(shot.get("camera_move", "") or "").strip()
+    if legacy_move in {"follow_subject", "push_in", "pull_out"}:
+        return legacy_move
+    if legacy_move and legacy_move != "hold":
+        return "reveal"
+    looks = looks_of(shot)
+    legacy_frame = str(shot.get("frame", ""))
+    if legacy_frame == "travels" and len(looks) == 1:
+        return "follow_subject"
+    if legacy_frame == "settles" or len(looks) < 2:
+        return "hold"
+    move = move_of(looks)
+    return move if move in {"push_in", "pull_out"} else (
+        "multi_stop" if len(looks) >= 3 else "reveal"
+    )
 
 
 def move_of(looks: "list[Look]") -> str:
@@ -765,6 +812,17 @@ def reframe_of(shot: dict) -> Reframe:
     looks = looks_of(shot)
 
     first = looks[0] if looks else None
+    editorial_intent = camera_intent_of(shot)
+    inferred_move = move_of(looks) if looks else str(
+        shot.get("camera_move", "hold") or "hold"
+    )
+    camera_move = {
+        "hold": "hold",
+        "use_source_motion": "hold",
+        "follow_subject": "follow_subject",
+        "push_in": "push_in",
+        "pull_out": "pull_out",
+    }.get(editorial_intent, inferred_move)
     return Reframe(
         looks=looks,
         subject=(
@@ -783,15 +841,17 @@ def reframe_of(shot: dict) -> Reframe:
         # before looks existed still carries the old field, and it is only
         # trusted when the looks cannot say -- otherwise the two could
         # disagree, which is the whole thing this replaced.
-        camera_move=(
-            move_of(looks) if looks
-            else str(shot.get("camera_move", "hold") or "hold")
-        ),
+        camera_move=camera_move,
         framing=(looks[0].framing if looks else
                  str(shot.get("framing", "thirds") or "thirds")),
         camera_energy=look_energy(shot.get("energy")),
-        planned_to_move=(
-            str(shot.get("frame", "")) == "travels" or len(looks) > 1
-        ),
+        planned_to_move=editorial_intent not in {"hold", "use_source_motion"},
         source_motion_role=str(shot.get("source_motion_role", "locked") or "locked"),
+        source_motion_description=str(
+            shot.get("source_motion_description", "") or ""
+        )[:240],
+        pacing_exception=bool(shot.get("pacing_exception", False)),
+        pacing_exception_reason=str(
+            shot.get("pacing_exception_reason", "") or ""
+        )[:200],
     )

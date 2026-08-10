@@ -12,7 +12,10 @@ and a hard-coded rate is a silent error the day they do.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 from typing import TypedDict
 
@@ -64,6 +67,8 @@ class Spend(TypedDict):
 class Ledger:
     cap_usd: float
     model_id: str = "gemini-3.6-flash"
+    journal_path: Path | None = None
+    run_id: str = field(default_factory=lambda: uuid4().hex)
     entries: list[dict[str, float | str]] = field(default_factory=list)
     reservations: dict[str, Reservation] = field(default_factory=dict)
 
@@ -166,16 +171,62 @@ class Ledger:
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
         )
-        self.entries.append(
-            {
-                "stage": stage,
-                "input": input_tokens,
-                "cached": cached_tokens,
-                "output": output_tokens,
-                "usd": round(usd, 6),
-            }
-        )
+        entry: dict[str, float | str] = {
+            "stage": stage,
+            "input": input_tokens,
+            "cached": cached_tokens,
+            "output": output_tokens,
+            "usd": round(usd, 6),
+        }
+        self.entries.append(entry)
+        self._journal(entry)
         return usd
+
+    def _journal(self, entry: dict[str, float | str]) -> None:
+        """Persist each settled paid call before the next stage can crash."""
+
+        if self.journal_path is None:
+            return
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            **entry,
+            "run_id": self.run_id,
+            "model_id": self.model_id,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with self.journal_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            handle.flush()
+
+    def cumulative_summary(self) -> "Spend":
+        """All attempts sharing this output folder, without charging twice."""
+
+        if self.journal_path is None or not self.journal_path.exists():
+            return self.summary()
+        entries: list[dict[str, object]] = []
+        for line in self.journal_path.read_text(encoding="utf-8").splitlines():
+            try:
+                one = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(one, dict):
+                entries.append(one)
+        by_stage: dict[str, float] = {}
+        spent = 0.0
+        for entry in entries:
+            raw_usd = entry.get("usd")
+            usd = float(raw_usd) if isinstance(raw_usd, (int, float, str)) else 0.0
+            stage = str(entry.get("stage") or "unknown")
+            spent += usd
+            by_stage[stage] = round(by_stage.get(stage, 0.0) + usd, 6)
+        return {
+            "cap_usd": self.cap_usd,
+            "spent_usd": round(spent, 6),
+            # The cap is per invocation; cumulative history may exceed it.
+            "remaining_usd": round(self.remaining_usd, 6),
+            "calls": len(entries),
+            "by_stage": by_stage,
+        }
 
     def check(self) -> None:
         """Call before dispatching, so the cap stops work rather than paying for it."""

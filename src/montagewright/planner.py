@@ -20,8 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from montagewright.schema import looks_of, move_of_shot
+from montagewright.schema import camera_intent_of, looks_of, move_of_shot
 from montagewright.capabilities import (
+    CAMERA_INTENT_NAMES,
     INTENT_NAMES,
     describe_for_prompt,
     describe_limits_for_prompt,
@@ -326,8 +327,19 @@ def _describe_clips(edl: EDL, context: dict[str, dict] | None = None) -> str:
             f"選片說這顆需要≈{approx:.1f}s",
             f"能量={clip.energy_intent}",
         ]
+        if clip.usable_window is not None:
+            available = max(
+                0.0, clip.usable_window[1] - clip.approx_in_seconds
+            )
+            facts.append(f"這顆最多可用 {available:.1f}s")
         if clip.reframe:
             facts.append(f"運鏡={clip.reframe.camera_move}")
+            facts.append(
+                f"剪輯意圖={extra.get('camera_intent', 'hold')}"
+            )
+            facts.append(
+                f"原素材運動={extra.get('source_motion', 'locked')}"
+            )
             # Measured from this shot: the rests it asked for plus the
             # distance between its looks at the speed its energy allows.
             # Not a suggestion and not a per-move constant -- below this the
@@ -377,10 +389,53 @@ def _is_spend_cap(error: Exception) -> bool:
     what tells them apart, so it is what this reads.
     """
 
-    if getattr(error, "code", None) != 429 and "429" not in str(error):
-        return False
-    said = str(error).lower()
-    return "spend" in said or "spending cap" in said or "billing" in said
+    return _provider_budget_message(error) is not None
+
+
+def _provider_budget_message(error: Exception) -> str | None:
+    """Translate a money-related provider 429 without erasing its cause.
+
+    Google uses RESOURCE_EXHAUSTED for several unrelated conditions: request
+    pace, ordinary quota, an empty Prepay balance, a project cap, and an
+    account-tier cap.  Only the money conditions belong on the resumable
+    BudgetSpent path, and they need different remedies.  The old translation
+    matched the word ``billing`` and then called every one of them a spending
+    cap, which hid the useful sentence "prepayment credits are depleted".
+    """
+
+    raw = " ".join(str(error).split())
+    if getattr(error, "code", None) != 429 and "429" not in raw:
+        return None
+    said = raw.lower()
+    if "prepayment credits are depleted" in said or "prepay" in said and (
+        "depleted" in said or "no credits" in said
+    ):
+        return (
+            "Gemini Prepay credits are depleted. Add credits or enable "
+            "auto-reload in Google AI Studio Billing, then resume; completed "
+            "work is cached. Provider detail: " + raw[:600]
+        )
+    if "monthly spending cap" in said or "monthly spend cap" in said:
+        return (
+            "Gemini project monthly spending cap has been reached. Raise the "
+            "project cap at https://ai.studio/spend or wait for the next "
+            "billing cycle, then resume. Provider detail: " + raw[:600]
+        )
+    if "billing account" in said and ("cap" in said or "limit" in said):
+        return (
+            "Gemini billing-account tier cap has been reached. This cap is "
+            "shared by projects on that billing account; review its tier or "
+            "request an increase, then resume. Provider detail: " + raw[:600]
+        )
+    if "billing" in said and any(
+        word in said for word in ("payment", "disabled", "inactive", "suspended")
+    ):
+        return (
+            "Gemini billing rejected this request. Check the project's billing "
+            "status and payment method, then resume. Provider detail: "
+            + raw[:600]
+        )
+    return None
 
 
 def ask(
@@ -444,12 +499,9 @@ def ask(
     except Exception as error:
         if reservation_id is not None and ledger is not None:
             ledger.cancel(reservation_id)
-        if _is_spend_cap(error):
-            raise BudgetSpent(
-                "the provider's own spending cap stopped this run -- raise "
-                "it at ai.studio/spend and resume; nothing already paid for "
-                "will be paid for twice"
-            ) from error
+        provider_budget = _provider_budget_message(error)
+        if provider_budget is not None:
+            raise BudgetSpent(provider_budget) from error
         raise
     if reservation_id is not None and ledger is not None:
         usage = Usage.from_interaction(interaction)
@@ -977,6 +1029,10 @@ def _direction_schema() -> dict[str, Any]:
             "material_assessment",
             "direction",
             "target_seconds",
+            "target_shot_count",
+            "typical_shot_seconds",
+            "max_static_seconds",
+            "pacing_reason",
             "music_under_speech",
             "unusable",
         ],
@@ -994,6 +1050,30 @@ def _direction_schema() -> dict[str, Any]:
             "target_seconds": {
                 "type": "string",
                 "description": "成片目標長度，寫成 MM:SS（`0:30`、`1:00`）。",
+            },
+            "target_shot_count": {
+                "type": "integer",
+                "description": (
+                    "這個方向預期需要多少顆鏡頭才有合適密度。依素材、類型"
+                    "與目標長度判斷，不要先選少量鏡頭再把它們平均拉長。"
+                ),
+            },
+            "typical_shot_seconds": {
+                "type": "string",
+                "description": "一般鏡頭典型長度，寫成 MM:SS（`0:03`）。",
+            },
+            "max_static_seconds": {
+                "type": "string",
+                "description": (
+                    "沒有原生運鏡、主體動作或需閱讀內容時，純靜態鏡頭通常"
+                    "最多停多久；寫成 MM:SS。這是節奏護欄，不是所有鏡頭上限。"
+                ),
+            },
+            "pacing_reason": {
+                "type": "string",
+                "description": (
+                    "為什麼這個鏡頭密度與長短分布適合這批素材和音樂。"
+                ),
             },
             "music_under_speech": {
                 "type": "string",
@@ -1161,6 +1241,7 @@ def _describe_material(material: list[MaterialItem]) -> str:
             head += "\n    可選片段：" + "；".join(
                 f"{span.span_id}（{span.starts_seconds:.1f}–"
                 f"{span.ends_seconds:.1f}s，{span.seconds:.1f} 秒"
+                f"，原素材運動={span.motion_role}"
                 + (f"，{span.why}" if span.why else "") + "）"
                 for span in item.spans
             )
@@ -1324,15 +1405,35 @@ def decide_direction(
     # will actually be rendered.
     decided["aspect"] = aspect
     decided["target_seconds"] = seconds_of(decided.get("target_seconds")) or 0.0
+    decided["typical_shot_seconds"] = (
+        seconds_of(decided.get("typical_shot_seconds")) or 0.0
+    )
+    decided["max_static_seconds"] = (
+        seconds_of(decided.get("max_static_seconds")) or 0.0
+    )
+    decided["target_shot_count"] = max(
+        1, int(decided.get("target_shot_count") or 1)
+    )
     if seconds > 0:
         # Overwritten rather than trusted. It is told the number and mostly
         # repeats it; a pass that occasionally does not would silently make
         # the film a different length than the one that was asked for.
         decided["target_seconds"] = seconds
+    # Length, typical shot duration and count are one equation, not three
+    # independent creative answers. A 90s direction once said 15 shots and
+    # typical 3s; the selection schema then hard-limited the cut to 13–17
+    # shots and rhythm had no option but to stretch them to roughly 6s each.
+    typical = float(decided.get("typical_shot_seconds") or 0.0)
+    target = float(decided.get("target_seconds") or 0.0)
+    if target > 0.0 and typical > 0.0:
+        decided["target_shot_count"] = max(1, round(target / typical))
     return decided, Usage.from_interaction(interaction)
 
 
-def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
+def _selection_schema(
+    span_ids: list[str], *, min_shots: int | None = None,
+    max_shots: int | None = None, replace_clip_ids: list[str] | None = None,
+) -> dict[str, Any]:
     """Flat shots plus flat coverage. Nothing nests more than one level.
 
     The previous plan schema reached the API's grammar ceiling and every call
@@ -1348,34 +1449,35 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
         "properties": {
             "shots": {
                 "type": "array",
+                **({"minItems": min_shots} if min_shots else {}),
+                **({"maxItems": max_shots} if max_shots else {}),
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    # `frame` is answered before `looks` on purpose. The old
-                    # schema made `camera_move` a required enum, so every
-                    # shot had to answer "does this one move?" before it
-                    # could be written down. Replacing it with an array whose
-                    # minimum length is one turned a question that had to be
-                    # answered into an option that had to be taken, and the
-                    # cheapest valid answer became a single look -- twenty
-                    # three shots in a row, no move anywhere in the film.
-                    #
-                    # This asks the question again without bringing the menu
-                    # back: two answers, neither of them the name of a move,
-                    # and the shape still comes from the looks. Ordering it
-                    # first is the working part. A model that has just
-                    # written "travels" is writing the looks that follow in
-                    # the presence of that word.
+                    # A binary settles/travels question recovered some motion
+                    # after the looks refactor, but kept push, pull, follow and
+                    # source motion out of sight.  Ask the editorial intention
+                    # explicitly; looks remain the executable semantic path.
                     "required": [
+                        *(["replace_clip_id"] if replace_clip_ids else []),
                         "span_id",
                         "start_offset_seconds",
-                        "frame",
+                        "camera_intent",
+                        "pacing_exception",
+                        "pacing_exception_reason",
                         "looks",
                         "energy",
                         "seconds_needed",
                         "why",
                     ],
                     "properties": {
+                        **({
+                            "replace_clip_id": {
+                                "type": "string",
+                                "enum": replace_clip_ids,
+                                "description": "要被這個新規劃取代的 clip_id。",
+                            }
+                        } if replace_clip_ids else {}),
                         # A span, not a file and a second. `C8330` plus 9.8
                         # is always well formed, including when 9.8 lands in
                         # the middle of somebody saying "again"; `C8330:s03`
@@ -1407,13 +1509,25 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                                 "寫成 MM:SS（`0:03`）。"
                             ),
                         },
-                        "frame": {
+                        "camera_intent": {
                             "type": "string",
-                            "enum": ["settles", "travels"],
+                            "enum": list(CAMERA_INTENT_NAMES),
                             "description": (
-                                "畫面定住還是要移動。先答這個，再讓 looks 配合："
-                                "`settles` 一個落點，`travels` 兩個以上。"
-                                "怎麼判斷見 prompt 的「畫面要不要動」。"
+                                "這顆採用哪一種剪輯運鏡意圖。先答，再用 looks "
+                                "寫出相符落點；完整語彙見 prompt 的運鏡能力。"
+                            ),
+                        },
+                        "pacing_exception": {
+                            "type": "boolean",
+                            "description": (
+                                "只有語音、完整動作或必須讀完的文字需要超過"
+                                "純靜態上限時才填 true。"
+                            ),
+                        },
+                        "pacing_exception_reason": {
+                            "type": "string",
+                            "description": (
+                                "若例外，寫出必須保留的可見／可聽內容；否則留空。"
                             ),
                         },
                         "looks": {
@@ -1421,9 +1535,8 @@ def _selection_schema(span_ids: list[str]) -> dict[str, Any]:
                             "minItems": 1,
                             "description": (
                                 "畫面依序停在哪裡，每個落點填 at／seconds／"
-                                "framing。運鏡是本機依落點推導的，你不用選；"
-                                "完整規則見「運鏡能力」那一節。你決定看什麼、"
-                                "看多久。"
+                                "framing。你選語意意圖與看什麼；本機量位置、"
+                                "方向、速度與可行性。"
                             ),
                             "items": {
                                 "type": "object",
@@ -1584,6 +1697,7 @@ def select_shots(
     # separated by somebody calling it offers two; one nobody segmented
     # offers itself whole.
     offered = [span for item in usable for span in item.spans]
+    min_shots, max_shots = _shot_count_bounds(direction, len(offered))
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     selection_input: list[dict[str, Any]] = [
         {
@@ -1593,6 +1707,12 @@ def select_shots(
                     f"{direction['direction']}\n\n"
                     f"目標長度 {direction['target_seconds']:.0f} 秒，"
                     f"輸出 {direction['aspect']}。\n\n"
+                    f"## 節奏密度\n\n目標約 "
+                    f"{direction.get('target_shot_count', 0)} 顆；典型鏡長 "
+                    f"{direction.get('typical_shot_seconds', 0):.1f} 秒；"
+                    f"沒有動作、閱讀或原生運鏡的純靜態鏡頭通常不超過 "
+                    f"{direction.get('max_static_seconds', 0):.1f} 秒。"
+                    f"理由：{direction.get('pacing_reason', '')}\n\n"
                     f"## 剪輯 brief\n\n{brief}\n\n"
                     f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
                     f"## 做不到的事\n\n{describe_limits_for_prompt()}\n\n"
@@ -1612,20 +1732,50 @@ def select_shots(
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
         response_format=structured_json(
-            _selection_schema([one.span_id for one in offered])
+            _selection_schema(
+                [one.span_id for one in offered],
+                min_shots=min_shots,
+                max_shots=max_shots,
+            )
         ),
         ledger=ledger,
         budget_stage="selection",
     )
     chosen = _parse(interaction, what="selection pass")
-    expand_spans(chosen, offered)
+    expand_spans(
+        chosen, offered,
+        source_motion={item.source_id: item.camera_motion for item in usable},
+    )
+    sequence_faults = sequence_disagreements(chosen.get("shots") or [])
+    if sequence_faults:
+        raise PlannerError(
+            "selection repeated overlapping adjacent source windows; it was "
+            "not cached or rendered: " + "; ".join(sequence_faults)
+        )
     chosen["frame_disagreements"] = frame_disagreements(
         chosen.get("shots") or [], material
     )
     return chosen, Usage.from_interaction(interaction)
 
 
-def expand_spans(chosen: dict[str, Any], offered: "list[Any]") -> None:
+def _shot_count_bounds(
+    direction: dict[str, Any], available_spans: int
+) -> tuple[int | None, int | None]:
+    """Turn the director's density into a forgiving structural contract."""
+
+    target = int(direction.get("target_shot_count") or 0)
+    if target <= 0 or available_spans <= 0:
+        return None, None
+    slack = max(2, round(target * 0.15))
+    lower = max(1, min(available_spans, target - slack))
+    upper = max(lower, min(available_spans, target + slack))
+    return lower, upper
+
+
+def expand_spans(
+    chosen: dict[str, Any], offered: "list[Any]", *,
+    source_motion: dict[str, str] | None = None,
+) -> None:
     """Write each shot's span back out as the file and second it resolves to.
 
     The one place that knows both shapes, which is the only way this project
@@ -1656,6 +1806,12 @@ def expand_spans(chosen: dict[str, Any], offered: "list[Any]") -> None:
         shot["seconds_needed"] = seconds_of(shot.get("seconds_needed")) or 0.0
         for look in shot.get("looks") or []:
             look["seconds"] = seconds_of(look.get("seconds")) or 0.0
+        intent = camera_intent_of(shot)
+        shot["camera_intent"] = intent
+        shot["frame"] = (
+            "settles" if intent in {"hold", "use_source_motion"}
+            else "travels"
+        )
         span = by_id.get(str(shot.get("span_id", "")))
         if span is None:
             continue
@@ -1671,12 +1827,19 @@ def expand_spans(chosen: dict[str, Any], offered: "list[Any]") -> None:
         shot["usable_from_seconds"] = span.starts_seconds
         shot["usable_to_seconds"] = span.ends_seconds
         shot["source_motion_role"] = span.motion_role
+        shot["source_motion_description"] = (source_motion or {}).get(
+            span.source_id, ""
+        )
+        shot["pacing_exception"] = bool(shot.get("pacing_exception", False))
+        shot["pacing_exception_reason"] = str(
+            shot.get("pacing_exception_reason", "") or ""
+        )
 
 
 def frame_disagreements(
     shots: list[dict[str, Any]], material: "list[MaterialItem] | None" = None
 ) -> list[str]:
-    """Shots whose `frame` answer and whose looks describe different shots.
+    """Shots whose motion intention and looks describe different shots.
 
     Deliberately redundant, which the looks refactor removed on purpose --
     `camera_move` sat beside its own targets and the two were free to
@@ -1714,12 +1877,63 @@ def frame_disagreements(
 
     off = []
     for index, shot in enumerate(shots):
+        legacy = "camera_intent" not in shot
+        intent = camera_intent_of(shot)
         travels = str(shot.get("frame", "")) == "travels"
         stops = len(shot.get("looks") or [])
-        if travels and stops < 2:
-            off.append(f"k{index:02d} said travels and gave one look")
-        elif not travels and stops > 1:
-            off.append(f"k{index:02d} said settles and gave {stops} looks")
+        labels = [str(one.get("at", "")) for one in shot.get("looks") or []]
+        framings = [
+            str(one.get("framing", "thirds"))
+            for one in shot.get("looks") or []
+        ]
+        if legacy:
+            if travels and stops < 2:
+                off.append(f"k{index:02d} said travels and gave one look")
+            elif not travels and stops > 1:
+                off.append(f"k{index:02d} said settles and gave {stops} looks")
+        elif intent in {"hold", "use_source_motion", "follow_subject"} and stops != 1:
+            off.append(
+                f"k{index:02d} chose {intent} and gave {stops} looks; it needs one"
+            )
+        elif intent in {"reveal", "compare"} and (
+            stops < 2 or len(set(labels)) < 2
+        ):
+            off.append(
+                f"k{index:02d} chose {intent} without two distinct looks"
+            )
+        elif intent == "multi_stop" and stops < 3:
+            off.append(f"k{index:02d} chose multi_stop and gave {stops} looks")
+        elif intent in {"push_in", "pull_out"} and (
+            stops != 2 or len(set(labels)) != 1 or len(set(framings)) < 2
+        ):
+            off.append(
+                f"k{index:02d} chose {intent} without one subject at two framings"
+            )
+        elif intent in {"push_in", "pull_out"}:
+            tightness = {"thirds": 1, "centre": 1, "fill": 2}
+            first = tightness.get(framings[0], 1)
+            last = tightness.get(framings[-1], 1)
+            wrong_way = (
+                intent == "push_in" and last <= first
+            ) or (
+                intent == "pull_out" and last >= first
+            )
+            if wrong_way:
+                off.append(
+                    f"k{index:02d} chose {intent} but its framing order "
+                    "executes the opposite move"
+                )
+        if intent == "use_source_motion" and str(
+            shot.get("source_motion_role", "locked")
+        ) not in {"authored", "subject_follow"}:
+            off.append(
+                f"k{index:02d} chose use_source_motion on a "
+                f"{shot.get('source_motion_role', 'locked')} span"
+            )
+        if shot.get("pacing_exception") and not str(
+            shot.get("pacing_exception_reason", "")
+        ).strip():
+            off.append(f"k{index:02d} claimed a pacing exception without a reason")
 
         # A subject named from the whole take, used in a window the take's
         # own camera has travelled away from. Both halves were on record and
@@ -1755,6 +1969,32 @@ def frame_disagreements(
                     "is not in this window"
                 )
     return off
+
+
+def sequence_disagreements(shots: list[dict[str, Any]]) -> list[str]:
+    """Accidental adjacent reuse that makes a cut appear to stop."""
+
+    notes: list[str] = []
+    for index, (left, right) in enumerate(zip(shots, shots[1:])):
+        same_source = str(left.get("source_id", "")) == str(
+            right.get("source_id", "")
+        )
+        left_start = float(left.get("start_seconds") or 0.0)
+        right_start = float(right.get("start_seconds") or 0.0)
+        left_end = left_start + float(left.get("seconds_needed") or 0.0)
+        right_end = right_start + float(right.get("seconds_needed") or 0.0)
+        overlap = min(left_end, right_end) - max(left_start, right_start)
+        same_span = str(left.get("span_id", "")) == str(
+            right.get("span_id", "")
+        )
+        if same_source and same_span and overlap > 0.25:
+            span = str(left.get("span_id", ""))
+            notes.append(
+                f"k{index:02d} and k{index + 1:02d} repeat overlapping "
+                f"windows of {span} ({overlap:.1f}s overlap); replan or "
+                "state an intentional repetition"
+            )
+    return notes
 
 
 def replan_shots(
@@ -1836,21 +2076,36 @@ def replan_shots(
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
         response_format=structured_json(
-            _selection_schema([one.span_id for one in offered])
+            _selection_schema(
+                [one.span_id for one in offered],
+                replace_clip_ids=[f"k{index:02d}" for index, _, _ in failing],
+            )
         ),
         ledger=ledger,
         budget_stage="replan",
     )
     again = _parse(interaction, what="replan pass")
-    expand_spans(again, offered)
+    expand_spans(
+        again, offered,
+        source_motion={item.source_id: item.camera_motion for item in usable},
+    )
     # The same check the selection pass runs, on the path that was left
     # without it. A replan is where a shot that failed for want of a move is
     # most likely to be answered with the word and not the thing -- the
     # reviewer just said the frame showed half a wordmark, and "改為橫向掃過
     # 運鏡" in the reasoning is not two looks.
-    again["frame_disagreements"] = frame_disagreements(
-        again.get("shots") or [], material
-    )
+    replacement_shots = again.get("shots") or []
+    local_disagreements = frame_disagreements(replacement_shots, material)
+    stable_disagreements: list[str] = []
+    for note in local_disagreements:
+        local_id = note.split(" ", 1)[0]
+        try:
+            local_index = int(local_id[1:])
+            stable_id = str(replacement_shots[local_index]["replace_clip_id"])
+        except (IndexError, KeyError, TypeError, ValueError):
+            stable_id = local_id
+        stable_disagreements.append(note.replace(local_id, stable_id, 1))
+    again["frame_disagreements"] = stable_disagreements
     return again, Usage.from_interaction(
         interaction
     )

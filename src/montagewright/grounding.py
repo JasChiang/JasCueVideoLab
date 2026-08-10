@@ -558,6 +558,25 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 # tail is the mix's problem, not the edit's.
                 note = "past the end of the analysed music; kept as planned"
 
+        # Feasibility belongs in the timeline calculation. Clamping only
+        # after every cut had been laid out made all later cuts move earlier
+        # in the rendered film while their beat labels and reported times
+        # stayed on the impossible, longer timeline.
+        window = clip.usable_window
+        if window is not None:
+            available = max(1e-3, window[1] - clip.approx_in_seconds)
+            feasible_end = cursor + available
+            if end > feasible_end:
+                missed = landed
+                end = feasible_end
+                landed = None
+                landed_kind = None
+                feasibility_note = (
+                    f"usable source ends after {available:.2f}s; could not "
+                    + (f"reach cue {missed}" if missed else "hold the requested length")
+                )
+                note = f"{note}; {feasibility_note}" if note else feasibility_note
+
         grounded.append(
             GroundedClip(
                 clip=clip,
@@ -586,16 +605,19 @@ def apply_to_edl(edl: EDL, timeline: GroundedTimeline) -> EDL:
     visible instead of silently reopening it here.
     """
 
-    grounded_by_id = {
-        entry.clip.clip_id: entry.duration_seconds for entry in timeline.clips
-    }
+    grounded_by_id = {entry.clip.clip_id: entry for entry in timeline.clips}
     rewritten = []
     for clip in edl.clips:
-        wanted = grounded_by_id.get(clip.clip_id)
-        if wanted is None:
+        grounded = grounded_by_id.get(clip.clip_id)
+        if grounded is None:
             rewritten.append(clip)
             continue
-        out = clip.approx_in_seconds + wanted
+        # `ground_timeline` may move the source in-point to put an action
+        # anchor on the music. Carry that grounded clip forward; copying only
+        # its duration made the report claim the anchor landed while render
+        # still read the planner's old in-point.
+        clip = grounded.clip
+        out = clip.approx_in_seconds + grounded.duration_seconds
         # Not past the end of what the take is worth using. Reaching a beat
         # is a good reason to hold a shot longer and it is not a good enough
         # one to run into the part where the camera is being repositioned or

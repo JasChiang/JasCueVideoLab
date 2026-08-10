@@ -95,6 +95,31 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         command, capture_output=True, text=True, check=False
     )
+    hardware_unavailable = (
+        "h264_videotoolbox" in command
+        and any(
+            marker in completed.stderr
+            for marker in (
+                "Cannot create compression session",
+                "hardware encoder may be busy",
+                "Could not open encoder before EOF",
+            )
+        )
+    )
+    if completed.returncode != 0 and hardware_unavailable:
+        # Listing an encoder only proves that this ffmpeg build knows its
+        # name.  VideoToolbox can still refuse a session at render time when
+        # the hardware pool is busy or a particular frame shape is not
+        # supported.  Retry the identical edit in software; do not hide
+        # unrelated filter, media, or filesystem failures behind a fallback.
+        software = [
+            "libx264" if token == "h264_videotoolbox" else token
+            for token in command
+        ]
+        completed = subprocess.run(
+            software, capture_output=True, text=True, check=False
+        )
+        command = software
     if completed.returncode != 0:
         tail = "\n".join(completed.stderr.strip().splitlines()[-15:])
         raise RenderError(

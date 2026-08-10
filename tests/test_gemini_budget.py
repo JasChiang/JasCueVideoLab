@@ -16,6 +16,7 @@ class _Models:
 
     def count_tokens(self, **kwargs):
         self.calls += 1
+        self.last = kwargs
         return SimpleNamespace(total_tokens=self.tokens)
 
 
@@ -65,6 +66,27 @@ def test_count_tokens_includes_a_conservative_schema_envelope():
     assert counted > 105
 
 
+def test_interactions_resolution_is_translated_for_count_tokens():
+    from google.genai import types
+
+    client = _Client(tokens=100)
+    count_request_tokens(
+        client,
+        model="gemini-3.6-flash",
+        input_value=[{
+            "type": "video",
+            "uri": "https://example.invalid/clip.mp4",
+            "mime_type": "video/mp4",
+            "resolution": "low",
+        }],
+    )
+    part = client.models.last["contents"].parts[0]
+    assert (
+        part.media_resolution.level
+        == types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW
+    )
+
+
 def test_a_call_that_cannot_fit_is_never_dispatched():
     client = _Client(tokens=1_000_000)
     ledger = Ledger(cap_usd=0.01)
@@ -107,6 +129,20 @@ def test_a_completed_call_replaces_its_reservation_with_actual_usage():
 def test_production_ledger_rejects_an_unpriced_model():
     with pytest.raises(ValueError, match="fixed"):
         Ledger(cap_usd=1.0, model_id="gemini-something-else")
+
+
+def test_paid_attempts_survive_a_later_run_in_the_same_output_folder(tmp_path):
+    journal = tmp_path / "spend-events.jsonl"
+    first = Ledger(cap_usd=10.0, journal_path=journal)
+    first.record("selection", input_tokens=1_000, output_tokens=100)
+
+    second = Ledger(cap_usd=10.0, journal_path=journal)
+    second.record("replan", input_tokens=2_000, output_tokens=200)
+
+    cumulative = second.cumulative_summary()
+    assert cumulative["calls"] == 2
+    assert cumulative["spent_usd"] > second.spent_usd
+    assert set(cumulative["by_stage"]) == {"selection", "replan"}
 
 
 def test_planning_contract_changes_with_its_schema():

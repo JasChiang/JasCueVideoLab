@@ -27,6 +27,13 @@ def _count_contents(value: Any) -> Any:
 
     from google.genai import types
 
+    resolution_levels = {
+        "low": types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW,
+        "medium": types.PartMediaResolutionLevel.MEDIA_RESOLUTION_MEDIUM,
+        "high": types.PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH,
+        "ultra_high": types.PartMediaResolutionLevel.MEDIA_RESOLUTION_ULTRA_HIGH,
+    }
+
     parts = []
     for part in value:
         if not isinstance(part, dict):
@@ -39,11 +46,20 @@ def _count_contents(value: Any) -> Any:
             uri = str(part.get("uri") or "")
             if not uri:
                 raise ValueError(f"{kind} content has no URI to count")
+            resolution = part.get("resolution")
+            counted_resolution = None
+            if resolution is not None:
+                try:
+                    counted_resolution = resolution_levels[str(resolution).lower()]
+                except KeyError as error:
+                    raise ValueError(
+                        f"unsupported media resolution {resolution!r}"
+                    ) from error
             parts.append(
                 types.Part.from_uri(
                     file_uri=uri,
                     mime_type=part.get("mime_type"),
-                    media_resolution=part.get("resolution"),
+                    media_resolution=counted_resolution,
                 )
             )
             continue

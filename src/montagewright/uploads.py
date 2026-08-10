@@ -166,7 +166,7 @@ def upload_now(path: Path, client: Any) -> Any:
     # back as UnicodeEncodeError for every clip in the folder. The bytes are
     # what is being sent; the name is not part of them.
     from montagewright.cost import BudgetSpent
-    from montagewright.planner import _is_spend_cap
+    from montagewright.planner import _is_spend_cap, _provider_budget_message
 
     path = Path(path)
     try:
@@ -179,12 +179,26 @@ def upload_now(path: Path, client: Any) -> Any:
         # died on an upload with a raw traceback, recorded as a crash rather
         # than as having run out of money. Which of the two it was decides
         # whether the answer is to debug or to top up.
-        if _is_spend_cap(error):
-            raise BudgetSpent(
-                "the provider's own spending cap stopped this run -- raise "
-                "it at ai.studio/spend and resume; nothing already paid for "
-                "will be paid for twice"
+        raw = " ".join(str(error).split())
+        if "ACCESS_TOKEN_TYPE_UNSUPPORTED" in raw:
+            raise RuntimeError(
+                "This credential type cannot call the Gemini Developer Files "
+                "API. MontageWright is currently using the Developer API, so "
+                "use a standard Gemini API key (not a service-account-backed "
+                "Google Cloud/Enterprise API key), or migrate the media layer "
+                "to Google Cloud Storage and the Enterprise backend. Provider "
+                f"detail: {raw[:600]}"
             ) from error
+        if _is_spend_cap(error):
+            # Keep ai.studio/spend in this source because project-cap recovery
+            # remains one of the branches, but do not call an empty Prepay
+            # balance a monthly cap.  _provider_budget_message preserves the
+            # provider detail and gives the matching remedy.
+            provider_budget = _provider_budget_message(error)
+            raise BudgetSpent(provider_budget or (
+                "Gemini billing rejected this request; review AI Studio "
+                "Billing or ai.studio/spend, then resume."
+            )) from error
         raise
     while getattr(uploaded.state, "name", str(uploaded.state)) == "PROCESSING":
         time.sleep(2.0)

@@ -73,6 +73,12 @@ class Report:
     total_cuts: int = 0
     following_shots: int = 0
     static_shots: int = 0
+    # Two layers a viewer sees at once.  A fixed digital crop over an authored
+    # source pan is not a static shot, and a digital pan over a locked source
+    # is not source camera work.  The old held/following totals collapsed them.
+    source_motion: dict[str, str] = field(default_factory=dict)
+    source_motion_details: dict[str, dict] = field(default_factory=dict)
+    digital_motion: dict[str, str] = field(default_factory=dict)
     degradations: list[DegradationStep] = field(default_factory=list)
     subject_notes: dict[str, str] = field(default_factory=dict)
     # Where a plan contradicted itself, kept rather than printed. These were
@@ -148,12 +154,93 @@ class Report:
         return (
             f"{self.aligned_cuts}/{wanted} cuts on a musical event "
             f"({self.total_cuts - wanted} content-led by choice), "
-            f"{self.following_shots} shots following a subject, "
-            f"{self.static_shots} held, "
+            f"{self.following_shots} digital frames moving, "
+            f"{self.static_shots} digital frames held, "
             f"{len(self.degradations)} degradations, "
             f"{self.input_tokens} in / {self.output_tokens} out tokens"
             f"{spent}{tail}"
         )
+
+
+def _digital_motion_of(path: CropPath | None) -> str:
+    """Describe measured crop motion instead of repeating the plan's label."""
+
+    if path is None or path.is_static:
+        return "hold"
+    crops = [frame.crop for frame in path.keyframes]
+    first, last = crops[0], crops[-1]
+    xs = [crop.x + crop.width / 2 for crop in crops]
+    ys = [crop.y + crop.height / 2 for crop in crops]
+    legs_x = [right - left for left, right in zip(xs, xs[1:])]
+    legs_y = [right - left for left, right in zip(ys, ys[1:])]
+    dx, dy = xs[-1] - xs[0], ys[-1] - ys[0]
+    travel_x = sum(abs(delta) for delta in legs_x)
+    travel_y = sum(abs(delta) for delta in legs_y)
+    scale = first.width / max(last.width, 1e-9)
+    parts: list[str] = []
+    reverses = any(a * b < 0 for a, b in zip(legs_x, legs_x[1:])) or any(
+        a * b < 0 for a, b in zip(legs_y, legs_y[1:])
+    )
+    if reverses:
+        parts.append("multi_stop")
+    if abs(scale - 1.0) >= 0.02:
+        parts.append("push_in" if scale > 1.0 else "pull_out")
+    if travel_x >= 0.002 and travel_y >= 0.002:
+        parts.append("diagonal")
+    elif travel_x >= 0.002:
+        parts.append("pan_right" if dx >= 0 else "pan_left")
+    elif travel_y >= 0.002:
+        parts.append("tilt_down" if dy >= 0 else "tilt_up")
+    return "+".join(parts) or "moving"
+
+
+def _audit_static_holds(
+    edl: EDL, max_static_seconds: float,
+) -> tuple[EDL, list[str]]:
+    """Audit long locked holds after rhythm has chosen the resolved windows.
+
+    Cutting a shot here would silently throw away speech/action and shorten
+    the film. The review loop treats these notes as mandatory replan input;
+    runs without review still expose the violation instead of disguising it.
+    """
+
+    if max_static_seconds <= 0:
+        return edl, []
+    notes: list[str] = []
+    for clip in edl.clips:
+        reframe = clip.reframe
+        seconds = clip.approx_out_seconds - clip.approx_in_seconds
+        visually_static = (
+            reframe is not None
+            and reframe.camera_move == "hold"
+            and reframe.source_motion_role == "locked"
+        )
+        exempt = bool(
+            reframe is not None
+            and reframe.pacing_exception
+            and reframe.pacing_exception_reason.strip()
+        )
+        if visually_static and not exempt and seconds > max_static_seconds:
+            notes.append(
+                f"{clip.clip_id} static hold resolves to {seconds:.1f}s, over "
+                f"the direction's {max_static_seconds:.1f}s maximum; replan "
+                "or document a content-led exception"
+            )
+    return edl, notes
+
+
+def _resolved_sequence_disagreements(edl: EDL) -> list[str]:
+    notes: list[str] = []
+    for left, right in zip(edl.clips, edl.clips[1:]):
+        overlap = min(left.approx_out_seconds, right.approx_out_seconds) - max(
+            left.approx_in_seconds, right.approx_in_seconds
+        )
+        if left.source_id == right.source_id and overlap > 0.25:
+            notes.append(
+                f"{left.clip_id} and {right.clip_id} repeat {overlap:.1f}s "
+                "of the same resolved source window"
+            )
+    return notes
 
 
 def _may_ask(client: Any) -> bool:
@@ -1019,7 +1106,7 @@ def follow_subjects(
                 if card is not None
                 else None
             )
-            if known is not None:
+            if known is not None and move != "follow_subject":
                 boxes = [
                     {
                         "frame_index": 0,
@@ -1036,6 +1123,10 @@ def follow_subjects(
             else:
                 if not _may_ask(client):
                     continue
+                # A card box is one observed place, not a trajectory.  It is
+                # enough to aim a hold and categorically insufficient for an
+                # explicit follow: without SAM, one observation made every
+                # follow static while the report claimed the chosen intent.
                 frames, times = _sample_frames(
                     source, clip.approx_in_seconds, clip.approx_out_seconds, work
                 )
@@ -1240,6 +1331,7 @@ def run(
     ledger: Ledger | None = None,
     decide_rhythm_first: bool = True,
     target_seconds: float = 0.0,
+    max_static_seconds: float = 0.0,
     keep_voice: bool = False,
     under_speech: str = "duck",
     client: Any | None = None,
@@ -1277,7 +1369,10 @@ def run(
         )
         _charge(report, "rhythm", usage)
 
+    # Grounding enforces each usable source window before advancing the next
+    # cut, so this is already the same timeline the renderer will receive.
     timeline = ground_timeline(edl, grid)
+    edl = apply_to_edl(edl, timeline)
     report.aligned_cuts = timeline.aligned_count
     report.total_cuts = len(timeline.clips)
     report.delivered_seconds = round(timeline.duration_seconds, 2)
@@ -1292,6 +1387,7 @@ def run(
             # position in a list, not a description, so "nine of nine on the
             # music" hid six cuts running one beat ahead of the bar.
             "landed_kind": entry.landed_kind,
+            "grounding_note": entry.note,
             "seconds": round(entry.duration_seconds, 3),
             "why": entry.clip.music_sync.rhythm_reason,
         }
@@ -1302,7 +1398,14 @@ def run(
         for entry in timeline.clips
         if entry.move_too_short
     }
-    edl = apply_to_edl(edl, timeline)
+    edl, pacing_notes = _audit_static_holds(edl, max_static_seconds)
+    report.plan_disagreements.extend(pacing_notes)
+    report.plan_disagreements.extend(_resolved_sequence_disagreements(edl))
+    for clip in edl.clips:
+        if clip.clip_id in report.rhythm_decisions:
+            report.rhythm_decisions[clip.clip_id]["seconds"] = round(
+                clip.approx_out_seconds - clip.approx_in_seconds, 3
+            )
 
     paths = follow_subjects(
         edl,
@@ -1313,6 +1416,22 @@ def run(
         checkpoint=checkpoint,
         client=client,
     )
+
+    for clip in edl.clips:
+        reframe = clip.reframe
+        if reframe is None:
+            continue
+        report.source_motion[clip.clip_id] = reframe.source_motion_role
+        report.source_motion_details[clip.clip_id] = {
+            "role": reframe.source_motion_role,
+            "description": reframe.source_motion_description,
+            "window": [
+                round(clip.approx_in_seconds, 3),
+                round(clip.approx_out_seconds, 3),
+            ],
+        }
+        path = paths.get(clip.clip_id)
+        report.digital_motion[clip.clip_id] = _digital_motion_of(path)
 
     write_crops(paths, output_dir / "work" / "crops.json")
 
@@ -1330,4 +1449,5 @@ def run(
         plan, output_dir, music=music, keep_segments=True,
         keep_voice=keep_voice, under_speech=under_speech,
     )
+    report.delivered_seconds = round(result.duration_seconds, 2)
     return result, plan, report, edl

@@ -842,10 +842,13 @@ def test_selection_is_told_a_row_needs_two_endpoints():
     # cannot hold whole is answered with more than one place to look.
     assert "只能露出" in prompt
     assert "兩個落點" in prompt
-    assert "travels" in prompt
+    assert "`reveal`" in prompt or "`compare`" in prompt
     # And that both ends have to be told apart, which is the part that makes
     # the two endpoints measurable rather than two names for the same place.
-    assert "起點終點" in prompt and "描述到能分辨" in prompt
+    assert (
+        "能分辨起點與終點" in prompt
+        or ("起點終點" in prompt and "描述到能分辨" in prompt)
+    )
 
 
 # --- a move has to arrive somewhere and stay there -----------------------
@@ -1378,7 +1381,7 @@ def test_the_providers_own_cap_is_this_project_s_budget(monkeypatch):
     import pytest
 
     from montagewright.cost import BudgetSpent
-    from montagewright.planner import _is_spend_cap, ask
+    from montagewright.planner import _is_spend_cap, _provider_budget_message, ask
 
     class Capped(Exception):
         code = 429
@@ -1397,6 +1400,21 @@ def test_the_providers_own_cap_is_this_project_s_budget(monkeypatch):
 
     assert _is_spend_cap(Capped())
     assert not _is_spend_cap(TooFast())
+    assert "monthly spending cap" in (_provider_budget_message(Capped()) or "")
+    assert _provider_budget_message(TooFast()) is None
+
+    class PrepayEmpty(Exception):
+        code = 429
+
+        def __str__(self):
+            return (
+                "429 RESOURCE_EXHAUSTED. Your prepayment credits are depleted. "
+                "Please manage your project and billing."
+            )
+
+    prepay = _provider_budget_message(PrepayEmpty()) or ""
+    assert "Prepay credits are depleted" in prepay
+    assert "Provider detail" in prepay
 
     class Client:
         def __init__(self, error):
@@ -1411,6 +1429,38 @@ def test_the_providers_own_cap_is_this_project_s_budget(monkeypatch):
     # Pace is the SDK's to retry, so it keeps its own type.
     with pytest.raises(TooFast):
         ask(Client(TooFast()))
+
+
+def test_renderer_retries_a_busy_videotoolbox_encoder_in_software(monkeypatch):
+    """Encoder presence is not proof that macOS can open a session now."""
+
+    from types import SimpleNamespace
+
+    from montagewright.renderer import _run
+
+    calls = []
+
+    def fake_run(command, **_):
+        calls.append(command)
+        if len(calls) == 1:
+            return SimpleNamespace(
+                returncode=187,
+                stderr=(
+                    "Cannot create compression session: -12903\n"
+                    "The hardware encoder may be busy, or not supported."
+                ),
+                stdout="",
+            )
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr("montagewright.renderer.subprocess.run", fake_run)
+    result = _run([
+        "ffmpeg", "-i", "in.mp4", "-c:v", "h264_videotoolbox", "out.mp4"
+    ])
+
+    assert result.returncode == 0
+    assert calls[0][4] == "h264_videotoolbox"
+    assert calls[1][4] == "libx264"
 
 
 # --- how long a shot needs is a fact about that shot --------------------

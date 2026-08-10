@@ -21,6 +21,7 @@ same constant meant two different things on 1080 and 4K sources.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from montagewright.executor import CROP_MARGIN, CropBox
@@ -1189,24 +1190,29 @@ def build_crop_path(
         crop_height = source_aspect / target_aspect
 
     free_x = max(0.0, 1.0 - crop_width)
+    free_y = max(0.0, 1.0 - crop_height)
 
     # Judge the movement on the raw observations, before anything is filtered.
-    centres = [observation.centre_x for observation in observations]
-    spread = _percentile(centres, 0.95) - _percentile(centres, 0.05)
+    centres_x = [observation.centre_x for observation in observations]
+    centres_y = [observation.centre_y for observation in observations]
+    spread_x = _percentile(centres_x, 0.95) - _percentile(centres_x, 0.05)
+    spread_y = _percentile(centres_y, 0.95) - _percentile(centres_y, 0.05)
+    spread = max(spread_x if free_x > 0 else 0.0,
+                 spread_y if free_y > 0 else 0.0)
 
-    def crop_at(centre_x: float, lead: float = 0.0) -> CropBox:
-        x = centre_x + lead - crop_width / 2.0
+    def crop_at(
+        centre_x: float, centre_y: float, lead_x: float = 0.0,
+        lead_y: float = 0.0,
+    ) -> CropBox:
+        x = centre_x + lead_x - crop_width / 2.0
         if free_x > 0.0:
             x = min(max(x, free_x * CROP_MARGIN), free_x * (1.0 - CROP_MARGIN))
         else:
             x = 0.0
         share = PLACEMENT.get(framing, 0.5)
-        subject_y = (
-            sum(o.centre_y for o in observations) / len(observations)
-            if observations
-            else 0.5
+        y = min(
+            max(centre_y + lead_y - crop_height * share, 0.0), free_y
         )
-        y = min(max(subject_y - crop_height * share, 0.0), max(0.0, 1.0 - crop_height))
         return CropBox(x=x, y=y, width=crop_width, height=crop_height)
 
     def hold(trigger: str, measured: dict[str, float]) -> CropPath:
@@ -1238,7 +1244,10 @@ def build_crop_path(
                 [
                     Keyframe(
                         observations[0].seconds,
-                        crop_at(_percentile(centres, 0.5)),
+                        crop_at(
+                            _percentile(centres_x, 0.5),
+                            _percentile(centres_y, 0.5),
+                        ),
                     )
                 ]
             ),
@@ -1248,24 +1257,32 @@ def build_crop_path(
             degradations=degradations,
         )
 
-    if spread < DEADBAND or free_x <= 0.0:
+    if spread < DEADBAND or (free_x <= 0.0 and free_y <= 0.0):
         return hold(
             "a follow was planned but the subject does not move in this shot"
-            if free_x > 0.0
+            if free_x > 0.0 or free_y > 0.0
             else "a follow was planned but the crop already fills the frame "
-            "on this axis, leaving nowhere to move",
+            "on both axes, leaving nowhere to move",
             {
-                "subject_spread_vw": round(spread, 4),
+                "subject_spread_x": round(spread_x, 4),
+                "subject_spread_y": round(spread_y, 4),
                 "deadband_vw": DEADBAND,
-                "free_travel_vw": round(free_x, 4),
+                "free_travel_x": round(free_x, 4),
+                "free_travel_y": round(free_y, 4),
             },
         )
 
+    def available_delta(earlier: Observation, later: Observation) -> tuple[float, float]:
+        return (
+            later.centre_x - earlier.centre_x if free_x > 0.0 else 0.0,
+            later.centre_y - earlier.centre_y if free_y > 0.0 else 0.0,
+        )
+
     wandered = sum(
-        abs(later.centre_x - earlier.centre_x)
+        math.hypot(*available_delta(earlier, later))
         for earlier, later in zip(observations, observations[1:])
     )
-    net = abs(centres[-1] - centres[0])
+    net = math.hypot(*available_delta(observations[0], observations[-1]))
     directness = net / wandered if wandered > 1e-9 else 0.0
     if directness < MIN_DIRECTNESS:
         return hold(
@@ -1298,15 +1315,21 @@ def build_crop_path(
         else:
             neighbour = observations[index - 1]
         span = max(abs(neighbour.seconds - observation.seconds), 1e-6)
-        drift = neighbour.centre_x - observation.centre_x
+        drift_x, drift_y = available_delta(observation, neighbour)
         if index + 1 >= len(observations):
-            drift = -drift  # looking backwards; the direction of travel flips
-        speed = drift / span
+            drift_x, drift_y = -drift_x, -drift_y
+        speed_x, speed_y = drift_x / span, drift_y / span
+        speed = math.hypot(speed_x, speed_y)
         # Full lead at the energy's top speed, proportionally less below it,
         # and nothing at all when the subject is effectively parked.
-        share = max(-1.0, min(1.0, speed / limits["max_speed"]))
-        lead = limits["lead"] * crop_width * share
-        raw.append(Keyframe(observation.seconds, crop_at(observation.centre_x, lead)))
+        share = min(1.0, speed / limits["max_speed"])
+        lead = limits["lead"] * min(crop_width, crop_height) * share
+        lead_x = lead * speed_x / speed if speed > 1e-9 else 0.0
+        lead_y = lead * speed_y / speed if speed > 1e-9 else 0.0
+        raw.append(Keyframe(
+            observation.seconds,
+            crop_at(observation.centre_x, observation.centre_y, lead_x, lead_y),
+        ))
 
     limited, peak_speed = _limit_speed(raw, limits)
     path = CropPath(_smooth(limited))
@@ -1323,7 +1346,8 @@ def build_crop_path(
                 measured={
                     "observed_speed_vw_per_s": round(peak_speed, 4),
                     "limit_vw_per_s": limits["max_speed"],
-                    "subject_spread_vw": round(spread, 4),
+                    "subject_spread_x": round(spread_x, 4),
+                    "subject_spread_y": round(spread_y, 4),
                 },
             )
         )

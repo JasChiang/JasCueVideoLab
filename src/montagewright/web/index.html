@@ -1333,6 +1333,13 @@ function inspect(i) {
 
     <section class="ins-part ${said.delivered === false ? 'off' : ''}">
       <h4>實際做到什麼</h4>
+      <div class="pairs">
+        <span>原素材</span><span>${esc(motionLabel(b.motion?.source, 'source'))}</span>
+        <span>數位裁切</span><span>${esc(motionLabel(b.motion?.digital, 'digital'))}</span>
+        <span>兩層關係</span><span>${esc(COMPOSITES[b.motion?.composite] || b.motion?.composite || '—')}</span>
+        ${b.source_motion_details?.description
+          ? `<span>素材運鏡說明</span><span>${esc(b.source_motion_details.description)}</span>` : ''}
+      </div>
       ${said.note ? `<p class="why">${esc(said.note)}</p>`
         : '<p class="why">逐顆驗收沒有單獨看這一顆。</p>'}
       ${deg.length ? `<div class="degs">${deg.map(tellDegradation).join('')}</div>` : ''}
@@ -2127,9 +2134,21 @@ function paintSteps(lines) {
 // A failure buried in a collapsed panel is a failure nobody sees. Pull out
 // the line that says what went wrong and put it where the eye already is.
 const FAULTS = [
+  [/ACCESS_TOKEN_TYPE_UNSUPPORTED|credential type cannot call the Gemini Developer Files API/i,
+   '這把 Google Cloud key 不能呼叫 Gemini Files API',
+   '目前 MontageWright 走 Gemini Developer API。請改用一般 Gemini API key（不要選「透過 service account 驗證」）；service-account-backed Cloud key 要等媒體層遷移到 GCS／Enterprise backend 才能使用。'],
+  [/Prepay credits are depleted|prepayment credits are depleted/i,
+   'Gemini 預付點數已用完',
+   '這不是 monthly spending cap。到 <a href="https://aistudio.google.com/app/billing" target="_blank">AI Studio Billing</a> 購買點數或啟用自動儲值，再按「繼續跑」；已完成的 proxy、卡片與規劃會沿用。'],
   [/exceeded its monthly spending cap/,
    'Google 專案的月度支出上限滿了',
    '這不是這裡設的 --budget，是 AI Studio 的專案設定。到 <a href="https://ai.studio/spend" target="_blank">ai.studio/spend</a> 調高額度，然後按上面的「繼續跑」——卡片、逐字稿、定調、選片都已經存起來了，不會重付。'],
+  [/billing-account tier cap|billing account.*(?:cap|limit)/i,
+   'Google Billing Account 的級別上限滿了',
+   '這是同一 billing account 下所有專案共享的上限，不是單一 API key。請檢查 usage tier 或申請提高額度後再繼續。'],
+  [/Quota exceeded for requests|rate.?limit/i,
+   'Gemini 暫時超過請求速率或配額',
+   '這不是金額上限。稍後重試；若持續發生，請到 Google Cloud Quotas 查看對應模型與區域的 request/token quota。'],
   [/RESOURCE_EXHAUSTED|429/,
    'Gemini 拒絕了請求（429）',
    '通常是額度或速率限制。等一下再試，或看下面的原始輸出。'],
@@ -2439,6 +2458,7 @@ function render(report) {
     const k = 'k' + String(i).padStart(2, '0');
     const r = rhythm[k] || {}, v = verdicts[k] || {};
     const degs = degByClip[k] || [];
+    const motion = report.motion?.[k] || {};
     const ok = v.delivered === undefined ? '' :
       `<span class="tag ${v.delivered ? 'ok' : 'no'}">${
         v.delivered ? '做到' : '沒做到'}</span>`;
@@ -2455,7 +2475,7 @@ function render(report) {
             <span class="mono no">${i}</span>
             <a class="mono shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a>
             <span class="mono">${Number(s.start_seconds ?? 0).toFixed(1)}s ＋${Number(r.seconds ?? 0).toFixed(1)}s</span>
-            <span class="move">${esc(s.camera_move)}</span>
+            <span class="move">${esc(motionLabel(motion.source, 'source'))} ＋ ${esc(motionLabel(motion.digital, 'digital'))}</span>
           </div>
         </div>
       </div>
@@ -3002,7 +3022,25 @@ function mirrorRaw() {
 
 const MOVES = {
   hold: '定住', pan: '橫搖', tilt: '直搖', push_in: '推近', pull_out: '拉遠',
+  follow_subject: '跟隨主體', source_motion: '沿用原生運鏡',
+  pan_left: '向左橫移', pan_right: '向右橫移',
+  tilt_up: '向上直移', tilt_down: '向下直移', diagonal: '斜向移動',
+  multi_stop: '多落點', moving: '有移動',
 };
+
+const SOURCE_MOTIONS = {
+  locked: '原素材固定', authored: '原素材有設計運鏡',
+  subject_follow: '原素材跟拍主體',
+};
+const COMPOSITES = {
+  source_only: '只用原生運鏡', digital_only: '只用數位運鏡',
+  stacked: '原生＋數位疊加', still: '兩層都固定',
+};
+function motionLabel(value, layer) {
+  if (!value) return '—';
+  if (layer === 'source') return SOURCE_MOTIONS[value] || value;
+  return String(value).split('+').map(v => MOVES[v] || v).join('＋');
+}
 
 // Where across the frame the box sits. The width is fixed by the delivery
 // aspect -- 9:16 out of 16:9 is 0.316 wide on every shot ever -- so a label

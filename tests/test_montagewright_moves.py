@@ -73,6 +73,26 @@ class TestFollow:
         assert not path.is_static
         assert path.travel() > 0.0
 
+    def test_a_vertical_subject_trajectory_is_followed_on_the_available_axis(self) -> None:
+        observations = [
+            Observation(
+                seconds=index * 0.5,
+                centre_x=0.5,
+                centre_y=0.20 + 0.10 * index,
+                width=0.3,
+                height=0.18,
+            )
+            for index in range(5)
+        ]
+        path = build_crop_path(
+            observations,
+            source_aspect=TALL,
+            target_aspect=WIDE,
+            energy="active",
+        )
+        assert not path.is_static
+        assert path.keyframes[-1].crop.y > path.keyframes[0].crop.y
+
     def test_a_still_subject_holds_and_says_so(self) -> None:
         degradations: list = []
         path = build_crop_path(
@@ -507,7 +527,7 @@ def test_replanning_is_a_new_plan_rather_than_a_softer_fallback() -> None:
 
     prompt = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
     assert "不是把原本的做法縮水" in prompt
-    assert "放棄這顆" in prompt
+    assert "換成一顆可交付" in prompt
     # It must also be able to stand its ground: the shot reviewer sees one
     # shot with no context, and "swept past without stopping to be read" is
     # sometimes exactly what was wanted.
@@ -757,8 +777,8 @@ def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
     # very different lengths made every shot six hundred pixels tall.
     page = PAGE.read_text(encoding="utf-8")
     for shown in (
-        "shotcard", "s.source_id", "s.camera_move", "s.subject", "s.why",
-        "tellDegradation", "實際做到什麼",
+        "shotcard", "s.source_id", "b.camera_move", "s.subject", "s.why",
+        "motion.source", "motion.digital", "tellDegradation", "實際做到什麼",
     ):
         assert shown in page, shown
 
@@ -3273,8 +3293,8 @@ def test_the_energy_a_shot_asks_for_reaches_the_camera():
         assert look_energy(junk) in ENERGY_LIMITS
 
 
-def test_the_planner_has_to_say_whether_the_frame_moves():
-    """The question the looks refactor deleted, asked again without the menu.
+def test_the_planner_has_to_choose_a_camera_intent_before_looks():
+    """A binary movement question still hid most of the available grammar.
 
     `camera_move` was a required enum, so every shot answered "does this one
     move?" before it could be written down. An array with a minimum length of
@@ -3285,26 +3305,18 @@ def test_the_planner_has_to_say_whether_the_frame_moves():
     from montagewright.planner import _selection_schema
 
     shot = _selection_schema(["A"])["properties"]["shots"]["items"]
-    assert "frame" in shot["required"]
-    assert shot["properties"]["frame"]["enum"] == ["settles", "travels"]
-
-    # Not the old menu under a new name. The two answers are not moves, and
-    # the description does not hand back the vocabulary the refactor removed
-    # -- "hold" is left out of this check because it is also an ordinary
-    # English verb, which is exactly why it stopped being a move name.
-    from montagewright.capabilities import MOVE_NAMES
-
-    written = repr(shot["properties"]["frame"])
-    menu = [name for name in MOVE_NAMES if name != "hold"]
-    assert not [name for name in menu if name in written]
-    assert not set(shot["properties"]["frame"]["enum"]) & set(MOVE_NAMES)
+    assert "camera_intent" in shot["required"]
+    assert shot["properties"]["camera_intent"]["enum"] == [
+        "hold", "use_source_motion", "follow_subject", "reveal", "compare",
+        "push_in", "pull_out", "multi_stop",
+    ]
 
     # Asked before the looks are written, which is the working part -- a
     # model that has just written "travels" writes what follows in the
     # presence of that word.
     order = shot["required"]
-    assert order.index("frame") < order.index("looks")
-    assert list(shot["properties"]).index("frame") < list(
+    assert order.index("camera_intent") < order.index("looks")
+    assert list(shot["properties"]).index("camera_intent") < list(
         shot["properties"]
     ).index("looks")
 
@@ -3334,10 +3346,12 @@ def test_a_plan_that_says_one_thing_and_describes_another_is_reported():
         {"frame": "travels", "looks": [one, one, one]},
     ]) == []
 
-    # The looks still decide what is rendered: this only reports.
+    # Legacy `travels` with one look meant follow-subject before the explicit
+    # intent field existed; preserving that meaning keeps old cached plans
+    # moving instead of silently turning them into holds.
     from montagewright.schema import move_of_shot
 
-    assert move_of_shot({"frame": "travels", "looks": [one]}) == "hold"
+    assert move_of_shot({"frame": "travels", "looks": [one]}) == "follow_subject"
 
 
 def test_the_speed_budget_covers_every_axis_not_just_across():
@@ -4265,6 +4279,30 @@ def test_the_spend_cap_reads_the_same_on_an_upload():
         uploads.upload_now(where, _Capped())
 
 
+def test_a_cloud_service_account_key_explains_why_file_upload_cannot_use_it():
+    """An Enterprise key is valid, but not for the Developer Files API."""
+
+    from montagewright import uploads
+
+    class _EnterpriseKey:
+        class files:
+            @staticmethod
+            def upload(**_):
+                raise RuntimeError(
+                    "401 UNAUTHENTICATED: ACCESS_TOKEN_TYPE_UNSUPPORTED "
+                    "google.ai.generativelanguage.v1beta.FileService.CreateFile"
+                )
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+        handle.write(b"x")
+        where = Path(handle.name)
+    with pytest.raises(RuntimeError, match="service-account-backed"):
+        uploads.upload_now(where, _EnterpriseKey())
+
+
 def _grid(bpm=120.0, bars=8):
     """A clean grid: downbeat every four beats, accents on the third."""
 
@@ -4567,7 +4605,9 @@ def test_a_named_music_point_is_actually_resolved():
     anyway.
     """
 
-    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.grounding import (
+        BeatGrid, Cue, apply_to_edl, ground_timeline,
+    )
     from montagewright.schema import EDL, Clip, MusicSync
 
     grid = BeatGrid(bpm=120.0, meter=4, duration_seconds=40.0, cues=tuple(
@@ -4623,7 +4663,9 @@ def test_cuts_are_placed_against_the_music_that_is_playing():
     been left at zero, and it exists to be moved.
     """
 
-    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.grounding import (
+        BeatGrid, Cue, apply_to_edl, ground_timeline,
+    )
     from montagewright.schema import EDL, Clip, MusicSync
 
     # A downbeat every two seconds, for a minute.
@@ -4746,6 +4788,68 @@ def test_a_digital_move_on_a_take_that_already_moves_is_reported():
     assert "digital_move_on_a_moving_take" in checking
     # A locked take is not flagged for having a move added to it.
     assert 'in {"authored", "subject_follow"}' in checking
+
+
+def test_each_span_tells_selection_its_own_source_motion_role():
+    from montagewright.planner import MaterialItem, _describe_material
+    from montagewright.spans import Span
+
+    item = MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="phone",
+        spans=(
+            Span("C1:s00", "C1", 0.0, 3.0, "", "authored"),
+            Span("C1:s01", "C1", 3.0, 8.0, "", "locked"),
+        ),
+    )
+    described = _describe_material([item])
+    assert "C1:s00" in described and "原素材運動=authored" in described
+    assert "C1:s01" in described and "原素材運動=locked" in described
+
+
+def test_direction_owns_shot_density_and_selection_enforces_a_range():
+    from montagewright.planner import (
+        _direction_schema, _selection_schema, _shot_count_bounds,
+    )
+
+    direction = _direction_schema()
+    for field in (
+        "target_shot_count", "typical_shot_seconds", "max_static_seconds",
+        "pacing_reason",
+    ):
+        assert field in direction["required"]
+    lower, upper = _shot_count_bounds({"target_shot_count": 30}, 74)
+    shots = _selection_schema(
+        [f"C{i}:s00" for i in range(74)],
+        min_shots=lower, max_shots=upper,
+    )["properties"]["shots"]
+    assert shots["minItems"] == 26
+    assert shots["maxItems"] == 34
+
+
+def test_overlapping_adjacent_windows_of_one_span_are_reported():
+    from montagewright.planner import sequence_disagreements
+
+    shots = [
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 0,
+         "seconds_needed": 7},
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 1,
+         "seconds_needed": 5},
+    ]
+    assert "overlapping windows" in sequence_disagreements(shots)[0]
+
+
+def test_an_explicit_follow_does_not_reuse_one_card_box_as_a_trajectory():
+    import inspect
+
+    from montagewright import pipeline
+    from montagewright.schema import reframe_of
+
+    built = reframe_of({
+        "camera_intent": "follow_subject", "looks": [{"at": "phone"}]
+    })
+    assert built.camera_move == "follow_subject" and built.planned_to_move
+    source = inspect.getsource(pipeline.follow_subjects)
+    assert 'known is not None and move != "follow_subject"' in source
 
 
 def test_unreadable_footage_says_so_rather_than_saying_still():
@@ -4950,7 +5054,9 @@ def test_a_moment_inside_the_shot_can_be_put_on_the_beat():
     goals were fighting through the same one control.
     """
 
-    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.grounding import (
+        BeatGrid, Cue, apply_to_edl, ground_timeline,
+    )
     from montagewright.schema import EDL, Clip, MusicSync
 
     # A downbeat every two seconds.
@@ -4984,6 +5090,28 @@ def test_a_moment_inside_the_shot_can_be_put_on_the_beat():
     landing = 0.0 + (5.3 - anchored.clip.approx_in_seconds)
     assert abs(landing % 2.0) < 1e-6, landing
     assert abs(anchored.duration_seconds - 4.0) < 1e-6
+
+    original = EDL(project_id="p", clips=[Clip(
+        clip_id="k00", source_id="C1",
+        approx_in_seconds=3.0, approx_out_seconds=7.0,
+        moments={"a01": 5.3}, usable_from_seconds=0.0,
+        usable_to_seconds=20.0,
+        music_sync=MusicSync(cut_on_beat=False, anchor="a01"),
+    )])
+    grounded = ground_timeline(original, grid)
+    applied = apply_to_edl(original, grounded)
+    assert applied.clips[0].approx_in_seconds == grounded.clips[0].clip.approx_in_seconds
+
+    short = EDL(project_id="p", clips=[Clip(
+        clip_id="k00", source_id="C1",
+        approx_in_seconds=0.0, approx_out_seconds=1.8,
+        usable_from_seconds=0.0, usable_to_seconds=1.2,
+        music_sync=MusicSync(cut_on_beat=True),
+    )])
+    feasible = ground_timeline(short, grid).clips[0]
+    assert feasible.duration_seconds <= 1.2 + 1e-6
+    assert feasible.landed_on is None
+    assert "usable source ends" in (feasible.note or "")
 
     # Deliberately loose is a decision, and it is a beat either side.
     late = film(anchor="a01", relation="after")

@@ -44,8 +44,10 @@ from montagewright.planner import (
     _describe_one,
     _direction_schema,
     _selection_schema,
+    _shot_count_bounds,
     decide_direction,
     replan_shots,
+    sequence_disagreements,
     select_shots,
 )
 from montagewright.schema import EDL, Clip, move_of_shot, reframe_of, subject_of
@@ -330,7 +332,11 @@ def command_render(args: argparse.Namespace) -> int:
     library = (args.library or default_library()).expanduser()
     client = _client()
     cache = UploadCache.load(args.upload_cache or default_cache_path())
-    ledger = Ledger(cap_usd=args.budget, model_id=MODEL_ID)
+    ledger = Ledger(
+        cap_usd=args.budget,
+        model_id=MODEL_ID,
+        journal_path=output / "spend-events.jsonl",
+    )
 
     sources_paths = sorted(
         path for path in rushes.iterdir() if path.suffix in VIDEO_SUFFIXES
@@ -647,8 +653,12 @@ def command_render(args: argparse.Namespace) -> int:
         if item.source_id not in broken
         for span in item.spans
     ]
+    min_shots, max_shots = _shot_count_bounds(direction, len(offered_ids))
     selection_contract = _planning_contract(
-        "selection_zh-TW.txt", _selection_schema(offered_ids)
+        "selection_zh-TW.txt",
+        _selection_schema(
+            offered_ids, min_shots=min_shots, max_shots=max_shots
+        ),
     )
     chose = _asked(
         asked,
@@ -665,6 +675,12 @@ def command_render(args: argparse.Namespace) -> int:
         _decide(work, "selection", chose, selection)
     else:
         print("selection: reused from the last attempt", flush=True)
+    cached_sequence_faults = sequence_disagreements(selection.get("shots") or [])
+    if cached_sequence_faults:
+        raise RuntimeError(
+            "cached selection repeats overlapping adjacent source windows; "
+            "refusing to render: " + "; ".join(cached_sequence_faults)
+        )
     travelling = sum(
         1 for shot in selection["shots"] if str(shot.get("frame", "")) == "travels"
     )
@@ -724,10 +740,19 @@ def command_render(args: argparse.Namespace) -> int:
             grid,
             output,
             target_aspect=aspect,
-            intent=direction["direction"],
+            intent=(
+                direction["direction"]
+                + "\n節奏密度：目標約 "
+                + f"{direction.get('target_shot_count', len(edl.clips))} 顆，"
+                + f"典型 {direction.get('typical_shot_seconds', 0):.1f}s，"
+                + "純靜態通常不超過 "
+                + f"{direction.get('max_static_seconds', 0):.1f}s。"
+                + str(direction.get("pacing_reason", ""))
+            ),
             brief=brief,
             rhythm_context=rhythm_context,
             target_seconds=float(direction["target_seconds"]),
+            max_static_seconds=float(direction.get("max_static_seconds") or 0.0),
             music=args.music,
             cards=cards,
             checkpoint=args.sam_checkpoint,
@@ -746,7 +771,9 @@ def command_render(args: argparse.Namespace) -> int:
     # went to stdout and nowhere else, so the one that mattered -- a shot
     # naming a subject its own window never reaches -- was on screen while
     # the same shot was replanned twice into the same failure.
-    report.plan_disagreements.extend(disagreed)
+    report.plan_disagreements.extend(
+        note for note in disagreed if note not in report.plan_disagreements
+    )
 
     rounds: list[Round] = []
     shot_verdicts: dict[str, dict] = {}
@@ -881,8 +908,11 @@ def command_render(args: argparse.Namespace) -> int:
                       ),
                   )
                   for index, shot in enumerate(selection["shots"])
-                  if not shot_verdicts.get(f"k{index:02d}", {}).get(
-                      "delivered", True
+                  if (
+                      not shot_verdicts.get(f"k{index:02d}", {}).get(
+                          "delivered", True
+                      )
+                      or bool(said.get(f"k{index:02d}"))
                   )
               ]
               # A whole-cut fault the per-shot pass did not raise still names
@@ -928,6 +958,14 @@ def command_render(args: argparse.Namespace) -> int:
                       "revision asked for, but no shot was named as undelivered"
                   )
                   break
+              sequence_context = "\n".join(
+                  f"第 {index + 1} 顆（span={shot.get('span_id')}，"
+                  f"source={shot['source_id']}，"
+                  f"intent={shot.get('camera_intent', 'hold')}，"
+                  f"約 {shot.get('seconds_needed', 0)} 秒）："
+                  f"{shot.get('why', '')}"
+                  for index, shot in enumerate(selection["shots"])
+              )
               try:
                   ledger.check()
                   replanned, usage = replan_shots(
@@ -935,11 +973,7 @@ def command_render(args: argparse.Namespace) -> int:
                       material,
                       direction,
                       brief=brief,
-                      context="\n".join(
-                          f"第 {index + 1} 顆（{shot['source_id']}）："
-                          f"{shot.get('why', '')}"
-                          for index, shot in enumerate(selection["shots"])
-                      ),
+                      context=sequence_context,
                       cache=cache,
                       client=client,
                       ledger=ledger,
@@ -954,7 +988,66 @@ def command_render(args: argparse.Namespace) -> int:
                       f"{len(failing)} that needed one"
                   )
                   break
-              for (index, old, _), new in zip(failing, fresh):
+              expected_replacements = {
+                  f"k{index:02d}": (index, old, note)
+                  for index, old, note in failing
+              }
+              fresh_by_id = {
+                  str(new.get("replace_clip_id", "")): new for new in fresh
+              }
+              if set(fresh_by_id) != set(expected_replacements):
+                  stopped = "replan did not identify each replacement clip exactly once"
+                  break
+              candidate = list(selection["shots"])
+              for clip_id, (index, _, _) in expected_replacements.items():
+                  new = fresh_by_id[clip_id]
+                  candidate[index] = new
+              sequence_notes = sequence_disagreements(candidate)
+              if sequence_notes:
+                  # One paid retry with the structural fault made explicit.
+                  # Shipping a repeated window is worse than keeping the last
+                  # reviewed cut, but a single correction usually resolves it.
+                  try:
+                      ledger.check()
+                      replanned, usage = replan_shots(
+                          failing,
+                          material,
+                          direction,
+                          brief=brief,
+                          context=(
+                              sequence_context
+                              + "\n\n上次替換不可接受："
+                              + "；".join(sequence_notes)
+                          ),
+                          cache=cache,
+                          client=client,
+                          ledger=ledger,
+                      )
+                  except BudgetSpent as error:
+                      stopped = str(error)
+                      break
+                  fresh = replanned.get("shots", [])
+                  if len(fresh) != len(failing):
+                      stopped = "sequence repair returned the wrong shot count"
+                      break
+                  fresh_by_id = {
+                      str(new.get("replace_clip_id", "")): new for new in fresh
+                  }
+                  if set(fresh_by_id) != set(expected_replacements):
+                      stopped = "sequence repair did not identify every clip"
+                      break
+                  candidate = list(selection["shots"])
+                  for clip_id, (index, _, _) in expected_replacements.items():
+                      new = fresh_by_id[clip_id]
+                      candidate[index] = new
+                  sequence_notes = sequence_disagreements(candidate)
+                  if sequence_notes:
+                      stopped = "replan repeated an adjacent source window twice"
+                      disagreed.extend(sequence_notes)
+                      report.plan_disagreements.extend(sequence_notes)
+                      break
+              for clip_id, (index, old, _) in expected_replacements.items():
+                  new = fresh_by_id[clip_id]
                   print(
                       f"  replan k{index:02d}: {old['source_id']} "
                       f"{move_of_shot(old)} → {new['source_id']} "
@@ -964,8 +1057,8 @@ def command_render(args: argparse.Namespace) -> int:
                   selection["shots"][index] = new
               for note in replanned.get("frame_disagreements") or []:
                   print(f"  {note}", flush=True)
-              report.plan_disagreements.extend(
-                  replanned.get("frame_disagreements") or []
+              disagreed.extend(
+                  (replanned.get("frame_disagreements") or []) + sequence_notes
               )
               # Everything downstream is rebuilt from the amended selection, so
               # the next round renders a different film rather than re-reading
@@ -988,6 +1081,10 @@ def command_render(args: argparse.Namespace) -> int:
                   stopped = str(error)
                   break
               report.target_seconds = float(direction["target_seconds"])
+              report.plan_disagreements.extend(
+                  note for note in disagreed
+                  if note not in report.plan_disagreements
+              )
           if rounds:
               report.degradations = adjudicate(
                   report.degradations, rounds[-1].verdict, shot_verdicts
@@ -1287,7 +1384,11 @@ def _rhythm_context(
             if shot["source_id"] in cards
             else None
         )
-        entry: dict[str, object] = {"why": shot.get("why", "")}
+        entry: dict[str, object] = {
+            "why": shot.get("why", ""),
+            "camera_intent": shot.get("camera_intent", "hold"),
+            "source_motion": shot.get("source_motion_role", "locked"),
+        }
         if card is not None:
             box = find_subject(card, subject_of(shot))
             if box is not None:
@@ -1433,6 +1534,37 @@ def _write_report(output: Path, **parts) -> None:
         ),
         "shots_following": report.following_shots,
         "shots_held": report.static_shots,
+        "source_motion": report.source_motion,
+        "source_motion_details": report.source_motion_details,
+        "digital_motion": report.digital_motion,
+        "motion": {
+            clip_id: {
+                "source": report.source_motion.get(clip_id, "locked"),
+                "digital": report.digital_motion.get(clip_id, "hold"),
+                "composite": (
+                    "stacked"
+                    if report.source_motion.get(clip_id, "locked") != "locked"
+                    and report.digital_motion.get(clip_id, "hold") != "hold"
+                    else "source_only"
+                    if report.source_motion.get(clip_id, "locked") != "locked"
+                    else "digital_only"
+                    if report.digital_motion.get(clip_id, "hold") != "hold"
+                    else "still"
+                ),
+                "camera_intent": (
+                    parts["selection"]["shots"][int(clip_id[1:])].get(
+                        "camera_intent", "hold"
+                    )
+                    if clip_id.startswith("k")
+                    and clip_id[1:].isdigit()
+                    and int(clip_id[1:]) < len(parts["selection"]["shots"])
+                    else "hold"
+                ),
+            }
+            for clip_id in sorted(
+                set(report.source_motion) | set(report.digital_motion)
+            )
+        },
         "upscales": {k: round(v, 3) for k, v in report.upscales.items()},
         "subject_notes": report.subject_notes,
         "plan_disagreements": report.plan_disagreements,
@@ -1461,6 +1593,10 @@ def _write_report(output: Path, **parts) -> None:
         "duration_shortfall_seconds": report.duration_shortfall,
         "moves_too_short": report.moves_too_short,
         "spend": report.spend(),
+        "spend_all_attempts": (
+            report.ledger.cumulative_summary()
+            if report.ledger is not None else report.spend()
+        ),
         "cut_on_action": parts.get("snaps", {}),
         "set_aside": parts.get("set_aside", {}),
         # Everything that was on the table. Without it there is no way to

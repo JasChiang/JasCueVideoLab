@@ -692,6 +692,8 @@ def create_app() -> FastAPI:
         shots = report.get("selection", {}).get("shots", [])
         rhythm = report.get("rhythm", {})
         verdicts = report.get("shots", {})
+        motion = report.get("motion", {})
+        source_motion_details = report.get("source_motion_details", {})
 
         found: dict[str, float] = {}
         crops: dict[str, list] = {}
@@ -788,6 +790,8 @@ def create_app() -> FastAPI:
                 "source_seconds": round(found[source_id], 3),
                 "subject": subject_of(shot),
                 "camera_move": move_of_shot(shot),
+                "motion": motion.get(key, {}),
+                "source_motion_details": source_motion_details.get(key, {}),
                 # Every stop, not only the first. A shot that settles on
                 # three watches in turn was showing one name and the word
                 # "pan", in the panel whose job is saying what was planned.

@@ -97,6 +97,48 @@ MOVE_FLOORS: dict[str, float] = {
     move.name: move.min_seconds for move in CAMERA_MOVES
 }
 
+# The editorial question is richer than the five physical crop labels above.
+# A source pan and a digital pan can look alike to the viewer while asking the
+# executor to do opposite things; a comparison and a reveal can use the same
+# two endpoints while carrying different timing.  Selection chooses one of
+# these intentions first, then writes semantic looks.  Local code still owns
+# coordinates, axes, easing and feasibility.
+CAMERA_INTENTS: tuple[tuple[str, str], ...] = (
+    ("hold", "固定數位裁切，讓一個已成立的構圖停住。"),
+    (
+        "use_source_motion",
+        "素材自己的 authored／subject-follow 運鏡已完成揭示；數位框固定，讓原生運鏡演完。",
+    ),
+    (
+        "follow_subject",
+        "主體在可用片段內移動，數位框持續跟住它；只需一個主體落點。",
+    ),
+    (
+        "reveal",
+        "從一個落點走到另一個落點，後者是這顆要揭示的答案。",
+    ),
+    (
+        "compare",
+        "在兩個以上主體間移動，讓觀眾比較它們，而不是只抵達最後一個。",
+    ),
+    (
+        "push_in",
+        "同一主體由較鬆 framing 收到較緊 framing，走向細節。",
+    ),
+    (
+        "pull_out",
+        "同一主體由較緊 framing 退到較鬆 framing，交代脈絡。",
+    ),
+    (
+        "multi_stop",
+        "三個以上落點依序停住，逐一介紹一列物件或一串資訊。",
+    ),
+)
+
+CAMERA_INTENT_NAMES: tuple[str, ...] = tuple(
+    name for name, _ in CAMERA_INTENTS
+)
+
 # Where the subject sits when it does not fill the output ratio.
 #
 # A subject small in a clean frame is a composition, not a shortfall. Product
@@ -135,18 +177,18 @@ def describe_for_prompt() -> str:
     """
 
     lines = [
-        "一顆鏡頭 = 一串「畫面停在哪裡」的清單（`looks`），照順序走。",
+        "先選 `camera_intent`，再用 `looks` 說落點：",
+    ]
+    lines.extend(f"- `{name}`：{when}" for name, when in CAMERA_INTENTS)
+    lines += [
         "",
-        "- **一個落點**：停在它上面不動。",
-        "- **兩個落點**：從第一個帶到第二個。",
-        "- **三個以上**：中途停下來，一個一個看過去。",
-        "- **兩個落點指向同一個東西、但 framing 不同**：那就是推近"
-        "（`thirds` → `fill`）；反過來寫就是拉遠。",
+        "意圖是剪輯判斷，looks 是它的語意路徑：hold／use_source_motion／"
+        "follow_subject 用一個落點；reveal／compare 用兩個以上不同落點；"
+        "push_in／pull_out 用同一主體兩次但 framing 一鬆一緊；multi_stop "
+        "用三個以上落點。",
         "",
-        "沒有另外一個「運鏡」欄位要選。以前叫做定住、橫搖、直搖、推近、"
-        "拉遠的那些，現在都只是一串落點碰巧長成的樣子——本機會判斷它變成"
-        "了哪一種並記錄下來。上下還是左右也不用你講，量了兩個落點在哪裡"
-        "就知道了。",
+        "本機會量落點後決定實際沿水平或垂直方向移動。不要填座標，也不要"
+        "把原素材的運鏡和數位裁切混成一件事。",
         "",
         "本機負責的是：每個落點實際在畫面的哪個位置、鏡頭走多快、"
         "兩端跟中途各停多久才算真的停下來、以及走不完的時候照實回報。"
