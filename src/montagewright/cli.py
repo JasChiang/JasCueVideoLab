@@ -628,7 +628,29 @@ def command_render(args: argparse.Namespace) -> int:
         for source_id, why in list(set_aside.items())[:5]:
             print(f"  {source_id} — {why[:110]}", flush=True)
 
-    brief = args.brief.read_text(encoding="utf-8") if args.brief else ""
+    from montagewright.brief import load_brief
+
+    brief_document = load_brief(args.brief)
+    # The copy manifest is data for the graphics track, not instructions to
+    # the edit planner. The creative prose keeps the exact legacy behaviour
+    # when no manifest exists.
+    brief = brief_document.creative_brief
+    if brief_document.approved_copy:
+        approved_copy = work / "approved-copy.json"
+        approved_copy.write_text(
+            json.dumps({
+                "brief_sha256": brief_document.sha256,
+                "facts": [
+                    fact.model_dump(mode="json")
+                    for fact in brief_document.approved_copy
+                ],
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        # A reused run directory must not retain copy approval from an older
+        # brief after the fenced manifest has been removed.
+        (work / "approved-copy.json").unlink(missing_ok=True)
     # What was decided has to be keyed on everything it was decided from.
     # This was source ids, brief, aspect and the music path -- so a card
     # rewritten with better segments, a span boundary moved, or a schema
@@ -1647,6 +1669,7 @@ def _write_report(output: Path, **parts) -> None:
         },
         "upscales": {k: round(v, 3) for k, v in report.upscales.items()},
         "subject_notes": report.subject_notes,
+        "subject_tracks": report.subject_tracks,
         "plan_disagreements": report.plan_disagreements,
         "degradations": [
             {

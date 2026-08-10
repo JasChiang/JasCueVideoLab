@@ -247,6 +247,14 @@
   .cue-row .who {
     grid-column: 2; font-size: 11px; color: var(--dim);
   }
+  .graphic-row {
+    padding: 9px 8px; border: 1px solid transparent; border-radius: 8px;
+    cursor: pointer; display: grid; grid-template-columns: 1fr auto; gap: 4px 8px;
+  }
+  .graphic-row:hover { background: var(--sunk); }
+  .graphic-row.on { background: var(--sunk); border-color: var(--accent); }
+  .graphic-row .graphic-copy { font-size: 13px; font-weight: 600; }
+  .graphic-row .graphic-meta { grid-column: 1 / -1; font-size: 10.5px; color: var(--dim); }
   /* A narrow column: the head of a shot wraps instead of overflowing. */
   .browser .shotcard .head { gap: 6px 10px; }
   .browser .shotcard .subject { flex-basis: 100%; }
@@ -309,6 +317,24 @@
       0 0 3px rgba(0,0,0,.9), 0 0 3px rgba(0,0,0,.9),
       1px 1px 0 rgba(0,0,0,.85), -1px -1px 0 rgba(0,0,0,.85),
       1px -1px 0 rgba(0,0,0,.85), -1px 1px 0 rgba(0,0,0,.85);
+  }
+  .graphic-preview {
+    position: absolute; z-index: 3; pointer-events: none; box-sizing: border-box;
+    max-width: 72%; color: white; line-height: 1.05;
+    filter: drop-shadow(0 2px 8px rgba(0,0,0,.45));
+  }
+  .graphic-preview.plate {
+    background: rgba(17,19,24,.82); border-radius: 10px; padding: 10px 14px;
+  }
+  .graphic-preview .gp-rule { width: 18%; height: 3px; background: #ffd65a; margin-bottom: 8px; }
+  .graphic-preview .gp-primary { font-weight: 850; letter-spacing: -.035em; }
+  .graphic-preview .gp-secondary { margin-top: 6px; opacity: .82; font-size: .45em; line-height: 1.2; }
+  .graphic-preview.center { text-align: center; }
+  .copy-bank { margin: 8px 0 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .copy-chip {
+    max-width: 100%; border: 1px solid var(--line); border-radius: 999px;
+    background: var(--sunk); color: var(--ink); padding: 4px 9px; cursor: pointer;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
 
   .cropbox {
@@ -629,6 +655,17 @@
   .lane.silent { background: var(--sunk); }
   .lane.silent .name { color: color-mix(in srgb, var(--dim) 60%, transparent); }
   .lane.subs { height: 44px; }
+  .lane.graphics { height: 38px; }
+  .graphic-block {
+    position: absolute; top: 5px; height: 27px; padding: 3px 7px;
+    box-sizing: border-box; overflow: hidden; white-space: nowrap;
+    text-overflow: ellipsis; border-radius: 4px; cursor: pointer;
+    color: var(--ink); background: color-mix(in srgb, var(--accent) 17%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--line));
+    font-size: 11px;
+  }
+  .graphic-block.draft { border-style: dashed; opacity: .72; }
+  .graphic-block.on { box-shadow: inset 0 0 0 1px var(--accent); }
   /* Every other lane draws a waveform behind its name. This one draws
      opaque blocks, and the first line of a cut usually starts at zero. */
   .lane.subs .name { top: -1px; left: 0; border-radius: 0 3px 3px 0; z-index: 9; }
@@ -845,6 +882,7 @@
     <div class="browser">
       <div class="tabs">
         <button class="tab on" data-pane="pane-shots">鏡頭</button>
+        <button class="tab" data-pane="pane-graphics">字卡</button>
         <button class="tab" data-pane="pane-subs">字幕</button>
         <button class="tab" data-pane="pane-tx">逐字稿</button>
         <button class="tab" data-pane="pane-aside">沒用的</button>
@@ -854,6 +892,17 @@
         <div class="pane" id="pane-shots">
           <p class="sub">點一顆會跳到時間軸上那一段。</p>
           <div class="scroll"><div id="shot-list"></div></div>
+        </div>
+        <div class="pane hide" id="pane-graphics">
+          <div class="subbar">
+            <button class="ghost" id="graphic-add">＋ 字卡</button>
+            <button class="ghost" id="graphic-del">刪除</button>
+            <span class="grow"></span>
+            <span class="why" id="graphic-count"></span>
+          </div>
+          <p class="sub">字卡是獨立圖層；自動位置會看多幀留白，已有 SAM 軌跡時也會納入主體範圍。</p>
+          <div class="copy-bank" id="graphic-copy-bank"></div>
+          <div class="scroll"><div id="graphic-list"></div></div>
         </div>
         <div class="pane hide" id="pane-subs">
           <div class="subbar">
@@ -900,6 +949,7 @@
             <video id="raw-next" playsinline muted preload="auto" class="waiting"></video>
           </div>
           <div class="cropbox hide" id="cropbox"></div>
+          <div class="graphic-preview hide" id="graphic-preview"></div>
           <div class="burnt hide" id="burnt"></div>
         </div>
         <div class="warn hide" id="crop-warn">這一輪沒有留下裁切紀錄，框是事後從素材卡重算的，不等於實際裁切</div>
@@ -916,6 +966,7 @@
     <aside class="side">
       <div class="head" id="ins-head"><span class="who">這一顆</span></div>
       <div class="body" id="inspector"></div>
+      <div class="body hide" id="graphic-inspector"></div>
       <div class="body hide" id="cue-inspector"></div>
     </aside>
   </div>
@@ -938,6 +989,8 @@
       <div class="reel" id="reel">
         <div class="ruler" id="ruler"></div>
         <div class="track" id="track"></div>
+        <div class="lane graphics" id="lane-graphics"
+             title="點字卡在右邊調整"><span class="name">字卡</span></div>
         <div class="lane subs" id="lane-subs"
              title="點一句在右邊改，雙擊跳到字幕清單"><span class="name">字幕</span></div>
         <div class="lane" id="lane-voice"><span class="name">人聲</span></div>
@@ -1275,7 +1328,9 @@ let cropsAre = 'recorded';
 function inspect(i) {
   // Choosing a shot is choosing away from a caption.
   cue = -1;
+  graphicPicked = -1;
   $('cue-inspector').classList.add('hide');
+  $('graphic-inspector').classList.add('hide');
   $('inspector').classList.remove('hide');
   $('ins-head').querySelector('.who').textContent = '這一顆';
   const b = blocks[i];
@@ -1391,6 +1446,7 @@ async function showStrip() {
   // button lit over an empty player.
   if (peeking) peek(true);
   loadSubs();
+  loadGraphics();
   loadFonts(runId);
   requestAnimationFrame(() => {
     const needs = reelNeeds();
@@ -1535,6 +1591,410 @@ function showBurnt() {
     `${holder.bottom - shown.bottom + shown.height * safeArea.up_from_bottom}px`;
   box.style.top = 'auto';
 }
+
+// Editorial graphics are not subtitles. They have their own copy provenance,
+// templates, motion and approval state, but use the same editing gestures.
+let graphicsPlan = { version: 'montagewright-graphics-v1', brand: {}, facts: [], cues: [] };
+let graphics = [], graphicTemplates = [], graphicPicked = -1;
+let graphicResolvedLayout = {};
+
+function graphicText(cue, which = 'primary') {
+  const id = which === 'primary' ? cue.primary_fact_id : cue.secondary_fact_id;
+  const fact = (graphicsPlan.facts || []).find(one => one.fact_id === id);
+  return fact?.exact_text || '';
+}
+
+async function loadGraphics() {
+  try {
+    const got = await fetch(`/api/runs/${runId}/graphics-track`);
+    if (!got.ok) throw new Error('no graphics track');
+    const data = await got.json();
+    graphicsPlan = {
+      version: data.version,
+      brand: data.brand || {}, facts: data.facts || [], cues: data.cues || [],
+    };
+    graphics = data.resolved || [];
+    graphicTemplates = data.templates || [];
+    graphicResolvedLayout = data.layout || {};
+  } catch (error) {
+    graphicsPlan = { version: 'montagewright-graphics-v1', brand: {}, facts: [], cues: [] };
+    graphics = []; graphicTemplates = []; graphicResolvedLayout = {};
+  }
+  paintGraphics(); paintGraphicList(); showGraphicPreview();
+}
+
+function paintGraphics() {
+  const lane = $('lane-graphics');
+  if (!lane) return;
+  lane.classList.toggle('silent', !graphics.length);
+  lane.innerHTML = '<span class="name">字卡</span>' + graphics.map((one, i) => {
+    const wide = Math.max(18, one.duration_seconds * scale - 2);
+    return `<div class="graphic-block ${one.status === 'draft' ? 'draft' : ''} ${i === graphicPicked ? 'on' : ''}"
+      data-i="${i}" style="left:${one.at_seconds * scale}px;width:${wide}px"
+      title="${esc(one.primary_text)}">${esc(one.primary_text)}</div>`;
+  }).join('');
+  for (const block of lane.querySelectorAll('.graphic-block')) {
+    block.onclick = () => selectGraphic(+block.dataset.i);
+    block.onpointerdown = (event) => dragGraphic(event, +block.dataset.i);
+  }
+}
+
+function dragGraphic(event, index) {
+  if (!(index >= 0 && index < graphicsPlan.cues.length)) return;
+  event.preventDefault();
+  const cue = graphicsPlan.cues[index], block = event.currentTarget;
+  delete graphicResolvedLayout[cue.graphic_id];
+  const startX = event.clientX, startAt = cue.at_seconds;
+  const startDuration = cue.duration_seconds;
+  const edge = event.offsetX < 8 ? 'left'
+    : event.offsetX > block.clientWidth - 8 ? 'right' : 'move';
+  graphicPicked = index;
+  const move = (next) => {
+    const delta = Math.round(((next.clientX - startX) / scale) * 20) / 20;
+    if (edge === 'left') {
+      const end = startAt + startDuration;
+      cue.at_seconds = Math.max(0, Math.min(end - .2, startAt + delta));
+      cue.duration_seconds = end - cue.at_seconds;
+    } else if (edge === 'right') {
+      cue.duration_seconds = Math.max(.2, startDuration + delta);
+    } else cue.at_seconds = Math.max(0, startAt + delta);
+    refreshGraphicsFromPlan();
+  };
+  const up = () => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    selectGraphic(index); saveGraphics();
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up, { once: true });
+}
+
+function paintGraphicList() {
+  const list = $('graphic-list');
+  if (!list) return;
+  const bank = $('graphic-copy-bank');
+  const briefFacts = (graphicsPlan.facts || []).filter(f =>
+    f.approved && f.source_kind === 'brief_exact'
+  );
+  bank.innerHTML = briefFacts.length
+    ? '<span class="why">Brief 指定文字</span>' + briefFacts.map(f =>
+      `<button class="copy-chip" data-fact="${esc(f.fact_id)}" title="用在播放頭">＋ ${esc(f.exact_text)}</button>`
+    ).join('') : '';
+  for (const chip of bank.querySelectorAll('.copy-chip')) {
+    chip.onclick = () => addGraphicAtPlayhead(chip.dataset.fact);
+  }
+  $('graphic-count').textContent = graphics.length ? `${graphics.length} 張` : '';
+  list.innerHTML = graphics.length ? graphics.map((one, i) => `
+    <div class="graphic-row ${i === graphicPicked ? 'on' : ''}" data-i="${i}">
+      <div class="graphic-copy">${esc(one.primary_text)}</div>
+      <span class="tag ${one.status === 'approved' ? 'ok' : ''}">${one.status === 'approved' ? '核准' : '草稿'}</span>
+      <div class="graphic-meta">${esc(one.kind)} · ${one.at_seconds.toFixed(2)}–${(one.at_seconds + one.duration_seconds).toFixed(2)}s · ${esc(one.template)}</div>
+    </div>`).join('') : '<p class="why">還沒有字卡。可在播放頭新增，乾淨母版不會被覆寫。</p>';
+  for (const row of list.querySelectorAll('.graphic-row')) {
+    row.onclick = () => selectGraphic(+row.dataset.i);
+  }
+}
+
+function selectGraphic(i) {
+  if (!(i >= 0 && i < graphics.length)) return;
+  graphicPicked = i; cue = -1;
+  $('video').currentTime = graphics[i].at_seconds + 0.01;
+  $('inspector').classList.add('hide');
+  $('cue-inspector').classList.add('hide');
+  $('graphic-inspector').classList.remove('hide');
+  $('ins-head').querySelector('.who').textContent = '字卡';
+  paintGraphics(); paintGraphicList(); inspectGraphic();
+  movePlayhead(); showGraphicPreview();
+}
+
+function graphicOptions(values, selected) {
+  return values.map(([value, label]) =>
+    `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(label)}</option>`
+  ).join('');
+}
+
+function inspectGraphic() {
+  const one = graphics[graphicPicked], box = $('graphic-inspector');
+  if (!one || !box) return;
+  const templates = graphicTemplates
+    .filter(t => (t.kinds || []).includes(one.kind))
+    .map(t => [t.template_id, t.label]);
+  box.innerHTML = `
+    <textarea id="graphic-primary" class="cue-text" spellcheck="false">${esc(one.primary_text)}</textarea>
+    <textarea id="graphic-secondary" class="cue-text" spellcheck="false" placeholder="第二行，可留空">${esc(one.secondary_text || '')}</textarea>
+    <section class="ins-part"><h4>內容與時間</h4><div class="pairs">
+      <span>類型</span><select id="graphic-kind" class="wide">${graphicOptions([
+        ['opening_title','開場主標'],['chapter','章節'],['product_name','產品名'],
+        ['feature','功能／規格'],['callout','重點標註'],['end_card','結尾卡']
+      ], one.kind)}</select>
+      <span>開始</span><input id="graphic-at" value="${stamp(one.at_seconds)}">
+      <span>結束</span><input id="graphic-until" value="${stamp(one.at_seconds + one.duration_seconds)}">
+      <span>狀態</span><select id="graphic-status" class="wide">${graphicOptions([
+        ['draft','草稿，不輸出'],['approved','核准並輸出']
+      ], one.status)}</select>
+    </div></section>
+    <section class="ins-part"><h4>設計</h4><div class="pairs">
+      <span>模板</span><select id="graphic-template" class="wide">${graphicOptions(templates, one.template)}</select>
+      <span>位置</span><select id="graphic-position" class="wide">${graphicOptions([
+        ['auto','多幀自動'],['top','上方'],['upper_left','左上'],['upper_right','右上'],
+        ['lower_left','左下'],['lower_right','右下'],['center','中央']
+      ], one.position)}</select>
+      <span>構圖</span><select id="graphic-composition" class="wide">${graphicOptions([
+        ['auto','自動判斷'],['negative_space','放在留白'],['avoid_subject','避開主體（需 SAM）'],
+        ['overlap_subject','刻意壓主體'],['foreground_plate','前景底板']
+      ], one.composition)}</select>
+      <span>背景</span><select id="graphic-background" class="wide">${graphicOptions([
+        ['auto','依模板'],['none','透明'],['plate','局部底板']
+      ], one.background)}</select>
+      <span>動畫</span><select id="graphic-motion" class="wide">${graphicOptions([
+        ['none','直接出現'],['fade','淡入淡出'],['rise','向上進場'],
+        ['slide_left','向左進場'],['slide_right','向右進場']
+      ], one.motion)}</select>
+    </div></section>
+    <section class="ins-part"><h4>品牌樣式</h4><div class="pairs">
+      <span>主文字</span><input id="graphic-fg" type="color" value="${esc(graphicsPlan.brand.foreground || '#FFFFFF')}">
+      <span>輔文字</span><input id="graphic-secondary-colour" type="color" value="${esc(graphicsPlan.brand.secondary || '#D9DCE3')}">
+      <span>強調色</span><input id="graphic-accent" type="color" value="${esc(graphicsPlan.brand.accent || '#FFD65A')}">
+      <span>底板色</span><input id="graphic-plate" type="color" value="${esc(graphicsPlan.brand.plate || '#111318')}">
+      <span>底板透明度</span><input id="graphic-plate-alpha" type="range" min="0" max="255" value="${graphicsPlan.brand.plate_alpha ?? 205}">
+    </div></section>
+    <section class="ins-part"><button id="graphic-burn">輸出字卡版</button>
+      <p class="why">輸出為另一支影片，乾淨母版保留。草稿不會被燒入。</p></section>`;
+  for (const id of ['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
+    'graphic-until','graphic-status','graphic-template','graphic-position',
+    'graphic-composition','graphic-background','graphic-motion','graphic-fg',
+    'graphic-secondary-colour','graphic-accent','graphic-plate','graphic-plate-alpha']) {
+    $(id).onchange = updateGraphicFromInspector;
+    $(id).onkeydown = (e) => e.stopPropagation();
+  }
+  $('graphic-burn').onclick = burnGraphics;
+}
+
+function editableGraphicFact(cue, which) {
+  const key = which === 'primary' ? 'primary_fact_id' : 'secondary_fact_id';
+  let fact = graphicsPlan.facts.find(f => f.fact_id === cue[key]);
+  if (!fact || fact.source_kind === 'user') return fact;
+  // A brief/OCR/transcript fact is immutable evidence. Editing its visible
+  // words creates a reviewed UI fact instead of falsifying that evidence or
+  // invalidating its approval digest.
+  const id = `user.${cue.graphic_id}.${which}`;
+  fact = {
+    ...fact, fact_id: id, source_kind: 'user', source_reference: 'web-ui',
+    source_sha256: '', text_sha256: '', approved: false,
+    approved_by: null,
+  };
+  graphicsPlan.facts.push(fact); cue[key] = id;
+  return fact;
+}
+
+function updateGraphicFromInspector(event) {
+  const cue = graphicsPlan.cues[graphicPicked];
+  if (!cue) return;
+  delete graphicResolvedLayout[cue.graphic_id];
+  let textChanged = false;
+  const primaryText = $('graphic-primary').value.trim();
+  const currentPrimary = graphicsPlan.facts.find(f => f.fact_id === cue.primary_fact_id);
+  if (currentPrimary && primaryText !== currentPrimary.exact_text) {
+    const primary = editableGraphicFact(cue, 'primary');
+    if (primary) {
+      primary.exact_text = primaryText; primary.approved = false;
+      primary.approved_by = null; textChanged = true;
+    }
+  }
+  const secondaryText = $('graphic-secondary').value.trim();
+  if (secondaryText) {
+    if (!cue.secondary_fact_id) {
+      cue.secondary_fact_id = `user.${cue.graphic_id}.secondary`;
+      graphicsPlan.facts.push({
+        fact_id: cue.secondary_fact_id, exact_text: secondaryText,
+        source_kind: 'user', source_reference: 'web-ui', confidence: 'certain',
+        approved: false, approved_by: null, allowed_kinds: [],
+        source_sha256: '', text_sha256: '',
+      });
+      textChanged = true;
+    } else {
+      const currentSecondary = graphicsPlan.facts.find(f => f.fact_id === cue.secondary_fact_id);
+      if (currentSecondary && secondaryText !== currentSecondary.exact_text) {
+        const secondary = editableGraphicFact(cue, 'secondary');
+        if (secondary) {
+          secondary.exact_text = secondaryText; secondary.approved = false;
+          secondary.approved_by = null; textChanged = true;
+        }
+      }
+    }
+  } else cue.secondary_fact_id = '';
+  const at = unstamp($('graphic-at').value, cue.at_seconds);
+  const until = unstamp($('graphic-until').value, at + cue.duration_seconds);
+  const kind = $('graphic-kind').value;
+  const status = textChanged ? 'draft' : $('graphic-status').value;
+  if (textChanged) $('graphic-status').value = 'draft';
+  if (status === 'approved') {
+    for (const factId of [cue.primary_fact_id, cue.secondary_fact_id]) {
+      const fact = graphicsPlan.facts.find(one => one.fact_id === factId);
+      if (fact?.source_kind === 'user') {
+        fact.approved = true; fact.approved_by = 'human_review';
+      }
+    }
+  }
+  let template = $('graphic-template').value;
+  if (!graphicTemplates.some(t => t.template_id === template && (t.kinds || []).includes(kind))) {
+    template = graphicTemplates.find(t => (t.kinds || []).includes(kind))?.template_id || template;
+  }
+  Object.assign(cue, {
+    kind, at_seconds: at,
+    duration_seconds: Math.max(.2, until - at), status,
+    template, position: $('graphic-position').value,
+    composition: $('graphic-composition').value,
+    background: $('graphic-background').value, motion: $('graphic-motion').value,
+  });
+  Object.assign(graphicsPlan.brand, {
+    foreground: $('graphic-fg').value.toUpperCase(),
+    secondary: $('graphic-secondary-colour').value.toUpperCase(),
+    accent: $('graphic-accent').value.toUpperCase(),
+    plate: $('graphic-plate').value.toUpperCase(),
+    plate_alpha: +$('graphic-plate-alpha').value,
+  });
+  refreshGraphicsFromPlan(); saveGraphics();
+  if (event?.target?.id === 'graphic-kind') inspectGraphic();
+}
+
+function refreshGraphicsFromPlan() {
+  graphics = graphicsPlan.cues.map(cue => ({
+    ...cue, primary_text: graphicText(cue), secondary_text: graphicText(cue, 'secondary'),
+  }));
+  paintGraphics(); paintGraphicList(); showGraphicPreview();
+}
+
+let graphicsSaving = null, graphicsSavePromise = Promise.resolve(true);
+async function saveGraphicsNow() {
+  clearTimeout(graphicsSaving);
+  graphicsSaving = null;
+  graphicsSavePromise = (async () => {
+    try {
+      const got = await fetch(`/api/runs/${runId}/graphics-track`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(graphicsPlan),
+      });
+      const answer = await got.json();
+      $('strip-note').textContent = got.ok
+        ? (answer.warnings?.length ? `字卡已存；${answer.warnings[0]}` : '字卡已存')
+        : `字卡存不了：${answer.detail || '格式錯誤'}`;
+      return got.ok;
+    } catch (error) {
+      $('strip-note').textContent = `字卡存不了：${error.message}`;
+      return false;
+    }
+  })();
+  return graphicsSavePromise;
+}
+
+function saveGraphics() {
+  clearTimeout(graphicsSaving);
+  graphicsSaving = setTimeout(saveGraphicsNow, 350);
+}
+
+function showGraphicPreview() {
+  const box = $('graphic-preview'), video = $('video');
+  if (!box || !video || peeking || !video.videoWidth) { box?.classList.add('hide'); return; }
+  const at = video.currentTime || 0;
+  const selected = graphics[graphicPicked];
+  const one = selected && at >= selected.at_seconds
+    && at < selected.at_seconds + selected.duration_seconds
+    ? selected
+    : graphics.find(g => g.status === 'approved'
+      && at >= g.at_seconds && at < g.at_seconds + g.duration_seconds);
+  if (!one) { box.classList.add('hide'); return; }
+  const shown = video.getBoundingClientRect(), holder = $('frame').getBoundingClientRect();
+  const positions = {
+    top: [.5,.10], upper_left: [.08,.10], upper_right: [.92,.10],
+    lower_left: [.08,.72], lower_right: [.92,.72], center: [.5,.48],
+  };
+  const template = graphicTemplates.find(t => t.template_id === one.template) || {};
+  const resolved = graphicResolvedLayout[one.graphic_id];
+  const position = one.position === 'auto' ? (template.default_position || 'upper_left') : one.position;
+  const [x,y] = positions[position] || positions.upper_left;
+  box.className = `graphic-preview ${template.plate || resolved?.fallback_plate || one.background === 'plate' || one.composition === 'foreground_plate' ? 'plate' : ''} ${position === 'center' || position === 'top' ? 'center' : ''}`;
+  box.style.color = graphicsPlan.brand.foreground || '#FFFFFF';
+  box.style.backgroundColor = (one.background === 'plate'
+    || template.plate || resolved?.fallback_plate || one.composition === 'foreground_plate')
+    ? `${graphicsPlan.brand.plate || '#111318'}${Math.round((graphicsPlan.brand.plate_alpha ?? 205) / 17).toString(16).repeat(2)}`
+    : 'transparent';
+  box.innerHTML = `${one.template === 'editorial_rule' ? `<div class="gp-rule" style="background:${esc(graphicsPlan.brand.accent || '#FFD65A')}"></div>` : ''}
+    <div class="gp-primary">${esc(one.primary_text)}</div>${one.secondary_text
+      ? `<div class="gp-secondary" style="color:${esc(graphicsPlan.brand.secondary || '#D9DCE3')}">${esc(one.secondary_text)}</div>` : ''}`;
+  box.style.fontSize = `${shown.height * (one.template === 'hero_center' ? .07 : .046)}px`;
+  if (resolved?.frame_width && resolved?.frame_height) {
+    box.style.left = `${shown.left - holder.left + shown.width * resolved.resolved_left / resolved.frame_width}px`;
+    box.style.top = `${shown.top - holder.top + shown.height * resolved.resolved_top / resolved.frame_height}px`;
+    box.style.width = `${shown.width * resolved.card_width / resolved.frame_width}px`;
+    box.style.transform = 'none';
+  } else {
+    box.style.left = `${shown.left - holder.left + shown.width * x}px`;
+    box.style.top = `${shown.top - holder.top + shown.height * y}px`;
+    box.style.width = '';
+    box.style.transform = `translate(${x > .7 ? '-100%' : x > .3 ? '-50%' : '0'}, ${y > .6 ? '-100%' : y > .3 ? '-50%' : '0'})`;
+  }
+  box.classList.remove('hide');
+}
+
+async function burnGraphics() {
+  const button = $('graphic-burn');
+  button.disabled = true; button.textContent = '輸出中…';
+  try {
+    const saved = await saveGraphicsNow();
+    if (!saved) throw new Error('最新字卡尚未存好，已停止輸出');
+    const got = await fetch(`/api/runs/${runId}/burn-graphics`, { method: 'POST' });
+    const answer = await got.json();
+    if (!got.ok) throw new Error(answer.detail || '無法輸出');
+    graphicResolvedLayout = answer.layout || {};
+    showGraphicPreview();
+    $('strip-note').innerHTML = `字卡版完成：${answer.cues} 張　<a class="link" href="/api/runs/${runId}/graphics-burned" download>下載</a>`;
+  } catch (error) { $('strip-note').textContent = `字卡版輸出失敗：${error.message}`; }
+  finally { button.disabled = false; button.textContent = '輸出字卡版'; }
+}
+
+function addGraphicAtPlayhead(approvedFactId = '') {
+  const id = `g${String(graphicsPlan.cues.length).padStart(2, '0')}-${Date.now().toString(36)}`;
+  const factId = approvedFactId || `user.${id}.primary`;
+  if (!approvedFactId) graphicsPlan.facts.push({
+      fact_id: factId, exact_text: '新字卡', source_kind: 'user',
+      source_reference: 'web-ui', source_sha256: '', text_sha256: '',
+      allowed_kinds: [], confidence: 'certain', approved: false,
+      approved_by: null,
+    });
+  const fact = graphicsPlan.facts.find(f => f.fact_id === factId);
+  const allowed = fact?.allowed_kinds || [];
+  const kind = allowed.includes('product_name') ? 'product_name'
+    : allowed.includes('opening_title') ? 'opening_title'
+    : allowed[0] || 'product_name';
+  const template = graphicTemplates.find(t => (t.kinds || []).includes(kind))?.template_id
+    || (kind === 'product_name' ? 'product_plate' : 'editorial_rule');
+  const now = $('video').currentTime || 0;
+  const anchor = blocks.find(block => now >= block.at && now < block.at + block.seconds)
+    || blocks[picked];
+  graphicsPlan.cues.push({
+    graphic_id: id, kind, primary_fact_id: factId,
+    secondary_fact_id: '', anchor_clip_id: anchor?.clip_id || '',
+    anchor_offset_seconds: Math.max(0, now - (anchor?.at || now)), at_seconds: now,
+    duration_seconds: 2.5, template, position: 'auto',
+    composition: 'auto', background: 'auto', motion: 'rise',
+    music_sync: 'none', status: approvedFactId ? 'approved' : 'draft',
+  });
+  refreshGraphicsFromPlan(); graphicPicked = graphics.length - 1;
+  saveGraphics(); selectGraphic(graphicPicked);
+}
+
+$('graphic-add').onclick = () => addGraphicAtPlayhead();
+
+$('graphic-del').onclick = () => {
+  if (!(graphicPicked >= 0 && graphicPicked < graphicsPlan.cues.length)) return;
+  graphicsPlan.cues.splice(graphicPicked, 1);
+  delete graphicResolvedLayout[graphics[graphicPicked]?.graphic_id];
+  const used = new Set(graphicsPlan.cues.flatMap(c => [c.primary_fact_id, c.secondary_fact_id]));
+  graphicsPlan.facts = graphicsPlan.facts.filter(f => f.source_kind !== 'user' || used.has(f.fact_id));
+  graphicPicked = -1; refreshGraphicsFromPlan(); saveGraphics();
+  $('graphic-inspector').classList.add('hide'); $('inspector').classList.remove('hide');
+};
 
 // Which cue the editor is working on. Separate from which one is being
 // spoken: you scrub away to look at something and come back, and the line
@@ -1800,6 +2260,7 @@ function paintStrip() {
     </div>`;
   }).join('');
   wireStrip();
+  paintGraphics();
   paintSubs();
   const changed = JSON.stringify(blocks) !== JSON.stringify(blocksWere);
   $('recut').classList.toggle('hide', !changed);
@@ -2590,7 +3051,7 @@ function movePlayhead() {
 // zoomed reel; this follows the frame.
 function tick() {
   if (!$('video').paused) {
-    movePlayhead(); mirrorRaw(); drawCrop(); showBurnt();
+    movePlayhead(); mirrorRaw(); drawCrop(); showBurnt(); showGraphicPreview();
   }
   requestAnimationFrame(tick);
 }

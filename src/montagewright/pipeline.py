@@ -81,6 +81,10 @@ class Report:
     digital_motion: dict[str, str] = field(default_factory=dict)
     degradations: list[DegradationStep] = field(default_factory=list)
     subject_notes: dict[str, str] = field(default_factory=dict)
+    # Lightweight, durable geometry from reliable SAM tracks. Full masks are
+    # temporary; downstream layout only needs where the subject was in the
+    # source frame at each moment.
+    subject_tracks: dict[str, list[dict]] = field(default_factory=dict)
     # Where a plan contradicted itself, kept rather than printed. These were
     # written to stdout and nowhere else, so the one that mattered -- a shot
     # naming a subject its own window never reaches -- was on screen while
@@ -520,6 +524,17 @@ def _measure_looks(
                         f"SAM tracked {look.at}: {states}"
                     )
                     if kept / total >= TRACK_QUORUM and tracked:
+                        report.subject_tracks.setdefault(
+                            clip.clip_id, []
+                        ).extend({
+                            "seconds": round(one.seconds, 4),
+                            "centre_x": round(one.centre_x, 6),
+                            "centre_y": round(one.centre_y, 6),
+                            "width": round(one.width, 6),
+                            "height": round(one.height, 6),
+                            "subject": look.at,
+                            "source": "sam2.1",
+                        } for one in tracked)
                         walked[look.at] = [
                             (one.seconds, one.centre_x, one.centre_y)
                             for one in tracked
@@ -1311,6 +1326,15 @@ def follow_subjects(
                                 )
                             )
                         elif tracked:
+                            report.subject_tracks[clip.clip_id] = [{
+                                "seconds": round(one.seconds, 4),
+                                "centre_x": round(one.centre_x, 6),
+                                "centre_y": round(one.centre_y, 6),
+                                "width": round(one.width, 6),
+                                "height": round(one.height, 6),
+                                "subject": reframe.subject.description,
+                                "source": "sam2.1",
+                            } for one in tracked]
                             observations = tracked
 
             if wants_tilt:

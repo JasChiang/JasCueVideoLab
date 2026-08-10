@@ -28,6 +28,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -349,6 +350,85 @@ def _safe_area_of(report: dict) -> dict:
         "text_height": area.text_height,
         "max_lines": area.max_lines,
     }
+
+
+def _graphics_layout_evidence(run: Run, plan: Any) -> dict:
+    """Map durable SAM boxes through the delivered crop for a cue window."""
+
+    from montagewright.graphics import LayoutEvidence
+
+    work = run.output / "work"
+    crops_path = work / "crops.json"
+    if not crops_path.exists():
+        return {}
+    try:
+        crops = json.loads(crops_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+    def crop_at(keys: list[dict], seconds: float) -> dict | None:
+        if not keys:
+            return None
+        before, after = keys[0], keys[-1]
+        for left, right in zip(keys, keys[1:]):
+            if float(left["at"]) <= seconds <= float(right["at"]):
+                before, after = left, right
+                break
+        span = float(after["at"]) - float(before["at"])
+        share = 0.0 if span <= 0 else max(
+            0.0, min(1.0, (seconds - float(before["at"])) / span)
+        )
+        return {
+            key: float(before[key]) + (float(after[key]) - float(before[key])) * share
+            for key in ("x", "y", "w", "h")
+        }
+
+    evidence = {}
+    report_tracks = (run.report() or {}).get("subject_tracks", {})
+    for cue in plan.cues:
+        clip_id = cue.anchor_clip_id
+        keys = crops.get(clip_id, [])
+        if not clip_id or not keys:
+            continue
+        durable = report_tracks.get(clip_id, [])
+        if not durable:
+            continue
+        window_start = cue.anchor_offset_seconds
+        window_end = window_start + cue.duration_seconds
+        boxes = []
+        for sample in durable:
+            relative = float(sample.get("seconds", 0))
+            if not window_start - 0.05 <= relative <= window_end + 0.05:
+                continue
+            half_w = float(sample.get("width", 0)) / 2.0
+            half_h = float(sample.get("height", 0)) / 2.0
+            raw = [
+                (float(sample.get("centre_x", 0)) - half_w) * 1000,
+                (float(sample.get("centre_y", 0)) - half_h) * 1000,
+                (float(sample.get("centre_x", 0)) + half_w) * 1000,
+                (float(sample.get("centre_y", 0)) + half_h) * 1000,
+            ]
+            crop = crop_at(keys, relative)
+            if crop is None or crop["w"] <= 0 or crop["h"] <= 0:
+                continue
+            x0, y0, x1, y1 = (float(value) / 1000.0 for value in raw)
+            x0 = max(x0, crop["x"]); y0 = max(y0, crop["y"])
+            x1 = min(x1, crop["x"] + crop["w"])
+            y1 = min(y1, crop["y"] + crop["h"])
+            if x1 <= x0 or y1 <= y0:
+                continue
+            boxes.append((
+                (x0 - crop["x"]) / crop["w"],
+                (y0 - crop["y"]) / crop["h"],
+                (x1 - x0) / crop["w"],
+                (y1 - y0) / crop["h"],
+            ))
+        if boxes:
+            evidence[cue.graphic_id] = LayoutEvidence(
+                subject_boxes=tuple(boxes),
+                source="sam2.1_report_track",
+            )
+    return evidence
 
 
 class _AlreadyHave(Exception):
@@ -1200,6 +1280,213 @@ def create_app() -> FastAPI:
             ],
             "edited": (run.output / "work" / "subtitles.json").exists(),
         })
+
+    @app.get("/api/runs/{run_id}/graphics-track")
+    def graphics_track(run_id: str) -> JSONResponse:
+        """The independent editorial-graphics track and its copy provenance."""
+
+        from montagewright.graphics import GraphicsPlan, templates_for_editor
+
+        run = _run(run_id)
+        source = run.output / "work" / "graphics.json"
+        if source.exists():
+            try:
+                plan = GraphicsPlan.model_validate_json(
+                    source.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as error:
+                raise HTTPException(422, f"graphics plan is unreadable: {error}")
+        else:
+            approved_copy = run.output / "work" / "approved-copy.json"
+            if approved_copy.exists():
+                try:
+                    payload = json.loads(approved_copy.read_text(encoding="utf-8"))
+                    plan = GraphicsPlan(facts=payload.get("facts", []))
+                except (OSError, ValueError, TypeError) as error:
+                    raise HTTPException(
+                        422, f"approved brief copy is unreadable: {error}"
+                    )
+            else:
+                plan = GraphicsPlan()
+        # A brief can gain approved copy after a manual graphics track was
+        # first saved. Keep the copy bank current without overwriting any
+        # cue or persisting until the editor actually saves.
+        approved_copy = run.output / "work" / "approved-copy.json"
+        if approved_copy.exists():
+            try:
+                trusted = json.loads(
+                    approved_copy.read_text(encoding="utf-8")
+                ).get("facts", [])
+                known = {fact.fact_id for fact in plan.facts}
+                plan = GraphicsPlan.model_validate({
+                    **plan.model_dump(mode="json"),
+                    "facts": [
+                        *plan.model_dump(mode="json")["facts"],
+                        *(fact for fact in trusted
+                          if fact.get("fact_id") not in known),
+                    ],
+                })
+            except (OSError, ValueError, TypeError) as error:
+                raise HTTPException(
+                    422, f"approved brief copy is unreadable: {error}"
+                )
+        by_id = {fact.fact_id: fact for fact in plan.facts}
+        layout_path = run.output / "work" / "graphics-render" / "layout.json"
+        try:
+            layout = (
+                json.loads(layout_path.read_text(encoding="utf-8"))
+                if layout_path.exists() else {}
+            )
+        except (OSError, ValueError):
+            layout = {}
+        return JSONResponse({
+            **plan.model_dump(mode="json"),
+            "templates": templates_for_editor(),
+            "layout": layout,
+            "resolved": [
+                {
+                    **cue.model_dump(mode="json"),
+                    "primary_text": by_id[cue.primary_fact_id].exact_text,
+                    "secondary_text": (
+                        by_id[cue.secondary_fact_id].exact_text
+                        if cue.secondary_fact_id else ""
+                    ),
+                }
+                for cue in plan.cues
+            ],
+        })
+
+    @app.put("/api/runs/{run_id}/graphics-track")
+    async def edit_graphics_track(
+        run_id: str, request: Request
+    ) -> JSONResponse:
+        """Save edits immediately; approved copy remains a typed contract."""
+
+        from montagewright.graphics import (
+            CopyFact,
+            GraphicsPlan,
+            validate_brief_authority,
+            validate_for_render,
+        )
+
+        run = _run(run_id)
+        try:
+            plan = GraphicsPlan.model_validate(await request.json())
+        except ValueError as error:
+            raise HTTPException(422, str(error))
+        approved_copy = run.output / "work" / "approved-copy.json"
+        try:
+            authority = (
+                [
+                    CopyFact.model_validate(fact)
+                    for fact in json.loads(
+                        approved_copy.read_text(encoding="utf-8")
+                    ).get("facts", [])
+                ]
+                if approved_copy.exists() else []
+            )
+            validate_brief_authority(plan, authority)
+        except (OSError, ValueError, TypeError) as error:
+            raise HTTPException(422, str(error))
+        source = next(
+            (
+                run.output / name
+                for name in ("deliverable.mp4", "picture.mp4")
+                if (run.output / name).exists()
+            ),
+            None,
+        )
+        duration = probe_duration(source) if source else 0.0
+        warnings = (
+            validate_for_render(plan, duration_seconds=duration)
+            if duration else []
+        )
+        destination = run.output / "work" / "graphics.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            plan.model_dump_json(indent=2), encoding="utf-8"
+        )
+        return JSONResponse({
+            "facts": len(plan.facts), "cues": len(plan.cues),
+            "warnings": warnings,
+        })
+
+    @app.post("/api/runs/{run_id}/burn-graphics")
+    def burn_graphics_track(run_id: str) -> JSONResponse:
+        """Render approved cards over a copy, never over the clean master."""
+
+        from montagewright.graphics import (
+            CopyFact,
+            GraphicsPlan,
+            burn_graphics,
+            validate_brief_authority,
+        )
+
+        run = _run(run_id)
+        stored = run.output / "work" / "graphics.json"
+        if not stored.exists():
+            raise HTTPException(404, "this run has no graphics track")
+        try:
+            plan = GraphicsPlan.model_validate_json(
+                stored.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as error:
+            raise HTTPException(422, str(error))
+        approved_copy = run.output / "work" / "approved-copy.json"
+        try:
+            authority = (
+                [
+                    CopyFact.model_validate(fact)
+                    for fact in json.loads(
+                        approved_copy.read_text(encoding="utf-8")
+                    ).get("facts", [])
+                ]
+                if approved_copy.exists() else []
+            )
+            validate_brief_authority(plan, authority)
+        except (OSError, ValueError, TypeError) as error:
+            raise HTTPException(422, str(error))
+        clean = next(
+            (
+                run.output / name
+                for name in ("deliverable.mp4", "picture.mp4")
+                if (run.output / name).exists()
+            ),
+            None,
+        )
+        if clean is None:
+            raise HTTPException(404, "this run has no finished cut")
+        subtitles = [
+            (line.starts_seconds, line.ends_seconds)
+            for line in _subtitle_lines(run)
+        ]
+        try:
+            made = burn_graphics(
+                clean, plan, run.output / "deliverable-graphics.mp4",
+                work=run.output / "work" / "graphics-render",
+                subtitle_windows=subtitles,
+                layout_evidence=_graphics_layout_evidence(run, plan),
+            )
+        except (RuntimeError, ValueError) as error:
+            raise HTTPException(422, str(error))
+        return JSONResponse({
+            "file": made.name,
+            "cues": sum(cue.status == "approved" for cue in plan.cues),
+            "layout": json.loads(
+                (run.output / "work" / "graphics-render" / "layout.json")
+                .read_text(encoding="utf-8")
+            ),
+        })
+
+    @app.get("/api/runs/{run_id}/graphics-burned")
+    def graphics_burned(run_id: str):
+        run = _run(run_id)
+        made = run.output / "deliverable-graphics.mp4"
+        if not made.exists():
+            raise HTTPException(404, "graphics have not been rendered")
+        return FileResponse(
+            made, media_type="video/mp4", filename=f"{run_id}-graphics.mp4"
+        )
 
     @app.put("/api/runs/{run_id}/subtitle-track")
     async def edit_subtitle_track(run_id: str, request: Request) -> JSONResponse:

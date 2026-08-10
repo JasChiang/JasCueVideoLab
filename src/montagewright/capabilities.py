@@ -221,7 +221,11 @@ def describe_for_prompt() -> str:
 # paid call spent on something no replan can ever fix, and a verdict of
 # "revise" on a cut that was as asked.
 CANNOT: tuple[tuple[str, str], ...] = (
-    ("字卡、標題、下標", "會燒字幕，但沒有其他文字圖層"),
+    (
+        "剪輯規劃階段自動建立字卡",
+        "另有可編輯的 Web 字卡圖層與獨立輸出，但文字必須來自 brief "
+        "核准清單或人工核准，shot replan 不會自行補字卡",
+    ),
     ("轉場特效", "每一次都是硬切；長度與切點是唯一的節奏工具"),
     ("調色與濾鏡", "畫面只做裁切、縮放與響度處理"),
     ("速度變化", "沒有慢動作或加速"),
