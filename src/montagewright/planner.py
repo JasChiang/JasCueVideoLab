@@ -1449,8 +1449,16 @@ def _selection_schema(
         "properties": {
             "shots": {
                 "type": "array",
-                **({"minItems": min_shots} if min_shots else {}),
-                **({"maxItems": max_shots} if max_shots else {}),
+                # With the large span enum and nested looks, a 26–34 item
+                # grammar crossed the Interactions API's schema-complexity
+                # ceiling and the server rejected the request with a bare
+                # 400. State density here and validate it on receipt instead
+                # of compiling the count into the grammar.
+                "description": (
+                    f"Return {min_shots} to {max_shots} shots."
+                    if min_shots is not None and max_shots is not None
+                    else "The ordered shots in the cut."
+                ),
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -1742,6 +1750,15 @@ def select_shots(
         budget_stage="selection",
     )
     chosen = _parse(interaction, what="selection pass")
+    shot_count = len(chosen.get("shots") or [])
+    if (
+        (min_shots is not None and shot_count < min_shots)
+        or (max_shots is not None and shot_count > max_shots)
+    ):
+        raise PlannerError(
+            f"selection returned {shot_count} shots; direction requires "
+            f"{min_shots}–{max_shots}"
+        )
     expand_spans(
         chosen, offered,
         source_motion={item.source_id: item.camera_motion for item in usable},

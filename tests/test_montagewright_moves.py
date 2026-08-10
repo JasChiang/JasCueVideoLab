@@ -4822,8 +4822,8 @@ def test_direction_owns_shot_density_and_selection_enforces_a_range():
         [f"C{i}:s00" for i in range(74)],
         min_shots=lower, max_shots=upper,
     )["properties"]["shots"]
-    assert shots["minItems"] == 26
-    assert shots["maxItems"] == 34
+    assert "26 to 34" in shots["description"]
+    assert "minItems" not in shots and "maxItems" not in shots
 
 
 def test_overlapping_adjacent_windows_of_one_span_are_reported():
