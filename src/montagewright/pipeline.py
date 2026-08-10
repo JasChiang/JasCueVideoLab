@@ -182,15 +182,19 @@ def _afford(report: "Report") -> None:
 
 
 def _charge(report: "Report", stage: str, usage: Usage) -> None:
-    """Book a call against both the token tally and the stage ledger."""
+    """Keep the report's token tally; ``ask`` settles the stage ledger."""
 
     report.usages.append(usage)
-    if report.ledger is not None:
-        report.ledger.record(
-            stage,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens + usage.thought_tokens,
-        )
+
+
+def _locate_subject(frames, description, *, client, report):
+    """Keep test/offline callers free of a keyword only live runs need."""
+
+    if report.ledger is None:
+        return locate_subject(frames, description, client=client)
+    return locate_subject(
+        frames, description, client=client, ledger=report.ledger
+    )
 
 
 # What a file is does not change while it sits there, and reading it costs
@@ -352,7 +356,9 @@ def _measure_looks(
     for look in looks:
         if look.at not in seen:
             _afford(report)
-            boxes, usage = locate_subject(frames, look.at, client=client)
+            boxes, usage = _locate_subject(
+                frames, look.at, client=client, report=report
+            )
             _charge(report, "subject", usage)
             found = [
                 one for one in boxes
@@ -808,8 +814,9 @@ def follow_subjects(
                         work,
                     )
                     _afford(report)
-                    boxes, usage = locate_subject(
-                        frames, reframe.subject.description, client=client
+                    boxes, usage = _locate_subject(
+                        frames, reframe.subject.description, client=client,
+                        report=report,
                     )
                     _charge(report, "subject", usage)
                     middles = [
@@ -951,8 +958,9 @@ def follow_subjects(
                             work,
                         )
                         _afford(report)
-                        boxes, usage = locate_subject(
-                            frames, reframe.subject.description, client=client
+                        boxes, usage = _locate_subject(
+                            frames, reframe.subject.description, client=client,
+                            report=report,
                         )
                         _charge(report, "subject", usage)
                         present = [
@@ -1032,8 +1040,9 @@ def follow_subjects(
                     source, clip.approx_in_seconds, clip.approx_out_seconds, work
                 )
                 _afford(report)
-                boxes, usage = locate_subject(
-                    frames, reframe.subject.description, client=client
+                boxes, usage = _locate_subject(
+                    frames, reframe.subject.description, client=client,
+                    report=report,
                 )
                 _charge(report, "subject", usage)
 
@@ -1264,6 +1273,7 @@ def run(
             music=music,
             target_seconds=target_seconds,
             client=client,
+            ledger=ledger,
         )
         _charge(report, "rhythm", usage)
 

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from montagewright.capabilities import describe_limits_for_prompt
+from montagewright.gemini import structured_json
 from montagewright.cost import BudgetSpent, Ledger
 from montagewright.planner import ask
 from montagewright.schema import looks_of, move_of_shot, must_be_whole_of, DegradationStep, Issue, ReviewVerdict
@@ -182,21 +183,13 @@ def review_cut(
             },
         ],
         generation_config={"thinking_level": "high", "max_output_tokens": MAX_OUTPUT_TOKENS},
-        response_format={
-            "mime_type": "application/json",
-            "schema": _verdict_schema(),
-        },
+        response_format=structured_json(_verdict_schema()),
+        ledger=ledger,
+        budget_stage="review",
     )
     from montagewright.planner import Usage, _parse
 
     payload = _parse(interaction, what="review")
-    if ledger is not None:
-        usage = Usage.from_interaction(interaction)
-        ledger.record(
-            "review",
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens + usage.thought_tokens,
-        )
     # A point in the finished film, so it comes back as a clock reading and
     # is resolved here rather than by the model that has to write it.
     from montagewright.spans import seconds_of
@@ -353,21 +346,15 @@ def review_shots(
             "thinking_level": "high",
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        response_format={
-            "mime_type": "application/json",
-            "schema": _shot_schema([clip_id for clip_id, _ in sent]),
-        },
+        response_format=structured_json(
+            _shot_schema([clip_id for clip_id, _ in sent])
+        ),
+        ledger=ledger,
+        budget_stage="shot_review",
     )
     from montagewright.planner import Usage, _parse
 
     payload = _parse(interaction, what="shot review")
-    if ledger is not None:
-        usage = Usage.from_interaction(interaction)
-        ledger.record(
-            "shot_review",
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens + usage.thought_tokens,
-        )
     return {entry["clip_id"]: entry for entry in payload.get("shots", [])}
 
 

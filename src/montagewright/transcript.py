@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from montagewright.planner import ask
+from montagewright.gemini import structured_json
 from montagewright.uploads import upload_now
 
 # v3: two listenings rather than one. The recogniser's timings never reach
@@ -35,7 +36,7 @@ from montagewright.uploads import upload_now
 # re-encode and gained the recogniser's alternative readings. Each is a
 # different answer to a different question, so none is reused -- unlike a
 # proxy or a card, these are cheap to get again.
-CARD_VERSION = "montagewright-transcript-v3"
+CARD_VERSION = ""  # derived below after both response schemas are defined
 TOOL = Path(__file__).resolve().parents[2] / "tools" / "transcribe" / "transcribe"
 
 # Below this a "word" is usually the recogniser splitting one syllable, and a
@@ -660,6 +661,26 @@ def _schema() -> dict[str, Any]:
     }
 
 
+def _transcript_version() -> str:
+    """Invalidate cached words when either listening contract changes."""
+
+    import hashlib
+
+    prompts = Path(__file__).resolve().parent / "prompts"
+    payload = json.dumps(
+        {"hearing": _hearing_schema(), "correction": _schema()},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    payload += (prompts / "hearing_zh-TW.txt").read_text(encoding="utf-8")
+    payload += (prompts / "transcript_zh-TW.txt").read_text(encoding="utf-8")
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+    return f"montagewright-transcript-{digest}"
+
+
+CARD_VERSION = _transcript_version()
+
+
 def describe(
     source: Path,
     *,
@@ -668,6 +689,7 @@ def describe(
     cache=None,
     model_id: str | None = None,
     audio: Path | None = None,
+    ledger: Any | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Hear it locally, then have the words corrected against the picture.
 
@@ -788,10 +810,9 @@ def describe(
             "thinking_level": "high",
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        response_format={
-            "mime_type": "application/json",
-            "schema": _hearing_schema(),
-        },
+        response_format=structured_json(_hearing_schema()),
+        ledger=ledger,
+        budget_stage="transcript",
     )
     listened = _parse(listening, what="hearing")
     usage = Usage.from_interaction(listening)
@@ -831,10 +852,9 @@ def describe(
             "thinking_level": "high",
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        response_format={
-            "mime_type": "application/json",
-            "schema": _schema(),
-        },
+        response_format=structured_json(_schema()),
+        ledger=ledger,
+        budget_stage="transcript",
     )
     payload = _parse(interaction, what="transcript")
     spent = Usage.from_interaction(interaction)

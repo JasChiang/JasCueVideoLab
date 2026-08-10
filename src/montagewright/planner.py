@@ -27,6 +27,7 @@ from montagewright.capabilities import (
     describe_limits_for_prompt,
 )
 from montagewright.grounding import BeatGrid
+from montagewright.gemini import structured_json
 from montagewright.uploads import UploadCache, upload_now
 from montagewright.schema import EDL, Clip, MusicSync
 
@@ -46,7 +47,7 @@ def _http_options(types):
         timeout=REQUEST_TIMEOUT_MS,
         retry_options=types.HttpRetryOptions(attempts=1),
     )
-MODEL_ID = os.environ.get("MONTAGEWRIGHT_MODEL", "gemini-3.6-flash")
+MODEL_ID = "gemini-3.6-flash"
 
 # 3.6 Flash deprecated the sampling knobs, so consistency comes from the
 # response schema and the instructions rather than from temperature.
@@ -382,7 +383,14 @@ def _is_spend_cap(error: Exception) -> bool:
     return "spend" in said or "spending cap" in said or "billing" in said
 
 
-def ask(client: Any, *, patience_seconds: float | None = None, **request: Any) -> Any:
+def ask(
+    client: Any,
+    *,
+    patience_seconds: float | None = None,
+    ledger: Any | None = None,
+    budget_stage: str | None = None,
+    **request: Any,
+) -> Any:
     """Make one model call, and say what happened in this project's terms.
 
     `patience_seconds` is how long this particular call is worth waiting for.
@@ -411,9 +419,31 @@ def ask(client: Any, *, patience_seconds: float | None = None, **request: Any) -
 
     if patience_seconds is not None:
         request["timeout"] = float(patience_seconds)
+    reservation_id = None
+    if ledger is not None:
+        if not budget_stage:
+            raise ValueError("a budgeted Gemini call needs a stage name")
+        from montagewright.gemini import count_request_tokens
+
+        input_tokens = count_request_tokens(
+            client,
+            model=str(request["model"]),
+            input_value=request.get("input"),
+            response_format=request.get("response_format"),
+        )
+        generation = request.get("generation_config") or {}
+        reservation_id = ledger.reserve(
+            budget_stage,
+            input_tokens=input_tokens,
+            max_output_tokens=int(
+                generation.get("max_output_tokens") or MAX_OUTPUT_TOKENS
+            ),
+        )
     try:
-        return _asked(client).interactions.create(**request)
+        interaction = _asked(client).interactions.create(**request)
     except Exception as error:
+        if reservation_id is not None and ledger is not None:
+            ledger.cancel(reservation_id)
         if _is_spend_cap(error):
             raise BudgetSpent(
                 "the provider's own spending cap stopped this run -- raise "
@@ -421,6 +451,18 @@ def ask(client: Any, *, patience_seconds: float | None = None, **request: Any) -
                 "will be paid for twice"
             ) from error
         raise
+    if reservation_id is not None and ledger is not None:
+        usage = Usage.from_interaction(interaction)
+        raw_usage = getattr(interaction, "usage", None) or {}
+        if not isinstance(raw_usage, dict):
+            raw_usage = getattr(raw_usage, "__dict__", {}) or {}
+        ledger.settle(
+            reservation_id,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens + usage.thought_tokens,
+            cached_tokens=int(raw_usage.get("total_cached_tokens") or 0),
+        )
+    return interaction
 
 
 def upload_music(path: Path, client: Any) -> Any:
@@ -454,6 +496,7 @@ def decide_rhythm(
     music: Path | None = None,
     target_seconds: float = 0.0,
     client: Any | None = None,
+    ledger: Any | None = None,
 ) -> tuple[EDL, Usage]:
     """Return the EDL with each clip's rhythm decided by the model.
 
@@ -537,13 +580,12 @@ def decide_rhythm(
             "thinking_level": THINKING_HIGH,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        "response_format": {
-            "mime_type": "application/json",
-            "schema": _rhythm_schema(clip_ids),
-        },
+        "response_format": structured_json(_rhythm_schema(clip_ids)),
     }
 
-    interaction = ask(client, **request)
+    interaction = ask(
+        client, ledger=ledger, budget_stage="rhythm", **request
+    )
     payload = _parse(interaction, what="rhythm pass")
     decisions = {
         entry["clip_id"]: entry for entry in payload.get("decisions", [])
@@ -786,6 +828,7 @@ def locate_subject(
     subject_description: str,
     *,
     client: Any | None = None,
+    ledger: Any | None = None,
 ) -> tuple[list[dict[str, Any]], Usage]:
     """Ask where a named subject sits in each sampled frame.
 
@@ -828,10 +871,9 @@ def locate_subject(
         store=False,
         input=request_input,
         generation_config={"thinking_level": "low", "max_output_tokens": MAX_OUTPUT_TOKENS},
-        response_format={
-            "mime_type": "application/json",
-            "schema": _subject_schema(len(frames)),
-        },
+        response_format=structured_json(_subject_schema(len(frames))),
+        ledger=ledger,
+        budget_stage="subject",
     )
     payload = _parse(interaction, what="subject pass")
     frames_out = _to_frame_fractions(payload.get("frames", []))
@@ -1214,6 +1256,7 @@ def decide_direction(
     seconds: float = 0.0,
     cache: UploadCache | None = None,
     client: Any | None = None,
+    ledger: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage one: what should this material become.
 
@@ -1266,10 +1309,9 @@ def decide_direction(
             "thinking_level": THINKING_HIGH,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        response_format={
-            "mime_type": "application/json",
-            "schema": _direction_schema(),
-        },
+        response_format=structured_json(_direction_schema()),
+        ledger=ledger,
+        budget_stage="direction",
     )
     decided = _parse(interaction, what="direction pass")
     from montagewright.spans import seconds_of
@@ -1522,6 +1564,7 @@ def select_shots(
     brief: str,
     cache: UploadCache | None = None,
     client: Any | None = None,
+    ledger: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage two: which shots, in what order, and why each one."""
 
@@ -1568,10 +1611,11 @@ def select_shots(
             "thinking_level": THINKING_HIGH,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        response_format={
-            "mime_type": "application/json",
-            "schema": _selection_schema([one.span_id for one in offered]),
-        },
+        response_format=structured_json(
+            _selection_schema([one.span_id for one in offered])
+        ),
+        ledger=ledger,
+        budget_stage="selection",
     )
     chosen = _parse(interaction, what="selection pass")
     expand_spans(chosen, offered)
@@ -1722,6 +1766,7 @@ def replan_shots(
     context: str = "",
     cache: UploadCache | None = None,
     client: Any | None = None,
+    ledger: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Plan the shots that did not deliver, again, from what was seen.
 
@@ -1790,10 +1835,11 @@ def replan_shots(
             "thinking_level": THINKING_HIGH,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        response_format={
-            "mime_type": "application/json",
-            "schema": _selection_schema([one.span_id for one in offered]),
-        },
+        response_format=structured_json(
+            _selection_schema([one.span_id for one in offered])
+        ),
+        ledger=ledger,
+        budget_stage="replan",
     )
     again = _parse(interaction, what="replan pass")
     expand_spans(again, offered)

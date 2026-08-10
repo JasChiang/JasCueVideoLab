@@ -36,8 +36,14 @@ from montagewright.review import (
     should_continue,
 )
 from montagewright.planner import (
+    MAX_OUTPUT_TOKENS,
     MODEL_ID,
+    PROMPTS,
+    THINKING_HIGH,
     MaterialItem,
+    _describe_one,
+    _direction_schema,
+    _selection_schema,
     decide_direction,
     replan_shots,
     select_shots,
@@ -46,6 +52,7 @@ from montagewright.schema import EDL, Clip, move_of_shot, reframe_of, subject_of
 from montagewright.spans import spans_of
 from montagewright.uploads import (
     UploadCache,
+    content_hash,
     default_cache_path,
     default_library,
 )
@@ -415,12 +422,7 @@ def command_render(args: argparse.Namespace) -> int:
     print(f"measuring camera motion across {len(proxies)} clips", flush=True)
     cards, stats = build_library(
         proxies, library / "cards", client=client, cache=cache, progress=wrote,
-        motion_of=motion_of,
-    )
-    ledger.record(
-        "clip_cards",
-        input_tokens=stats["input"],
-        output_tokens=stats["output"],
+        motion_of=motion_of, ledger=ledger,
     )
     print(
         f"cards: {stats['written']} written, {stats['reused']} reused, "
@@ -450,8 +452,6 @@ def command_render(args: argparse.Namespace) -> int:
             flush=True,
         )
         for source_id in speaking:
-            from montagewright.uploads import content_hash
-
             destination = (
                 library / "transcripts"
                 / f"{content_hash(proxies[source_id])[:20]}.json"
@@ -471,6 +471,7 @@ def command_render(args: argparse.Namespace) -> int:
                         # reason to listen to a 64 kbps re-encode of a file
                         # sitting next to it.
                         audio=originals.get(source_id),
+                        ledger=ledger,
                     )
                 except Exception as error:
                     print(
@@ -479,11 +480,6 @@ def command_render(args: argparse.Namespace) -> int:
                         flush=True,
                     )
                     continue
-                ledger.record(
-                    "transcript",
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens + usage.thought_tokens,
-                )
                 save_transcript(card, destination)
             transcripts[source_id] = card
         print(f"  transcribed, running total ${ledger.spent_usd:.4f}", flush=True)
@@ -578,30 +574,37 @@ def command_render(args: argparse.Namespace) -> int:
     # against material that no longer exists in that shape. The card version
     # already moves when the card's shape does, and the span ids move when
     # its answers do; both belong here.
+    # Hash the request the model actually sees, not a hand-picked subset of
+    # fields. This includes card/transcript text through ``_describe_one`` and
+    # the exact proxy bytes through their content hashes.
     catalogue = _asked(*(
         f"{item.source_id}|{CARD_VERSION}|"
+        f"{content_hash(item.proxy) if item.proxy else 'no-proxy'}|"
         + ",".join(
             f"{one.span_id}:{one.starts_seconds:.3f}-{one.ends_seconds:.3f}"
             for one in item.spans
-        )
+        ) + "|"
+        f"{_describe_one(item)}"
         for item in sorted(material, key=lambda one: one.source_id)
     ))
+    music_key = (
+        content_hash(args.music)
+        if args.music is not None and args.music.exists()
+        else "no-music"
+    )
+    direction_contract = _planning_contract(
+        "direction_zh-TW.txt", _direction_schema()
+    )
     asked = _asked(
-        catalogue, brief, args.aspect, str(args.music or ""),
-        f"seconds={args.seconds or 0}",
+        catalogue, brief, args.aspect, music_key,
+        f"seconds={args.seconds or 0}", direction_contract,
     )
     direction = _decided(work, "direction", asked)
     if direction is None:
         ledger.check()
         direction, usage_direction = decide_direction(
             material, brief=brief, aspect=args.aspect, music=args.music,
-            seconds=args.seconds, cache=cache, client=client
-        )
-        ledger.record(
-            "direction",
-            input_tokens=usage_direction.input_tokens,
-            output_tokens=usage_direction.output_tokens
-            + usage_direction.thought_tokens,
+            seconds=args.seconds, cache=cache, client=client, ledger=ledger
         )
         _decide(work, "direction", asked, direction)
     else:
@@ -638,18 +641,26 @@ def command_render(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    chose = _asked(asked, json.dumps(direction, sort_keys=True, ensure_ascii=False))
+    offered_ids = [
+        span.span_id
+        for item in material
+        if item.source_id not in broken
+        for span in item.spans
+    ]
+    selection_contract = _planning_contract(
+        "selection_zh-TW.txt", _selection_schema(offered_ids)
+    )
+    chose = _asked(
+        asked,
+        json.dumps(direction, sort_keys=True, ensure_ascii=False),
+        selection_contract,
+    )
     selection = _decided(work, "selection", chose)
     if selection is None:
         ledger.check()
         selection, usage_selection = select_shots(
-            material, direction, brief=brief, cache=cache, client=client
-        )
-        ledger.record(
-            "selection",
-            input_tokens=usage_selection.input_tokens,
-            output_tokens=usage_selection.output_tokens
-            + usage_selection.thought_tokens,
+            material, direction, brief=brief, cache=cache, client=client,
+            ledger=ledger,
         )
         _decide(work, "selection", chose, selection)
     else:
@@ -931,15 +942,11 @@ def command_render(args: argparse.Namespace) -> int:
                       ),
                       cache=cache,
                       client=client,
+                      ledger=ledger,
                   )
               except BudgetSpent as error:
                   stopped = str(error)
                   break
-              ledger.record(
-                  "replan",
-                  input_tokens=usage.input_tokens,
-                  output_tokens=usage.output_tokens + usage.thought_tokens,
-              )
               fresh = replanned.get("shots", [])
               if len(fresh) != len(failing):
                   stopped = (
@@ -1244,6 +1251,25 @@ def _asked(*parts: str) -> str:
     return hashlib.sha256("\u0000".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
+def _planning_contract(prompt_name: str, schema: dict) -> str:
+    """Everything that gives a planning answer its meaning."""
+
+    from montagewright.capabilities import (
+        describe_for_prompt,
+        describe_limits_for_prompt,
+    )
+
+    prompt = (PROMPTS / prompt_name).read_text(encoding="utf-8")
+    return _asked(
+        MODEL_ID,
+        f"thinking={THINKING_HIGH}|max_output={MAX_OUTPUT_TOKENS}",
+        prompt,
+        json.dumps(schema, ensure_ascii=False, sort_keys=True),
+        describe_for_prompt(),
+        describe_limits_for_prompt(),
+    )
+
+
 def _rhythm_context(
     selection: dict, cards: dict[str, Path]
 ) -> dict[str, dict]:
@@ -1518,12 +1544,8 @@ def command_transcribe(args: argparse.Namespace) -> int:
         card = load(destination)
         if card is None:
             card, usage = describe(
-                proxy, client=client, locale=args.locale, cache=cache
-            )
-            ledger.record(
-                "transcript",
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens + usage.thought_tokens,
+                proxy, client=client, locale=args.locale, cache=cache,
+                ledger=ledger,
             )
             save(card, destination)
         lines = lines_of(card)

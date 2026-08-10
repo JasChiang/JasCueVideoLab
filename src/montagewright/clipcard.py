@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from montagewright.planner import MAX_OUTPUT_TOKENS, ask
+from montagewright.gemini import structured_json
 from montagewright.spans import seconds_of
 
 from montagewright.uploads import upload_now
@@ -749,6 +750,7 @@ def describe_clip(
     model_id: str | None = None,
     thinking: str = "low",
     motion: "list[Any] | None" = None,
+    ledger: Any | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Watch one clip and write its card.
 
@@ -834,10 +836,9 @@ def describe_clip(
             "thinking_level": thinking,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        response_format={
-            "mime_type": "application/json",
-            "schema": card_schema(),
-        },
+        response_format=structured_json(card_schema()),
+        ledger=ledger,
+        budget_stage="clip_cards",
     )
     card = _parse(interaction, what="clip card")
     # The model answers boxes in its native 0..1000 space for some clips
@@ -879,6 +880,7 @@ def build_library(
     model_id: str | None = None,
     progress=None,
     motion_of=None,
+    ledger=None,
 ) -> tuple[dict[str, Path], dict[str, Any]]:
     """Write a card for every asset that does not already have one.
 
@@ -911,6 +913,7 @@ def build_library(
             card, usage = describe_clip(
                 proxy, client=client, cache=cache, model_id=model_id,
                 motion=motion_of(source_id) if motion_of else None,
+                ledger=ledger,
                 # Cutting a take into what survives and what does not is a
                 # judgement -- whether an action finished, whether "again"
                 # was a line or an instruction -- and low turns out to mean
