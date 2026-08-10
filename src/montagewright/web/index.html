@@ -327,15 +327,30 @@
     background: rgba(17,19,24,.82); border-radius: 10px; padding: 10px 14px;
   }
   .graphic-preview .gp-rule { width: 18%; height: 3px; background: #ffd65a; margin-bottom: 8px; }
-  .graphic-preview .gp-primary { font-weight: 850; letter-spacing: -.035em; }
-  .graphic-preview .gp-secondary { margin-top: 6px; opacity: .82; font-size: .45em; line-height: 1.2; }
+  .graphic-preview .gp-primary { font-weight: 850; letter-spacing: -.035em; white-space: pre-line; }
+  .graphic-preview .gp-secondary { margin-top: 6px; opacity: .82; font-size: .45em; line-height: 1.2; white-space: pre-line; }
   .graphic-preview.center { text-align: center; }
-  .copy-bank { margin: 8px 0 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .copy-bank {
+    margin: 8px 0 10px; display: flex; gap: 6px; flex-wrap: wrap;
+    max-height: 48%; overflow: auto;
+  }
   .copy-chip {
     max-width: 100%; border: 1px solid var(--line); border-radius: 999px;
     background: var(--sunk); color: var(--ink); padding: 4px 9px; cursor: pointer;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .brief-candidate {
+    width: 100%; display: grid; grid-template-columns: minmax(0,1fr) auto;
+    gap: 5px 8px; padding: 8px 9px; border: 1px solid var(--line);
+    border-radius: 7px; background: var(--sunk);
+  }
+  .brief-candidate .copy { min-width: 0; white-space: pre-line; }
+  .brief-candidate .copy b { display: block; }
+  .brief-candidate .copy small, .brief-candidate .instruction {
+    color: var(--dim); white-space: pre-line;
+  }
+  .brief-candidate select { max-width: 130px; }
+  .brief-candidate .instruction { grid-column: 1 / -1; font-size: 10.5px; }
 
   .cropbox {
     position: absolute; border: 1.5px solid var(--accent); border-radius: 2px;
@@ -1597,6 +1612,7 @@ function showBurnt() {
 let graphicsPlan = { version: 'montagewright-graphics-v1', brand: {}, facts: [], cues: [] };
 let graphics = [], graphicTemplates = [], graphicPicked = -1;
 let graphicResolvedLayout = {};
+let briefCandidates = [], briefInstructions = [], briefDigest = '';
 
 function graphicText(cue, which = 'primary') {
   const id = which === 'primary' ? cue.primary_fact_id : cue.secondary_fact_id;
@@ -1616,9 +1632,13 @@ async function loadGraphics() {
     graphics = data.resolved || [];
     graphicTemplates = data.templates || [];
     graphicResolvedLayout = data.layout || {};
+    briefCandidates = data.brief_candidates || [];
+    briefInstructions = data.brief_instructions || [];
+    briefDigest = data.brief_sha256 || '';
   } catch (error) {
     graphicsPlan = { version: 'montagewright-graphics-v1', brand: {}, facts: [], cues: [] };
     graphics = []; graphicTemplates = []; graphicResolvedLayout = {};
+    briefCandidates = []; briefInstructions = []; briefDigest = '';
   }
   paintGraphics(); paintGraphicList(); showGraphicPreview();
 }
@@ -1676,12 +1696,30 @@ function paintGraphicList() {
   const briefFacts = (graphicsPlan.facts || []).filter(f =>
     f.approved && f.source_kind === 'brief_exact'
   );
-  bank.innerHTML = briefFacts.length
-    ? '<span class="why">Brief 指定文字</span>' + briefFacts.map(f =>
+  const exact = briefFacts.length
+    ? '<span class="why">Brief 已核准文字</span>' + briefFacts.map(f =>
       `<button class="copy-chip" data-fact="${esc(f.fact_id)}" title="用在播放頭">＋ ${esc(f.exact_text)}</button>`
     ).join('') : '';
+  const candidates = briefCandidates.length
+    ? '<span class="why" style="width:100%">從一般 Brief 找到的候選（加入後仍是草稿）</span>'
+      + briefCandidates.map(candidate => `
+        <div class="brief-candidate" data-candidate="${esc(candidate.candidate_id)}">
+          <div class="copy"><b>${esc(candidate.primary_text)}</b>${candidate.secondary_text
+            ? `<small>${esc(candidate.secondary_text)}</small>` : ''}</div>
+          <div><select class="candidate-variant"><option value="-1">完整版</option>${
+            (candidate.variants || []).map((variant, i) =>
+              `<option value="${i}">${esc(variant.label)}</option>`).join('')
+          }</select> <button class="ghost candidate-add">加入草稿</button></div>
+          ${candidate.instruction ? `<div class="instruction">排版備註：${esc(candidate.instruction)}</div>` : ''}
+        </div>`).join('') : '';
+  bank.innerHTML = exact + candidates;
   for (const chip of bank.querySelectorAll('.copy-chip')) {
     chip.onclick = () => addGraphicAtPlayhead(chip.dataset.fact);
+  }
+  for (const card of bank.querySelectorAll('.brief-candidate')) {
+    card.querySelector('.candidate-add').onclick = () => addBriefCandidate(
+      card.dataset.candidate, +card.querySelector('.candidate-variant').value
+    );
   }
   $('graphic-count').textContent = graphics.length ? `${graphics.length} 張` : '';
   list.innerHTML = graphics.length ? graphics.map((one, i) => `
@@ -1732,6 +1770,7 @@ function inspectGraphic() {
       <span>狀態</span><select id="graphic-status" class="wide">${graphicOptions([
         ['draft','草稿，不輸出'],['approved','核准並輸出']
       ], one.status)}</select>
+      <span>Brief 備註</span><textarea id="graphic-note" class="wide" placeholder="排版或剪輯指示">${esc(one.editor_note || '')}</textarea>
     </div></section>
     <section class="ins-part"><h4>設計</h4><div class="pairs">
       <span>模板</span><select id="graphic-template" class="wide">${graphicOptions(templates, one.template)}</select>
@@ -1761,7 +1800,7 @@ function inspectGraphic() {
     <section class="ins-part"><button id="graphic-burn">輸出字卡版</button>
       <p class="why">輸出為另一支影片，乾淨母版保留。草稿不會被燒入。</p></section>`;
   for (const id of ['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
-    'graphic-until','graphic-status','graphic-template','graphic-position',
+    'graphic-until','graphic-status','graphic-note','graphic-template','graphic-position',
     'graphic-composition','graphic-background','graphic-motion','graphic-fg',
     'graphic-secondary-colour','graphic-accent','graphic-plate','graphic-plate-alpha']) {
     $(id).onchange = updateGraphicFromInspector;
@@ -1781,7 +1820,7 @@ function editableGraphicFact(cue, which) {
   fact = {
     ...fact, fact_id: id, source_kind: 'user', source_reference: 'web-ui',
     source_sha256: '', text_sha256: '', approved: false,
-    approved_by: null,
+    approved_by: null, allowed_kinds: [],
   };
   graphicsPlan.facts.push(fact); cue[key] = id;
   return fact;
@@ -1829,8 +1868,12 @@ function updateGraphicFromInspector(event) {
   const status = textChanged ? 'draft' : $('graphic-status').value;
   if (textChanged) $('graphic-status').value = 'draft';
   if (status === 'approved') {
-    for (const factId of [cue.primary_fact_id, cue.secondary_fact_id]) {
-      const fact = graphicsPlan.facts.find(one => one.fact_id === factId);
+    for (const which of ['primary', 'secondary']) {
+      const key = which === 'primary' ? 'primary_fact_id' : 'secondary_fact_id';
+      let fact = graphicsPlan.facts.find(one => one.fact_id === cue[key]);
+      if (fact && !fact.approved && fact.source_kind !== 'user') {
+        fact = editableGraphicFact(cue, which);
+      }
       if (fact?.source_kind === 'user') {
         fact.approved = true; fact.approved_by = 'human_review';
       }
@@ -1846,6 +1889,7 @@ function updateGraphicFromInspector(event) {
     template, position: $('graphic-position').value,
     composition: $('graphic-composition').value,
     background: $('graphic-background').value, motion: $('graphic-motion').value,
+    editor_note: $('graphic-note').value.trim(),
   });
   Object.assign(graphicsPlan.brand, {
     foreground: $('graphic-fg').value.toUpperCase(),
@@ -1979,6 +2023,39 @@ function addGraphicAtPlayhead(approvedFactId = '') {
     duration_seconds: 2.5, template, position: 'auto',
     composition: 'auto', background: 'auto', motion: 'rise',
     music_sync: 'none', status: approvedFactId ? 'approved' : 'draft',
+  });
+  refreshGraphicsFromPlan(); graphicPicked = graphics.length - 1;
+  saveGraphics(); selectGraphic(graphicPicked);
+}
+
+function addBriefCandidate(candidateId, variantIndex = -1) {
+  const candidate = briefCandidates.find(one => one.candidate_id === candidateId);
+  if (!candidate) return;
+  const variant = variantIndex >= 0 ? (candidate.variants || [])[variantIndex] : null;
+  const primaryText = variant?.primary_text || candidate.primary_text;
+  const secondaryText = variant?.secondary_text ?? candidate.secondary_text;
+  const id = `g${String(graphicsPlan.cues.length).padStart(2, '0')}-${Date.now().toString(36)}`;
+  const primaryId = `candidate.${id}.primary`;
+  const secondaryId = secondaryText ? `candidate.${id}.secondary` : '';
+  const facts = [[primaryId, primaryText], ...(secondaryId ? [[secondaryId, secondaryText]] : [])];
+  for (const [factId, exactText] of facts) graphicsPlan.facts.push({
+    fact_id: factId, exact_text: exactText, source_kind: 'brief_candidate',
+    source_reference: candidate.source_reference, source_sha256: briefDigest,
+    text_sha256: '', allowed_kinds: [candidate.kind], confidence: 'certain',
+    approved: false, approved_by: null,
+  });
+  const now = $('video').currentTime || 0;
+  const anchor = blocks.find(block => now >= block.at && now < block.at + block.seconds)
+    || blocks[picked];
+  const lines = 1 + (secondaryText ? secondaryText.split('\n').length : 0);
+  graphicsPlan.cues.push({
+    graphic_id: id, kind: candidate.kind, primary_fact_id: primaryId,
+    secondary_fact_id: secondaryId, anchor_clip_id: anchor?.clip_id || '',
+    anchor_offset_seconds: Math.max(0, now - (anchor?.at || now)), at_seconds: now,
+    duration_seconds: Math.min(5.5, 2.2 + lines * .45),
+    template: candidate.template, position: candidate.position || 'auto',
+    composition: 'auto', background: 'auto', motion: 'rise',
+    music_sync: 'none', editor_note: candidate.instruction || '', status: 'draft',
   });
   refreshGraphicsFromPlan(); graphicPicked = graphics.length - 1;
   saveGraphics(); selectGraphic(graphicPicked);

@@ -26,7 +26,8 @@ from pydantic import Field, model_validator
 from montagewright.schema import Local
 
 SourceKind = Literal[
-    "user", "brief_exact", "onscreen", "transcript", "model_draft"
+    "user", "brief_exact", "brief_candidate", "onscreen", "transcript",
+    "model_draft",
 ]
 GraphicKind = Literal[
     "opening_title", "chapter", "product_name", "feature", "callout",
@@ -114,6 +115,7 @@ class GraphicCue(Local):
     background: BackgroundTreatment = "auto"
     motion: MotionPreset = "rise"
     music_sync: Literal["none", "accent", "downbeat"] = "none"
+    editor_note: str = Field(default="", max_length=500)
     status: CueStatus = "draft"
 
 
@@ -212,6 +214,18 @@ TEMPLATES: dict[str, TemplateSpec] = {
     "stat_badge": TemplateSpec(
         "stat_badge", "規格徽章", ("feature", "callout"),
         "center", 0.42, 0.060, 0.022, True, default_position="upper_right",
+    ),
+    "center_stack": TemplateSpec(
+        "center_stack", "置中多行", ("opening_title", "chapter", "feature", "end_card"),
+        "center", 0.86, 0.060, 0.034, False, default_position="center",
+    ),
+    "spec_stack": TemplateSpec(
+        "spec_stack", "多行規格", ("product_name", "feature", "callout"),
+        "left", 0.74, 0.048, 0.031, True, default_position="upper_left",
+    ),
+    "end_roster": TemplateSpec(
+        "end_roster", "多行結尾卡", ("end_card",),
+        "center", 0.90, 0.060, 0.029, True, default_position="center",
     ),
 }
 
@@ -325,11 +339,11 @@ def _fit(text: str, *, asked: int, room: int, font_path: str):
     size = asked
     for _ in range(16):
         face = _font(max(12, size), text, font_path)
-        if face.getbbox(text)[2] <= room:
+        if max((face.getbbox(line)[2] for line in text.splitlines()), default=0) <= room:
             return face
         size = round(size * 0.94)
     face = _font(max(12, size), text, font_path)
-    if face.getbbox(text)[2] > room:
+    if max((face.getbbox(line)[2] for line in text.splitlines()), default=0) > room:
         raise ValueError(
             "graphic copy is too long for this one-line template; shorten "
             "it or choose a wider template"
@@ -530,10 +544,23 @@ def draw_graphic(
         )
         if secondary else None
     )
-    title_box = title.getbbox(primary)
+    title_spacing = round(height * 0.009)
+    secondary_spacing = round(height * 0.007)
+    measure = ImageDraw.Draw(Image.new("L", (1, 1)))
+    title_box = measure.multiline_textbbox(
+        (0, 0), primary, font=title, spacing=title_spacing,
+        align=spec.align,
+    )
     title_height = title_box[3] - title_box[1]
     secondary_height = (
-        secondary_face.getbbox(secondary)[3] - secondary_face.getbbox(secondary)[1]
+        measure.multiline_textbbox(
+            (0, 0), secondary, font=secondary_face,
+            spacing=secondary_spacing, align=spec.align,
+        )[3]
+        - measure.multiline_textbbox(
+            (0, 0), secondary, font=secondary_face,
+            spacing=secondary_spacing, align=spec.align,
+        )[1]
         if secondary_face else 0
     )
     gap = round(height * 0.010) if secondary else 0
@@ -558,20 +585,27 @@ def draw_graphic(
             fill=(*_rgb(plan.brand.accent), 255),
         )
     y = pad_y + rule + (round(height * 0.010) if rule else 0)
-    title_width = title.getbbox(primary)[2]
+    title_width = title_box[2] - title_box[0]
     x = (card_width - title_width) // 2 if spec.align == "center" else pad_x
-    pen.text((x, y - title_box[1]), primary, font=title,
-             fill=(*_rgb(plan.brand.foreground), 255))
+    pen.multiline_text(
+        (x - title_box[0], y - title_box[1]), primary, font=title,
+        spacing=title_spacing, align=spec.align,
+        fill=(*_rgb(plan.brand.foreground), 255),
+    )
     y += title_height + gap
     if secondary_face:
-        secondary_box = secondary_face.getbbox(secondary)
-        secondary_width = secondary_box[2]
+        secondary_box = pen.multiline_textbbox(
+            (0, 0), secondary, font=secondary_face,
+            spacing=secondary_spacing, align=spec.align,
+        )
+        secondary_width = secondary_box[2] - secondary_box[0]
         x = (
             (card_width - secondary_width) // 2
             if spec.align == "center" else pad_x
         )
-        pen.text(
-            (x, y - secondary_box[1]), secondary, font=secondary_face,
+        pen.multiline_text(
+            (x - secondary_box[0], y - secondary_box[1]), secondary,
+            font=secondary_face, spacing=secondary_spacing, align=spec.align,
             fill=(*_rgb(plan.brand.secondary), 255),
         )
 

@@ -71,6 +71,40 @@ def test_brief_prose_is_not_approved_screen_copy():
     assert parsed.approved_copy == ()
 
 
+def test_plain_markdown_becomes_unapproved_cards_and_layout_notes():
+    from montagewright.brief import parse_brief_markdown
+
+    parsed = parse_brief_markdown('''# 發表會
+Galaxy Z Fold 系列
+星成員登場
+
+—
+Galaxy Z Fold8 Ultra
+極致進化
+
+串場：兩款手機比較畫面
+
+全系列支援
+Galaxy AI
+Gemini Intelligence
+（可以的話置中三行）
+
+Galaxy Watch Ultra2
+EN13319 國際潛水標準認證
+最深 40 公尺水下環境使用
+（兩行塞不下就用 40m 那個好了）
+''')
+
+    assert parsed.approved_copy == ()
+    assert parsed.candidates[0].kind == "opening_title"
+    assert parsed.candidates[1].primary_text == "Galaxy Z Fold8 Ultra"
+    assert parsed.candidates[2].template == "center_stack"
+    assert parsed.candidates[2].instruction == "可以的話置中三行"
+    assert parsed.candidates[3].variants[0].secondary_text == "40m"
+    assert parsed.instructions[0].kind == "editorial"
+    assert all(candidate.primary_text != "—" for candidate in parsed.candidates)
+
+
 def test_model_copy_cannot_approve_itself():
     with pytest.raises(ValidationError, match="cannot be approved in place"):
         CopyFact(
@@ -186,6 +220,29 @@ def test_graphics_burn_to_a_separate_deliverable(tmp_path: Path):
     assert (tmp_path / "work" / "layout.json").exists()
 
 
+def test_multiline_center_and_end_templates_render(tmp_path: Path):
+    from montagewright.graphics import draw_graphic
+
+    plan = GraphicsPlan(
+        facts=[
+            fact("hero", "全系列支援"),
+            fact("lines", "Galaxy AI\nGemini Intelligence"),
+        ],
+        cues=[cue(
+            kind="feature", primary_fact_id="hero",
+            secondary_fact_id="lines", template="center_stack",
+            position="center",
+        )],
+    )
+
+    made = draw_graphic(
+        plan.cues[0], plan, width=1080, height=1920,
+        into=tmp_path / "three-lines.png",
+    )
+
+    assert made.path.exists() and made.height > 150
+
+
 def test_web_graphics_track_round_trips_approved_copy(tmp_path: Path):
     import json
     import montagewright.webapp as web
@@ -252,6 +309,79 @@ def test_web_graphics_track_starts_with_copy_approved_by_brief(tmp_path: Path):
         assert loaded.status_code == 200
         assert loaded.json()["facts"][0]["exact_text"] == "Galaxy Z Fold8"
         assert loaded.json()["facts"][0]["approved_by"] == "user_brief"
+    finally:
+        web.RUNS_ROOT = was
+        web.RUNS.pop("r1", None)
+
+
+def test_web_graphics_track_exposes_plain_brief_candidates(tmp_path: Path):
+    import json
+    import montagewright.webapp as web
+    from fastapi.testclient import TestClient
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        here = web.RUNS_ROOT / "r1"
+        work = here / "out" / "work"
+        work.mkdir(parents=True)
+        (here / "run.json").write_text(
+            json.dumps({"state": "done", "started_at": 0.0}),
+            encoding="utf-8",
+        )
+        (work / "brief-candidates.json").write_text(json.dumps({
+            "brief_sha256": "abc",
+            "candidates": [{
+                "candidate_id": "brief.p01", "primary_text": "Galaxy AI",
+                "secondary_text": "Gemini Intelligence", "kind": "feature",
+                "template": "center_stack", "position": "center",
+                "instruction": "置中", "source_reference": "/paragraphs/1",
+                "variants": [],
+            }],
+            "instructions": [],
+        }), encoding="utf-8")
+
+        loaded = TestClient(web.create_app()).get(
+            "/api/runs/r1/graphics-track"
+        )
+
+        assert loaded.status_code == 200
+        assert loaded.json()["brief_candidates"][0]["template"] == "center_stack"
+        assert loaded.json()["brief_sha256"] == "abc"
+    finally:
+        web.RUNS_ROOT = was
+        web.RUNS.pop("r1", None)
+
+
+def test_old_web_run_backfills_candidates_from_its_brief_without_gemini(
+    tmp_path: Path,
+):
+    import json
+    import montagewright.webapp as web
+    from fastapi.testclient import TestClient
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        brief = tmp_path / "brief.md"
+        brief.write_text(
+            "Galaxy Z Fold8\n全新比例\n\n串場：比較畫面",
+            encoding="utf-8",
+        )
+        here = web.RUNS_ROOT / "r1"
+        (here / "out" / "work").mkdir(parents=True)
+        (here / "run.json").write_text(json.dumps({
+            "state": "done", "started_at": 0.0,
+            "command": ["montagewright", "--brief", str(brief)],
+        }), encoding="utf-8")
+
+        loaded = TestClient(web.create_app()).get(
+            "/api/runs/r1/graphics-track"
+        )
+
+        assert loaded.status_code == 200
+        assert loaded.json()["brief_candidates"][0]["primary_text"] == "Galaxy Z Fold8"
+        assert loaded.json()["brief_instructions"][0]["kind"] == "editorial"
     finally:
         web.RUNS_ROOT = was
         web.RUNS.pop("r1", None)

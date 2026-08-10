@@ -651,6 +651,16 @@ def command_render(args: argparse.Namespace) -> int:
         # A reused run directory must not retain copy approval from an older
         # brief after the fenced manifest has been removed.
         (work / "approved-copy.json").unlink(missing_ok=True)
+    brief_candidates = work / "brief-candidates.json"
+    if brief_document.candidates or brief_document.instructions:
+        brief_candidates.write_text(
+            json.dumps(
+                brief_document.candidates_json(), ensure_ascii=False, indent=2
+            ),
+            encoding="utf-8",
+        )
+    else:
+        brief_candidates.unlink(missing_ok=True)
     # What was decided has to be keyed on everything it was decided from.
     # This was source ids, brief, aspect and the music path -- so a card
     # rewritten with better segments, a span boundary moved, or a schema

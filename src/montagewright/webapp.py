@@ -1339,10 +1339,41 @@ def create_app() -> FastAPI:
             )
         except (OSError, ValueError):
             layout = {}
+        candidate_path = run.output / "work" / "brief-candidates.json"
+        brief_path = None
+        try:
+            if candidate_path.exists():
+                candidate_data = json.loads(
+                    candidate_path.read_text(encoding="utf-8")
+                )
+            else:
+                brief_path = None
+                for index, argument in enumerate(run.command):
+                    if argument == "--brief" and index + 1 < len(run.command):
+                        brief_path = Path(run.command[index + 1])
+                        break
+                    if argument.startswith("--brief="):
+                        brief_path = Path(argument.split("=", 1)[1])
+                        break
+                if brief_path is not None and brief_path.exists():
+                    from montagewright.brief import load_brief
+
+                    candidate_data = load_brief(brief_path).candidates_json()
+                else:
+                    candidate_data = {
+                        "brief_sha256": "", "candidates": [],
+                        "instructions": [],
+                    }
+        except (OSError, ValueError) as error:
+            raise HTTPException(422, f"brief candidates are unreadable: {error}")
         return JSONResponse({
             **plan.model_dump(mode="json"),
             "templates": templates_for_editor(),
             "layout": layout,
+            "brief_sha256": candidate_data.get("brief_sha256", ""),
+            "brief_source": str(brief_path) if brief_path else "",
+            "brief_candidates": candidate_data.get("candidates", []),
+            "brief_instructions": candidate_data.get("instructions", []),
             "resolved": [
                 {
                     **cue.model_dump(mode="json"),
