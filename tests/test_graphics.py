@@ -13,10 +13,13 @@ from montagewright.graphics import (
     LayoutEvidence,
     burn_graphics,
     compile_graphic,
+    draw_graphic,
+    graphic_preset_defaults,
     minimum_read_seconds,
     validate_for_render,
     validate_brief_authority,
     resolve_auto_position,
+    resolve_graphic_animation,
 )
 
 
@@ -44,6 +47,31 @@ def cue(**changes):
     }
     values.update(changes)
     return GraphicCue(**values)
+
+
+def test_new_surface_payload_uses_documented_auto_contrast_default():
+    assert GraphicStyle(surface="glass").contrast_mode == "auto"
+
+
+@pytest.mark.parametrize("text", [
+    "AAAA\nI", "gypq\nHI", "中文測試\nAg", "I\ngypq\n中文",
+])
+def test_per_line_contrast_masks_exactly_cover_rendered_text(
+    tmp_path: Path, text: str,
+):
+    from PIL import Image, ImageChops
+
+    plan = GraphicsPlan(facts=[fact(text=text)], cues=[cue()])
+    card = draw_graphic(
+        plan.cues[0], plan, width=540, height=960,
+        into=tmp_path / "multiline.png",
+    )
+    combined = Image.open(card.text_mask_path).convert("L")
+    rebuilt = Image.new("L", combined.size, 0)
+    for path in card.text_run_mask_paths:
+        rebuilt = ImageChops.lighter(rebuilt, Image.open(path).convert("L"))
+
+    assert ImageChops.difference(combined, rebuilt).getbbox() is None
 
 
 def test_brief_copy_must_be_verbatim_before_it_is_auto_approved():
@@ -105,6 +133,118 @@ EN13319 國際潛水標準認證
     assert parsed.candidates[3].variants[0].secondary_text == "40m"
     assert parsed.instructions[0].kind == "editorial"
     assert all(candidate.primary_text != "—" for candidate in parsed.candidates)
+
+
+def test_initial_selection_can_place_plain_brief_copy_only_as_a_draft():
+    from montagewright.brief import initial_graphics_plan, parse_brief_markdown
+
+    parsed = parse_brief_markdown("Galaxy Z Fold8 Ultra\n極致進化")
+    candidate = parsed.candidates[0]
+    plan = initial_graphics_plan(
+        parsed,
+        {
+            "covered": [{
+                "goal": "介紹產品",
+                "shot_indexes": [1],
+                "show_as_graphic": True,
+                "graphic_candidate_id": candidate.candidate_id,
+                "graphic_reason": "觀眾需要看到名稱",
+            }],
+        },
+        shot_durations=[2.0, 3.0],
+    )
+
+    assert len(plan.cues) == 1
+    assert plan.cues[0].status == "draft"
+    assert plan.cues[0].anchor_clip_id == "k01"
+    assert plan.cues[0].at_seconds == pytest.approx(2.2)
+    assert all(f.source_kind == "brief_candidate" for f in plan.facts)
+    assert all(not f.approved and f.approved_by is None for f in plan.facts)
+    assert all(f.fact_id.startswith("brief_candidate.") for f in plan.facts)
+
+
+def test_gemini_design_family_remains_freely_composable():
+    from montagewright.brief import initial_graphics_plan, parse_brief_markdown
+
+    parsed = parse_brief_markdown("Galaxy Z Fold8 Ultra\n極致進化")
+    candidate = parsed.candidates[0]
+    plan = initial_graphics_plan(
+        parsed,
+        {"covered": [{
+            "goal": "介紹產品", "shot_indexes": [0],
+            "show_as_graphic": True,
+            "graphic_candidate_id": candidate.candidate_id,
+            "graphic_design_family": "broadcast_info",
+            "graphic_surface": "sticker",
+            "graphic_motion": "fade",
+            "graphic_composition": "overlap_subject",
+            "graphic_shot_index": 0,
+            "graphic_reason": "用資訊條語言，但改成貼紙並刻意疊產品",
+        }]},
+        shot_durations=[3.0],
+    )
+
+    made = plan.cues[0]
+    assert made.style.preset == "broadcast_info"
+    assert made.style.surface == "sticker"
+    assert made.style.primary_color == "#FFFFFF"
+    assert made.motion == "fade"
+    assert made.composition == "overlap_subject"
+    assert made.position == "auto"
+
+
+def test_selection_contract_exposes_family_and_independent_overrides():
+    from montagewright.planner import _selection_schema
+
+    schema = _selection_schema(["s00"], graphic_candidate_ids=["brief.p00"])
+    covered = schema["properties"]["covered"]["items"]
+    required = set(covered["required"])
+    properties = covered["properties"]
+
+    assert {
+        "graphic_design_family", "graphic_surface", "graphic_motion",
+        "graphic_composition", "graphic_shot_index",
+    } <= required
+    assert "broadcast_info" in properties["graphic_design_family"]["enum"]
+    assert "sticker" in properties["graphic_surface"]["enum"]
+    assert "inherit" in properties["graphic_composition"]["enum"]
+    assert "auto" in properties["graphic_composition"]["enum"]
+    assert properties["graphic_candidate_id"]["enum"] == ["none", "brief.p00"]
+
+
+def test_legacy_sparse_metadata_preset_keeps_old_pixels():
+    made = GraphicCue(
+        graphic_id="legacy", kind="callout", primary_fact_id="name",
+        style={"preset": "tech_frame"},
+    )
+
+    assert made.background == "auto"
+    assert made.style.stroke_width == 0
+    assert made.style.preset == "tech_frame"
+
+
+def test_preset_only_api_payload_is_materialised_by_backend():
+    made = GraphicCue(
+        graphic_id="family", kind="callout", primary_fact_id="name",
+        style={"preset": "social_sticker", "surface": "outline"},
+    )
+
+    # Families style the authored content structure; they do not silently
+    # replace a one-line callout with a different template.
+    assert made.template == "editorial_rule"
+    assert made.motion == "rise"
+    assert made.style.surface == "outline"
+    assert made.style.plate_color == "#FFFFFF"
+    assert made.style.contrast_mode == "auto"
+
+
+def test_approved_copy_cannot_use_the_server_candidate_namespace():
+    from montagewright.brief import parse_brief_markdown
+
+    with pytest.raises(ValueError, match="reserved copy_id prefix"):
+        parse_brief_markdown('''```montagewright-approved-copy
+{"version": 1, "items": [{"copy_id": "brief_candidate.fake", "text": "No"}]}
+```''')
 
 
 def test_model_copy_cannot_approve_itself():
@@ -346,9 +486,141 @@ def test_auto_contrast_repairs_white_text_on_white_picture(tmp_path: Path):
         frames=[Image.new("RGB", (360, 640), "white") for _ in range(3)],
     )
 
-    assert report["fallback_plate"] is True
+    assert report["fallback_plate"] is False
     assert report["contrast_ratio"] >= 4.5
-    assert "dark_plate" in report["contrast_adjustments"]
+    assert report["contrast_adjustments"] == ["white_text", "outline"]
+
+
+def test_family_contrast_repair_never_erases_an_explicit_surface_override(
+    tmp_path: Path,
+):
+    from PIL import Image
+
+    plan = GraphicsPlan(
+        facts=[fact(text="保留貼紙")],
+        cues=[cue(
+            template="stat_badge", background="plate",
+            style=GraphicStyle(
+                preset="cinematic_title", surface="sticker",
+                primary_color="#FFFFFF", plate_color="#FFFFFF",
+                plate_border_color="#FFFFFF", contrast_mode="auto",
+            ),
+        )],
+    )
+    _, report = compile_graphic(
+        plan.cues[0], plan, width=360, height=640,
+        into=tmp_path / "family-surface-override.png",
+        frames=[Image.new("RGB", (360, 640), "white") for _ in range(3)],
+    )
+
+    assert "cinematic_scrim" not in report["contrast_adjustments"]
+    assert report["authored_style"]["surface"] == "sticker"
+
+
+def test_editorial_family_flips_palette_before_adding_an_outline(tmp_path: Path):
+    from PIL import Image
+
+    plan = GraphicsPlan(
+        facts=[fact(text="安靜的章節")],
+        cues=[cue(style=GraphicStyle(preset="editorial_minimal"))],
+    )
+    _, report = compile_graphic(
+        plan.cues[0], plan, width=360, height=640,
+        into=tmp_path / "editorial-dark.png",
+        frames=[Image.new("RGB", (360, 640), "black") for _ in range(3)],
+    )
+
+    assert report["contrast_adjustments"] == ["light_editorial_palette"]
+
+
+def test_cinematic_motion_override_keeps_a_real_travel_distance(tmp_path: Path):
+    style_defaults, _ = graphic_preset_defaults("cinematic_title")
+    moving = cue(
+        motion="rise", style=GraphicStyle.model_validate({
+            **style_defaults, "preset": "cinematic_title",
+        }),
+    )
+    card = DrawnGraphic(tmp_path / "card.png", 100, 200, 240, 90)
+
+    animation = resolve_graphic_animation(moving, card, 1080, 1920)
+
+    assert animation["from_top"] > animation["settled_top"]
+
+
+def test_sticker_shadow_stays_outside_two_line_content(tmp_path: Path):
+    from PIL import Image
+
+    primary = fact("primary", "TEST DECK")
+    secondary = fact("secondary", "下一段內容")
+    plan = GraphicsPlan(
+        facts=[primary, secondary],
+        cues=[cue(
+            primary_fact_id="primary", secondary_fact_id="secondary",
+            style=GraphicStyle(preset="social_sticker"),
+        )],
+    )
+    _, report = compile_graphic(
+        plan.cues[0], plan, width=360, height=640,
+        into=tmp_path / "two-line-sticker.png",
+        frames=[Image.new("RGB", (360, 640), "#AAAAAA") for _ in range(3)],
+    )
+
+    assert report["contrast_adjustments"] == []
+
+
+def test_auto_contrast_fallback_does_not_reuse_destructive_outline(
+    tmp_path: Path,
+):
+    from PIL import Image
+
+    plan = GraphicsPlan(
+        facts=[fact(text="4.1mm 纖薄機身")],
+        cues=[cue(
+            template="spec_stack", background="none",
+            style=GraphicStyle(
+                surface="outline", primary_color="#FFFFFF",
+                stroke_color="#FFFFFF", stroke_width=12,
+                contrast_mode="auto",
+            ),
+        )],
+    )
+    _, report = compile_graphic(
+        plan.cues[0], plan, width=360, height=640,
+        into=tmp_path / "fallback-outline.png",
+        frames=[Image.new("RGB", (360, 640), "white") for _ in range(3)],
+    )
+
+    assert report["fallback_plate"] is False
+    assert report["contrast_ratio"] >= 4.5
+    assert report["contrast_adjustments"] == ["white_text", "outline"]
+    assert report["authored_style"]["stroke_width"] == 12
+
+
+def test_each_text_run_must_pass_contrast_independently(tmp_path: Path):
+    from PIL import Image
+
+    primary = fact("primary", "A" * 20)
+    secondary = fact("secondary", "I")
+    plan = GraphicsPlan(
+        facts=[primary, secondary],
+        cues=[cue(
+            primary_fact_id="primary", secondary_fact_id="secondary",
+            template="product_plate", background="plate",
+            style=GraphicStyle(
+                surface="split", primary_color="#FFFFFF",
+                secondary_color="#FFE000", plate_color="#000000",
+                surface_secondary_color="#FFE000", plate_alpha=255,
+                contrast_mode="strict",
+            ),
+        )],
+    )
+
+    with pytest.raises(ValueError, match="contrast"):
+        compile_graphic(
+            plan.cues[0], plan, width=540, height=960,
+            into=tmp_path / "split-low-secondary.png",
+            frames=[Image.new("RGB", (540, 960), "white") for _ in range(3)],
+        )
 
 
 def test_strict_unreadable_colours_fail_closed(tmp_path: Path):
@@ -435,6 +707,82 @@ def test_multiline_center_and_end_templates_render(tmp_path: Path):
     )
 
     assert made.path.exists() and made.height > 150
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "solid", "pill", "split", "ribbon", "sticker", "highlight",
+        "outline", "glass", "editorial",
+    ],
+)
+def test_surface_treatments_render_with_production_pixels(
+    tmp_path: Path, surface: str,
+):
+    from PIL import Image
+    from montagewright.graphics import draw_graphic
+
+    plan = GraphicsPlan(
+        brand=BrandKit(plate="#171A22", accent="#F4B942"),
+        facts=[fact("name", "人物專訪"), fact("deck", "關於選擇與改變")],
+        cues=[],
+    )
+    card = draw_graphic(
+        cue(
+            secondary_fact_id="deck", template="editorial_rule",
+            position="upper_left", background="none",
+            style=GraphicStyle(
+                surface=surface, surface_secondary_color="#F4B942",
+                plate_color="#171A22", plate_alpha=220,
+                plate_border_width=2, corner_radius=18,
+            ),
+        ),
+        plan, width=360, height=640, into=tmp_path / f"{surface}.png",
+    )
+
+    pixels = Image.open(card.path).convert("RGBA")
+    assert pixels.getbbox() is not None
+    assert card.backing_path is not None and card.backing_path.exists()
+
+
+def test_split_surface_accepts_large_border_and_zero_padding(tmp_path: Path):
+    """Every schema-valid family/surface combination must remain renderable."""
+    from montagewright.graphics import draw_graphic
+
+    plan = GraphicsPlan(
+        facts=[fact("name", "自由組合"), fact("deck", "粗框與零內距")],
+        cues=[],
+    )
+    card = draw_graphic(
+        cue(
+            secondary_fact_id="deck", template="stat_badge",
+            position="center", background="plate",
+            style=GraphicStyle(
+                surface="split", corner_radius=18,
+                padding_x=0, padding_y=0, plate_border_width=24,
+            ),
+        ),
+        plan, width=360, height=640, into=tmp_path / "split-boundary.png",
+    )
+
+    assert card.path.exists()
+    assert card.width > 0 and card.height > 0
+
+
+def test_legacy_template_surface_keeps_the_old_plate_pixels(tmp_path: Path):
+    from montagewright.graphics import draw_graphic
+
+    plan = GraphicsPlan(facts=[fact()], cues=[])
+    legacy = draw_graphic(
+        cue(background="plate", style=GraphicStyle()), plan,
+        width=360, height=640, into=tmp_path / "legacy.png",
+    )
+    explicit = draw_graphic(
+        cue(background="plate", style=GraphicStyle(surface="template")), plan,
+        width=360, height=640, into=tmp_path / "explicit.png",
+    )
+
+    assert legacy.path.read_bytes() == explicit.path.read_bytes()
 
 
 def test_old_graphics_json_without_style_gets_safe_defaults():
@@ -796,6 +1144,30 @@ def test_web_preview_uses_the_production_card_compiler(tmp_path: Path):
         assert compiled.json()["card_width"] > 0
         assert client.get(compiled.json()["url"]).headers["content-type"] == "image/png"
 
+        # Cached pixels are durable, but the run alias in the original URL
+        # is not. Reopening the same output after a server restart must
+        # project the current id instead of returning a broken old route.
+        metadata_file = next(
+            path for path in
+            (here / "out" / "work" / "graphics-preview").glob("*.json")
+            if "g00" in json.loads(path.read_text(encoding="utf-8"))
+            .get("joint_layout", {})
+        )
+        cached = json.loads(metadata_file.read_text(encoding="utf-8"))
+        if cached.get("url"):
+            cached["url"] = cached["url"].replace(
+                "/runs/r1/", "/runs/stale/"
+            )
+        for item in cached["joint_layout"].values():
+            item["url"] = item["url"].replace("/runs/r1/", "/runs/stale/")
+        metadata_file.write_text(json.dumps(cached), encoding="utf-8")
+        reopened = client.post(
+            "/api/runs/r1/graphics-preview/g00", json=payload
+        )
+        assert reopened.status_code == 200
+        assert reopened.json()["url"].startswith("/api/runs/r1/")
+        assert client.get(reopened.json()["url"]).status_code == 200
+
         joint = GraphicsPlan(
             facts=[fact(), fact("second", "Second")],
             cues=[
@@ -869,9 +1241,8 @@ def test_web_graphics_track_starts_with_copy_approved_by_brief(tmp_path: Path):
             "facts": [brief_fact.model_dump(mode="json")],
         }), encoding="utf-8")
 
-        loaded = TestClient(web.create_app()).get(
-            "/api/runs/r1/graphics-track"
-        )
+        client = TestClient(web.create_app())
+        loaded = client.get("/api/runs/r1/graphics-track")
 
         assert loaded.status_code == 200
         assert loaded.json()["facts"][0]["exact_text"] == "Galaxy Z Fold8"
@@ -896,6 +1267,11 @@ def test_web_graphics_track_exposes_plain_brief_candidates(tmp_path: Path):
             json.dumps({"state": "done", "started_at": 0.0}),
             encoding="utf-8",
         )
+        candidate_fact = CopyFact(
+            fact_id="brief.p01.primary", exact_text="Galaxy AI",
+            source_kind="brief_candidate", source_reference="/paragraphs/1",
+            source_sha256="abc", allowed_kinds=["feature"], approved=False,
+        )
         (work / "brief-candidates.json").write_text(json.dumps({
             "brief_sha256": "abc",
             "candidates": [{
@@ -905,16 +1281,83 @@ def test_web_graphics_track_exposes_plain_brief_candidates(tmp_path: Path):
                 "instruction": "置中", "source_reference": "/paragraphs/1",
                 "variants": [],
             }],
+            "facts": [candidate_fact.model_dump(mode="json")],
             "instructions": [],
         }), encoding="utf-8")
 
-        loaded = TestClient(web.create_app()).get(
-            "/api/runs/r1/graphics-track"
-        )
+        client = TestClient(web.create_app())
+        loaded = client.get("/api/runs/r1/graphics-track")
 
         assert loaded.status_code == 200
         assert loaded.json()["brief_candidates"][0]["template"] == "center_stack"
         assert loaded.json()["brief_sha256"] == "abc"
+        assert loaded.json()["facts"][0]["source_kind"] == "brief_candidate"
+    finally:
+        web.RUNS_ROOT = was
+        web.RUNS.pop("r1", None)
+
+
+def test_generic_web_save_cannot_forge_an_evidence_source(tmp_path: Path):
+    import json
+    import montagewright.webapp as web
+    from fastapi.testclient import TestClient
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        here = web.RUNS_ROOT / "r1"
+        (here / "out" / "work").mkdir(parents=True)
+        (here / "run.json").write_text(
+            json.dumps({"state": "done", "started_at": 0.0}),
+            encoding="utf-8",
+        )
+        forged = GraphicsPlan(facts=[CopyFact(
+            fact_id="fake-ocr", exact_text="Not really on screen",
+            source_kind="onscreen", source_reference="client-claim",
+        )])
+
+        saved = TestClient(web.create_app()).put(
+            "/api/runs/r1/graphics-track",
+            json=forged.model_dump(mode="json"),
+        )
+
+        assert saved.status_code == 422
+        assert "不能由一般存檔宣稱" in saved.json()["detail"]
+    finally:
+        web.RUNS_ROOT = was
+        web.RUNS.pop("r1", None)
+
+
+def test_legacy_unverified_provenance_is_downgraded_on_read(tmp_path: Path):
+    import json
+    import montagewright.webapp as web
+    from fastapi.testclient import TestClient
+
+    was = web.RUNS_ROOT
+    try:
+        web.RUNS_ROOT = tmp_path / "runs"
+        here = web.RUNS_ROOT / "r1"
+        work = here / "out" / "work"
+        work.mkdir(parents=True)
+        (here / "run.json").write_text(
+            json.dumps({"state": "done", "started_at": 0.0}),
+            encoding="utf-8",
+        )
+        legacy = GraphicsPlan(facts=[CopyFact(
+            fact_id="old-ocr", exact_text="Unverified legacy label",
+            source_kind="onscreen", source_reference="old-client",
+        )])
+        (work / "graphics.json").write_text(
+            legacy.model_dump_json(), encoding="utf-8"
+        )
+
+        client = TestClient(web.create_app())
+        loaded = client.get("/api/runs/r1/graphics-track")
+
+        assert loaded.status_code == 200
+        assert loaded.json()["facts"][0]["source_kind"] == "user"
+        assert loaded.json()["facts"][0]["source_reference"] == "legacy-unverified"
+        assert not loaded.json()["facts"][0]["approved"]
     finally:
         web.RUNS_ROOT = was
         web.RUNS.pop("r1", None)
@@ -942,13 +1385,18 @@ def test_old_web_run_backfills_candidates_from_its_brief_without_gemini(
             "command": ["montagewright", "--brief", str(brief)],
         }), encoding="utf-8")
 
-        loaded = TestClient(web.create_app()).get(
-            "/api/runs/r1/graphics-track"
-        )
+        client = TestClient(web.create_app())
+        loaded = client.get("/api/runs/r1/graphics-track")
 
         assert loaded.status_code == 200
         assert loaded.json()["brief_candidates"][0]["primary_text"] == "Galaxy Z Fold8"
         assert loaded.json()["brief_instructions"][0]["kind"] == "editorial"
+        payload = loaded.json()
+        saved = client.put("/api/runs/r1/graphics-track", json={
+            key: payload[key]
+            for key in ("version", "revision", "brand", "facts", "cues")
+        })
+        assert saved.status_code == 200
     finally:
         web.RUNS_ROOT = was
         web.RUNS.pop("r1", None)

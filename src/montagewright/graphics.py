@@ -49,11 +49,195 @@ CueStatus = Literal["draft", "approved"]
 TextAlignment = Literal["auto", "left", "center", "right"]
 StylePreset = Literal[
     "custom", "clean", "outlined", "soft_shadow", "colour_label",
-    "tech_frame", "bold_pop",
+    "tech_frame", "bold_pop", "editorial_minimal", "youtube_pop",
+    "magazine_story", "social_sticker", "broadcast_info",
+    "cinematic_title", "sports_energy", "soft_lifestyle",
+]
+SurfaceTreatment = Literal[
+    "template", "solid", "pill", "split", "ribbon", "sticker",
+    "highlight", "outline", "glass", "editorial",
 ]
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
-GRAPHICS_RENDERER_VERSION = 6
+GRAPHICS_RENDERER_VERSION = 8
+GRAPHIC_PRESET_REGISTRY_VERSION = 1
+
+
+# A family is a curated starting point, never a sealed template. The model,
+# Web editor and API all materialise these same defaults and may then override
+# any individual renderer-safe field. Keeping this registry in Python avoids
+# the old split where the browser knew what a preset meant but CLI/API did not.
+GRAPHIC_PRESET_SPECS: dict[str, dict] = {
+    "clean": {
+        "label": "純字", "description": "無底板的安靜純字",
+        "style": {"stroke_width": 0, "shadow_opacity": 0,
+                  "plate_border_width": 0},
+        "cue": {"background": "none"},
+    },
+    "outlined": {
+        "label": "台灣 YouTube 描邊", "description": "高辨識粗描邊口播重點",
+        "style": {"stroke_width": 5, "stroke_color": "#000000",
+                  "shadow_opacity": 0, "plate_border_width": 0},
+        "cue": {"background": "none"},
+    },
+    "soft_shadow": {
+        "label": "柔陰影", "description": "不搶畫面的柔和浮字",
+        "style": {"stroke_width": 1, "stroke_color": "#000000",
+                  "shadow_opacity": 185, "shadow_blur": 9,
+                  "shadow_offset_x": 3, "shadow_offset_y": 5,
+                  "plate_border_width": 0},
+        "cue": {"background": "none"},
+    },
+    "colour_label": {
+        "label": "彩色標籤", "description": "緊湊的產品與人物標籤",
+        "style": {"stroke_width": 0, "shadow_opacity": 0,
+                  "plate_border_width": 0, "plate_alpha": 232,
+                  "corner_radius": 18, "padding_x": 32, "padding_y": 20},
+        "cue": {"background": "plate"},
+    },
+    "tech_frame": {
+        "label": "科技細框", "description": "清晰的規格與介面資訊框",
+        "style": {"stroke_width": 2, "stroke_color": "#07101F",
+                  "shadow_opacity": 140, "shadow_blur": 8,
+                  "shadow_offset_y": 4, "plate_alpha": 128,
+                  "plate_border_width": 2, "corner_radius": 8},
+        "cue": {"background": "plate"},
+    },
+    "bold_pop": {
+        "label": "粗框立體字", "description": "娛樂感強烈的重點字",
+        "style": {"stroke_width": 7, "stroke_color": "#111111",
+                  "shadow_opacity": 210, "shadow_blur": 0,
+                  "shadow_offset_x": 6, "shadow_offset_y": 7,
+                  "primary_scale": 1.18, "plate_border_width": 0},
+        "cue": {"background": "none"},
+    },
+    "editorial_minimal": {
+        "label": "極簡編輯", "description": "留白、細線與克制層級",
+        "best_for": "紀錄片、旅遊、章節與安靜的產品敘事",
+        "style": {"surface": "editorial", "primary_color": "#171717",
+                  "secondary_color": "#303030",
+                  "surface_secondary_color": "#D59A21", "padding_x": 34,
+                  "padding_y": 22, "primary_scale": 1.02,
+                  "secondary_scale": .9, "line_spacing": 1.08,
+                  "block_gap_scale": 1.15,
+                  "shadow_opacity": 0, "entrance_seconds": .32,
+                  "exit_seconds": .22, "motion_distance": 18},
+        "cue": {"background": "none",
+                "motion": "fade", "composition": "negative_space"},
+    },
+    "youtube_pop": {
+        "label": "YouTube 強調", "description": "粗描邊與螢光筆重點",
+        "best_for": "口播重點、教學結論與娛樂節奏",
+        "style": {"surface": "highlight", "primary_color": "#111111",
+                  "secondary_color": "#111111", "plate_color": "#FFE35A",
+                  "surface_secondary_color": "#FFFFFF", "plate_alpha": 245,
+                  "stroke_width": 0, "primary_scale": 1.14,
+                  "padding_x": 24, "padding_y": 16,
+                  "entrance_seconds": .2, "exit_seconds": .16,
+                  "motion_distance": 24},
+        "cue": {"background": "none",
+                "motion": "rise", "composition": "negative_space"},
+    },
+    "magazine_story": {
+        "label": "雜誌專題", "description": "暖紙底、清楚層級與編輯感",
+        "best_for": "人物、文化、生活風格與專題敘事",
+        "style": {"surface": "solid", "primary_color": "#181716",
+                  "secondary_color": "#4B4741", "plate_color": "#F3EFE7",
+                  "surface_secondary_color": "#A75C3B", "plate_alpha": 242,
+                  "corner_radius": 5, "primary_scale": 1.08,
+                  "secondary_scale": .82, "line_spacing": 1.16,
+                  "block_gap_scale": 1.35,
+                  "padding_x": 38, "padding_y": 28,
+                  "max_width_scale": .92, "shadow_opacity": 75,
+                  "shadow_blur": 7, "shadow_offset_y": 3,
+                  "entrance_seconds": .38, "exit_seconds": .28,
+                  "motion_distance": 30},
+        "cue": {"background": "none",
+                "motion": "slide_right", "composition": "negative_space"},
+    },
+    "social_sticker": {
+        "label": "社群貼紙", "description": "白貼紙、硬陰影與活潑層次",
+        "best_for": "短影音反應、人物標註與輕鬆內容",
+        "style": {"surface": "sticker", "primary_color": "#171717",
+                  "secondary_color": "#171717", "plate_color": "#FFFFFF",
+                  "surface_secondary_color": "#171717", "plate_alpha": 255,
+                  "plate_border_width": 3, "plate_border_color": "#171717",
+                  "corner_radius": 24, "shadow_opacity": 0,
+                  "primary_scale": 1.12, "entrance_seconds": .22,
+                  "exit_seconds": .16, "motion_distance": 24},
+        "cue": {"background": "plate",
+                "motion": "rise", "composition": "negative_space"},
+    },
+    "broadcast_info": {
+        "label": "資訊下標", "description": "中性雙層資訊板，不綁特定產業配色",
+        "best_for": "姓名職稱、地點、產品名稱與兩層資料",
+        "style": {"surface": "split", "primary_color": "#FFFFFF",
+                  "secondary_color": "#1C1B19", "plate_color": "#1D2024",
+                  "surface_secondary_color": "#EEEAE2", "plate_alpha": 245,
+                  "corner_radius": 10, "padding_x": 36, "padding_y": 25,
+                  "primary_scale": 1.04, "secondary_scale": .78,
+                  "line_spacing": 1.12, "block_gap_scale": .75,
+                  "plate_border_width": 1,
+                  "plate_border_color": "#FFFFFF",
+                  "entrance_seconds": .28, "exit_seconds": .2,
+                  "motion_distance": 32},
+        "cue": {"background": "plate",
+                "motion": "slide_right", "composition": "negative_space"},
+    },
+    "cinematic_title": {
+        "label": "電影標題", "description": "大留白、慢淡入與低調陰影",
+        "best_for": "開場、情緒轉折、預告與章節標題",
+        "style": {"surface": "template", "primary_scale": 1.2,
+                  "secondary_scale": .72, "line_spacing": 1.24,
+                  "block_gap_scale": 1.45,
+                  "max_width_scale": 1.08, "shadow_opacity": 170,
+                  "shadow_blur": 12, "shadow_offset_y": 4,
+                  "stroke_width": 2, "stroke_color": "#000000",
+                  "entrance_seconds": .7, "exit_seconds": .45,
+                  # Fade ignores distance; keeping a restrained non-zero
+                  # token lets Gemini/Web freely switch this family to rise
+                  # or slide without declaring motion that cannot move.
+                  "motion_distance": 18},
+        "cue": {"background": "none",
+                "motion": "fade", "position": "center",
+                "composition": "auto"},
+    },
+    "sports_energy": {
+        "label": "運動娛樂", "description": "斜角色塊與快速方向感",
+        "best_for": "比分、倒數、挑戰、活動與高能量重點",
+        "style": {"surface": "ribbon", "primary_color": "#FFFFFF",
+                  "secondary_color": "#FFFFFF", "plate_color": "#A72B31",
+                  "plate_alpha": 248, "surface_angle": 8,
+                  "primary_scale": 1.13, "secondary_scale": .78,
+                  "block_gap_scale": .75,
+                  "padding_x": 38, "padding_y": 22,
+                  "entrance_seconds": .18, "exit_seconds": .14,
+                  "motion_distance": 42},
+        "cue": {"background": "plate",
+                "motion": "slide_left", "composition": "negative_space"},
+    },
+    "soft_lifestyle": {
+        "label": "柔和生活", "description": "半透明霧面板與緩慢上浮",
+        "best_for": "美食、居家、人物心情與生活片段",
+        "style": {"surface": "glass", "primary_color": "#282521",
+                  "secondary_color": "#575149", "plate_color": "#F3EDE3",
+                  "plate_alpha": 176, "plate_border_width": 1,
+                  "plate_border_color": "#FFFFFF", "corner_radius": 22,
+                  "stroke_width": 0, "stroke_color": "#000000",
+                  "primary_scale": 1.04, "secondary_scale": .8,
+                  "block_gap_scale": 1.2,
+                  "shadow_opacity": 120, "shadow_blur": 10,
+                  "shadow_offset_y": 3, "entrance_seconds": .52,
+                  "exit_seconds": .38, "motion_distance": 22},
+        "cue": {"background": "plate",
+                "motion": "rise", "composition": "negative_space"},
+    },
+}
+CURATED_GRAPHIC_FAMILY_IDS = {
+    "editorial_minimal", "youtube_pop", "magazine_story",
+    "social_sticker", "broadcast_info", "cinematic_title",
+    "sports_energy", "soft_lifestyle",
+}
 
 
 class CopyFact(Local):
@@ -115,6 +299,9 @@ class GraphicStyle(Local):
     """
 
     preset: StylePreset = "custom"
+    surface: SurfaceTreatment = "template"
+    surface_secondary_color: str = ""
+    surface_angle: float = Field(default=6.0, ge=-18.0, le=18.0)
     contrast_mode: AdaptiveMode = "auto"
     primary_color: str = ""
     secondary_color: str = ""
@@ -125,6 +312,7 @@ class GraphicStyle(Local):
     primary_scale: float = Field(default=1.0, ge=0.55, le=1.8)
     secondary_scale: float = Field(default=1.0, ge=0.55, le=1.8)
     line_spacing: float = Field(default=1.0, ge=0.65, le=2.0)
+    block_gap_scale: float = Field(default=1.0, ge=0.5, le=2.0)
     max_width_scale: float = Field(default=1.0, ge=0.45, le=1.25)
     padding_x: float = Field(default=28.0, ge=0.0, le=160.0)
     padding_y: float = Field(default=19.0, ge=0.0, le=120.0)
@@ -147,10 +335,29 @@ class GraphicStyle(Local):
     @model_validator(mode="before")
     @classmethod
     def legacy_visual_overrides_are_not_silently_adaptive(cls, value):
-        if not isinstance(value, dict) or "contrast_mode" in value:
+        if not isinstance(value, dict):
+            return value
+        has_contrast_mode = "contrast_mode" in value
+        preset = str(value.get("preset") or "")
+        # The six original Web presets were metadata-only in sparse v1 API
+        # payloads.  Materialise only the new, versioned design families here;
+        # the Web sends explicit values for every registry entry it applies.
+        preset_style = (
+            (GRAPHIC_PRESET_SPECS.get(preset) or {}).get("style")
+            if preset in CURATED_GRAPHIC_FAMILY_IDS else None
+        )
+        if preset_style:
+            value = {**preset_style, **value}
+        if has_contrast_mode:
             return value
         if not value:
             return {"contrast_mode": "auto"}
+        # Surface fields did not exist in v1. Their presence proves this is a
+        # current authored payload, so the documented auto default applies.
+        if any(key in value for key in (
+            "surface", "surface_secondary_color", "surface_angle",
+        )):
+            return {**value, "contrast_mode": "auto"}
         # A serialized v1 style was authored before automatic visual
         # mutation existed. Its intent cannot be inferred from whether each
         # value happens to equal today's default, so preserve it wholesale.
@@ -162,7 +369,7 @@ class GraphicStyle(Local):
     def colours_are_empty_or_hex(self) -> "GraphicStyle":
         for field in (
             "primary_color", "secondary_color", "accent_color",
-            "plate_color", "emphasis_color",
+            "plate_color", "emphasis_color", "surface_secondary_color",
         ):
             value = getattr(self, field)
             if value and not HEX.match(value):
@@ -214,11 +421,28 @@ class GraphicCue(Local):
     @model_validator(mode="before")
     @classmethod
     def legacy_background_choice_is_strict(cls, value):
-        if not isinstance(value, dict) or "style" in value:
+        if not isinstance(value, dict):
             return value
-        if value.get("background") in {"none", "plate"}:
-            return {**value, "style": {"contrast_mode": "strict"}}
-        return value
+        payload = dict(value)
+        style = payload.get("style")
+        preset = (
+            style.preset if isinstance(style, GraphicStyle)
+            else str((style or {}).get("preset") or "")
+            if isinstance(style, dict) else ""
+        )
+        cue_defaults = (
+            (GRAPHIC_PRESET_SPECS.get(preset) or {}).get("cue") or {}
+            if preset in CURATED_GRAPHIC_FAMILY_IDS else {}
+        )
+        for field, default in cue_defaults.items():
+            if field == "template" and payload.get("kind"):
+                spec = globals().get("TEMPLATES", {}).get(str(default))
+                if spec is not None and payload["kind"] not in spec.kinds:
+                    continue
+            payload.setdefault(field, default)
+        if "style" not in payload and payload.get("background") in {"none", "plate"}:
+            payload["style"] = {"contrast_mode": "strict"}
+        return payload
 
 
 class GraphicsPlan(Local):
@@ -338,7 +562,8 @@ TEMPLATES: dict[str, TemplateSpec] = {
         "center", 0.42, 0.060, 0.022, True, default_position="upper_right",
     ),
     "center_stack": TemplateSpec(
-        "center_stack", "置中多行", ("opening_title", "chapter", "feature", "end_card"),
+        "center_stack", "置中多行",
+        ("opening_title", "chapter", "feature", "callout", "end_card"),
         "center", 0.86, 0.060, 0.034, False, default_position="center",
     ),
     "spec_stack": TemplateSpec(
@@ -367,6 +592,57 @@ def templates_for_editor() -> list[dict]:
         }
         for spec in TEMPLATES.values()
     ]
+
+
+def graphic_presets_for_editor() -> list[dict]:
+    """Versioned registry shared by Gemini materialisation and Web editing."""
+
+    return [
+        {
+            "preset_id": preset_id,
+            "label": spec["label"],
+            "description": spec["description"],
+            "best_for": spec.get("best_for", ""),
+            "style": dict(spec.get("style") or {}),
+            "cue": dict(spec.get("cue") or {}),
+            "curated_family": preset_id in CURATED_GRAPHIC_FAMILY_IDS,
+        }
+        for preset_id, spec in GRAPHIC_PRESET_SPECS.items()
+    ]
+
+
+def curated_graphic_family_ids() -> tuple[str, ...]:
+    return tuple(
+        item["preset_id"] for item in graphic_presets_for_editor()
+        if item["curated_family"]
+    )
+
+
+def graphic_preset_defaults(preset_id: str) -> tuple[dict, dict]:
+    spec = GRAPHIC_PRESET_SPECS.get(preset_id) or {}
+    return dict(spec.get("style") or {}), dict(spec.get("cue") or {})
+
+
+def graphic_family_prompt() -> str:
+    """Small semantic menu; the model may still override surface and motion."""
+
+    return "\n".join(
+        f"- `{item['preset_id']}`：{item['description']}"
+        + (f"；適合 {item['best_for']}" if item.get("best_for") else "")
+        for item in graphic_presets_for_editor()
+        if item["curated_family"]
+    )
+
+
+def recommended_graphic_family(kind: GraphicKind) -> str:
+    return {
+        "opening_title": "cinematic_title",
+        "chapter": "magazine_story",
+        "product_name": "broadcast_info",
+        "feature": "editorial_minimal",
+        "callout": "youtube_pop",
+        "end_card": "cinematic_title",
+    }[kind]
 
 
 def minimum_read_seconds(text: str, kind: GraphicKind) -> float:
@@ -499,6 +775,7 @@ class DrawnGraphic:
     height: int
     text_mask_path: Path | None = None
     backing_path: Path | None = None
+    text_run_mask_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -520,9 +797,13 @@ def _apply_authored_transform(
     from PIL import Image
 
     transform = cue.transform
-    paths = [card.path, card.text_mask_path, card.backing_path]
+    paths = [
+        card.path, card.text_mask_path, card.backing_path,
+        *card.text_run_mask_paths,
+    ]
+    mask_indexes = {1, *range(3, len(paths))}
     images = [
-        Image.open(path).convert("L" if index == 1 else "RGBA")
+        Image.open(path).convert("L" if index in mask_indexes else "RGBA")
         if path is not None else None
         for index, path in enumerate(paths)
     ]
@@ -541,7 +822,10 @@ def _apply_authored_transform(
         images = [
             image.rotate(
                 -transform.rotation_degrees, expand=True,
-                resample=Image.Resampling.BICUBIC, fillcolor=(0 if index == 1 else (0, 0, 0, 0)),
+                resample=Image.Resampling.BICUBIC,
+                fillcolor=(
+                    0 if index in mask_indexes else (0, 0, 0, 0)
+                ),
             ) if image is not None else None
             for index, image in enumerate(images)
         ]
@@ -863,24 +1147,31 @@ def measured_text_contrast(
     if not frames or card.text_mask_path is None or card.backing_path is None:
         return None
     glyph = Image.open(card.path).convert("RGBA")
-    mask = Image.open(card.text_mask_path).convert("L")
     backing = Image.open(card.backing_path).convert("RGBA")
-    maximum_ink = mask.getextrema()[1]
-    if maximum_ink <= 0:
-        raise ValueError("graphic text mask contains no auditable glyph pixels")
-    ink_threshold = max(8, round(maximum_ink * 0.75))
-    points = [
-        (x, y)
-        for y in range(card.height)
-        for x in range(card.width)
-        if mask.getpixel((x, y)) >= ink_threshold
-    ]
-    if not points:
-        return None
-    # A deterministic even sample bounds work for long multi-line cards.
-    stride = max(1, len(points) // 4000)
-    points = points[::stride]
-    ratios: list[float] = []
+    mask_paths = (
+        card.text_run_mask_paths
+        if card.text_run_mask_paths else (card.text_mask_path,)
+    )
+    point_groups: list[list[tuple[int, int]]] = []
+    for mask_path in mask_paths:
+        mask = Image.open(mask_path).convert("L")
+        maximum_ink = mask.getextrema()[1]
+        if maximum_ink <= 0:
+            raise ValueError("graphic text mask contains no auditable glyph pixels")
+        ink_threshold = max(8, round(maximum_ink * 0.75))
+        points = [
+            (x, y)
+            for y in range(card.height)
+            for x in range(card.width)
+            if mask.getpixel((x, y)) >= ink_threshold
+        ]
+        if not points:
+            return None
+        # Bound work independently for each text run. A short secondary line
+        # must not disappear inside thousands of primary-title pixels.
+        stride = max(1, len(points) // 4000)
+        point_groups.append(points[::stride])
+    ratio_groups: list[list[float]] = [[] for _ in point_groups]
     sample_shares = _layout_sample_shares(cue) if cue is not None else (0.03, 0.5, 0.97)
     animation = (
         resolve_graphic_animation(
@@ -909,28 +1200,37 @@ def measured_text_contrast(
                 * (1 - progress)
             )
         picture = frame.convert("RGB")
-        for x, y in points:
-            px, py = at_left + x, at_top + y
-            if not (0 <= px < picture.width and 0 <= py < picture.height):
-                ratios.append(1.0)
-                continue
-            base = picture.getpixel((px, py))
-            under = backing.getpixel((x, y))
-            alpha = under[3] / 255.0
-            background = tuple(round(under[index] * alpha + base[index] * (1 - alpha)) for index in range(3))
-            foreground = glyph.getpixel((x, y))[:3]
-            direct = _contrast_ratio(foreground, background)
-            if outline_width >= 1.5:
-                outline_chain = min(
-                    _contrast_ratio(foreground, outline_rgb),
-                    _contrast_ratio(outline_rgb, background),
+        for ratios, points in zip(ratio_groups, point_groups):
+            for x, y in points:
+                px, py = at_left + x, at_top + y
+                if not (0 <= px < picture.width and 0 <= py < picture.height):
+                    ratios.append(1.0)
+                    continue
+                base = picture.getpixel((px, py))
+                under = backing.getpixel((x, y))
+                alpha = under[3] / 255.0
+                background = tuple(
+                    round(under[index] * alpha + base[index] * (1 - alpha))
+                    for index in range(3)
                 )
-                direct = max(direct, outline_chain)
-            ratios.append(direct)
-    ratios.sort()
-    # Isolated antialias pixels should not fail an otherwise readable title,
-    # while the weakest substantial patch still must be legible.
-    return round(ratios[max(0, int(len(ratios) * 0.05) - 1)], 3)
+                foreground = glyph.getpixel((x, y))[:3]
+                direct = _contrast_ratio(foreground, background)
+                if outline_width >= 1.5:
+                    outline_chain = min(
+                        _contrast_ratio(foreground, outline_rgb),
+                        _contrast_ratio(outline_rgb, background),
+                    )
+                    direct = max(direct, outline_chain)
+                ratios.append(direct)
+    percentiles = []
+    for ratios in ratio_groups:
+        ratios.sort()
+        # Isolated antialias pixels should not fail an otherwise readable
+        # line, while the weakest substantial patch must still be legible.
+        percentiles.append(
+            ratios[max(0, int(len(ratios) * 0.05) - 1)]
+        )
+    return round(min(percentiles), 3)
 
 
 def _layout_sample_shares(cue: GraphicCue) -> tuple[float, float, float]:
@@ -1012,6 +1312,13 @@ def draw_graphic(
         )
     pad_x = round(style.padding_x * unit)
     pad_y = round(style.padding_y * unit)
+    # A sticker's hard shadow belongs outside its foreground plate. Reserve
+    # that room before fitting/placing text so the last line cannot sit on
+    # the bottom/right shadow and trigger a misleading contrast fallback.
+    sticker_offset = (
+        max(2, round(7 * unit)) if style.surface == "sticker" else 0
+    )
+    content_width = card_width - sticker_offset
     stroke_width = round(style.stroke_width * unit)
     shadow_blur = round(style.shadow_blur * unit)
     shadow_x = round(style.shadow_offset_x * unit)
@@ -1020,7 +1327,7 @@ def draw_graphic(
         shadow_blur * 2 + max(abs(shadow_x), abs(shadow_y))
         if style.shadow_opacity else 0
     )
-    text_room = card_width - (pad_x + stroke_width + shadow_room) * 2
+    text_room = content_width - (pad_x + stroke_width + shadow_room) * 2
     title = _fit(
         primary, asked=round(
             height * spec.title_height * style.primary_scale * render_scale
@@ -1064,12 +1371,16 @@ def draw_graphic(
         )[1]
         if secondary_face else 0
     )
-    gap = round(height * 0.010 * render_scale) if secondary else 0
+    gap = (
+        round(height * 0.010 * style.block_gap_scale * render_scale)
+        if secondary else 0
+    )
     rule = round(height * 0.005 * render_scale) if spec.rule else 0
     card_height = (
         pad_y * 2 + title_height + secondary_height + gap + rule
         + shadow_room * 2 + stroke_width * 2
     )
+    card_height += sticker_offset
     top_safe = round(height * 0.09)
     bottom_safe = round(height * (0.25 if width < height else 0.10))
     if card_height > height - top_safe - bottom_safe:
@@ -1079,29 +1390,187 @@ def draw_graphic(
         )
     canvas = Image.new("RGBA", (card_width, card_height), (0, 0, 0, 0))
     text_mask = Image.new("L", (card_width, card_height), 0)
+    line_masks = []
     pen = ImageDraw.Draw(canvas)
     mask_pen = ImageDraw.Draw(text_mask)
+    y = (
+        pad_y + shadow_room + stroke_width + rule
+        + (round(height * 0.010 * render_scale) if rule else 0)
+    )
+    title_width = title_box[2] - title_box[0]
+    if align == "center":
+        x = (content_width - title_width) // 2
+    elif align == "right":
+        x = content_width - pad_x - shadow_room - stroke_width - title_width
+    else:
+        x = pad_x + shadow_room + stroke_width
+
+    secondary_box = None
+    secondary_width = 0
+    secondary_x = 0
+    secondary_y = y + title_height + gap
+    if secondary_face:
+        secondary_box = pen.multiline_textbbox(
+            (0, 0), secondary, font=secondary_face,
+            spacing=secondary_spacing, align=align,
+            stroke_width=stroke_width,
+        )
+        secondary_width = secondary_box[2] - secondary_box[0]
+        secondary_x = (
+            (content_width - secondary_width) // 2
+            if align == "center" else (
+                content_width - pad_x - shadow_room - stroke_width
+                - secondary_width if align == "right"
+                else pad_x + shadow_room + stroke_width
+            )
+        )
 
     plate = spec.plate if cue.background == "auto" else cue.background != "none"
     if cue.composition == "foreground_plate":
         plate = True
-    if plate:
-        radius = (
-            round(style.corner_radius * unit)
-            if style.corner_radius is not None
-            else round(card_height * plan.brand.corner_radius)
-        )
-        border_width = round(style.plate_border_width * unit)
+    surface = style.surface
+    if surface == "template":
+        surface = "solid" if plate else "none"
+    if cue.composition == "foreground_plate" and surface == "none":
+        surface = "solid"
+    alpha = (
+        style.plate_alpha
+        if style.plate_alpha is not None else plan.brand.plate_alpha
+    )
+    radius = (
+        round(style.corner_radius * unit)
+        if style.corner_radius is not None
+        else round(card_height * plan.brand.corner_radius)
+    )
+    border_width = round(style.plate_border_width * unit)
+    surface_secondary = style.surface_secondary_color or accent
+    edge = (0, 0, card_width - 1, card_height - 1)
+    outline = (
+        (*_rgb(style.plate_border_color), 255)
+        if border_width else None
+    )
+
+    if surface == "solid":
         pen.rounded_rectangle(
-            (0, 0, card_width - 1, card_height - 1),
-            radius=radius,
-            fill=(*_rgb(plate_colour), (
-                style.plate_alpha
-                if style.plate_alpha is not None else plan.brand.plate_alpha
-            )),
-            outline=(*_rgb(style.plate_border_color), 255)
-            if border_width else None,
+            edge, radius=radius, fill=(*_rgb(plate_colour), alpha),
+            outline=outline, width=border_width,
+        )
+    elif surface == "pill":
+        pen.rounded_rectangle(
+            edge, radius=card_height // 2,
+            fill=(*_rgb(plate_colour), alpha), outline=outline,
             width=border_width,
+        )
+    elif surface == "split":
+        pen.rounded_rectangle(
+            edge, radius=radius, fill=(*_rgb(plate_colour), alpha),
+            outline=outline, width=border_width,
+        )
+        split_at = max(
+            1, min(card_height - 1,
+                   secondary_y - max(1, gap // 2) if secondary_face
+                   else round(card_height * 0.64)),
+        )
+        # A large authored radius can leave no straight section between the
+        # split and the rounded bottom.  Pillow rejects an inverted rectangle,
+        # so only paint that bridge when it actually exists; the rounded fill
+        # below still covers the complete lower surface.
+        straight_bottom = card_height - radius
+        if straight_bottom >= split_at:
+            pen.rectangle(
+                (0, split_at, card_width - 1, straight_bottom),
+                fill=(*_rgb(surface_secondary), alpha),
+            )
+        pen.rounded_rectangle(
+            (0, split_at, card_width - 1, card_height - 1),
+            radius=radius, fill=(*_rgb(surface_secondary), alpha),
+        )
+        pen.rectangle(
+            (0, split_at, card_width - 1,
+             min(card_height - 1, split_at + radius)),
+            fill=(*_rgb(surface_secondary), alpha),
+        )
+        if outline:
+            pen.rounded_rectangle(
+                edge, radius=radius, outline=outline, width=border_width,
+            )
+    elif surface == "ribbon":
+        slant = min(
+            max(2, round(card_height * abs(style.surface_angle) / 45.0)),
+            max(2, pad_x),
+        )
+        points = (
+            [(slant, 0), (card_width - 1, 0),
+             (card_width - slant - 1, card_height - 1), (0, card_height - 1)]
+            if style.surface_angle >= 0 else
+            [(0, 0), (card_width - slant - 1, 0),
+             (card_width - 1, card_height - 1), (slant, card_height - 1)]
+        )
+        pen.polygon(points, fill=(*_rgb(plate_colour), alpha))
+        if border_width:
+            pen.line(points + [points[0]], fill=outline, width=border_width,
+                     joint="curve")
+    elif surface == "sticker":
+        offset = sticker_offset or max(2, round(7 * unit))
+        sticker_edge = (0, 0, card_width - offset - 1, card_height - offset - 1)
+        pen.rounded_rectangle(
+            (offset, offset, card_width - 1, card_height - 1),
+            radius=radius, fill=(0, 0, 0, 150),
+        )
+        pen.rounded_rectangle(
+            sticker_edge, radius=radius,
+            fill=(*_rgb(plate_colour), alpha),
+            outline=outline or (*_rgb(surface_secondary), 255),
+            width=border_width or max(1, round(3 * unit)),
+        )
+    elif surface == "highlight":
+        extra_x = max(2, round(10 * unit))
+        extra_y = max(1, round(4 * unit))
+        slant = round(card_height * style.surface_angle / 90.0)
+
+        def highlight(left: int, top: int, wide: int, tall: int, colour: str) -> None:
+            pen.polygon(
+                [(left - extra_x + slant, top - extra_y),
+                 (left + wide + extra_x, top - extra_y),
+                 (left + wide + extra_x - slant, top + tall + extra_y),
+                 (left - extra_x, top + tall + extra_y)],
+                fill=(*_rgb(colour), alpha),
+            )
+
+        highlight(x, y, title_width, title_height, plate_colour)
+        if secondary_face and secondary_box:
+            highlight(
+                secondary_x, secondary_y, secondary_width, secondary_height,
+                surface_secondary,
+            )
+    elif surface == "outline":
+        pen.rounded_rectangle(
+            edge, radius=radius, fill=None,
+            outline=outline or (*_rgb(surface_secondary), 255),
+            width=border_width or max(1, round(3 * unit)),
+        )
+    elif surface == "glass":
+        glass_alpha = style.plate_alpha if style.plate_alpha is not None else 105
+        pen.rounded_rectangle(
+            edge, radius=radius, fill=(*_rgb(plate_colour), glass_alpha),
+            outline=outline or (255, 255, 255, 180),
+            width=border_width or max(1, round(2 * unit)),
+        )
+        shine = max(1, round(2 * unit))
+        pen.line(
+            (radius, shine, card_width - radius, shine),
+            fill=(255, 255, 255, 125), width=shine,
+        )
+    elif surface == "editorial":
+        rail = max(2, round(7 * unit))
+        pen.rounded_rectangle(
+            (0, 0, rail, card_height - 1), radius=rail // 2,
+            fill=(*_rgb(surface_secondary), 255),
+        )
+        pen.line(
+            (pad_x, card_height - 1, card_width - pad_x, card_height - 1),
+            fill=(*_rgb(surface_secondary), 210),
+            width=max(1, round(2 * unit)),
         )
     if spec.rule:
         pen.rectangle(
@@ -1109,17 +1578,6 @@ def draw_graphic(
             fill=(*_rgb(accent), 255),
         )
     backing = canvas.copy()
-    y = (
-        pad_y + shadow_room + stroke_width + rule
-        + (round(height * 0.010 * render_scale) if rule else 0)
-    )
-    title_width = title_box[2] - title_box[0]
-    if align == "center":
-        x = (card_width - title_width) // 2
-    elif align == "right":
-        x = card_width - pad_x - shadow_room - stroke_width - title_width
-    else:
-        x = pad_x + shadow_room + stroke_width
 
     def paint_text(
         text: str, face, *, at_x: int, at_y: int, spacing: int,
@@ -1149,6 +1607,27 @@ def draw_graphic(
         mask_pen.multiline_text(
             target, text, font=face, spacing=spacing, align=align, fill=255,
         )
+        lines = text.split("\n")
+        widths = [pen.textlength(line, font=face) for line in lines]
+        max_line_width = max(widths, default=0)
+        line_advance = (
+            pen.textbbox((0, 0), "A", font=face)[3] + spacing
+        )
+        line_y = at_y
+        for line, line_width in zip(lines, widths):
+            line_mask = Image.new("L", canvas.size, 0)
+            line_pen = ImageDraw.Draw(line_mask)
+            if align == "center":
+                line_x = at_x + (max_line_width - line_width) / 2
+            elif align == "right":
+                line_x = at_x + max_line_width - line_width
+            else:
+                line_x = at_x
+            line_pen.text(
+                (line_x, line_y), line, font=face, fill=255, anchor="la",
+            )
+            line_masks.append(line_mask)
+            line_y += line_advance
         if emphasis:
             line_y = at_y
             for line in text.splitlines() or [text]:
@@ -1184,20 +1663,8 @@ def draw_graphic(
     )
     y += title_height + gap
     if secondary_face:
-        secondary_box = pen.multiline_textbbox(
-            (0, 0), secondary, font=secondary_face,
-            spacing=secondary_spacing, align=align,
-            stroke_width=stroke_width,
-        )
-        secondary_width = secondary_box[2] - secondary_box[0]
-        x = (
-            (card_width - secondary_width) // 2
-            if align == "center" else (
-                card_width - pad_x - shadow_room - stroke_width
-                - secondary_width if align == "right"
-                else pad_x + shadow_room + stroke_width
-            )
-        )
+        assert secondary_box is not None
+        x = secondary_x
         paint_text(
             secondary, secondary_face,
             at_x=x - secondary_box[0], at_y=y - secondary_box[1],
@@ -1214,9 +1681,14 @@ def draw_graphic(
     backing_path = into.with_name(f"{into.stem}-backing.png")
     text_mask.save(mask_path)
     backing.save(backing_path)
+    run_mask_paths = []
+    for index, line_mask in enumerate(line_masks):
+        line_mask_path = into.with_name(f"{into.stem}-line-{index}.png")
+        line_mask.save(line_mask_path)
+        run_mask_paths.append(line_mask_path)
     return DrawnGraphic(
         into, max(0, left), max(0, top), card_width, card_height,
-        mask_path, backing_path,
+        mask_path, backing_path, tuple(run_mask_paths),
     )
 
 
@@ -1286,47 +1758,138 @@ def compile_graphic(
                 f"{cue.graphic_id}: strict colours measure only "
                 f"{ratio:.2f}:1 contrast; change the text, outline or plate"
             )
-        # A neutral accessibility fallback, not an inferred brand. It is
-        # intentionally local and deterministic so preview and export agree.
-        fallback_style = cue.style.model_copy(update={
+        def compile_accessible_variant(
+            variant_style: GraphicStyle, *, background: str,
+        ) -> tuple[DrawnGraphic, GraphicCue, dict[str, float], float | None]:
+            variant_cue = cue.model_copy(update={
+                "background": background, "style": variant_style,
+            })
+            variant = draw_graphic(
+                variant_cue, plan, width=width, height=height, into=into,
+                render_scale=max(1.0, variant_cue.transform.scale),
+            )
+            variant = _apply_authored_transform(
+                variant_cue, variant, width, height
+            )
+            variant_scores: dict[str, float] = {}
+            if cue.position == "auto":
+                variant, variant_scores = resolve_auto_position(
+                    variant_cue, variant, frames, frame_width=width,
+                    frame_height=height, evidence=evidence,
+                    forbidden_positions=forbidden_positions or set(),
+                    keepout_rects=keepout_rects,
+                )
+            variant = _place_for_motion_safe(cue, variant, width, height)
+            variant_ratio = measured_text_contrast(
+                variant, frames or [], cue=variant_cue,
+                frame_width=width, frame_height=height,
+                outline_width=round(
+                    variant_style.stroke_width * height / 1080.0
+                    * variant_cue.transform.scale
+                ),
+                outline_rgb=_rgb(variant_style.stroke_color),
+            )
+            return variant, variant_cue, variant_scores, variant_ratio
+
+        # Curated families get a first chance to remain themselves.  A
+        # cinematic title should become a restrained translucent scrim, and
+        # a lifestyle card should deepen its frosted plate, before the global
+        # emergency treatment turns either one into outlined YouTube copy.
+        family_variants: list[tuple[str, GraphicStyle, str]] = []
+        family_surface = str(
+            ((GRAPHIC_PRESET_SPECS.get(cue.style.preset) or {}).get("style") or {})
+            .get("surface", "")
+        )
+        family_surface_is_inherited = cue.style.surface == family_surface
+        if cue.style.preset == "editorial_minimal" and family_surface_is_inherited:
+            family_variants.append((
+                "light_editorial_palette",
+                cue.style.model_copy(update={
+                    "primary_color": "#F7F5F0",
+                    "secondary_color": "#D8D5CE",
+                    "stroke_width": 0.0,
+                }),
+                cue.background,
+            ))
+        elif cue.style.preset == "cinematic_title" and family_surface_is_inherited:
+            family_variants.append((
+                "cinematic_scrim",
+                cue.style.model_copy(update={
+                    "surface": "solid", "primary_color": "#FFFFFF",
+                    "secondary_color": "#F1EEE8", "plate_color": "#090A0D",
+                    "plate_alpha": 125, "stroke_width": 0.0,
+                    "shadow_opacity": 185, "shadow_blur": 12,
+                    "shadow_offset_y": 4,
+                }),
+                "plate",
+            ))
+        elif cue.style.preset == "soft_lifestyle" and family_surface_is_inherited:
+            family_variants.extend([
+                (
+                    "deeper_frosted_plate",
+                    cue.style.model_copy(update={
+                        "surface": "glass", "primary_color": "#24211D",
+                        "secondary_color": "#514A43", "plate_color": "#F5EFE5",
+                        "plate_alpha": alpha, "stroke_width": 0.0,
+                    }),
+                    "plate",
+                )
+                for alpha in (210, 235)
+            ])
+        for name, family_style, family_background in family_variants:
+            candidate, _candidate_cue, candidate_scores, candidate_ratio = (
+                compile_accessible_variant(
+                    family_style, background=family_background,
+                )
+            )
+            if candidate_ratio is not None and candidate_ratio >= 4.5:
+                card, scores, ratio = candidate, candidate_scores, candidate_ratio
+                adjustments.append(name)
+                break
+
+        # Preserve the authored surface first. A controlled black outline is
+        # enough on many mixed backgrounds and keeps an editorial line,
+        # ribbon or highlight looking like itself instead of turning every
+        # adaptive title into the same black rectangle.
+        outline_style = cue.style.model_copy(update={
             "primary_color": "#FFFFFF",
             "secondary_color": "#FFFFFF",
             "emphasis_color": "#FFFFFF",
-            "plate_color": "#000000",
-            "plate_alpha": 235,
             "stroke_color": "#000000",
-            "stroke_width": max(2.0, cue.style.stroke_width),
+            "stroke_width": 3.0,
         })
-        fallback_cue = cue.model_copy(update={
-            "background": "plate", "style": fallback_style,
-        })
-        fallback = draw_graphic(
-            fallback_cue, plan, width=width, height=height, into=into,
-            render_scale=max(1.0, fallback_cue.transform.scale),
-        )
-        fallback = _apply_authored_transform(
-            fallback_cue, fallback, width, height
-        )
-        card = fallback
-        if cue.position == "auto":
-            card, scores = resolve_auto_position(
-                fallback_cue, card, frames, frame_width=width,
-                frame_height=height, evidence=evidence,
-                forbidden_positions=forbidden_positions or set(),
-                keepout_rects=keepout_rects,
+        if ratio < 4.5:
+            outlined, _outlined_cue, outlined_scores, outlined_ratio = (
+                compile_accessible_variant(
+                    outline_style, background=cue.background,
+                )
             )
-        card = _place_for_motion_safe(cue, card, width, height)
-        ratio = measured_text_contrast(
-            card, frames or [], cue=fallback_cue,
-            frame_width=width, frame_height=height,
-            outline_width=round(
-                fallback_style.stroke_width * height / 1080.0
-                * fallback_cue.transform.scale
-            ),
-            outline_rgb=_rgb(fallback_style.stroke_color),
-        )
-        fallback_plate = True
-        adjustments.extend(["white_text", "dark_plate", "outline"])
+        else:
+            outlined_ratio = None
+        if ratio < 4.5 and outlined_ratio is not None and outlined_ratio >= 4.5:
+            card, scores, ratio = outlined, outlined_scores, outlined_ratio
+            adjustments.extend(["white_text", "outline"])
+        elif ratio < 4.5:
+            # A neutral final fallback, not an inferred brand. It is local
+            # and deterministic so preview and export agree.
+            fallback_style = cue.style.model_copy(update={
+                "surface": "solid",
+                "primary_color": "#FFFFFF",
+                "secondary_color": "#FFFFFF",
+                "emphasis_color": "#FFFFFF",
+                "plate_color": "#000000",
+                "plate_alpha": 235,
+                "stroke_color": "#000000",
+                # The fallback owns its accessibility treatment. Reusing an
+                # authored extreme outline can swallow thin CJK glyphs and
+                # turn nominal white-on-black copy into black-on-black.
+                "stroke_width": 2.0,
+            })
+            card, fallback_cue, scores, ratio = compile_accessible_variant(
+                fallback_style, background="plate",
+            )
+            fallback_plate = True
+            adjustments.extend(["white_text", "dark_plate", "outline"])
         if ratio is None:
             raise ValueError(
                 f"{cue.graphic_id}: automatic contrast fallback could not be audited"

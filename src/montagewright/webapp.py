@@ -207,13 +207,25 @@ def _ran_with(run, flag: str, *, after: bool = True) -> str:
 def _brief_of(run) -> str:
     """The brief this run was written against, if it was kept."""
 
-    said = _ran_with(run, "--brief")
-    if not said:
+    path = _brief_path_of(run)
+    if path is None:
         return ""
     try:
-        return Path(said).read_text(encoding="utf-8")[:4000]
+        return path.read_text(encoding="utf-8")[:4000]
     except OSError:
         return ""
+
+
+def _brief_path_of(run) -> Path | None:
+    """The durable Brief path, accepting both CLI flag spellings."""
+
+    command = run.command or []
+    for index, argument in enumerate(command):
+        if argument == "--brief" and index + 1 < len(command):
+            return Path(command[index + 1])
+        if argument.startswith("--brief="):
+            return Path(argument.split("=", 1)[1])
+    return None
 
 
 def _transcript_map(run) -> dict:
@@ -1788,7 +1800,11 @@ def create_app() -> FastAPI:
     def graphics_track(run_id: str) -> JSONResponse:
         """The independent editorial-graphics track and its copy provenance."""
 
-        from montagewright.graphics import GraphicsPlan, templates_for_editor
+        from montagewright.graphics import (
+            GRAPHIC_PRESET_REGISTRY_VERSION, CopyFact, GraphicsPlan,
+            graphic_presets_for_editor,
+            templates_for_editor,
+        )
 
         run = _run(run_id)
         source = run.output / "work" / "graphics.json"
@@ -1850,14 +1866,7 @@ def create_app() -> FastAPI:
                     candidate_path.read_text(encoding="utf-8")
                 )
             else:
-                brief_path = None
-                for index, argument in enumerate(run.command):
-                    if argument == "--brief" and index + 1 < len(run.command):
-                        brief_path = Path(run.command[index + 1])
-                        break
-                    if argument.startswith("--brief="):
-                        brief_path = Path(argument.split("=", 1)[1])
-                        break
+                brief_path = _brief_path_of(run)
                 if brief_path is not None and brief_path.exists():
                     from montagewright.brief import load_brief
 
@@ -1869,9 +1878,90 @@ def create_app() -> FastAPI:
                     }
         except (OSError, ValueError) as error:
             raise HTTPException(422, f"brief candidates are unreadable: {error}")
+        # Candidate provenance is server-issued just like approved copy. It
+        # is not approval, but exposing these immutable facts lets the Web UI
+        # cite ordinary Brief prose without manufacturing a source label.
+        candidate_facts = candidate_data.get("facts", []) or []
+        if candidate_facts:
+            try:
+                known = {fact.fact_id for fact in plan.facts}
+                plan = GraphicsPlan.model_validate({
+                    **plan.model_dump(mode="json"),
+                    "facts": [
+                        *plan.model_dump(mode="json")["facts"],
+                        *(fact for fact in candidate_facts
+                          if fact.get("fact_id") not in known),
+                    ],
+                })
+            except (ValueError, TypeError) as error:
+                raise HTTPException(
+                    422, f"brief candidate facts are unreadable: {error}"
+                )
+        # Older clients were once able to persist an evidence-looking label
+        # without the artifact that proves it. Reconcile those records while
+        # loading: verified server facts keep their lineage; everything else
+        # becomes an unapproved user draft instead of being grandfathered as
+        # OCR/transcript/Gemini evidence forever.
+        try:
+            trusted_catalog = {
+                fact.fact_id: fact
+                for fact in [
+                    *(
+                        CopyFact.model_validate(raw)
+                        for raw in (
+                            json.loads(approved_copy.read_text(encoding="utf-8"))
+                            .get("facts", [])
+                            if approved_copy.exists() else []
+                        )
+                    ),
+                    *(
+                        CopyFact.model_validate(raw)
+                        for raw in candidate_facts
+                    ),
+                ]
+            }
+            downgraded: set[str] = set()
+            reconciled_facts = []
+            for fact in plan.facts:
+                trusted = trusted_catalog.get(fact.fact_id)
+                if fact.source_kind == "user" or (
+                    trusted is not None
+                    and fact.model_dump() == trusted.model_dump()
+                ):
+                    reconciled_facts.append(fact)
+                    continue
+                downgraded.add(fact.fact_id)
+                reconciled_facts.append(fact.model_copy(update={
+                    "source_kind": "user",
+                    "source_reference": "legacy-unverified",
+                    "source_sha256": "",
+                    "text_sha256": "",
+                    "allowed_kinds": [],
+                    "approved": False,
+                    "approved_by": None,
+                }))
+            if downgraded:
+                plan = GraphicsPlan(
+                    version=plan.version,
+                    revision=plan.revision,
+                    brand=plan.brand,
+                    facts=reconciled_facts,
+                    cues=[
+                        cue.model_copy(update={"status": "draft"})
+                        if cue.primary_fact_id in downgraded
+                        or cue.secondary_fact_id in downgraded
+                        else cue
+                        for cue in plan.cues
+                    ],
+                )
+        except (OSError, ValueError, TypeError) as error:
+            raise HTTPException(422, f"graphics provenance is unreadable: {error}")
+        by_id = {fact.fact_id: fact for fact in plan.facts}
         return JSONResponse({
             **plan.model_dump(mode="json"),
             "templates": templates_for_editor(),
+            "presets": graphic_presets_for_editor(),
+            "preset_registry_version": GRAPHIC_PRESET_REGISTRY_VERSION,
             "layout": layout,
             "brief_sha256": candidate_data.get("brief_sha256", ""),
             "brief_source": str(brief_path) if brief_path else "",
@@ -1954,6 +2044,47 @@ def create_app() -> FastAPI:
             validate_brief_authority(plan, authority)
         except (OSError, ValueError, TypeError) as error:
             raise HTTPException(422, str(error))
+        # A generic PUT may add user-authored drafts, but it may not claim an
+        # evidence provenance. Non-user facts must be byte-for-byte records
+        # already issued by this run's server artifacts or its stored plan.
+        trusted_non_user = {
+            fact.fact_id: fact for fact in authority
+            if fact.source_kind != "user"
+        }
+        candidate_path = run.output / "work" / "brief-candidates.json"
+        try:
+            if candidate_path.exists():
+                candidate_payload = json.loads(
+                    candidate_path.read_text(encoding="utf-8")
+                )
+            else:
+                brief_path = _brief_path_of(run)
+                if brief_path is not None and brief_path.exists():
+                    from montagewright.brief import load_brief
+
+                    candidate_payload = load_brief(brief_path).candidates_json()
+                else:
+                    candidate_payload = {"facts": []}
+            for raw in candidate_payload.get("facts", []) or []:
+                fact = CopyFact.model_validate(raw)
+                trusted_non_user[fact.fact_id] = fact
+        except (OSError, ValueError, TypeError) as error:
+            raise HTTPException(422, f"brief candidates are unreadable: {error}")
+        forged = [
+            fact.fact_id for fact in plan.facts
+            if fact.source_kind != "user"
+            and (
+                fact.fact_id not in trusted_non_user
+                or fact.model_dump()
+                != trusted_non_user[fact.fact_id].model_dump()
+            )
+        ]
+        if forged:
+            raise HTTPException(
+                422,
+                "文字來源必須由伺服器證據建立，不能由一般存檔宣稱："
+                + ", ".join(forged),
+            )
         source = next(
             (
                 run.output / name
@@ -2322,10 +2453,24 @@ def create_app() -> FastAPI:
                 "joint_layout": joint_layout,
             })
             write_json(metadata_path, metadata)
+        # Preview files outlive the in-memory run alias that first compiled
+        # them.  A server restart may reopen the same output directory under
+        # its durable run id; never return the stale alias embedded in cached
+        # metadata.  The digest filename is the authority, the URL is merely
+        # a request-scoped projection.
+        for item in metadata.get("joint_layout", {}).values():
+            filename = Path(str(item.get("url") or "")).name
+            if re.fullmatch(r"[0-9a-f]{64}\.png", filename):
+                item["url"] = (
+                    f"/api/runs/{run_id}/graphics-preview-file/{filename}"
+                )
+        current_url = metadata["joint_layout"][graphic_id]["url"]
         return JSONResponse({
-            "url": metadata["joint_layout"][graphic_id]["url"],
             "frame_width": width, "frame_height": height,
             **metadata,
+            # Keep this after **metadata: old cache records also contain a
+            # top-level URL and dict expansion would otherwise restore it.
+            "url": current_url,
         })
 
     @app.get("/api/runs/{run_id}/graphics-preview-file/{filename}")

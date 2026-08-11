@@ -38,7 +38,7 @@
     /* A real default, not auto: an auto row whose flex child may collapse
        to nothing sizes itself to the transport bar and clips every track
        out of sight. */
-    display: grid; grid-template-rows: var(--rail) 1fr 5px var(--reel, 282px);
+    display: grid; grid-template-rows: var(--rail) 1fr 5px var(--reel, 244px);
     height: 100%;
   }
 
@@ -101,7 +101,8 @@
 
   .nothing-yet {
     flex: 1; display: none; flex-direction: column; align-items: center;
-    justify-content: center; gap: 14px; text-align: center; padding: 40px;
+    justify-content: flex-start; gap: 14px; text-align: left;
+    padding: clamp(28px, 5vh, 58px) clamp(18px, 4vw, 56px) 64px;
     min-height: 0; overflow: auto;
     background:
       radial-gradient(1100px 520px at 50% -10%,
@@ -109,15 +110,41 @@
       var(--deep);
   }
   .nothing-yet.on { display: flex; }
-  .nothing-yet h2 { margin: 0; font-size: 19px; font-weight: 600; }
-  .nothing-yet p { margin: 0; color: var(--soft); font-size: 13.5px; line-height: 1.7; }
-  .nothing-yet p.quiet { color: var(--dim); font-size: 12px; }
-  .nothing-yet button { font-size: 14px; padding: 9px 18px; }
-  .cold-past {
-    width: min(820px, 100%); margin-top: 22px; text-align: left;
+  body.cold-start .app {
+    /* Hidden timeline rows used to keep their 244px allocation, leaving a
+       white slab below the chooser. A chooser owns the whole work area. */
+    grid-template-rows: var(--rail) minmax(0, 1fr) 0 0;
+  }
+  .cold-hero {
+    width: min(1040px, 100%); display: grid;
+    grid-template-columns: minmax(0, 1fr) auto; align-items: center;
+    gap: 28px; padding: 24px 26px;
     background: var(--panel); border: 1px solid var(--line);
-    border-radius: 12px; padding: 4px 16px 8px;
-    box-shadow: 0 10px 34px rgba(0,0,0,.16);
+    border-radius: 14px; box-shadow: 0 12px 34px rgba(0,0,0,.10);
+  }
+  .cold-eyebrow {
+    display: block; margin-bottom: 5px; color: var(--dim);
+    font-size: 10px; font-weight: 650; letter-spacing: .09em;
+    text-transform: uppercase;
+  }
+  .nothing-yet h2 { margin: 0; font-size: 23px; font-weight: 670; letter-spacing: -.02em; }
+  .nothing-yet p { margin: 0; color: var(--soft); font-size: 13.5px; line-height: 1.7; }
+  .cold-copy > p { margin-top: 6px; max-width: 620px; }
+  .cold-action { display: flex; flex-direction: column; align-items: stretch; gap: 7px; }
+  .nothing-yet p.quiet { color: var(--dim); font-size: 12px; }
+  .cold-action p.quiet { max-width: 240px; text-align: center; line-height: 1.45; }
+  .nothing-yet button { font-size: 14px; padding: 10px 20px; }
+  .cold-section-label {
+    width: min(1040px, 100%); display: flex; align-items: baseline;
+    justify-content: space-between; gap: 16px; margin-top: 8px; padding: 0 3px;
+  }
+  .cold-section-label strong { font-size: 13px; }
+  .cold-section-label span { color: var(--dim); font-size: 11.5px; }
+  .cold-past {
+    width: min(1040px, 100%); margin-top: 0; text-align: left;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 4px 16px 14px;
+    box-shadow: 0 8px 26px rgba(0,0,0,.09);
   }
   .cold-past .folder {
     display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
@@ -324,6 +351,10 @@
   .graphic-preview-card {
     position: absolute; z-index: 3; pointer-events: auto; box-sizing: border-box;
     color: white; line-height: 1.05; cursor: pointer; touch-action: none;
+    transform-origin: center center;
+  }
+  .graphic-preview-card.interacting {
+    will-change: transform; contain: layout paint style;
   }
   .graphic-preview-card.selected {
     cursor: move; outline: 1px solid #77b7ff; outline-offset: 3px;
@@ -331,6 +362,12 @@
   .graphic-preview-card.locked { cursor: text; }
   .graphic-preview-card.invalid {
     outline: 2px solid #ef4f4f; outline-offset: 4px;
+  }
+  .graphic-preview-status {
+    position: absolute; right: 12px; top: 12px; z-index: 9;
+    padding: 5px 9px; border-radius: 999px; background: rgba(23,25,29,.88);
+    box-shadow: 0 3px 12px rgba(0,0,0,.18); backdrop-filter: blur(8px);
+    color: #fff; font-size: 11px; font-weight: 620; pointer-events: none;
   }
   .graphic-handle {
     position: absolute; width: 12px; height: 12px; border-radius: 50%;
@@ -442,6 +479,50 @@
   }
   .cue-text:focus { outline: none; border-color: var(--accent); }
   select.wide { width: 100%; }
+
+  .graphic-family-grid {
+    grid-column: 1 / -1; display: grid;
+    grid-template-columns: repeat(2, minmax(0,1fr)); gap: 7px;
+  }
+  .graphic-family-card {
+    min-width: 0; display: grid; grid-template-columns: 34px minmax(0,1fr);
+    gap: 8px; align-items: center; padding: 8px; text-align: left;
+    border: 1px solid var(--line); border-radius: 9px;
+    background: var(--panel); color: var(--ink); cursor: pointer;
+  }
+  .graphic-family-card:hover { border-color: var(--soft); }
+  .graphic-family-card.on {
+    border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset;
+    background: color-mix(in srgb, var(--panel) 92%, var(--accent));
+  }
+  .graphic-family-card .sample {
+    width: 34px; height: 27px; border-radius: 5px; overflow: hidden;
+    position: relative; background: var(--family-plate, #202328);
+    border: 1px solid color-mix(in srgb, var(--family-accent, #fff) 55%, transparent);
+  }
+  .graphic-family-card .sample::before,
+  .graphic-family-card .sample::after {
+    content: ''; position: absolute; left: 6px; right: 6px; height: 3px;
+    border-radius: 2px; background: var(--family-fg, #fff);
+  }
+  .graphic-family-card .sample::before { top: 7px; }
+  .graphic-family-card .sample::after {
+    top: 14px; right: 13px; background: var(--family-accent, #ddd);
+  }
+  .graphic-family-card b { display: block; font-size: 11.5px; line-height: 1.2; }
+  .graphic-family-card small {
+    display: block; margin-top: 2px; color: var(--dim); font-size: 9.5px;
+    line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .graphic-project-style {
+    grid-column: 1 / -1; padding: 9px 10px; border: 1px solid var(--hair);
+    border-radius: 9px; background: var(--sunk);
+  }
+  .graphic-project-style strong { display: block; margin-bottom: 7px; font-size: 11.5px; }
+  .graphic-project-style .font-row {
+    display: grid; grid-template-columns: 70px 1fr; gap: 6px 9px; align-items: center;
+  }
+  .graphic-project-style label { color: var(--dim); font-size: 10.5px; }
 
   .ins-part { margin-top: 18px; }
   .ins-part h4 {
@@ -869,6 +950,275 @@
   .fault b { display: block; margin-bottom: 4px; }
   .fault .detail { font-family: var(--mono); font-size: 11.5px; color: var(--soft); }
   .fault a { color: var(--accent); }
+
+  /* Review-first workspace. The picture gets the room; reference material
+     and detailed controls stay one click away instead of permanently
+     squeezing the decision being reviewed. */
+  .work {
+    grid-template-columns: minmax(280px, 330px) 5px minmax(320px, 1fr) 5px minmax(330px, 390px);
+  }
+  .work > .browser { grid-column: 1; }
+  .work > #grip-left { grid-column: 2; }
+  .work > .stage { grid-column: 3; }
+  .work > #grip-right { grid-column: 4; }
+  .work > .side { grid-column: 5; }
+  .panel-toggle.on { background: var(--ink); color: var(--panel); }
+  body.library-closed .work { grid-template-columns: 0 0 minmax(320px, 1fr) 5px minmax(330px, 390px); }
+  body.library-closed .browser, body.library-closed #grip-left { display: none; }
+  body.inspector-closed .work { grid-template-columns: minmax(280px, 330px) 5px minmax(320px, 1fr) 0 0; }
+  body.inspector-closed .side, body.inspector-closed #grip-right { display: none; }
+  body.library-closed.inspector-closed .work { grid-template-columns: 0 0 1fr 0 0; }
+  .browser .tabs {
+    display: flex; gap: 3px; overflow-x: auto; border-bottom: 1px solid var(--hair);
+    scrollbar-width: none; flex: 0 0 auto; min-height: 40px;
+  }
+  .browser .tabs::-webkit-scrollbar { display: none; }
+  .browser .tab { flex: 0 0 auto; }
+  .browser .panes { padding: 8px 14px 18px; }
+  .shotcard { padding: 10px 8px; }
+  .shotcard .thumb { width: 62px; height: 82px; }
+  .line2 { -webkit-line-clamp: 2; }
+  .copy-bank { max-height: none; overflow: visible; }
+  .copy-drawer {
+    width: 100%; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--sunk); margin-bottom: 10px;
+  }
+  .copy-drawer > summary {
+    cursor: pointer; list-style: none; padding: 8px 10px; font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .copy-drawer > summary::after { content: '展開'; color: var(--dim); font-size: 11px; font-weight: 400; }
+  .copy-drawer[open] > summary::after { content: '收起'; }
+  .copy-drawer .copy-drawer-body { display: flex; gap: 7px; flex-wrap: wrap; padding: 0 8px 9px; }
+  .graphic-editor-nav {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
+    position: sticky; top: -14px; z-index: 6; padding: 8px 0 10px;
+    background: var(--panel); border-bottom: 1px solid var(--hair);
+  }
+  .graphic-editor-nav button {
+    padding: 6px 7px; font-size: 11.5px; background: var(--sunk);
+    color: var(--soft); border-color: var(--line);
+  }
+  .graphic-editor-nav button.on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+  .graphic-editor-panel.hide-panel { display: none; }
+  .graphic-advanced { margin: 10px 0; border: 1px solid var(--line); border-radius: 8px; }
+  .graphic-advanced > summary { cursor: pointer; padding: 8px 10px; color: var(--soft); font-size: 12px; }
+  .graphic-advanced > .ins-part { border-top: 1px solid var(--hair); margin: 0; padding: 12px 10px; }
+  #graphic-inspector > .cue-text { min-height: 72px; }
+  #graphic-inspector > .ins-part:last-child {
+    position: static; margin: 18px -16px -20px;
+    padding: 9px 16px; background: color-mix(in srgb, var(--panel) 94%, transparent);
+    backdrop-filter: blur(12px); border-top: 1px solid var(--line);
+    display: grid; grid-template-columns: 1fr 1fr; gap: 7px;
+  }
+  #graphic-inspector > .ins-part:last-child p { grid-column: 1 / -1; }
+  @media (max-height: 800px) {
+    #graphic-inspector > .ins-part:last-child p { display: none; }
+  }
+  .brief-field {
+    padding: 14px; border-radius: 10px; background: var(--sunk);
+    border: 1px solid var(--line); order: -1;
+  }
+  .source-field { order: -2; }
+  .brief-field textarea { min-height: 150px; }
+  .setup-advanced { grid-column: 1 / -1; border-top: 1px solid var(--line); padding-top: 8px; }
+  .setup-advanced summary { cursor: pointer; color: var(--soft); font-weight: 600; }
+  .setup-advanced .fields { margin-top: 10px; }
+
+  /* Editorial surfaces. Each column has a different job, so its blocks
+     should be recognisable before their copy is read: browse, judge, edit. */
+  .browser, .side { background: var(--bg); }
+  .browser .tabs, .side .head {
+    background: color-mix(in srgb, var(--panel) 92%, var(--sunk));
+    box-shadow: 0 1px 0 var(--line);
+  }
+  .browser .panes { background: var(--bg); }
+  .pane-intro {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 12px; margin: 4px 0 10px; padding: 0 2px;
+  }
+  .pane-intro strong { font-size: 12.5px; font-weight: 650; }
+  .pane-intro span { color: var(--dim); font-size: 11px; text-align: right; }
+
+  /* The library is a stack of editorial decisions, not a document made of
+     paragraphs. A persistent card edge makes one shot legible from the next. */
+  .shotcard {
+    position: relative; margin: 0 0 8px; padding: 9px;
+    background: var(--panel); border-color: var(--line);
+    box-shadow: 0 1px 2px color-mix(in srgb, #000 8%, transparent);
+    transition: border-color .12s, box-shadow .12s, transform .12s;
+  }
+  .shotcard:hover {
+    background: var(--panel); border-color: color-mix(in srgb, var(--ink) 25%, var(--line));
+    box-shadow: 0 4px 12px color-mix(in srgb, #000 11%, transparent);
+    transform: translateY(-1px);
+  }
+  .shotcard.on {
+    background: var(--panel); border-color: var(--accent);
+    box-shadow: inset 3px 0 0 var(--accent), 0 4px 14px color-mix(in srgb, #000 12%, transparent);
+  }
+  .shotcard .thumb { border: 1px solid var(--hair); }
+  .shotcard .subject { font-size: 13.5px; letter-spacing: -.01em; }
+  .shotcard .move, .shotcard .no {
+    border-radius: 999px; padding: 1px 7px;
+  }
+  .shotcard .line2 { color: var(--soft); font-size: 11.5px; line-height: 1.55; }
+
+  /* A monitor needs an edge and a control shelf. Without those, the neutral
+     canvas reads as unused page space rather than a place to judge a frame. */
+  .screen {
+    padding: 42px 28px 58px;
+    background:
+      radial-gradient(ellipse at 50% 44%, color-mix(in srgb, var(--panel) 34%, transparent), transparent 58%),
+      color-mix(in srgb, var(--deep) 88%, #151515);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line) 70%, transparent);
+  }
+  .stage-label {
+    position: absolute; z-index: 8; left: 18px; top: 14px;
+    display: flex; align-items: center; gap: 8px;
+    color: var(--dim); font-size: 10px; letter-spacing: .08em;
+    text-transform: uppercase; pointer-events: none;
+  }
+  .stage-label::before {
+    content: ''; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 16%, transparent);
+  }
+  .peek {
+    left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 9;
+    padding: 3px; gap: 1px; border: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+    border-radius: 9px; background: color-mix(in srgb, var(--panel) 88%, transparent);
+    box-shadow: 0 6px 20px rgba(0,0,0,.16); backdrop-filter: blur(12px);
+  }
+  .peek button { padding: 5px 9px; color: var(--soft); }
+  .peek button.on { background: var(--ink); color: var(--panel); }
+  .screen .over { top: 15px; left: auto; right: 18px; }
+
+  /* The inspector leads with verdict, then evidence and controls. Each part
+     remains scannable even when the explanation itself is several lines. */
+  .side .head {
+    min-height: 48px; padding: 9px 14px; flex-direction: column;
+    align-items: flex-start; justify-content: center; gap: 0;
+  }
+  .side .head .eyebrow {
+    color: var(--dim); font-size: 9.5px; letter-spacing: .09em;
+    text-transform: uppercase; line-height: 1.2;
+  }
+  .side .head .who { font-family: var(--sans); font-size: 13px; font-weight: 650; }
+  .side .body { padding: 12px; }
+  #inspector .ins-card {
+    background: var(--panel); border-color: var(--line);
+    box-shadow: 0 2px 7px color-mix(in srgb, #000 8%, transparent);
+  }
+  #inspector .ins-part {
+    position: relative; margin-top: 10px; padding: 13px;
+    border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel);
+  }
+  #inspector .ins-part h4 {
+    display: flex; align-items: center; gap: 7px; margin: 0 0 10px;
+    padding: 0; border: 0; color: var(--soft); font-size: 11px;
+    letter-spacing: .04em;
+  }
+  #inspector .ins-part h4::before {
+    content: ''; width: 7px; height: 7px; border-radius: 2px;
+    background: var(--dim);
+  }
+  #inspector .ins-part h4 small {
+    margin-left: auto; color: var(--dim); font-size: 10px;
+    font-weight: 450; letter-spacing: 0; text-transform: none;
+  }
+  #inspector .ins-part.result { border-left: 3px solid var(--ok); }
+  #inspector .ins-part.result h4::before { background: var(--ok); }
+  #inspector .ins-part.result.off { border-left-color: var(--accent); }
+  #inspector .ins-part.result.off h4 { color: var(--accent); }
+  #inspector .ins-part.result.off h4::before { background: var(--accent); }
+  #inspector .ins-part.adjust { background: var(--sunk); }
+  #inspector .ins-part.adjust h4::before { background: var(--ink); }
+  #inspector .pairs { grid-template-columns: minmax(72px, auto) 1fr; row-gap: 7px; }
+  #inspector .pairs > span:nth-child(odd) { padding-top: 1px; }
+  #inspector .gainrow { background: var(--panel); }
+
+  /* Track headers live outside the time surface. Putting their labels inside
+     a lane covered anything beginning at 00:00 -- usually the opening card. */
+  .reelwrap { box-shadow: 0 -5px 18px color-mix(in srgb, #000 7%, transparent); }
+  .reelbar { min-height: 46px; background: var(--panel); }
+  .ruler { background: color-mix(in srgb, var(--sunk) 88%, var(--panel)); }
+  .timeline-body {
+    flex: 1; min-height: 0; min-width: 0;
+    display: grid; grid-template-columns: 48px minmax(0, 1fr);
+  }
+  .timeline-body > .scroller { height: 100%; min-height: 0; }
+  .timeline-body .reel { min-height: 100%; }
+  .track-rail {
+    min-height: 0; display: flex; flex-direction: column;
+    color: var(--dim); background: var(--panel);
+    border-right: 1px solid var(--line); padding-bottom: 11px;
+    box-shadow: 2px 0 7px color-mix(in srgb, #000 7%, transparent);
+    z-index: 8;
+  }
+  .track-rail > span {
+    display: flex; align-items: center; justify-content: center;
+    flex: 0 0 30px; border-bottom: 1px solid var(--hair);
+    font-size: 9px; font-weight: 650; letter-spacing: .04em;
+  }
+  .track-rail .rail-ruler { flex-basis: 20px; background: var(--sunk); }
+  .track-rail .rail-picture {
+    flex: 1 1 auto; min-height: 104px; max-height: 340px;
+  }
+  .track-rail .rail-graphics { flex-basis: 38px; }
+  .track-rail .rail-subs { flex-basis: 44px; }
+  .lane .name, .track .name {
+    /* Kept in the DOM for old cached markup and accessibility tests; the
+       visible, non-overlapping labels are in .track-rail. */
+    display: none;
+  }
+  .track { background: color-mix(in srgb, var(--sunk) 92%, var(--panel)); }
+  .lane { background: color-mix(in srgb, var(--sunk) 82%, var(--panel)); }
+
+  @media (max-width: 767px) {
+    :root { --rail: 52px; }
+    .bar { gap: 7px; padding: 0 9px; }
+    .bar .brand, .bar .sep, .bar .meta, #open-past { display: none; }
+    .bar button { padding: 6px 8px; font-size: 11px; }
+    .app { grid-template-rows: var(--rail) minmax(0, 1fr) 4px var(--reel, 220px); }
+    .work, body.library-closed .work, body.inspector-closed .work,
+    body.library-closed.inspector-closed .work { display: block; position: relative; min-width: 0; }
+    .stage { width: 100%; height: 100%; }
+    #grip-left, #grip-right { display: none !important; }
+    .browser, .side {
+      display: none !important; position: absolute; inset: 0; z-index: 40;
+      width: min(92vw, 390px); max-width: 100%; box-shadow: 12px 0 36px rgba(0,0,0,.32);
+    }
+    .side { left: auto; right: 0; box-shadow: -12px 0 36px rgba(0,0,0,.32); }
+    body.mobile-library-open .browser { display: flex !important; }
+    body.mobile-inspector-open .side { display: flex !important; }
+    .screen { padding: 34px 10px 52px; }
+    .nothing-yet { justify-content: flex-start; padding: 16px 12px 36px; }
+    .cold-hero { grid-template-columns: 1fr; gap: 18px; padding: 20px; }
+    .cold-action p.quiet { max-width: none; }
+    .cold-section-label { margin-top: 2px; }
+    .nothing-yet .cold-past { margin-top: 10px; }
+    .reelbar { gap: 5px; padding-inline: 8px; }
+    .reelbar .vol, .reelbar .zoom, #show-keys { display: none; }
+    .graphic-editor-nav { grid-template-columns: repeat(4, 1fr); }
+    .graphic-view-canvas { display: inline-flex !important; }
+  }
+  @media (min-width: 768px) and (max-width: 1100px) {
+    .work, body.library-closed .work, body.inspector-closed .work,
+    body.library-closed.inspector-closed .work { display: block; position: relative; min-width: 0; }
+    .stage { width: 100%; height: 100%; }
+    #grip-left, #grip-right { display: none !important; }
+    .browser, .side {
+      display: none !important; position: absolute; inset: 0; z-index: 40;
+      width: min(44vw, 390px); min-width: 320px; max-width: 100%;
+      box-shadow: 12px 0 36px rgba(0,0,0,.32);
+    }
+    .side { left: auto; right: 0; box-shadow: -12px 0 36px rgba(0,0,0,.32); }
+    body.mobile-library-open .browser { display: flex !important; }
+    body.mobile-inspector-open .side { display: flex !important; }
+    .graphic-editor-nav { grid-template-columns: repeat(4, 1fr); }
+    .graphic-view-canvas { display: inline-flex !important; }
+  }
 </style>
 </head>
 <body>
@@ -883,6 +1233,8 @@
     </span>
     <span class="grow"></span>
     <span id="picked" class="meta"></span>
+    <button class="ghost panel-toggle" id="toggle-library" title="開關素材與軌道清單">素材</button>
+    <button class="ghost panel-toggle" id="toggle-inspector" title="開關檢查器">檢查器</button>
     <div class="menu">
       <button class="ghost" id="export">匯出 ▾</button>
       <div class="drop hide" id="export-drop">
@@ -918,11 +1270,18 @@
   </div>
 
   <div class="nothing-yet" id="nothing-yet">
-    <h2>還沒有剪過東西</h2>
-    <p>指一個放毛片的資料夾，它會看過每一支、決定怎麼剪、然後交出一支片<br>
-       跟一份說明每個決定是怎麼來的報表。</p>
-    <button id="first-run">選素材開始</button>
-    <p class="quiet">命令列跑過的也算，`--output` 指到哪裡都找得到。</p>
+    <div class="cold-hero">
+      <div class="cold-copy">
+        <span class="cold-eyebrow">還沒有剪過東西也沒關係</span>
+        <h2>開始一輪剪輯</h2>
+        <p>選擇毛片資料夾、音樂與 Brief。系統會完成看素材、挑片、裁切、節奏與驗收，之後仍可回到編輯器檢查與微調。</p>
+      </div>
+      <div class="cold-action">
+        <button id="first-run">選素材開始</button>
+        <p class="quiet">也可以開啟下方既有剪輯</p>
+      </div>
+    </div>
+    <div class="cold-section-label"><strong>最近剪輯</strong><span>依素材資料夾分組</span></div>
     <div class="cold-past hide" id="cold-past"></div>
   </div>
 
@@ -938,7 +1297,7 @@
       </div>
       <div class="panes" id="panes">
         <div class="pane" id="pane-shots">
-          <p class="sub">點一顆會跳到時間軸上那一段。</p>
+          <div class="pane-intro"><strong>剪輯順序</strong><span>點鏡頭會跳到時間軸</span></div>
           <div class="scroll"><div id="shot-list"></div></div>
         </div>
         <div class="pane hide" id="pane-graphics">
@@ -986,6 +1345,7 @@
 
     <div class="stage">
       <div class="screen">
+        <div class="stage-label">預覽工作區</div>
         <div class="over" id="over"></div>
         <div class="frame" id="frame">
           <div class="half"><video id="video" playsinline></video></div>
@@ -998,6 +1358,7 @@
           </div>
           <div class="cropbox hide" id="cropbox"></div>
           <div class="graphic-preview-layer hide" id="graphic-preview"></div>
+          <div class="graphic-preview-status hide" id="graphic-preview-status">正在產生精準預覽…</div>
           <div class="burnt hide" id="burnt"></div>
         </div>
         <div class="warn hide" id="crop-warn">這一輪沒有留下裁切紀錄，框是事後從素材卡重算的，不等於實際裁切</div>
@@ -1012,7 +1373,7 @@
     <div class="grip" id="grip-right" title="拖動調整寬度"></div>
 
     <aside class="side">
-      <div class="head" id="ins-head"><span class="who">這一顆</span></div>
+      <div class="head" id="ins-head"><span class="eyebrow">檢查器</span><span class="who">這一顆</span></div>
       <div class="body" id="inspector"></div>
       <div class="body hide" id="graphic-inspector"></div>
       <div class="body hide" id="cue-inspector"></div>
@@ -1033,17 +1394,27 @@
       <button class="ghost" id="undo-cut">還原</button>
       <button id="recut" class="hide">重新輸出</button>
     </div>
-    <div class="scroller" id="scroller">
-      <div class="reel" id="reel">
-        <div class="ruler" id="ruler"></div>
-        <div class="track" id="track"></div>
-        <div class="lane graphics" id="lane-graphics"
-             title="點字卡在右邊調整"><span class="name">字卡</span></div>
-        <div class="lane subs" id="lane-subs"
-             title="點一句在右邊改，雙擊跳到字幕清單"><span class="name">字幕</span></div>
-        <div class="lane" id="lane-voice"><span class="name">人聲</span></div>
-        <div class="lane" id="lane-music"><span class="name">音樂</span></div>
-        <div class="playhead" id="playhead" style="left:0"></div>
+    <div class="timeline-body">
+      <div class="track-rail" aria-hidden="true">
+        <span class="rail-ruler"></span>
+        <span class="rail-picture">畫面</span>
+        <span class="rail-graphics">字卡</span>
+        <span class="rail-subs">字幕</span>
+        <span>人聲</span>
+        <span>音樂</span>
+      </div>
+      <div class="scroller" id="scroller">
+        <div class="reel" id="reel">
+          <div class="ruler" id="ruler"></div>
+          <div class="track" id="track"></div>
+          <div class="lane graphics" id="lane-graphics"
+               title="點字卡在右邊調整"><span class="name">字卡</span></div>
+          <div class="lane subs" id="lane-subs"
+               title="點一句在右邊改，雙擊跳到字幕清單"><span class="name">字幕</span></div>
+          <div class="lane" id="lane-voice"><span class="name">人聲</span></div>
+          <div class="lane" id="lane-music"><span class="name">音樂</span></div>
+          <div class="playhead" id="playhead" style="left:0"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -1055,7 +1426,7 @@
       <h2>新的一輪</h2>
       <p class="sub">指到素材，其餘留空也能跑。</p>
       <div class="fields">
-        <div class="field wide">
+        <div class="field wide source-field">
           <label>素材</label>
           <div class="row" style="gap:8px;flex-wrap:nowrap">
             <input type="text" id="path" placeholder="點「瀏覽」選一個資料夾，或直接貼路徑">
@@ -1092,6 +1463,8 @@
           <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select></div>
         <div class="field"><label>語音</label>
           <select id="speech"><option value="auto">自動判斷</option><option value="never">不要轉錄</option></select></div>
+        <details class="setup-advanced"><summary>字幕、可編輯時間軸與預算</summary>
+        <div class="fields">
         <div class="field"><label>語言</label><input type="text" id="locale" value="zh-TW"></div>
         <div class="field"><label>字幕</label>
           <select id="subtitles">
@@ -1117,8 +1490,10 @@
           </select></div>
         <div class="field"><label>預算上限（美元）</label>
           <input type="number" id="budget" value="6" min="0.5" step="0.5"></div>
-        <div class="field wide"><label>Brief（可留空）</label>
-          <textarea id="brief" placeholder="這支片要傳達什麼、給誰看、非講不可的是什麼"></textarea></div>
+        </div></details>
+        <div class="field wide brief-field"><label>創作 Brief（可留空）</label>
+          <textarea id="brief" placeholder="這支片要給誰看？希望觀眾記得什麼？哪些內容非講不可？也可以直接貼現有文件。"></textarea>
+          <div class="why">Gemini 會用它決定敘事、挑片與哪些文字值得做成字卡；一般文字只會先成為可檢查的字卡草稿，不會自行變成已核准文案。</div></div>
       </div>
       <div class="actions">
         <button id="go">開始剪</button>
@@ -1318,6 +1693,11 @@ function wirePast(within) {
 }
 
 async function openRun(id, where) {
+  // A debounced save belongs to the run and plan that scheduled it. Flush it
+  // before switching global workspace state, then invalidate every preview
+  // and undo artifact whose cue ids may also exist in the next run.
+  if (graphicsSaving) saveGraphicsNow(runId, graphicsPlan);
+  resetGraphicsEditorState();
   runId = id; seen = 0; lastSource = where || '';
   const data = await (await fetch(`/api/runs/${id}`)).json();
   $('log').textContent = data.lines.join('\n');
@@ -1415,8 +1795,22 @@ function inspect(i) {
          claim and then gets checked against it. Interleaving the plan with
          the verdict made both read as one undifferentiated column of
          sentences, and hid the one relationship worth seeing. -->
-    <section class="ins-part">
-      <h4>它打算做什麼</h4>
+    <section class="ins-part result ${said.delivered === false ? 'off' : ''}">
+      <h4>驗收結果 <small>實際做到什麼</small></h4>
+      <div class="pairs">
+        <span>原素材</span><span>${esc(motionLabel(b.motion?.source, 'source'))}</span>
+        <span>數位裁切</span><span>${esc(motionLabel(b.motion?.digital, 'digital'))}</span>
+        <span>兩層關係</span><span>${esc(COMPOSITES[b.motion?.composite] || b.motion?.composite || '—')}</span>
+        ${b.source_motion_details?.description
+          ? `<span>素材運鏡說明</span><span>${esc(b.source_motion_details.description)}</span>` : ''}
+      </div>
+      ${said.note ? `<p class="why">${esc(said.note)}</p>`
+        : '<p class="why">逐顆驗收沒有單獨看這一顆。</p>'}
+      ${deg.length ? `<div class="degs">${deg.map(tellDegradation).join('')}</div>` : ''}
+    </section>
+
+    <section class="ins-part plan">
+      <h4>原計畫</h4>
       <div class="pairs">
         <span>運鏡</span><span>${esc(MOVES[b.camera_move] || b.camera_move || '—')}${
           plan.frame ? `<i class="why">　宣告${plan.frame === 'travels' ? '會動' : '不動'}</i>` : ''}</span>
@@ -1435,22 +1829,8 @@ function inspect(i) {
       ${rhythm.why ? `<p class="why"><i>為什麼這個長度：</i>${esc(rhythm.why)}</p>` : ''}
     </section>
 
-    <section class="ins-part ${said.delivered === false ? 'off' : ''}">
-      <h4>實際做到什麼</h4>
-      <div class="pairs">
-        <span>原素材</span><span>${esc(motionLabel(b.motion?.source, 'source'))}</span>
-        <span>數位裁切</span><span>${esc(motionLabel(b.motion?.digital, 'digital'))}</span>
-        <span>兩層關係</span><span>${esc(COMPOSITES[b.motion?.composite] || b.motion?.composite || '—')}</span>
-        ${b.source_motion_details?.description
-          ? `<span>素材運鏡說明</span><span>${esc(b.source_motion_details.description)}</span>` : ''}
-      </div>
-      ${said.note ? `<p class="why">${esc(said.note)}</p>`
-        : '<p class="why">逐顆驗收沒有單獨看這一顆。</p>'}
-      ${deg.length ? `<div class="degs">${deg.map(tellDegradation).join('')}</div>` : ''}
-    </section>
-
-    <section class="ins-part">
-      <h4>你可以改的</h4>
+    <section class="ins-part adjust">
+      <h4>可調整</h4>
       <div class="pairs">
         <span>進出點</span><span class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds).toFixed(2)}s
           <i class="why">${b.seconds.toFixed(2)}s${moved ? '，已改動' : ''}</i></span>
@@ -1646,9 +2026,12 @@ function showBurnt() {
 // templates, motion and approval state, but use the same editing gestures.
 let graphicsPlan = { version: 'montagewright-graphics-v2', revision: 0, brand: {}, facts: [], cues: [] };
 let graphics = [], graphicTemplates = [], graphicPicked = -1;
+let graphicStylePresets = {}, graphicStylePresetOptions = [['custom','自訂']];
+let activeGraphicPanel = 'content';
 let graphicApprovalInFlight = false;
 let graphicResolvedLayout = {};
 let briefCandidates = [], briefInstructions = [], briefDigest = '';
+let graphicsFontOptions = [];
 let compiledGraphicPreviews = {}, graphicPreviewTimer = null;
 let graphicPreviewRequests = {}, graphicPreviewPending = new Map();
 let graphicPreviewEpoch = 0;
@@ -1679,6 +2062,7 @@ function graphicSourceLabel(cue) {
 }
 
 async function loadGraphics() {
+  graphicsUndoStack = []; graphicsUndoKey = ''; graphicsUndoAt = 0;
   try {
     const got = await fetch(`/api/runs/${runId}/graphics-track`);
     if (!got.ok) throw new Error('no graphics track');
@@ -1689,6 +2073,13 @@ async function loadGraphics() {
     };
     graphics = data.resolved || [];
     graphicTemplates = data.templates || [];
+    graphicStylePresets = Object.fromEntries(
+      (data.presets || []).map(item => [item.preset_id, item])
+    );
+    graphicStylePresetOptions = [
+      ['custom','自訂'],
+      ...(data.presets || []).map(item => [item.preset_id, item.label]),
+    ];
     graphicResolvedLayout = data.layout || {};
     briefCandidates = data.brief_candidates || [];
     briefInstructions = data.brief_instructions || [];
@@ -1696,6 +2087,7 @@ async function loadGraphics() {
   } catch (error) {
     graphicsPlan = { version: 'montagewright-graphics-v2', revision: 0, brand: {}, facts: [], cues: [] };
     graphics = []; graphicTemplates = []; graphicResolvedLayout = {};
+    graphicStylePresets = {}; graphicStylePresetOptions = [['custom','自訂']];
     briefCandidates = []; briefInstructions = []; briefDigest = '';
   }
   paintGraphics(); paintGraphicList(); showGraphicPreview();
@@ -1706,7 +2098,9 @@ function paintGraphics() {
   if (!lane) return;
   lane.classList.toggle('silent', !graphics.length);
   lane.innerHTML = '<span class="name">字卡</span>' + graphics.map((one, i) => {
-    const wide = Math.max(18, one.duration_seconds * scale - 2);
+    // Keep the block visually faithful to its real duration.  A large
+    // minimum made a 0.2s accent look more than a second long at fit scale.
+    const wide = Math.max(6, one.duration_seconds * scale - 2);
     return `<div class="graphic-block ${one.status === 'draft' ? 'draft' : ''} ${i === graphicPicked ? 'on' : ''}"
       data-i="${i}" style="left:${one.at_seconds * scale}px;width:${wide}px"
       title="${esc(one.primary_text)}">${esc(one.primary_text)}</div>`;
@@ -1773,6 +2167,7 @@ function dragGraphic(event, index) {
   const move = (next) => {
     if (next.pointerId !== pointerId) return;
     if (Math.abs(next.clientX - startX) < 2) return;
+    if (!changed) rememberGraphicsUndo(`timeline-${cue.graphic_id}`);
     changed = true;
     const delta = Math.round(((next.clientX - startX) / scale) * 20) / 20;
     if (edge === 'left') {
@@ -1824,7 +2219,11 @@ function paintGraphicList() {
           }</select> <button class="ghost candidate-add">加入草稿</button></div>
           ${candidate.instruction ? `<div class="instruction">排版備註：${esc(candidate.instruction)}</div>` : ''}
         </div>`).join('') : '';
-  bank.innerHTML = exact + candidates;
+  const suggestions = exact + candidates;
+  bank.innerHTML = suggestions ? `<details class="copy-drawer">
+    <summary>Brief 建議與核准文字 <span class="tag">${briefFacts.length + briefCandidates.length}</span></summary>
+    <div class="copy-drawer-body">${suggestions}</div>
+  </details>` : '';
   for (const chip of bank.querySelectorAll('.copy-chip')) {
     chip.onclick = () => addGraphicAtPlayhead(chip.dataset.fact);
   }
@@ -1848,6 +2247,11 @@ function paintGraphicList() {
 function selectGraphic(i, seekSeconds = null) {
   if (!(i >= 0 && i < graphics.length)) return;
   graphicPicked = i; cue = -1;
+  if (matchMedia('(max-width: 1100px)').matches) {
+    document.body.classList.remove('mobile-library-open');
+    document.body.classList.add('mobile-inspector-open');
+    syncPanelButtons();
+  }
   // Land after the entrance so selecting an animated card never presents an
   // almost-transparent first frame while the user is trying to edit it.
   const target = seekSeconds == null
@@ -1867,7 +2271,8 @@ function selectGraphic(i, seekSeconds = null) {
   $('graphic-inspector').classList.remove('hide');
   $('ins-head').querySelector('.who').textContent = '字卡';
   paintGraphics(); paintGraphicList(); inspectGraphic();
-  scheduleGraphicPreview();
+  // Selection changes no pixels. Reuse the exact cached preview and only
+  // request one if this card has never been compiled; do not dirty the track.
   movePlayhead(); showGraphicPreview();
 }
 
@@ -1877,45 +2282,43 @@ function graphicOptions(values, selected) {
   ).join('');
 }
 
+function graphicFontOptions(selected) {
+  const choices = [['','系統自動'], ...graphicsFontOptions.map(one => [one.file, one.family])];
+  if (selected && !choices.some(([value]) => value === selected)) {
+    choices.push([selected, selected.split('/').pop() || '目前字型']);
+  }
+  return choices
+    .map(([value, label]) =>
+      `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(label)}</option>`
+    ).join('');
+}
+
+function graphicFamilyCards(selected) {
+  return Object.values(graphicStylePresets).filter(one => one.curated_family).map(one => {
+    const style = one.style || {};
+    const plate = style.plate_color || '#24262B';
+    const fg = style.primary_color || '#FFFFFF';
+    const accent = style.surface_secondary_color || style.emphasis_color || '#D8D2C8';
+    return `<button type="button" class="graphic-family-card ${one.preset_id === selected ? 'on' : ''}"
+      data-family="${esc(one.preset_id)}"
+      style="--family-plate:${esc(plate)};--family-fg:${esc(fg)};--family-accent:${esc(accent)}">
+      <span class="sample" aria-hidden="true"></span><span><b>${esc(one.label)}</b>
+      <small>${esc(one.best_for || one.description)}</small></span></button>`;
+  }).join('');
+}
+
 const graphicStyleDefaults = {
-  preset: 'custom', primary_color: '', secondary_color: '', accent_color: '',
+  preset: 'custom', surface: 'template', surface_secondary_color: '',
+  surface_angle: 6, primary_color: '', secondary_color: '', accent_color: '',
   contrast_mode: 'auto',
   plate_color: '', plate_alpha: null, align: 'auto', primary_scale: 1,
-  secondary_scale: 1, line_spacing: 1, max_width_scale: 1,
+  secondary_scale: 1, line_spacing: 1, block_gap_scale: 1, max_width_scale: 1,
   padding_x: 28, padding_y: 19, corner_radius: null,
   stroke_width: 0, stroke_color: '#000000', shadow_color: '#000000',
   shadow_opacity: 0, shadow_blur: 0, shadow_offset_x: 0, shadow_offset_y: 0,
   plate_border_width: 0, plate_border_color: '#FFFFFF',
   emphasis_text: '', emphasis_color: '', entrance_seconds: null,
   exit_seconds: null, motion_distance: null,
-};
-
-const graphicStylePresets = {
-  clean: {stroke_width: 0, shadow_opacity: 0, shadow_blur: 0,
-    plate_border_width: 0, background: 'none'},
-  outlined: {stroke_width: 5, stroke_color: '#000000', shadow_opacity: 0,
-    plate_border_width: 0, background: 'none'},
-  soft_shadow: {stroke_width: 1, stroke_color: '#000000', shadow_opacity: 185,
-    shadow_blur: 9, shadow_offset_x: 3, shadow_offset_y: 5,
-    plate_border_width: 0, background: 'none'},
-  colour_label: {stroke_width: 0, shadow_opacity: 0, plate_border_width: 0,
-    plate_alpha: 232, corner_radius: 18, padding_x: 32, padding_y: 20,
-    background: 'plate'},
-  tech_frame: {stroke_width: 2, stroke_color: '#07101F', shadow_opacity: 140,
-    shadow_blur: 8, shadow_offset_y: 4, plate_alpha: 128,
-    plate_border_width: 2, corner_radius: 8, background: 'plate'},
-  bold_pop: {stroke_width: 7, stroke_color: '#111111', shadow_opacity: 210,
-    shadow_blur: 0, shadow_offset_x: 6, shadow_offset_y: 7,
-    primary_scale: 1.18, plate_border_width: 0, background: 'none'},
-};
-
-const graphicPresetReset = {
-  primary_scale: 1, secondary_scale: 1, line_spacing: 1,
-  max_width_scale: 1, padding_x: 28, padding_y: 19,
-  corner_radius: null, stroke_width: 0, shadow_opacity: 0,
-  shadow_blur: 0, shadow_offset_x: 0, shadow_offset_y: 0,
-  plate_border_width: 0, entrance_seconds: null, exit_seconds: null,
-  motion_distance: null,
 };
 
 function styleOfGraphic(one) {
@@ -1931,12 +2334,20 @@ function inspectGraphic() {
     .filter(t => (t.kinds || []).includes(one.kind))
     .map(t => [t.template_id, t.label]);
   box.innerHTML = `
+    <nav class="graphic-editor-nav" aria-label="字卡編輯分類">
+      <button type="button" class="on" data-graphic-panel="content">內容</button>
+      <button type="button" data-graphic-panel="style">樣式</button>
+      <button type="button" data-graphic-panel="motion">動畫</button>
+      <button type="button" class="graphic-view-canvas" style="display:none">看畫面</button>
+    </nav>
+    <section class="ins-part graphic-editor-panel" data-panel="content"><h4>文字內容</h4>
     <div class="why">第一行 · ${esc(graphicFactSourceLabel(one.primary_fact_id))}</div>
     <textarea id="graphic-primary" class="cue-text" spellcheck="false">${esc(one.primary_text)}</textarea>
     <div class="why">第二行 · ${esc(one.secondary_fact_id
       ? graphicFactSourceLabel(one.secondary_fact_id) : '尚未輸入')}</div>
     <textarea id="graphic-secondary" class="cue-text" spellcheck="false" placeholder="第二行，可留空">${esc(one.secondary_text || '')}</textarea>
-    <section class="ins-part"><h4>內容與時間</h4><div class="pairs">
+    </section>
+    <section class="ins-part graphic-editor-panel" data-panel="content"><h4>內容與時間</h4><div class="pairs">
       <span>類型</span><select id="graphic-kind" class="wide">${graphicOptions([
         ['opening_title','開場主標'],['chapter','章節'],['product_name','產品名'],
         ['feature','功能／規格'],['callout','重點標註'],['end_card','結尾卡']
@@ -1948,13 +2359,25 @@ function inspectGraphic() {
       ], one.status)}</select>
       <span>Brief 備註</span><textarea id="graphic-note" class="wide" placeholder="排版或剪輯指示">${esc(one.editor_note || '')}</textarea>
     </div></section>
-    <section class="ins-part"><h4>設計</h4><div class="pairs">
+    <section class="ins-part graphic-editor-panel hide-panel" data-panel="style"><h4>版面與樣式</h4><div class="pairs">
       <span>模板</span><select id="graphic-template" class="wide">${graphicOptions(templates, one.template)}</select>
-      <span>快速樣式</span><select id="graphic-style-preset" class="wide">${graphicOptions([
-        ['custom','自訂'],['clean','純字'],['outlined','台灣 YouTube 描邊'],
-        ['soft_shadow','柔陰影'],['colour_label','彩色標籤'],
-        ['tech_frame','科技細框'],['bold_pop','粗框立體字']
-      ], style.preset)}</select>
+      <span>設計起點</span><select id="graphic-style-preset" class="wide">${graphicOptions(
+        graphicStylePresetOptions, style.preset
+      )}</select>
+      <div class="graphic-family-grid">${graphicFamilyCards(style.preset)}</div>
+      <span></span><p class="why wide">${esc(
+        graphicStylePresets[style.preset]?.description
+        || '選家族後仍可逐項修改；修改不會把能力鎖死。'
+      )}</p>
+      <div class="graphic-project-style"><strong>專案字型組合</strong>
+        <div class="font-row">
+          <label for="graphic-display-font">標題／主字</label>
+          <select id="graphic-display-font">${graphicFontOptions(graphicsPlan.brand.display_font_path || '')}</select>
+          <label for="graphic-body-font">資訊／輔字</label>
+          <select id="graphic-body-font">${graphicFontOptions(graphicsPlan.brand.font_path || '')}</select>
+        </div>
+        <p class="why">整支影片共用，設計家族再決定大小、層級與外觀。</p>
+      </div>
       <span>可讀性補救</span><select id="graphic-contrast-mode" class="wide">${graphicOptions([
         ['auto','不足時自動補救'],['strict','保留人工值，不足則停止輸出']
       ], style.contrast_mode)}</select>
@@ -1975,25 +2398,31 @@ function inspectGraphic() {
       <span>背景</span><select id="graphic-background" class="wide">${graphicOptions([
         ['auto','依模板'],['none','透明'],['plate','局部底板']
       ], one.background)}</select>
+      <span>底板造型</span><select id="graphic-surface" class="wide">${graphicOptions([
+        ['template','依模板／基本底板'],['solid','純色方板'],['pill','膠囊標籤'],
+        ['split','雙層底板'],['ribbon','斜切緞帶'],['sticker','貼紙'],
+        ['highlight','螢光筆'],['outline','透明框線'],['glass','半透明霧面板'],
+        ['editorial','雜誌線條']
+      ], style.surface)}</select>
+      <span>底板第二色</span><input id="graphic-surface-secondary" type="color" value="${esc(style.surface_secondary_color || style.accent_color || graphicsPlan.brand.accent || '#FFFFFF')}">
+      <span>斜切角度</span><input id="graphic-surface-angle" type="range" min="-18" max="18" step="1" value="${style.surface_angle}">
       <span>圖層</span><input id="graphic-z-index" type="number" min="-100" max="100" value="${one.z_index ?? ''}" placeholder="依時間軸順序">
       <span>字卡互相避讓</span><select id="graphic-collision-policy" class="wide">${graphicOptions([
         ['avoid','避開其他字卡'],['allow','可重疊（雙方都允許時）']
       ], one.collision_policy || 'avoid')}</select>
-      <span>動畫</span><select id="graphic-motion" class="wide">${graphicOptions([
-        ['none','直接出現'],['fade','淡入淡出'],['rise','向上進場'],
-        ['slide_left','向左進場'],['slide_right','向右進場']
-      ], one.motion)}</select>
       <span>對齊</span><select id="graphic-align" class="wide">${graphicOptions([
         ['auto','依模板'],['left','靠左'],['center','置中'],['right','靠右']
       ], style.align)}</select>
       <span>主字大小</span><input id="graphic-primary-scale" type="range" min="0.55" max="1.8" step="0.05" value="${style.primary_scale}">
       <span>輔字大小</span><input id="graphic-secondary-scale" type="range" min="0.55" max="1.8" step="0.05" value="${style.secondary_scale}">
       <span>行距</span><input id="graphic-line-spacing" type="range" min="0.65" max="2" step="0.05" value="${style.line_spacing}">
+      <span>主副標間距</span><input id="graphic-block-gap" type="range" min="0.5" max="2" step="0.05" value="${style.block_gap_scale}">
       <span>字卡寬度</span><input id="graphic-width-scale" type="range" min="0.45" max="1.25" step="0.05" value="${style.max_width_scale}">
       <span>水平內距</span><input id="graphic-padding-x" type="number" min="0" max="160" value="${style.padding_x}">
       <span>垂直內距</span><input id="graphic-padding-y" type="number" min="0" max="120" value="${style.padding_y}">
     </div></section>
-    <section class="ins-part"><h4>文字外觀</h4><div class="pairs">
+    <details class="graphic-advanced graphic-editor-panel hide-panel" data-panel="style"><summary>進階文字外觀</summary>
+    <section class="ins-part"><div class="pairs">
       <span>主文字</span><input id="graphic-fg" type="color" value="${esc(style.primary_color || graphicsPlan.brand.foreground || '#FFFFFF')}">
       <span>輔文字</span><input id="graphic-secondary-colour" type="color" value="${esc(style.secondary_color || graphicsPlan.brand.secondary || '#D9DCE3')}">
       <span>強調文字</span><input id="graphic-emphasis-text" value="${esc(style.emphasis_text)}" placeholder="例如 4.1mm">
@@ -2005,35 +2434,43 @@ function inspectGraphic() {
       <span>陰影模糊</span><input id="graphic-shadow-blur" type="range" min="0" max="40" value="${style.shadow_blur}">
       <span>陰影水平</span><input id="graphic-shadow-x" type="number" min="-40" max="40" value="${style.shadow_offset_x}">
       <span>陰影垂直</span><input id="graphic-shadow-y" type="number" min="-40" max="40" value="${style.shadow_offset_y}">
-    </div></section>
-    <section class="ins-part"><h4>底板與外框</h4><div class="pairs">
+    </div></section></details>
+    <details class="graphic-advanced graphic-editor-panel hide-panel" data-panel="style"><summary>進階底板與外框</summary>
+    <section class="ins-part"><div class="pairs">
       <span>底板色</span><input id="graphic-plate" type="color" value="${esc(style.plate_color || graphicsPlan.brand.plate || '#111318')}">
       <span>底板透明度</span><input id="graphic-plate-alpha" type="range" min="0" max="255" value="${style.plate_alpha ?? graphicsPlan.brand.plate_alpha ?? 205}">
       <span>圓角</span><input id="graphic-corner-radius" type="range" min="0" max="160" value="${style.corner_radius ?? Math.round((graphicsPlan.brand.corner_radius || .18) * 100)}">
       <span>外框粗細</span><input id="graphic-border-width" type="range" min="0" max="24" value="${style.plate_border_width}">
       <span>外框色</span><input id="graphic-border-colour" type="color" value="${esc(style.plate_border_color)}">
-    </div></section>
-    <section class="ins-part"><h4>動畫細節</h4><div class="pairs">
+    </div></section></details>
+    <section class="ins-part graphic-editor-panel hide-panel" data-panel="motion"><h4>進出動畫</h4><div class="pairs">
+      <span>動畫</span><select id="graphic-motion" class="wide">${graphicOptions([
+        ['none','直接出現'],['fade','淡入淡出'],['rise','向上進場'],
+        ['slide_left','向左進場'],['slide_right','向右進場']
+      ], one.motion)}</select>
       <span>進場秒數</span><input id="graphic-enter" type="number" min="0.05" max="2" step="0.05" value="${style.entrance_seconds ?? .35}">
       <span>退場秒數</span><input id="graphic-exit" type="number" min="0.05" max="2" step="0.05" value="${style.exit_seconds ?? .25}">
       <span>移動距離</span><input id="graphic-motion-distance" type="range" min="0" max="240" value="${style.motion_distance ?? 28}">
     </div></section>
     <section class="ins-part"><button id="graphic-burn">輸出字卡版</button>
+      <button type="button" id="graphic-undo" class="ghost">還原字卡修改</button>
       <p class="why">輸出為另一支影片，乾淨母版保留。草稿不會被燒入。</p></section>`;
   for (const id of ['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
     'graphic-until','graphic-status','graphic-note','graphic-template','graphic-position',
     'graphic-transform-x','graphic-transform-y','graphic-transform-scale',
     'graphic-transform-rotation','graphic-transform-locked',
-    'graphic-composition','graphic-background','graphic-motion','graphic-style-preset',
+    'graphic-composition','graphic-background','graphic-surface',
+    'graphic-surface-secondary','graphic-surface-angle',
+    'graphic-motion','graphic-style-preset',
     'graphic-contrast-mode','graphic-z-index','graphic-collision-policy',
     'graphic-align','graphic-primary-scale','graphic-secondary-scale',
-    'graphic-line-spacing','graphic-width-scale','graphic-padding-x','graphic-padding-y',
+    'graphic-line-spacing','graphic-block-gap','graphic-width-scale','graphic-padding-x','graphic-padding-y',
     'graphic-fg','graphic-secondary-colour','graphic-emphasis-text','graphic-accent',
     'graphic-stroke-width','graphic-stroke-colour','graphic-shadow-opacity',
     'graphic-shadow-colour','graphic-shadow-blur','graphic-shadow-x','graphic-shadow-y',
     'graphic-plate','graphic-plate-alpha','graphic-corner-radius',
     'graphic-border-width','graphic-border-colour','graphic-enter','graphic-exit',
-    'graphic-motion-distance']) {
+    'graphic-motion-distance','graphic-display-font','graphic-body-font']) {
     const control = $(id);
     control.onchange = updateGraphicFromInspector;
     if (control.type === 'range' || control.type === 'color'
@@ -2043,6 +2480,34 @@ function inspectGraphic() {
     control.onkeydown = (e) => e.stopPropagation();
   }
   $('graphic-burn').onclick = burnGraphics;
+  $('graphic-undo').onclick = undoGraphicEdit;
+  const showGraphicEditorPanel = (wanted) => {
+    activeGraphicPanel = wanted;
+    for (const button of box.querySelectorAll('.graphic-editor-nav button')) {
+      button.classList.toggle('on', button.dataset.graphicPanel === wanted);
+    }
+    for (const panel of box.querySelectorAll('.graphic-editor-panel')) {
+      panel.classList.toggle('hide-panel', panel.dataset.panel !== wanted);
+    }
+  };
+  for (const tab of box.querySelectorAll('[data-graphic-panel]')) {
+    if (!tab.matches('button')) continue;
+    tab.onclick = () => {
+      showGraphicEditorPanel(tab.dataset.graphicPanel);
+      box.closest('.body')?.scrollTo({top: 0, behavior: 'instant'});
+    };
+  }
+  box.querySelector('.graphic-view-canvas').onclick = () => {
+    document.body.classList.remove('mobile-inspector-open');
+    syncPanelButtons();
+  };
+  for (const card of box.querySelectorAll('.graphic-family-card')) {
+    card.onclick = () => {
+      $('graphic-style-preset').value = card.dataset.family;
+      updateGraphicFromInspector({target: $('graphic-style-preset')});
+    };
+  }
+  showGraphicEditorPanel(activeGraphicPanel);
   $('graphic-restore-auto').onclick = () => {
     $('graphic-position').value = 'auto';
     $('graphic-transform-locked').checked = false;
@@ -2070,6 +2535,7 @@ function editableGraphicFact(cue, which) {
 async function updateGraphicFromInspector(event) {
   const cue = graphicsPlan.cues[graphicPicked];
   if (!cue) return;
+  rememberGraphicsUndo(event?.target?.id || 'graphic-edit');
   delete graphicResolvedLayout[cue.graphic_id];
   let textChanged = false;
   const primaryText = $('graphic-primary').value.trim();
@@ -2142,24 +2608,39 @@ async function updateGraphicFromInspector(event) {
     template = graphicTemplates.find(t => (t.kinds || []).includes(kind))?.template_id || template;
   }
   const selectedPreset = $('graphic-style-preset').value;
+  const projectFontChange = event?.target?.id === 'graphic-display-font'
+    || event?.target?.id === 'graphic-body-font';
+  if (projectFontChange) {
+    graphicsPlan.brand = {
+      ...(graphicsPlan.brand || {}),
+      display_font_path: $('graphic-display-font').value,
+      font_path: $('graphic-body-font').value,
+    };
+  }
   const priorStyle = cue.style || {};
   const styleControl = event?.target?.id?.startsWith('graphic-')
     && !['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
       'graphic-until','graphic-status','graphic-note','graphic-template',
       'graphic-position','graphic-composition','graphic-background',
+      'graphic-surface','graphic-surface-secondary','graphic-surface-angle',
       'graphic-motion','graphic-style-preset','graphic-contrast-mode',
       'graphic-z-index','graphic-collision-policy','graphic-transform-x',
       'graphic-transform-y','graphic-transform-scale',
       'graphic-transform-rotation','graphic-transform-locked'].includes(event.target.id);
-  if (styleControl) $('graphic-style-preset').value = 'custom';
   let style = {
     ...graphicStyleDefaults, ...(cue.style || {}),
-    preset: styleControl ? 'custom' : selectedPreset,
+    preset: selectedPreset,
+    surface: $('graphic-surface').value,
+    surface_secondary_color: !priorStyle.surface_secondary_color
+      && event?.target?.id !== 'graphic-surface-secondary'
+      ? '' : $('graphic-surface-secondary').value.toUpperCase(),
+    surface_angle: +$('graphic-surface-angle').value,
     contrast_mode: $('graphic-contrast-mode').value,
     align: $('graphic-align').value,
     primary_scale: +$('graphic-primary-scale').value,
     secondary_scale: +$('graphic-secondary-scale').value,
     line_spacing: +$('graphic-line-spacing').value,
+    block_gap_scale: +$('graphic-block-gap').value,
     max_width_scale: +$('graphic-width-scale').value,
     padding_x: +$('graphic-padding-x').value,
     padding_y: +$('graphic-padding-y').value,
@@ -2205,17 +2686,35 @@ async function updateGraphicFromInspector(event) {
       ? null : +$('graphic-motion-distance').value,
   };
   let background = $('graphic-background').value;
+  let presetCue = {};
   if (event?.target?.id === 'graphic-style-preset' && selectedPreset !== 'custom') {
     const preset = graphicStylePresets[selectedPreset] || {};
-    background = preset.background || background;
-    style = {
-      ...style, ...graphicPresetReset, ...preset, preset: selectedPreset,
+    // Selecting a different family is an explicit reset to that family's
+    // clean baseline.  Otherwise colours/surfaces/position from the previous
+    // family leak into the new one and Web no longer matches API/CLI.
+    presetCue = {
+      position: 'auto', composition: 'auto', background: 'auto', motion: 'rise',
+      ...(preset.cue || {}),
     };
-    delete style.background;
+    background = presetCue.background || background;
+    if (presetCue.template && graphicTemplates.some(
+      item => item.template_id === presetCue.template
+        && (item.kinds || []).includes(kind)
+    )) template = presetCue.template;
+    style = {...graphicStyleDefaults, ...(preset.style || {}), preset: selectedPreset};
   }
   if (event?.target?.id === 'graphic-transform-x'
       || event?.target?.id === 'graphic-transform-y') {
     $('graphic-position').value = 'manual';
+  }
+  if (event?.target?.id === 'graphic-composition'
+      && $('graphic-composition').value !== 'auto') {
+    $('graphic-position').value = 'auto';
+    $('graphic-transform-locked').checked = false;
+  }
+  if (event?.target?.id === 'graphic-position'
+      && $('graphic-position').value !== 'auto') {
+    $('graphic-composition').value = 'auto';
   }
   if (event?.target?.id === 'graphic-transform-scale'
       || event?.target?.id === 'graphic-transform-rotation') {
@@ -2227,9 +2726,9 @@ async function updateGraphicFromInspector(event) {
   Object.assign(cue, {
     kind, at_seconds: at,
     duration_seconds: Math.max(.2, until - at), status,
-    template, position: $('graphic-position').value,
-    composition: $('graphic-composition').value,
-    background, motion: $('graphic-motion').value,
+    template, position: presetCue.position || $('graphic-position').value,
+    composition: presetCue.composition || $('graphic-composition').value,
+    background, motion: presetCue.motion || $('graphic-motion').value,
     z_index: $('graphic-z-index').value === ''
       ? null : +$('graphic-z-index').value,
     collision_policy: $('graphic-collision-policy').value,
@@ -2245,9 +2744,22 @@ async function updateGraphicFromInspector(event) {
   });
   if (event?.target?.id === 'graphic-at'
       || event?.target?.id === 'graphic-until') reanchorGraphicCue(cue);
+  const exactGeometryControls = new Set([
+    'graphic-template','graphic-composition','graphic-background',
+    'graphic-surface','graphic-surface-secondary','graphic-surface-angle',
+    'graphic-style-preset','graphic-padding-x','graphic-padding-y',
+    'graphic-corner-radius','graphic-border-width','graphic-border-colour',
+  ]);
   const previewMode = event?.target?.id?.startsWith('graphic-transform-')
-    || event?.target?.id === 'graphic-position' ? 'transform' : 'content';
-  refreshGraphicsFromPlan(previewMode); saveGraphics();
+    || event?.target?.id === 'graphic-position' ? 'transform'
+    : exactGeometryControls.has(event?.target?.id) ? 'exact' : 'content';
+  const structuralPreviewChange = projectFontChange
+    || ['graphic-at','graphic-until','graphic-status','graphic-collision-policy']
+      .includes(event?.target?.id);
+  refreshGraphicsFromPlan(
+    previewMode, structuralPreviewChange ? 'all' : 'component'
+  );
+  saveGraphics();
   if (event?.target?.id === 'graphic-kind'
       || event?.target?.id === 'graphic-style-preset'
       || event?.target?.id === 'graphic-transform-locked') inspectGraphic();
@@ -2284,36 +2796,65 @@ async function updateGraphicFromInspector(event) {
   }
 }
 
-function refreshGraphicsFromPlan(previewMode = 'content') {
+function refreshGraphicsFromPlan(previewMode = 'content', previewScope = 'all') {
   graphics = graphicsPlan.cues.map(cue => ({
     ...cue, primary_text: graphicText(cue), secondary_text: graphicText(cue, 'secondary'),
   }));
-  scheduleGraphicPreview(previewMode);
+  scheduleGraphicPreview(previewMode, previewScope);
   paintGraphics(); paintGraphicList(); showGraphicPreview();
 }
 
 let graphicsSaving = null, graphicsSavePromise = Promise.resolve(true);
-async function saveGraphicsNow() {
+let graphicsUndoStack = [], graphicsUndoKey = '', graphicsUndoAt = 0;
+
+function rememberGraphicsUndo(key = '') {
+  const now = performance.now();
+  if (key === graphicsUndoKey && now - graphicsUndoAt < 500) return;
+  graphicsUndoStack.push({runId, plan: JSON.stringify(graphicsPlan)});
+  if (graphicsUndoStack.length > 40) graphicsUndoStack.shift();
+  graphicsUndoKey = key; graphicsUndoAt = now;
+}
+
+function undoGraphicEdit() {
+  const snapshot = graphicsUndoStack.pop();
+  if (!snapshot || snapshot.runId !== runId) {
+    graphicsUndoStack = []; graphicsUndoKey = ''; graphicsUndoAt = 0;
+    return false;
+  }
+  const currentRevision = graphicsPlan.revision || 0;
+  graphicsPlan = JSON.parse(snapshot.plan);
+  graphicsPlan.revision = currentRevision;
+  graphicsUndoKey = ''; graphicsUndoAt = 0;
+  graphicPicked = Math.min(graphicPicked, graphicsPlan.cues.length - 1);
+  refreshGraphicsFromPlan('exact', 'all');
+  paintGraphicList(); if (graphicPicked >= 0) inspectGraphic();
+  saveGraphics();
+  $('strip-note').textContent = '已還原上一個字卡修改';
+  return true;
+}
+async function saveGraphicsNow(targetRunId = runId, targetPlan = graphicsPlan) {
   clearTimeout(graphicsSaving);
   graphicsSaving = null;
   const previousSave = graphicsSavePromise;
   graphicsSavePromise = previousSave.catch(() => false).then(async () => {
     try {
-      const payload = JSON.stringify(graphicsPlan);
-      const got = await fetch(`/api/runs/${runId}/graphics-track`, {
+      const payload = JSON.stringify(targetPlan);
+      const got = await fetch(`/api/runs/${targetRunId}/graphics-track`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: payload,
       });
       const answer = await got.json();
-      if (got.ok && Number.isInteger(answer.revision)) {
-        graphicsPlan.revision = answer.revision;
+      const ownsWorkspace = runId === targetRunId && graphicsPlan === targetPlan;
+      if (got.ok && Number.isInteger(answer.revision) && ownsWorkspace) {
+        targetPlan.revision = answer.revision;
       }
-      $('strip-note').textContent = got.ok
-        ? (answer.warnings?.length ? `字卡已存；${answer.warnings[0]}` : '字卡已存')
-        : `字卡存不了：${answer.detail || '格式錯誤'}`;
+      if (ownsWorkspace) $('strip-note').textContent = got.ok
+          ? (answer.warnings?.length ? `字卡已存；${answer.warnings[0]}` : '字卡已存')
+          : `字卡存不了：${answer.detail || '格式錯誤'}`;
       return got.ok;
     } catch (error) {
-      $('strip-note').textContent = `字卡存不了：${error.message}`;
+      if (runId === targetRunId && graphicsPlan === targetPlan)
+        $('strip-note').textContent = `字卡存不了：${error.message}`;
       return false;
     }
   });
@@ -2322,7 +2863,9 @@ async function saveGraphicsNow() {
 
 function saveGraphics() {
   clearTimeout(graphicsSaving);
-  graphicsSaving = setTimeout(saveGraphicsNow, 350);
+  const targetRunId = runId, targetPlan = graphicsPlan;
+  graphicsSaving = setTimeout(
+    () => saveGraphicsNow(targetRunId, targetPlan), 350);
 }
 
 function graphicEmphasisMarkup(text, needle, colour) {
@@ -2392,18 +2935,56 @@ function invalidateGraphicPreviews() {
   graphicPreviewPending.clear();
 }
 
-function scheduleGraphicPreview(mode = 'content') {
+function resetGraphicsEditorState() {
+  clearTimeout(graphicPreviewTimer);
+  graphicPreviewTimer = null;
+  graphicPreviewEpoch += 1;
+  compiledGraphicPreviews = {};
+  graphicPreviewRequests = {};
+  graphicPreviewPending.clear();
+  graphicPreviewDirty.clear();
+  graphicPreviewErrors = {};
+  graphicPreviewModes = {};
+  graphicsUndoStack = []; graphicsUndoKey = ''; graphicsUndoAt = 0;
+  graphicPicked = -1; graphicInteraction = null;
+}
+
+function graphicPreviewComponent(seed) {
+  const component = new Set([seed.graphic_id]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const members = graphicsPlan.cues.filter(one => component.has(one.graphic_id));
+    for (const one of graphicsPlan.cues) {
+      if (component.has(one.graphic_id)) continue;
+      if (members.some(other => one.at_seconds < other.at_seconds + other.duration_seconds
+          && one.at_seconds + one.duration_seconds > other.at_seconds)) {
+        component.add(one.graphic_id); changed = true;
+      }
+    }
+  }
+  return component;
+}
+
+function scheduleGraphicPreview(mode = 'content', scope = 'component') {
   if (!(graphicPicked >= 0 && graphicPicked < graphicsPlan.cues.length)) return;
   clearTimeout(graphicPreviewTimer);
   graphicPreviewEpoch += 1;
-  for (const cue of graphicsPlan.cues) graphicPreviewDirty.add(cue.graphic_id);
   const cue = graphicsPlan.cues[graphicPicked];
+  const affected = scope === 'all'
+    ? new Set(graphicsPlan.cues.map(one => one.graphic_id))
+    : graphicPreviewComponent(cue);
+  for (const id of affected) graphicPreviewDirty.add(id);
   graphicPreviewModes[cue.graphic_id] = mode;
   showGraphicPreview();
+  // Geometry is already previewed every pointer frame by transforming the
+  // last production PNG.  Re-audit/rasterise quietly after the gesture has
+  // settled instead of making a local drag feel like a server operation.
+  const delay = mode === 'transform' ? 700 : 220;
   graphicPreviewTimer = setTimeout(() => {
     graphicPreviewTimer = null;
     requestGraphicPreview(cue);
-  }, 180);
+  }, delay);
 }
 
 function liveGraphicMarkup(cue) {
@@ -2411,14 +2992,39 @@ function liveGraphicMarkup(cue) {
   const primary = graphicText(cue), secondary = graphicText(cue, 'secondary');
   const foreground = style.primary_color || graphicsPlan.brand.foreground || '#FFFFFF';
   const secondaryColour = style.secondary_color || graphicsPlan.brand.secondary || '#D9DCE3';
-  const plate = cue.background === 'plate' || cue.composition === 'foreground_plate';
+  const templatePlate = ['product_plate','stat_badge','spec_stack','end_roster'].includes(cue.template);
+  const plate = cue.background === 'plate' || cue.composition === 'foreground_plate'
+    || (cue.background === 'auto' && templatePlate);
   const plateColour = style.plate_color || graphicsPlan.brand.plate || '#111318';
+  const accent = style.surface_secondary_color || style.accent_color
+    || graphicsPlan.brand.accent || '#FFFFFF';
   const alpha = (style.plate_alpha ?? graphicsPlan.brand.plate_alpha ?? 205) / 255;
+  const rgba = (hex, opacity = alpha) => `rgba(${parseInt(hex.slice(1,3),16)},${parseInt(hex.slice(3,5),16)},${parseInt(hex.slice(5,7),16)},${opacity})`;
   const shadow = `${style.shadow_offset_x}px ${style.shadow_offset_y}px ${style.shadow_blur}px ${style.shadow_color}`;
   const align = style.align === 'auto'
     ? (['hero_center','center_stack','stat_badge'].includes(cue.template) ? 'center' : 'left')
     : style.align;
-  return `<div class="graphic-live-surface" style="color:${esc(foreground)};text-align:${esc(align)};font-size:${style.primary_scale}em;padding:${style.padding_y / 54}em ${style.padding_x / 54}em;background:${plate ? `rgba(${parseInt(plateColour.slice(1,3),16)},${parseInt(plateColour.slice(3,5),16)},${parseInt(plateColour.slice(5,7),16)},${alpha})` : 'transparent'};border-radius:${(style.corner_radius ?? 0) / 54}em;-webkit-text-stroke:${style.stroke_width / 54}em ${esc(style.stroke_color)};text-shadow:${shadow}"><div>${graphicEmphasisMarkup(primary, style.emphasis_text, style.emphasis_color || style.accent_color || '#FFFFFF')}</div>${secondary ? `<div class="graphic-live-secondary" style="color:${esc(secondaryColour)};font-size:${style.secondary_scale * .48}em">${esc(secondary)}</div>` : ''}</div>`;
+  let surface = style.surface || 'template';
+  if (surface === 'template') surface = plate ? 'solid' : 'none';
+  if (cue.composition === 'foreground_plate' && surface === 'none') surface = 'solid';
+  const radius = (style.corner_radius ?? 0) / 54;
+  const borderWidth = Math.max(style.plate_border_width || 0, surface === 'outline' ? 3 : 0) / 54;
+  let surfaceCss = `background:transparent;border-radius:${radius}em;`;
+  if (surface === 'solid') surfaceCss += `background:${rgba(plateColour)};`;
+  if (surface === 'pill') surfaceCss += `background:${rgba(plateColour)};border-radius:999px;`;
+  if (surface === 'split') surfaceCss += `background:linear-gradient(to bottom,${rgba(plateColour)} 0 58%,${rgba(accent)} 58% 100%);`;
+  if (surface === 'ribbon') surfaceCss += `background:${rgba(plateColour)};clip-path:polygon(4% 0,100% 0,96% 100%,0 100%);`;
+  if (surface === 'sticker') surfaceCss += `background:${rgba(plateColour)};border:${Math.max(3/54,borderWidth)}em solid ${esc(accent)};box-shadow:.12em .14em 0 rgba(0,0,0,.65);`;
+  if (surface === 'outline') surfaceCss += `border:${borderWidth}em solid ${esc(style.plate_border_color || accent)};`;
+  if (surface === 'glass') surfaceCss += `background:${rgba(plateColour, Math.min(alpha,.72))};border:${Math.max(.025,borderWidth)}em solid rgba(255,255,255,.7);backdrop-filter:blur(8px);`;
+  if (surface === 'editorial') surfaceCss += `border-left:.11em solid ${esc(accent)};border-bottom:.035em solid ${esc(accent)};`;
+  const highlightPrimary = surface === 'highlight'
+    ? `background:${rgba(plateColour)};padding:0 .12em;box-decoration-break:clone;-webkit-box-decoration-break:clone;`
+    : '';
+  const highlightSecondary = surface === 'highlight'
+    ? `background:${rgba(accent)};padding:0 .12em;box-decoration-break:clone;-webkit-box-decoration-break:clone;`
+    : '';
+  return `<div class="graphic-live-surface" style="color:${esc(foreground)};text-align:${esc(align)};font-size:${style.primary_scale}em;padding:${style.padding_y / 54}em ${style.padding_x / 54}em;${surfaceCss}-webkit-text-stroke:${style.stroke_width / 54}em ${esc(style.stroke_color)};text-shadow:${shadow}"><div><span style="${highlightPrimary}">${graphicEmphasisMarkup(primary, style.emphasis_text, style.emphasis_color || style.accent_color || '#FFFFFF')}</span></div>${secondary ? `<div class="graphic-live-secondary" style="color:${esc(secondaryColour)};font-size:${style.secondary_scale * .48}em"><span style="${highlightSecondary}">${esc(secondary)}</span></div>` : ''}</div>`;
 }
 
 function preserveGraphicCenterAsManual(cue) {
@@ -2462,6 +3068,9 @@ function beginGraphicCanvasGesture(event, id, mode = 'move') {
   const startAngle = Math.atan2(startY - cy, startX - cx) * 180 / Math.PI;
   const pointerId = event.pointerId;
   graphicInteraction = {id, mode, pointerId};
+  const baseTransform = card.style.transform === 'none'
+    ? '' : card.style.transform;
+  card.classList.add('interacting');
   card.setPointerCapture?.(pointerId);
   let moved = false;
   const move = next => {
@@ -2470,6 +3079,7 @@ function beginGraphicCanvasGesture(event, id, mode = 'move') {
       return;
     if (cue.transform.locked) return;
     if (!moved) {
+      rememberGraphicsUndo(`canvas-${id}`);
       moved = true;
       if (mode === 'scale' || mode === 'rotate') {
         preserveGraphicCenterAsManual(cue);
@@ -2504,9 +3114,18 @@ function beginGraphicCanvasGesture(event, id, mode = 'move') {
     }
     graphicPreviewDirty.add(id);
     graphicPreviewModes[id] = 'transform';
-    graphics = graphicsPlan.cues.map(one => ({...one,
-      primary_text: graphicText(one), secondary_text: graphicText(one, 'secondary')}));
-    showGraphicPreview();
+    // Gesture fast path: do not rebuild the active-card set, recreate
+    // handles or change layout geometry on every pointer event. Keep the
+    // exact production PNG on a compositor layer and only transform it.
+    if (mode === 'move') {
+      card.style.transform = `translate3d(${next.clientX - startX}px,${next.clientY - startY}px,0) ${baseTransform}`;
+    } else if (mode === 'scale') {
+      const factor = cue.transform.scale / Math.max(.001, start.scale);
+      card.style.transform = `${baseTransform} scale(${factor})`;
+    } else {
+      const delta = cue.transform.rotation_degrees - start.rotation_degrees;
+      card.style.transform = `${baseTransform} rotate(${delta}deg)`;
+    }
     const x = $('graphic-transform-x'), y = $('graphic-transform-y');
     if (x) x.value = cue.transform.x; if (y) y.value = cue.transform.y;
     if ($('graphic-transform-scale')) $('graphic-transform-scale').value = cue.transform.scale;
@@ -2522,11 +3141,14 @@ function beginGraphicCanvasGesture(event, id, mode = 'move') {
     card.removeEventListener('pointercancel', up);
     card.removeEventListener('lostpointercapture', up);
     if (card.hasPointerCapture?.(pointerId)) card.releasePointerCapture(pointerId);
+    card.classList.remove('interacting');
     graphicInteraction = null;
     if (!moved) {
       editGraphicFromCanvas(id);
       return;
     }
+    graphics = graphicsPlan.cues.map(one => ({...one,
+      primary_text: graphicText(one), secondary_text: graphicText(one, 'secondary')}));
     scheduleGraphicPreview('transform'); saveGraphics(); paintGraphics(); paintGraphicList();
   };
   card.addEventListener('pointermove', move);
@@ -2537,8 +3159,9 @@ function beginGraphicCanvasGesture(event, id, mode = 'move') {
 
 function showGraphicPreview() {
   const layer = $('graphic-preview'), video = $('video');
+  const previewStatus = $('graphic-preview-status');
   if (!layer || !video || (peeking && !beside) || !video.videoWidth) {
-    layer?.classList.add('hide'); return;
+    layer?.classList.add('hide'); previewStatus?.classList.add('hide'); return;
   }
   const at = video.currentTime || 0;
   const active = graphics.filter(one => one.status === 'approved'
@@ -2547,7 +3170,10 @@ function showGraphicPreview() {
   if (selected && selected.status !== 'approved'
       && at >= selected.at_seconds
       && at < selected.at_seconds + selected.duration_seconds) active.push(selected);
-  if (!active.length) { layer.innerHTML = ''; layer.classList.add('hide'); return; }
+  if (!active.length) {
+    layer.innerHTML = ''; layer.classList.add('hide');
+    previewStatus?.classList.add('hide'); return;
+  }
   if (!graphicPreviewTimer && !graphicInteraction) {
     const target = active.find(cue => cue.graphic_id === selected?.graphic_id)
       || active[0];
@@ -2655,12 +3281,12 @@ function showGraphicPreview() {
     card.style.opacity = animation.fade ? `${Math.min(progress, remaining)}` : '1';
     card.style.zIndex = `${3 + (made.z_index || 0)}`;
     const isSelected = one.graphic_id === selected?.graphic_id;
+    const dirty = graphicPreviewDirty.has(one.graphic_id) || made.synthetic;
     card.classList.toggle('selected', isSelected);
     card.classList.toggle('locked', !!transform.locked);
     card.classList.toggle('invalid', !!graphicPreviewErrors[one.graphic_id]);
     card.title = graphicPreviewErrors[one.graphic_id]
       || '點一下編輯文字；拖曳可移動字卡';
-    const dirty = graphicPreviewDirty.has(one.graphic_id) || made.synthetic;
     let live = card.querySelector('.graphic-live-surface-wrap');
     if (dirty && isSelected && dirtyMode === 'content') {
       if (!live) {
@@ -2686,6 +3312,20 @@ function showGraphicPreview() {
     }
   }
   layer.classList.toggle('hide', !ready.length);
+  const selectedActive = active.find(one => one.graphic_id === selected?.graphic_id);
+  const selectedUpdating = selectedActive
+    && (graphicPreviewDirty.has(selectedActive.graphic_id)
+      || graphicPreviewPending.has(selectedActive.graphic_id));
+  const selectedMode = graphicPreviewModes[selectedActive?.graphic_id];
+  if (previewStatus) {
+    previewStatus.textContent = graphicPreviewErrors[selectedActive?.graphic_id]
+      ? '預覽需要調整'
+      : graphicPreviewPending.has(selectedActive?.graphic_id)
+        ? '正在產生精準預覽…' : '等待更新預覽…';
+    // Editor status stays fixed and never covers the picture during playback.
+    previewStatus.classList.toggle(
+      'hide', !selectedUpdating || !video.paused || selectedMode === 'transform');
+  }
 }
 
 async function burnGraphics() {
@@ -2705,6 +3345,7 @@ async function burnGraphics() {
 }
 
 function addGraphicAtPlayhead(approvedFactId = '') {
+  rememberGraphicsUndo('add-graphic');
   const id = `g${String(graphicsPlan.cues.length).padStart(2, '0')}-${Date.now().toString(36)}`;
   const factId = approvedFactId || `user.${id}.primary`;
   if (!approvedFactId) graphicsPlan.facts.push({
@@ -2741,19 +3382,36 @@ function addGraphicAtPlayhead(approvedFactId = '') {
 function addBriefCandidate(candidateId, variantIndex = -1) {
   const candidate = briefCandidates.find(one => one.candidate_id === candidateId);
   if (!candidate) return;
+  rememberGraphicsUndo('add-brief-candidate');
   const variant = variantIndex >= 0 ? (candidate.variants || [])[variantIndex] : null;
   const primaryText = variant?.primary_text || candidate.primary_text;
   const secondaryText = variant?.secondary_text ?? candidate.secondary_text;
   const id = `g${String(graphicsPlan.cues.length).padStart(2, '0')}-${Date.now().toString(36)}`;
-  const primaryId = `candidate.${id}.primary`;
-  const secondaryId = secondaryText ? `candidate.${id}.secondary` : '';
-  const facts = [[primaryId, primaryText], ...(secondaryId ? [[secondaryId, secondaryText]] : [])];
-  for (const [factId, exactText] of facts) graphicsPlan.facts.push({
-    fact_id: factId, exact_text: exactText, source_kind: 'brief_candidate',
-    source_reference: candidate.source_reference, source_sha256: briefDigest,
-    text_sha256: '', allowed_kinds: [candidate.kind], confidence: 'certain',
-    approved: false, approved_by: null,
-  });
+  const exactPrimary = candidate.primary_fact_id
+    && primaryText === candidate.primary_text;
+  const exactSecondary = candidate.secondary_fact_id
+    && secondaryText === candidate.secondary_text;
+  const primaryId = exactPrimary
+    ? candidate.primary_fact_id : `user.${id}.primary`;
+  const secondaryId = secondaryText ? (
+    exactSecondary
+      ? candidate.secondary_fact_id : `user.${id}.secondary`
+  ) : '';
+  // Every unchanged line reuses its immutable server-issued Brief fact. A
+  // shortened line is new editorial copy selected in the UI, so only that
+  // line becomes an unapproved user draft instead of losing all provenance.
+  if (!exactPrimary || (secondaryText && !exactSecondary)) {
+    const facts = [
+      ...(!exactPrimary ? [[primaryId, primaryText]] : []),
+      ...(secondaryId && !exactSecondary ? [[secondaryId, secondaryText]] : []),
+    ];
+    for (const [factId, exactText] of facts) graphicsPlan.facts.push({
+      fact_id: factId, exact_text: exactText, source_kind: 'user',
+      source_reference: 'web-ui-from-brief-variant', source_sha256: '',
+      text_sha256: '', allowed_kinds: [], confidence: 'certain',
+      approved: false, approved_by: null,
+    });
+  }
   const now = $('video').currentTime || 0;
   const found = graphicAnchorAt(now);
   const anchor = found?.block || blocks[picked];
@@ -2777,6 +3435,7 @@ $('graphic-add').onclick = () => addGraphicAtPlayhead();
 
 $('graphic-del').onclick = () => {
   if (!(graphicPicked >= 0 && graphicPicked < graphicsPlan.cues.length)) return;
+  rememberGraphicsUndo('delete-graphic');
   graphicsPlan.cues.splice(graphicPicked, 1);
   delete graphicResolvedLayout[graphics[graphicPicked]?.graphic_id];
   const used = new Set(graphicsPlan.cues.flatMap(c => [c.primary_fact_id, c.secondary_fact_id]));
@@ -3231,12 +3890,16 @@ function showExtras() {
 // What this machine can set subtitles in, for the language of the cut --
 // offering Chinese faces to somebody cutting a Japanese interview is a
 // list with nothing they want in it.
+let fontRequestSerial = 0;
 async function loadFonts(forRun) {
+  const requestSerial = ++fontRequestSerial;
   try {
     const got = await fetch(
       '/api/fonts' + (forRun ? `?run_id=${forRun}` : '')
     );
     const list = (await got.json()).fonts || [];
+    if (requestSerial !== fontRequestSerial || (forRun && forRun !== runId)) return;
+    graphicsFontOptions = list;
     for (const where of ['font', 'setup-font']) {
       const box = $(where);
       if (!box) continue;
@@ -3250,6 +3913,15 @@ async function loadFonts(forRun) {
         box.appendChild(item);
       }
       box.value = held;
+    }
+    for (const [id, selected] of [
+      ['graphic-display-font', graphicsPlan.brand?.display_font_path || ''],
+      ['graphic-body-font', graphicsPlan.brand?.font_path || ''],
+    ]) {
+      const box = $(id);
+      if (!box) continue;
+      box.innerHTML = graphicFontOptions(selected);
+      box.value = selected;
     }
   } catch (error) { /* the default still works */ }
 }
@@ -3646,6 +4318,7 @@ function showWorkspace(on) {
   // siblings the browser and the inspector stayed behind on a cold page --
   // an empty inspector and a tab strip under an invitation to begin.
   $('nothing-yet').classList.toggle('on', !on);
+  document.body.classList.toggle('cold-start', !on);
   document.querySelector('.work').classList.toggle('hide', !on);
   document.querySelector('.reelwrap').classList.toggle('hide', !on);
   // The handle between them is a sibling of both, so it stayed behind --
@@ -3656,6 +4329,8 @@ function showWorkspace(on) {
   // rest of the browser.
   $('cold-past').classList.toggle('hide', on);
   $('export').parentElement.classList.toggle('hide', !on);
+  $('toggle-library').classList.toggle('hide', !on);
+  $('toggle-inspector').classList.toggle('hide', !on);
 }
 
 function render(report) {
@@ -3983,7 +4658,12 @@ addEventListener('keydown', (e) => {
   if (/input|textarea/i.test(e.target.tagName)) return;
   if (e.target.isContentEditable) return;
   if (e.metaKey || e.ctrlKey) {
-    if (e.key === 'z') { e.preventDefault(); $('undo-cut').click(); }
+    if (e.key === 'z') {
+      e.preventDefault();
+      if (!$('graphic-inspector').classList.contains('hide')
+          && undoGraphicEdit()) return;
+      $('undo-cut').click();
+    }
     return;
   }
 
@@ -4012,8 +4692,8 @@ addEventListener('keydown', (e) => {
     },
     p: () => (peeking ? $('see-cut') : $('see-raw')).click(),
     f: () => $('fit').click(),
-    Backspace: () => dropShot(picked),
-    Delete: () => dropShot(picked),
+    Backspace: deleteActiveSelection,
+    Delete: deleteActiveSelection,
     '?': () => $('keys').classList.toggle('hide'),
   };
   const act = keys[e.code === 'Space' ? 'Space' : e.key];
@@ -4021,6 +4701,18 @@ addEventListener('keydown', (e) => {
   e.preventDefault();
   act();
 });
+
+function deleteActiveSelection() {
+  if (!$('graphic-inspector').classList.contains('hide') && graphicPicked >= 0) {
+    $('graphic-del').click();
+    return;
+  }
+  if (!$('cue-inspector').classList.contains('hide') && pickedCue() >= 0) {
+    $('cue-del').click();
+    return;
+  }
+  dropShot(picked);
+}
 
 function dropShot(i) {
   if (i < 0 || blocks.length < 2) return;
@@ -4079,6 +4771,15 @@ function inspectCue() {
   // caption did nothing visible unless you had already found the tab --
   // so the editor was there and nobody could get to it.
   const showing = cue >= 0 && cue < subs.length;
+  if (showing) {
+    graphicPicked = -1;
+    $('graphic-inspector').classList.add('hide');
+    if (matchMedia('(max-width: 1100px)').matches) {
+      document.body.classList.remove('mobile-library-open');
+      document.body.classList.add('mobile-inspector-open');
+      syncPanelButtons();
+    }
+  }
   $('cue-inspector').classList.toggle('hide', !showing);
   $('inspector').classList.toggle('hide', showing);
   $('ins-head').querySelector('.who').textContent = showing ? '這一句' : '這一顆';
@@ -4207,6 +4908,44 @@ $('cue-del').addEventListener('click', () => {
 });
 
 $('show-keys').addEventListener('click', () => $('keys').classList.toggle('hide'));
+
+function syncPanelButtons() {
+  const mobile = matchMedia('(max-width: 1100px)').matches;
+  $('toggle-library').classList.toggle('on', mobile
+    ? document.body.classList.contains('mobile-library-open')
+    : !document.body.classList.contains('library-closed'));
+  $('toggle-inspector').classList.toggle('on', mobile
+    ? document.body.classList.contains('mobile-inspector-open')
+    : !document.body.classList.contains('inspector-closed'));
+}
+
+$('toggle-library').addEventListener('click', () => {
+  if (matchMedia('(max-width: 1100px)').matches) {
+    document.body.classList.toggle('mobile-library-open');
+    document.body.classList.remove('mobile-inspector-open');
+  } else {
+    document.body.classList.toggle('library-closed');
+    localStorage.setItem('mw-library-closed', document.body.classList.contains('library-closed') ? '1' : '0');
+  }
+  syncPanelButtons();
+});
+$('toggle-inspector').addEventListener('click', () => {
+  if (matchMedia('(max-width: 1100px)').matches) {
+    document.body.classList.toggle('mobile-inspector-open');
+    document.body.classList.remove('mobile-library-open');
+  } else {
+    document.body.classList.toggle('inspector-closed');
+    localStorage.setItem('mw-inspector-closed', document.body.classList.contains('inspector-closed') ? '1' : '0');
+  }
+  syncPanelButtons();
+});
+if (localStorage.getItem('mw-library-closed') === '1') document.body.classList.add('library-closed');
+if (localStorage.getItem('mw-inspector-closed') === '1') document.body.classList.add('inspector-closed');
+matchMedia('(max-width: 1100px)').addEventListener('change', () => {
+  document.body.classList.remove('mobile-library-open', 'mobile-inspector-open');
+  syncPanelButtons();
+});
+syncPanelButtons();
 
 // The browser is a column now, not a drawer, so there is nothing to fold.
 // Switching project is not a bin in the browser -- it leaves this cut and

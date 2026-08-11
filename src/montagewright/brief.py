@@ -8,7 +8,16 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from montagewright.graphics import CopyFact
+from montagewright.graphics import (
+    TEMPLATES,
+    CopyFact,
+    GraphicCue,
+    GraphicStyle,
+    GraphicsPlan,
+    curated_graphic_family_ids,
+    graphic_preset_defaults,
+    recommended_graphic_family,
+)
 
 APPROVED_COPY_FENCE = re.compile(
     r"```montagewright-approved-copy\s*\n(?P<body>.*?)\n```",
@@ -38,11 +47,64 @@ class BriefDocument:
         )
 
     def candidates_json(self) -> dict:
+        facts = self.candidate_facts()
+        ids = {fact.fact_id: fact for fact in facts}
         return {
             "brief_sha256": self.sha256,
-            "candidates": [asdict(candidate) for candidate in self.candidates],
+            "candidates": [
+                {
+                    **asdict(candidate),
+                    "primary_fact_id": self.candidate_fact_id(candidate, "primary"),
+                    "secondary_fact_id": (
+                        self.candidate_fact_id(candidate, "secondary")
+                        if candidate.secondary_text else ""
+                    ),
+                }
+                for candidate in self.candidates
+            ],
+            "facts": [fact.model_dump(mode="json") for fact in ids.values()],
             "instructions": [asdict(note) for note in self.instructions],
         }
+
+    def candidate_facts(self) -> tuple[CopyFact, ...]:
+        """Unapproved copy suggestions extracted from ordinary Brief prose.
+
+        The server can prove where these words came from, but extracting a
+        phrase is not the same thing as the user approving it for the screen.
+        Only the explicit approved-copy manifest has that authority.
+        """
+
+        facts: list[CopyFact] = []
+        for candidate in self.candidates:
+            for which, text in (
+                ("primary", candidate.primary_text),
+                ("secondary", candidate.secondary_text),
+            ):
+                if not text:
+                    continue
+                facts.append(CopyFact(
+                    fact_id=self.candidate_fact_id(candidate, which),
+                    exact_text=text,
+                    source_kind="brief_candidate",
+                    source_reference=f"{candidate.source_reference}/{which}",
+                    source_sha256=self.sha256,
+                    text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    allowed_kinds=[candidate.kind],
+                    confidence="certain",
+                    approved=False,
+                    approved_by=None,
+                ))
+        return tuple(facts)
+
+    def candidate_fact_id(
+        self, candidate: "BriefCandidate", which: str
+    ) -> str:
+        """A server-reserved fact id that cannot collide with copy ids."""
+
+        return (
+            f"brief_candidate.{self.sha256[:12]}."
+            f"{candidate.candidate_id}.{which}"
+        )
 
 
 @dataclass(frozen=True)
@@ -190,6 +252,10 @@ def parse_brief_markdown(raw: str) -> BriefDocument:
         allowed = item.get("allowed_kinds") or []
         if not copy_id or not text:
             raise ValueError(f"approved-copy item {index} needs copy_id and text")
+        if copy_id.startswith("brief_candidate."):
+            raise ValueError(
+                f"approved-copy item {index} uses a reserved copy_id prefix"
+            )
         facts.append(CopyFact(
             fact_id=copy_id,
             exact_text=text,
@@ -217,3 +283,118 @@ def load_brief(path: Path | None) -> BriefDocument:
     if path is None:
         return BriefDocument.from_legacy("")
     return parse_brief_markdown(path.read_text(encoding="utf-8"))
+
+
+def initial_graphics_plan(
+    document: BriefDocument,
+    selection: dict,
+    *,
+    shot_durations: list[float],
+) -> GraphicsPlan:
+    """Materialise Gemini's selection-time overlay decisions locally.
+
+    The model may choose *whether* and *where* a card helps. It may only cite
+    candidate ids that came from this exact Brief snapshot; pixels and copy
+    authority remain deterministic local work.
+    """
+
+    candidates = {one.candidate_id: one for one in document.candidates}
+    facts = [*document.approved_copy, *document.candidate_facts()]
+    cues: list[GraphicCue] = []
+    starts: list[float] = []
+    cursor = 0.0
+    for duration in shot_durations:
+        starts.append(cursor)
+        cursor += duration
+    used: set[str] = set()
+    for coverage in selection.get("covered") or []:
+        if not coverage.get("show_as_graphic"):
+            continue
+        candidate_id = str(coverage.get("graphic_candidate_id") or "")
+        candidate = candidates.get(candidate_id)
+        indexes = coverage.get("shot_indexes") or []
+        if candidate is None or candidate_id in used or not indexes:
+            continue
+        shot_index = int(coverage.get("graphic_shot_index", indexes[0]))
+        if shot_index not in indexes or not 0 <= shot_index < len(shot_durations):
+            continue
+        duration = shot_durations[shot_index]
+        if duration < 0.6:
+            continue
+        inset = min(0.2, duration * 0.08)
+        shown = max(0.4, min(duration - inset, 4.2))
+        requested_family = str(
+            coverage.get("graphic_design_family") or "auto"
+        )
+        family = (
+            requested_family
+            if requested_family in curated_graphic_family_ids()
+            else recommended_graphic_family(candidate.kind)
+        )
+        style_defaults, cue_defaults = graphic_preset_defaults(family)
+        surface = str(coverage.get("graphic_surface") or "inherit")
+        if surface not in {"inherit", "auto"}:
+            style_defaults["surface"] = surface
+        style = GraphicStyle.model_validate({
+            **style_defaults, "preset": family, "contrast_mode": "auto",
+        })
+        # The Brief parser's template is driven by copy structure (one-line
+        # badge, spec stack, centered roster).  A visual family may restyle it
+        # but must not silently destroy that authored hierarchy.
+        template = candidate.template
+        if template not in TEMPLATES or candidate.kind not in TEMPLATES[template].kinds:
+            template = next(
+                name for name, spec in TEMPLATES.items()
+                if candidate.kind in spec.kinds
+            )
+        motion = str(coverage.get("graphic_motion") or "inherit")
+        if motion == "inherit":
+            motion = str(cue_defaults.get("motion") or (
+                "fade" if candidate.kind in {"opening_title", "end_card"}
+                else "rise"
+            ))
+        requested_composition = str(
+            coverage.get("graphic_composition") or "inherit"
+        )
+        composition = requested_composition
+        if composition == "inherit":
+            composition = str(cue_defaults.get("composition") or "auto")
+        position = str(
+            cue_defaults.get("position") or candidate.position or "auto"
+        )
+        if candidate.position != "auto":
+            position = candidate.position
+        # A semantic composition override needs the local layout solver.  A
+        # fixed family position would otherwise preserve the value in JSON
+        # while making avoid/overlap/auto ineffective in rendered pixels.
+        if requested_composition != "inherit":
+            position = "auto"
+        cues.append(GraphicCue(
+            graphic_id=f"brief-{len(cues):02d}",
+            kind=candidate.kind,
+            primary_fact_id=document.candidate_fact_id(candidate, "primary"),
+            secondary_fact_id=(
+                document.candidate_fact_id(candidate, "secondary")
+                if candidate.secondary_text else ""
+            ),
+            anchor_clip_id=f"k{shot_index:02d}",
+            anchor_selection_index=shot_index,
+            anchor_offset_seconds=inset,
+            at_seconds=starts[shot_index] + inset,
+            duration_seconds=shown,
+            template=template,
+            position=position,
+            composition=composition,
+            background=str(cue_defaults.get("background") or "auto"),
+            motion=motion,
+            style=style,
+            editor_note="；".join(filter(None, (
+                candidate.instruction,
+                str(coverage.get("graphic_reason") or ""),
+            ))),
+            # Gemini chooses the editorial opportunity and timing. It cannot
+            # promote ordinary Brief prose into approved on-screen copy.
+            status="draft",
+        ))
+        used.add(candidate_id)
+    return GraphicsPlan(facts=facts, cues=cues)

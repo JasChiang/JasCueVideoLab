@@ -745,7 +745,10 @@ def command_render(args: argparse.Namespace) -> int:
     selection_contract = _planning_contract(
         "selection_zh-TW.txt",
         _selection_schema(
-            offered_ids, min_shots=min_shots, max_shots=max_shots
+            offered_ids, min_shots=min_shots, max_shots=max_shots,
+            graphic_candidate_ids=[
+                one.candidate_id for one in brief_document.candidates
+            ],
         ),
     )
     chose = _asked(
@@ -1182,6 +1185,28 @@ def command_render(args: argparse.Namespace) -> int:
         result=result,
         usages=[],
     )
+    # The same selection call may identify useful on-screen Brief moments.
+    # Materialise those as editable drafts for the Web/CLI graphics backend;
+    # never overwrite a plan the editor has already touched, and never let
+    # the model's choice promote ordinary prose into approved copy.
+    graphics_path = work / "graphics.json"
+    if crashed is None and plan is not None and not graphics_path.exists():
+        from montagewright.brief import initial_graphics_plan
+
+        initial_graphics = initial_graphics_plan(
+            brief_document,
+            selection,
+            shot_durations=[segment.duration_seconds for segment in plan.segments],
+        )
+        if initial_graphics.cues:
+            graphics_path.write_text(
+                json.dumps(
+                    initial_graphics.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
     if crashed is not None:
         print(
             "\nthe report was written before this run gave up, so what it "

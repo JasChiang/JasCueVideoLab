@@ -1433,6 +1433,7 @@ def decide_direction(
 def _selection_schema(
     span_ids: list[str], *, min_shots: int | None = None,
     max_shots: int | None = None, replace_clip_ids: list[str] | None = None,
+    graphic_candidate_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Flat shots plus flat coverage. Nothing nests more than one level.
 
@@ -1442,6 +1443,9 @@ def _selection_schema(
     that cannot.
     """
 
+    from montagewright.graphics import curated_graphic_family_ids
+
+    graphic_families = ["auto", *curated_graphic_family_ids()]
     return {
         "type": "object",
         "additionalProperties": False,
@@ -1626,7 +1630,17 @@ def _selection_schema(
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["goal", "shot_indexes"],
+                    "required": [
+                        "goal", "shot_indexes",
+                        *(
+                            ["show_as_graphic", "graphic_candidate_id",
+                             "graphic_design_family", "graphic_surface",
+                             "graphic_motion", "graphic_composition",
+                             "graphic_shot_index",
+                             "graphic_reason"]
+                            if graphic_candidate_ids else []
+                        ),
+                    ],
                     "properties": {
                         "goal": {"type": "string"},
                         "shot_indexes": {
@@ -1634,6 +1648,72 @@ def _selection_schema(
                             "items": {"type": "integer"},
                             "description": "0-based positions in `shots`.",
                         },
+                        **({
+                            "show_as_graphic": {
+                                "type": "boolean",
+                                "description": (
+                                    "這個 brief 目標是否值得在畫面上出現字卡。"
+                                    "只有觀眾需要讀到文字才選 true；不要把每個"
+                                    "目標都做成字卡。"
+                                ),
+                            },
+                            "graphic_candidate_id": {
+                                "type": "string",
+                                "enum": ["none", *graphic_candidate_ids],
+                                "description": (
+                                    "show_as_graphic=true 時引用下面提供的 Brief "
+                                    "原文候選 ID；否則填 none。不能自行改寫原文。"
+                                ),
+                            },
+                            "graphic_design_family": {
+                                "type": "string",
+                                "enum": graphic_families,
+                                "description": (
+                                    "選完整設計家族作起點，或填 auto。家族不是"
+                                    "鎖死模板，下面仍可覆寫底板、動畫與構圖。"
+                                    "show_as_graphic=false 時填 auto。"
+                                ),
+                            },
+                            "graphic_surface": {
+                                "type": "string",
+                                "enum": [
+                                    "inherit", "template", "solid", "pill",
+                                    "split", "ribbon", "sticker", "highlight",
+                                    "outline", "glass", "editorial",
+                                ],
+                                "description": "偏離家族時指定底板；否則 inherit。",
+                            },
+                            "graphic_motion": {
+                                "type": "string",
+                                "enum": [
+                                    "inherit", "none", "fade", "rise",
+                                    "slide_left", "slide_right",
+                                ],
+                                "description": "偏離家族時指定動態；否則 inherit。",
+                            },
+                            "graphic_composition": {
+                                "type": "string",
+                                "enum": [
+                                    "inherit", "auto", "negative_space", "avoid_subject",
+                                    "overlap_subject", "foreground_plate",
+                                ],
+                                "description": (
+                                    "字卡與畫面的關係；inherit 沿用家族，auto "
+                                    "明確交給本機判斷；像素位置仍由本機求解。"
+                                ),
+                            },
+                            "graphic_shot_index": {
+                                "type": "integer", "minimum": -1,
+                                "description": (
+                                    "字卡實際落點，必須是 shot_indexes 其中一個；"
+                                    "show_as_graphic=false 時填 -1。"
+                                ),
+                            },
+                            "graphic_reason": {
+                                "type": "string",
+                                "description": "為何此處需要／不需要讓觀眾讀字。",
+                            },
+                        } if graphic_candidate_ids else {}),
                     },
                 },
             },
@@ -1707,6 +1787,30 @@ def select_shots(
     offered = [span for item in usable for span in item.spans]
     min_shots, max_shots = _shot_count_bounds(direction, len(offered))
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
+    from montagewright.brief import parse_brief_markdown
+    from montagewright.graphics import graphic_family_prompt
+
+    graphic_candidates = parse_brief_markdown(brief).candidates
+    graphic_candidate_ids = [one.candidate_id for one in graphic_candidates]
+    graphic_copy = (
+        "## 可引用的 Brief 字卡原文\n\n"
+        + "\n".join(
+            f"- `{one.candidate_id}`：{one.primary_text}"
+            + (f"／{one.secondary_text}" if one.secondary_text else "")
+            for one in graphic_candidates
+        )
+        + "\n\n## 可用字卡設計家族\n\n"
+        + graphic_family_prompt()
+        + (
+            "\n\n家族只是完整而安全的起點。你可以依畫面語意另選 "
+            "graphic_surface、graphic_motion、graphic_composition；"
+            "各欄填 inherit 才沿用家族，composition 的 auto 是明確交由"
+            "本機判斷。並以 graphic_shot_index 指定 coverage 中真正適合"
+            "顯示字卡的那顆鏡頭；"
+            "字型檔、像素位置、對比與碰撞避讓仍由本機處理。\n\n"
+        )
+        if graphic_candidates else ""
+    )
     selection_input: list[dict[str, Any]] = [
         {
             "type": "text",
@@ -1722,6 +1826,8 @@ def select_shots(
                     f"{direction.get('max_static_seconds', 0):.1f} 秒。"
                     f"理由：{direction.get('pacing_reason', '')}\n\n"
                     f"## 剪輯 brief\n\n{brief}\n\n"
+                    + graphic_copy
+                    +
                     f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
                     f"## 做不到的事\n\n{describe_limits_for_prompt()}\n\n"
                     f"## 可用素材\n\n以下 {len(usable)} 支，每一支的說明就寫在它自己那段影片前面。\n"
@@ -1744,6 +1850,7 @@ def select_shots(
                 [one.span_id for one in offered],
                 min_shots=min_shots,
                 max_shots=max_shots,
+                graphic_candidate_ids=graphic_candidate_ids,
             )
         ),
         ledger=ledger,
