@@ -757,6 +757,9 @@ def _default_client() -> Any:
     from google import genai  # imported lazily so tests need no key
     from google.genai import types
 
+    from montagewright.environment import load_project_env
+
+    load_project_env()
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise PlannerError("GEMINI_API_KEY is required for a live rhythm pass")
@@ -1691,6 +1694,14 @@ def _selection_schema(
                                 ],
                                 "description": "偏離家族時指定動態；否則 inherit。",
                             },
+                            "graphic_music_sync": {
+                                "type": "string",
+                                "enum": ["inherit", "none", "accent", "downbeat"],
+                                "description": (
+                                    "是否讓進場完成點對齊鄰近的音樂事件；"
+                                    "沒有配樂或不需要同步時填 none。"
+                                ),
+                            },
                             "graphic_composition": {
                                 "type": "string",
                                 "enum": [
@@ -1808,7 +1819,8 @@ def select_shots(
         + graphic_family_prompt()
         + (
             "\n\n家族只是完整而安全的起點。你可以依畫面語意另選 "
-            "graphic_surface、graphic_motion、graphic_composition；"
+            "graphic_surface、graphic_motion、graphic_music_sync、"
+            "graphic_composition；"
             "各欄填 inherit 才沿用家族，composition 的 auto 是明確交由"
             "本機判斷。並以 graphic_shot_index 指定 coverage 中真正適合"
             "顯示字卡的那顆鏡頭；"

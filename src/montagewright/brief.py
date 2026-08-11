@@ -399,6 +399,9 @@ def initial_graphics_plan(
         # while making avoid/overlap/auto ineffective in rendered pixels.
         if requested_composition != "inherit":
             position = "auto"
+        music_sync = str(coverage.get("graphic_music_sync") or "inherit")
+        if music_sync == "inherit":
+            music_sync = "none"
         authoritative = (
             next(
                 (fact for fact in document.approved_copy
@@ -428,6 +431,7 @@ def initial_graphics_plan(
             composition=composition,
             background=str(cue_defaults.get("background") or "auto"),
             motion=motion,
+            music_sync=music_sync,
             style=style,
             editor_note="；".join(filter(None, (
                 candidate.instruction,

@@ -2630,6 +2630,9 @@ function inspectGraphic() {
         ['none','直接出現'],['fade','淡入淡出'],['rise','向上進場'],
         ['slide_left','向左進場'],['slide_right','向右進場']
       ], one.motion)}</select>
+      <span>音樂同步</span><select id="graphic-music-sync" class="wide">${graphicOptions([
+        ['none','不吸附'],['accent','進場完成對齊重音'],['downbeat','進場完成對齊小節第一拍']
+      ], one.music_sync || 'none')}</select>
     </div>
       <p class="graphic-quick-help">輸出整支字卡版請使用上方「匯出」。</p>
     </section>
@@ -2646,7 +2649,7 @@ function inspectGraphic() {
     'graphic-transform-rotation','graphic-transform-locked',
     'graphic-composition','graphic-background','graphic-surface',
     'graphic-surface-secondary','graphic-surface-angle',
-    'graphic-motion','graphic-style-preset',
+    'graphic-motion','graphic-music-sync','graphic-style-preset',
     'graphic-contrast-mode','graphic-z-index','graphic-collision-policy',
     'graphic-align','graphic-primary-scale','graphic-secondary-scale',
     'graphic-line-spacing','graphic-block-gap','graphic-width-scale','graphic-padding-x','graphic-padding-y',
@@ -2826,7 +2829,7 @@ async function updateGraphicFromInspector(event) {
       'graphic-until','graphic-status','graphic-note','graphic-template',
       'graphic-position','graphic-composition','graphic-background',
       'graphic-surface','graphic-surface-secondary','graphic-surface-angle',
-      'graphic-motion','graphic-style-preset','graphic-contrast-mode',
+      'graphic-motion','graphic-music-sync','graphic-style-preset','graphic-contrast-mode',
       'graphic-z-index','graphic-collision-policy','graphic-transform-x',
       'graphic-transform-y','graphic-transform-scale',
       'graphic-transform-rotation','graphic-transform-locked'].includes(event.target.id);
@@ -2949,6 +2952,7 @@ async function updateGraphicFromInspector(event) {
     template, position: presetCue.position || $('graphic-position').value,
     composition: presetCue.composition || $('graphic-composition').value,
     background, motion: presetCue.motion || $('graphic-motion').value,
+    music_sync: $('graphic-music-sync').value,
     z_index: $('graphic-z-index').value === ''
       ? null : +$('graphic-z-index').value,
     collision_policy: $('graphic-collision-policy').value,
@@ -4382,6 +4386,7 @@ $('rushes').addEventListener('change', () => {
 });
 
 $('go').addEventListener('click', async () => {
+  if ($('go').disabled) return;
   const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
   const path = $('path').value.trim();
   if (!path && !files.length) { alert('給一個素材路徑，或改用上傳'); return; }
@@ -4402,15 +4407,53 @@ $('go').addEventListener('click', async () => {
   body.append('subtitle_font', $('setup-font').value);
 
   $('go').disabled = true;
+  clearInterval(timer); clearInterval(ticker);
   $('veil').classList.remove('hide');
   $('progress').classList.remove('hide');
+  $('state').textContent = '準備中';
+  $('state').className = 'state';
+  $('fault').classList.add('hide');
+  $('fault').innerHTML = '';
+  $('resume').classList.add('hide');
+  $('steps').innerHTML = '';
+  $('raw').open = false;
   $('log').textContent = '準備中…\n';
-  const res = await fetch('/api/runs', { method: 'POST', body });
+  // The completed steps from the open run filled this sheet, so changing
+  // only the collapsed raw log made a new click look like no click at all.
+  // Put the launch state where the eye already is and keep network failures
+  // recoverable instead of leaving the button disabled forever.
+  $('progress').scrollIntoView({block: 'start', behavior: 'smooth'});
+  let res;
+  try {
+    res = await fetch('/api/runs', { method: 'POST', body });
+  } catch (error) {
+    const message = error?.message || String(error);
+    $('state').textContent = '啟動失敗';
+    $('fault').innerHTML = `<b>無法連到本機剪輯服務</b><div>${esc(message)}</div>`;
+    $('fault').classList.remove('hide');
+    $('log').textContent = `啟動失敗：${message}`;
+    $('go').disabled = false;
+    return;
+  }
   if (!res.ok) {
-    $('log').textContent = '啟動失敗：' + (await res.text());
-    $('go').disabled = false; return;
+    const raw = await res.text();
+    let message = raw;
+    try {
+      const answer = JSON.parse(raw);
+      const detail = answer.detail;
+      message = typeof detail === 'string'
+        ? detail
+        : (detail?.message || answer.message || raw);
+    } catch (_) {}
+    $('state').textContent = '啟動失敗';
+    $('fault').innerHTML = `<b>這一輪還沒開始</b><div>${esc(message)}</div>`;
+    $('fault').classList.remove('hide');
+    $('log').textContent = '啟動失敗：' + message;
+    $('go').disabled = false;
+    return;
   }
   runId = (await res.json()).run_id;
+  $('state').textContent = '執行中';
   seen = 0; allLines = []; stepWas = -1; $('log').textContent = '';
   // Whatever is on screen belongs to the last run. Leaving it there while a
   // new one writes cards reads as though the new one already finished.

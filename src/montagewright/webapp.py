@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,15 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # does with a tool like this.
 RUNS_ROOT = Path(
     os.environ.get("MONTAGEWRIGHT_RUNS", Path.home() / ".cache" / "montagewright" / "runs")
+)
+# A sandboxed/local development server may need to create new runs inside the
+# workspace while still showing older CLI/Codex runs from the normal cache.
+# These roots are discovery-only: every new run is always written to
+# ``RUNS_ROOT``.
+LEGACY_RUNS_ROOTS = tuple(
+    Path(value).expanduser()
+    for value in os.environ.get("MONTAGEWRIGHT_LEGACY_RUNS", "").split(os.pathsep)
+    if value.strip()
 )
 # A browser upload of local material copies it into the browser and writes it
 # back out; the bytes were already on disk. Uploading stays for the case where
@@ -119,9 +129,15 @@ RUNS: dict[str, Run] = {}
 def recall() -> None:
     """Pick up runs left by an earlier server."""
 
-    if not RUNS_ROOT.exists():
-        return
-    for folder in sorted(RUNS_ROOT.iterdir()):
+    folders: list[Path] = []
+    for runs_root in (RUNS_ROOT, *LEGACY_RUNS_ROOTS):
+        if not runs_root.exists():
+            continue
+        try:
+            folders.extend(sorted(runs_root.iterdir()))
+        except OSError:
+            continue
+    for folder in folders:
         if folder.name in RUNS or not folder.is_dir():
             continue
         # Either the note this server wrote, or the one the command line
@@ -310,6 +326,9 @@ def _invalidate_graphics_delivery(run: Run) -> None:
     for name in (
         "deliverable-graphics.mp4",
         "deliverable-graphics-subtitled.mp4",
+        "graphics-overlay.mov",
+        "timeline.xml",
+        "timeline.fcpxml",
     ):
         (run.output / name).unlink(missing_ok=True)
     (run.output / "work" / "graphics-render" / "layout.json").unlink(
@@ -332,6 +351,9 @@ def _invalidate_subtitle_delivery(run: Run) -> None:
         "deliverable-subtitled.mp4",
         "deliverable-graphics.mp4",
         "deliverable-graphics-subtitled.mp4",
+        "graphics-overlay.mov",
+        "timeline.xml",
+        "timeline.fcpxml",
     ):
         (run.output / name).unlink(missing_ok=True)
     (run.output / "work" / "graphics-render" / "layout.json").unlink(
@@ -856,6 +878,25 @@ def _video_display_size(picture: Path) -> tuple[int, int]:
     return width, height
 
 
+def _video_timing(picture: Path) -> tuple[str, float]:
+    """A lightweight rational FPS/duration probe for frame-exact previews."""
+
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate:format=duration",
+            "-of", "json", str(picture),
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    payload = json.loads(completed.stdout)
+    streams = payload.get("streams", [])
+    rate = str(streams[0].get("avg_frame_rate") or "30/1") if streams else "30/1"
+    if rate == "0/0":
+        rate = "30/1"
+    return rate, float(payload.get("format", {}).get("duration") or 0.0)
+
+
 def _prepare_run_subtitle_track(
     run: Run, picture: Path, *, dimensions: tuple[int, int] | None = None,
 ):
@@ -918,6 +959,35 @@ def _save(upload: UploadFile, destination: Path) -> Path:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="montagewright")
+
+    @app.exception_handler(Exception)
+    async def unexpected_request_failure(
+        request: Request, error: Exception
+    ) -> JSONResponse:
+        """Keep local UI failures diagnosable without returning a blank 500.
+
+        This application is a localhost editing workstation, not a public API.
+        A generic ``Internal Server Error`` hides the one fact needed to repair
+        a failed launch (for example an unreadable folder or a process limit),
+        while the traceback may belong to a terminal that is no longer open.
+        Keep the traceback in the server output and return the exception class
+        plus message to the local editor.
+        """
+
+        error_id = uuid.uuid4().hex[:8]
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": (
+                    f"本機剪輯服務發生錯誤（{error_id}）："
+                    f"{type(error).__name__}: {error}"
+                ),
+                "error_code": "internal_server_error",
+                "error_id": error_id,
+                "path": request.url.path,
+            },
+        )
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -1052,15 +1122,42 @@ def create_app() -> FastAPI:
             run_id=run_id, root=keep(), source=str(rush_dir), command=command
         )
         run.lines.append(f"{kept} clips from {rush_dir}")
-        run.remember()
-        run.process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
+        try:
+            run.remember()
+            run.process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+        except OSError as error:
+            # A launch can fail before the CLI has a chance to print anything
+            # (process limits, permissions, a missing interpreter).  Record a
+            # truthful terminal state and give the editor an actionable 503;
+            # otherwise it looks as though Gemini started and then vanished.
+            run.state = "failed"
+            run.returncode = -1
+            run.lines.append(
+                f"launch failed: {type(error).__name__}: {error}"
+            )
+            try:
+                run.remember()
+            except OSError:
+                traceback.print_exc()
+            RUNS[run_id] = run
+            raise HTTPException(
+                503,
+                {
+                    "message": (
+                        "無法啟動本機剪輯程序："
+                        f"{type(error).__name__}: {error}"
+                    ),
+                    "error_code": "process_launch_failed",
+                    "run_id": run_id,
+                },
+            ) from error
         RUNS[run_id] = run
         threading.Thread(target=_collect, args=(run,), daemon=True).start()
         return JSONResponse({"run_id": run_id})
@@ -1894,9 +1991,11 @@ def create_app() -> FastAPI:
                 maybe = Path(run.command[run.command.index("--music") + 1])
                 bed = maybe if maybe.exists() else None
             build = to_xmeml if flavour == "premiere" else to_fcpxml
+            graphics = run.output / "graphics-overlay.mov"
             path.write_text(
                 build(plan, report, name=run.output.name,
-                      width=width, height=height, music=bed),
+                      width=width, height=height, music=bed,
+                      graphics=graphics if graphics.exists() else None),
                 encoding="utf-8",
             )
         return FileResponse(
@@ -2429,8 +2528,10 @@ def create_app() -> FastAPI:
             CopyFact,
             GraphicsPlan,
             burn_graphics,
+            render_graphics_overlay,
             validate_brief_authority,
         )
+        from montagewright.grounding import read_runtime_beat_grid
 
         run = _run(run_id)
         stored = run.output / "work" / "graphics.json"
@@ -2468,6 +2569,9 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "this run has no finished cut")
         merged_graphics = run.output / "deliverable-graphics-subtitled.mp4"
         try:
+            beat_grid = read_runtime_beat_grid(
+                run.output / "work" / "graphics-beat-grid.json"
+            )
             subtitle_track = _prepare_run_subtitle_track(run, clean)
             subtitles = subtitle_track.windows
             subtitle_boxes = subtitle_track.boxes
@@ -2483,7 +2587,20 @@ def create_app() -> FastAPI:
                 subtitle_boxes=subtitle_boxes,
                 subtitle_overlays=subtitle_overlays,
                 layout_evidence=_graphics_layout_evidence(run, plan),
+                beat_grid=beat_grid,
             )
+            overlay = render_graphics_overlay(
+                clean, plan, run.output / "graphics-overlay.mov",
+                work=run.output / "work" / "graphics-render",
+                subtitle_windows=subtitles,
+                subtitle_boxes=subtitle_boxes,
+                layout_evidence=_graphics_layout_evidence(run, plan),
+                beat_grid=beat_grid,
+            )
+            for stale_timeline in (
+                run.output / "timeline.xml", run.output / "timeline.fcpxml"
+            ):
+                stale_timeline.unlink(missing_ok=True)
             if not subtitle_overlays:
                 merged_graphics.unlink(missing_ok=True)
         except (
@@ -2492,6 +2609,7 @@ def create_app() -> FastAPI:
             raise HTTPException(422, str(error))
         return JSONResponse({
             "file": made.name,
+            "overlay": overlay.name,
             "cues": sum(cue.status == "approved" for cue in plan.cues),
             "layout": json.loads(
                 (run.output / "work" / "graphics-render" / "layout.json")
@@ -2510,8 +2628,11 @@ def create_app() -> FastAPI:
         from starlette.concurrency import run_in_threadpool
         from montagewright.graphics import (
             GRAPHICS_RENDERER_VERSION, GraphicsPlan, _layout_frames,
-            _swept_rect,
+            _swept_rect, resolve_graphic_window,
             compile_graphic,
+        )
+        from montagewright.grounding import (
+            beat_grid_payload, read_runtime_beat_grid,
         )
 
         run = _run(run_id)
@@ -2547,6 +2668,9 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "no picture available for graphics preview")
         try:
             width, height = await run_in_threadpool(_video_display_size, picture)
+            output_fps, picture_duration = await run_in_threadpool(
+                _video_timing, picture
+            )
             picture_stat = picture.stat()
             subtitle_track = await run_in_threadpool(partial(
                 _prepare_run_subtitle_track, run, picture,
@@ -2561,6 +2685,9 @@ def create_app() -> FastAPI:
                 suggested_patch={"action": "retry"},
             )
         subtitle_boxes_all = subtitle_track.boxes
+        beat_grid = read_runtime_beat_grid(
+            run.output / "work" / "graphics-beat-grid.json"
+        )
         evidence_map = _graphics_layout_evidence(run, plan)
         digest = hashlib.sha256(
             json.dumps(
@@ -2568,11 +2695,17 @@ def create_app() -> FastAPI:
                     "target_graphic_id": graphic_id,
                     "plan": plan.model_dump(mode="json"),
                     "width": width, "height": height,
+                    "output_fps": output_fps,
+                    "picture_duration": picture_duration,
                     "picture": {
                         "size": picture_stat.st_size,
                         "mtime_ns": picture_stat.st_mtime_ns,
                     },
                     "renderer_version": GRAPHICS_RENDERER_VERSION,
+                    "beat_grid": (
+                        beat_grid_payload(beat_grid) if beat_grid is not None
+                        else None
+                    ),
                     "subtitle_keepout": subtitle_boxes_all,
                     "evidence": {
                         key: {
@@ -2631,22 +2764,27 @@ def create_app() -> FastAPI:
             preview_cues.sort(key=lambda item: (
                 item.position == "auto", plan_order[item.graphic_id]
             ))
+            cue_windows = {
+                item.graphic_id: resolve_graphic_window(
+                    item, beat_grid=beat_grid, output_fps=output_fps,
+                    timeline_duration=picture_duration,
+                )
+                for item in preview_cues
+            }
             earlier: list[tuple[Any, Any]] = []
             card = metadata = None
             joint_layout: dict[str, dict] = {}
             for current in preview_cues:
+                current_start, current_end = cue_windows[current.graphic_id]
                 current_boxes = [
                     (left, top, wide, tall)
                     for start, end, left, top, wide, tall in subtitle_boxes_all
-                    if current.at_seconds < end
-                    and current.at_seconds + current.duration_seconds > start
+                    if current_start < end and current_end > start
                 ]
                 overlapping = [
                     (other, other_card) for other, other_card in earlier
-                    if current.at_seconds
-                    < other.at_seconds + other.duration_seconds
-                    and current.at_seconds + current.duration_seconds
-                    > other.at_seconds
+                    if current_start < cue_windows[other.graphic_id][1]
+                    and current_end > cue_windows[other.graphic_id][0]
                     and (
                         current.collision_policy == "avoid"
                         or other.collision_policy == "avoid"
@@ -2663,7 +2801,8 @@ def create_app() -> FastAPI:
                 try:
                     frames = await run_in_threadpool(
                         partial(
-                            _layout_frames, picture, current,
+                            _layout_frames, picture,
+                            current.model_copy(update={"at_seconds": current_start}),
                             cache_dir=preview_dir / "frames",
                         )
                     )
@@ -2690,6 +2829,9 @@ def create_app() -> FastAPI:
                             frames=frames,
                             evidence=evidence_map.get(current.graphic_id),
                             forbidden_positions=set(), keepout_rects=keepouts,
+                            beat_grid=beat_grid,
+                            output_fps=output_fps,
+                            timeline_duration=picture_duration,
                         )
                     )
                 except ValueError as error:
@@ -3092,7 +3234,9 @@ app = create_app()
 
 def main() -> int:
     import uvicorn
+    from montagewright.environment import load_project_env
 
+    load_project_env()
     uvicorn.run(
         app,
         host=os.environ.get("MONTAGEWRIGHT_HOST", "127.0.0.1"),

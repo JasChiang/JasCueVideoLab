@@ -26,7 +26,10 @@ from montagewright.clipcard import (
     subjects_from_card,
 )
 from montagewright.cost import BudgetSpent, Ledger
-from montagewright.grounding import analyse_track, load_beat_grid, shots_in
+from montagewright.grounding import (
+    analyse_track, beat_grid_payload, load_beat_grid, read_runtime_beat_grid,
+    shots_in,
+)
 from montagewright.pipeline import probe, run
 from montagewright.review import (
     Round,
@@ -118,7 +121,9 @@ def _sam_checkpoint_for(args: argparse.Namespace) -> Path | None:
 def _client():
     from google import genai
     from google.genai import types
+    from montagewright.environment import load_project_env
 
+    load_project_env()
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise SystemExit("GEMINI_API_KEY is required")
@@ -857,6 +862,15 @@ def command_render(args: argparse.Namespace) -> int:
         )
 
     result, plan, report, resolved = cut(edl, sources, rhythm_context)
+    if grid is not None:
+        from montagewright.measure.storage import write_json
+
+        write_json(
+            work / "graphics-beat-grid.json",
+            beat_grid_payload(
+                grid.as_heard(plan.music_from_seconds, plan.music_spans)
+            ),
+        )
     # The direction set a length; somebody has to compare it with what came
     # out. Three layers each made a defensible call last run and delivered
     # 17.9 seconds against 30, with nothing in the report saying so.
@@ -1294,7 +1308,12 @@ def command_render(args: argparse.Namespace) -> int:
                 path.write_text(
                     build(plan, payload, name=output.name,
                           width=width, height=height,
-                          music=laid_bed if laid_bed.exists() else args.music),
+                          music=laid_bed if laid_bed.exists() else args.music,
+                          graphics=(
+                              output / "graphics-overlay.mov"
+                              if (output / "graphics-overlay.mov").exists()
+                              else None
+                          )),
                     encoding="utf-8",
                 )
                 print(f"timeline    {path}", flush=True)
@@ -1928,7 +1947,16 @@ def command_timeline(args: argparse.Namespace) -> int:
             path = output / f"timeline.{suffix}"
             path.write_text(
                 build(plan, report, name=output.name,
-                      width=width, height=height),
+                      width=width, height=height,
+                      music=(
+                          output / "bed-as-laid.m4a"
+                          if (output / "bed-as-laid.m4a").exists() else None
+                      ),
+                      graphics=(
+                          output / "graphics-overlay.mov"
+                          if (output / "graphics-overlay.mov").exists()
+                          else None
+                      )),
                 encoding="utf-8",
             )
             print(f"timeline    {path}", flush=True)
@@ -1943,6 +1971,7 @@ def command_graphics(args: argparse.Namespace) -> int:
         GraphicsPlan,
         _layout_frames,
         burn_graphics,
+        render_graphics_overlay,
         compile_graphic,
         validate_brief_authority,
         validate_for_render,
@@ -2046,6 +2075,7 @@ def command_graphics(args: argparse.Namespace) -> int:
         )
         return 0
 
+    beat_grid = read_runtime_beat_grid(output / "work" / "graphics-beat-grid.json")
     if args.action == "preview":
         if not args.graphic_id:
             raise SystemExit("graphics preview requires --graphic-id")
@@ -2055,11 +2085,23 @@ def command_graphics(args: argparse.Namespace) -> int:
             raise SystemExit(f"unknown graphic id {args.graphic_id}") from None
         shape = probe_video(clean).video
         width, height = int(shape.display_width), int(shape.display_height)
+        rate = shape.average_frame_rate or shape.real_frame_rate or 30
+        from montagewright.graphics import resolve_graphic_window
+        start, _ = resolve_graphic_window(
+            cue, beat_grid=beat_grid, output_fps=rate,
+            timeline_duration=duration,
+        )
         preview_dir = output / "work" / "graphics-cli-preview"
-        frames = _layout_frames(clean, cue, cache_dir=preview_dir / "frames")
+        frames = _layout_frames(
+            clean, cue.model_copy(update={"at_seconds": start}),
+            cache_dir=preview_dir / "frames",
+        )
         made, _ = compile_graphic(
             cue, plan, width=width, height=height,
             into=preview_dir / f"{cue.graphic_id}.png", frames=frames,
+            beat_grid=beat_grid,
+            output_fps=rate,
+            timeline_duration=duration,
         )
         print(f"preview     {made.path}", flush=True)
         return 0
@@ -2068,12 +2110,24 @@ def command_graphics(args: argparse.Namespace) -> int:
     made = burn_graphics(
         clean, plan, destination,
         work=output / "work" / "graphics-render",
+        beat_grid=beat_grid,
     )
+    overlay = render_graphics_overlay(
+        clean, plan, output / "graphics-overlay.mov",
+        work=output / "work" / "graphics-render",
+        beat_grid=beat_grid,
+    )
+    for stale_timeline in (output / "timeline.xml", output / "timeline.fcpxml"):
+        stale_timeline.unlink(missing_ok=True)
     print(f"graphics    {made}", flush=True)
+    print(f"overlay     {overlay}", flush=True)
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
+    from montagewright.environment import load_project_env
+
+    load_project_env()
     parser = argparse.ArgumentParser(prog="montagewright")
     sub = parser.add_subparsers(dest="command", required=True)
 

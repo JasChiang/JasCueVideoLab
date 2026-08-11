@@ -19,12 +19,16 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field, model_validator
 
 from montagewright.schema import Local
+
+if TYPE_CHECKING:
+    from montagewright.grounding import BeatGrid
 
 SourceKind = Literal[
     "user", "brief_exact", "brief_candidate", "onscreen", "transcript",
@@ -59,7 +63,7 @@ SurfaceTreatment = Literal[
 ]
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
-GRAPHICS_RENDERER_VERSION = 9
+GRAPHICS_RENDERER_VERSION = 10
 GRAPHIC_PRESET_REGISTRY_VERSION = 1
 
 
@@ -1150,8 +1154,90 @@ def _place_for_motion_safe(
     )
 
 
+def _fps_fraction(value) -> Fraction:
+    return (
+        Fraction(int(value.numerator), int(value.denominator))
+        if hasattr(value, "numerator") and hasattr(value, "denominator")
+        else Fraction(value)
+    )
+
+
+def _frame_seconds(seconds: float, fps: Fraction) -> float:
+    from decimal import Decimal
+    from montagewright.executor import seconds_to_frames
+
+    decimal_fps = Decimal(fps.numerator) / Decimal(fps.denominator)
+    return seconds_to_frames(seconds, decimal_fps) / float(fps)
+
+
+def resolve_graphic_timing(
+    cue: GraphicCue,
+    *,
+    enter_seconds: float,
+    beat_grid: "BeatGrid | None" = None,
+    output_fps: Fraction | int = Fraction(30, 1),
+    timeline_duration: float | None = None,
+) -> dict:
+    """Resolve authored seconds to the film clock without changing duration.
+
+    ``music_sync`` means the end of the entrance lands on the requested
+    audible event.  A distant beat is not the same editorial decision, so
+    the resolver only accepts a small local correction and otherwise leaves
+    the authored time alone.  All consumers receive frame-quantised seconds.
+    """
+
+    fps = _fps_fraction(output_fps)
+    authored_start = float(cue.at_seconds)
+    duration = float(cue.duration_seconds)
+    start = authored_start
+    matched = None
+    drift = 0.0
+    wanted = cue.music_sync
+    if wanted != "none" and beat_grid is not None:
+        target = authored_start + enter_seconds
+        candidates = [one for one in beat_grid.cues if one.kind == wanted]
+        if candidates:
+            nearest = min(
+                candidates,
+                key=lambda one: (abs(one.time_seconds - target), -one.strength),
+            )
+            limit = min(0.4, beat_grid.seconds_per_beat * 0.75)
+            proposed = _frame_seconds(nearest.time_seconds, fps) - enter_seconds
+            if abs(proposed - authored_start) <= limit + 1e-9:
+                start = proposed
+                matched = nearest
+    start = max(0.0, start)
+    if timeline_duration is not None:
+        start = min(start, max(0.0, timeline_duration - duration))
+    start = _frame_seconds(start, fps)
+    end = _frame_seconds(start + duration, fps)
+    if timeline_duration is not None:
+        end = min(end, _frame_seconds(timeline_duration, fps))
+    if matched is not None:
+        landed = start + enter_seconds
+        expected = _frame_seconds(matched.time_seconds, fps)
+        if abs(landed - expected) > (0.5 / float(fps)) + 1e-9:
+            matched = None
+        else:
+            drift = start - authored_start
+    return {
+        "requested_start_seconds": authored_start,
+        "start_seconds": start,
+        "end_seconds": end,
+        "music_sync": wanted,
+        "sync_applied": matched is not None,
+        "sync_cue_id": matched.cue_id if matched is not None else None,
+        "sync_cue_kind": matched.kind if matched is not None else None,
+        "sync_cue_seconds": matched.time_seconds if matched is not None else None,
+        "sync_drift_seconds": drift if matched is not None else 0.0,
+    }
+
+
 def resolve_graphic_animation(
-    cue: GraphicCue, card: DrawnGraphic, width: int, height: int
+    cue: GraphicCue, card: DrawnGraphic, width: int, height: int,
+    *, beat_grid: "BeatGrid | None" = None,
+    output_fps: Fraction | int = Fraction(30, 1),
+    timeline_duration: float | None = None,
 ) -> dict:
     enter = (
         min(cue.style.entrance_seconds, cue.duration_seconds * 0.4)
@@ -1163,6 +1249,9 @@ def resolve_graphic_animation(
         if cue.style.exit_seconds is not None
         else min(0.32, max(0.12, cue.duration_seconds * 0.08))
     )
+    fps = _fps_fraction(output_fps)
+    enter = max(1 / float(fps), _frame_seconds(enter, fps))
+    leave = max(1 / float(fps), _frame_seconds(leave, fps))
     motion, distance = _feasible_graphic_motion(cue, card, width, height)
     requested_distance = _motion_distance_pixels(cue, width, height)
     from_left, from_top = card.left, card.top
@@ -1172,9 +1261,15 @@ def resolve_graphic_animation(
         from_left += distance
     elif motion == "slide_right":
         from_left -= distance
+    timing = resolve_graphic_timing(
+        cue,
+        enter_seconds=enter,
+        beat_grid=beat_grid,
+        output_fps=fps,
+        timeline_duration=timeline_duration,
+    )
     return {
-        "start_seconds": cue.at_seconds,
-        "end_seconds": cue.at_seconds + cue.duration_seconds,
+        **timing,
         "enter_seconds": enter,
         "leave_seconds": leave,
         "from_left": from_left,
@@ -1188,6 +1283,31 @@ def resolve_graphic_animation(
         "resolved_motion_distance": distance,
         "easing": "linear",
     }
+
+
+def resolve_graphic_window(
+    cue: GraphicCue,
+    *, beat_grid: "BeatGrid | None" = None,
+    output_fps: Fraction | int = Fraction(30, 1),
+    timeline_duration: float | None = None,
+) -> tuple[float, float]:
+    """The half-open film window used by layout, preview and delivery."""
+
+    fps = _fps_fraction(output_fps)
+    enter = (
+        min(cue.style.entrance_seconds, cue.duration_seconds * 0.4)
+        if cue.style.entrance_seconds is not None
+        else min(0.45, max(0.16, cue.duration_seconds * 0.12))
+    )
+    enter = max(1 / float(fps), _frame_seconds(enter, fps))
+    made = resolve_graphic_timing(
+        cue,
+        enter_seconds=enter,
+        beat_grid=beat_grid,
+        output_fps=fps,
+        timeline_duration=timeline_duration,
+    )
+    return made["start_seconds"], made["end_seconds"]
 
 
 def _relative_luminance(rgb: tuple[int, int, int]) -> float:
@@ -1847,6 +1967,9 @@ def compile_graphic(
     evidence: LayoutEvidence | None = None,
     forbidden_positions: set[str] | None = None,
     keepout_rects: list[tuple[int, int, int, int]] | None = None,
+    beat_grid: "BeatGrid | None" = None,
+    output_fps: Fraction | int = Fraction(30, 1),
+    timeline_duration: float | None = None,
 ) -> tuple[DrawnGraphic, dict]:
     """Compile pixels and placement once for both preview and delivery."""
 
@@ -2118,7 +2241,12 @@ def compile_graphic(
         "authored_style": cue.style.model_dump(mode="json"),
         "requested_template": requested_template,
         "resolved_template": cue.template,
-        "animation": resolve_graphic_animation(cue, card, width, height),
+        "animation": resolve_graphic_animation(
+            cue, card, width, height,
+            beat_grid=beat_grid,
+            output_fps=output_fps,
+            timeline_duration=timeline_duration,
+        ),
     })
     return card, report
 
@@ -2133,6 +2261,8 @@ def burn_graphics(
     subtitle_boxes: list[tuple[float, float, int, int, int, int]] | None = None,
     subtitle_overlays: list | None = None,
     layout_evidence: dict[str, LayoutEvidence] | None = None,
+    beat_grid: "BeatGrid | None" = None,
+    alpha_only: bool = False,
 ) -> Path:
     """Composite approved graphics and keep the clean picture untouched."""
 
@@ -2142,6 +2272,7 @@ def burn_graphics(
     shape = probe_video(picture).video
     width, height = int(shape.display_width), int(shape.display_height)
     rate = shape.average_frame_rate or shape.real_frame_rate
+    fps_fraction = rate if rate is not None and rate.denominator else Fraction(30, 1)
     output_fps = (
         f"{rate.numerator}/{rate.denominator}"
         if rate is not None and rate.denominator else "30/1"
@@ -2158,29 +2289,35 @@ def burn_graphics(
         raise ValueError("no approved graphics to render")
 
     plan_order = {cue.graphic_id: index for index, cue in enumerate(plan.cues)}
+    cue_windows = {
+        cue.graphic_id: resolve_graphic_window(
+            cue, beat_grid=beat_grid, output_fps=fps_fraction,
+            timeline_duration=duration,
+        )
+        for cue in cues
+    }
     layout_cues = sorted(
         cues, key=lambda item: (item.position == "auto", plan_order[item.graphic_id])
     )
     drawn = []
     layout_report: dict[str, dict] = {}
     for cue in layout_cues:
+        cue_start, cue_end = cue_windows[cue.graphic_id]
         overlaps_subtitles = bool(subtitle_windows and any(
-            cue.at_seconds < sub_end
-            and cue.at_seconds + cue.duration_seconds > sub_start
+            cue_start < sub_end and cue_end > sub_start
             for sub_start, sub_end in subtitle_windows
         ))
         evidence = (layout_evidence or {}).get(cue.graphic_id)
         cue_keepouts = [
             (left, top, wide, tall)
             for sub_start, sub_end, left, top, wide, tall in (subtitle_boxes or [])
-            if cue.at_seconds < sub_end
-            and cue.at_seconds + cue.duration_seconds > sub_start
+            if cue_start < sub_end and cue_end > sub_start
         ]
         overlapping_graphics = [
             (other, other_card)
             for other, other_card in drawn
-            if cue.at_seconds < other.at_seconds + other.duration_seconds
-            and cue.at_seconds + cue.duration_seconds > other.at_seconds
+            if cue_start < cue_windows[other.graphic_id][1]
+            and cue_end > cue_windows[other.graphic_id][0]
             and (
                 cue.collision_policy == "avoid"
                 or other.collision_policy == "avoid"
@@ -2193,13 +2330,19 @@ def burn_graphics(
         card, compiled = compile_graphic(
             cue, plan, width=width, height=height,
             into=work / f"{cue.graphic_id}.png",
-            frames=_layout_frames(picture, cue),
+            frames=_layout_frames(
+                picture,
+                cue.model_copy(update={"at_seconds": cue_start}),
+            ),
             evidence=evidence,
             forbidden_positions=(
                 {"lower_left", "lower_right"}
                 if overlaps_subtitles and subtitle_boxes is None else set()
             ),
             keepout_rects=cue_keepouts,
+            beat_grid=beat_grid,
+            output_fps=fps_fraction,
+            timeline_duration=duration,
         )
         compiled.update({
             "z_index": (
@@ -2219,8 +2362,15 @@ def burn_graphics(
         plan_order[item[0].graphic_id],
     ))
     work.mkdir(parents=True, exist_ok=True)
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-               "-i", str(picture)]
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    if alpha_only:
+        command += [
+            "-f", "lavfi", "-i",
+            f"color=c=black@0.0:s={width}x{height}:r={output_fps}:"
+            f"d={duration:.9f},format=rgba",
+        ]
+    else:
+        command += ["-i", str(picture)]
     for _, card in drawn:
         command += [
             "-loop", "1", "-framerate", output_fps,
@@ -2232,13 +2382,18 @@ def burn_graphics(
     filters: list[str] = []
     tag = "0:v"
     for index, (cue, card) in enumerate(drawn):
-        animation = resolve_graphic_animation(cue, card, width, height)
+        animation = resolve_graphic_animation(
+            cue, card, width, height,
+            beat_grid=beat_grid,
+            output_fps=fps_fraction,
+            timeline_duration=duration,
+        )
         since = animation["start_seconds"]
         until = animation["end_seconds"]
         enter = animation["enter_seconds"]
         leave = animation["leave_seconds"]
         overlay_tag = f"g{index}"
-        if cue.motion == "none":
+        if animation["resolved_motion"] == "none":
             filters.append(f"[{index + 1}:v]format=rgba[{overlay_tag}]")
         else:
             filters.append(
@@ -2271,13 +2426,25 @@ def burn_graphics(
             f"lt(t,{overlay.ends_seconds:.9f})'[{next_tag}]"
         )
         tag = next_tag
-    command += [
-        "-filter_complex", ";".join(filters),
-        "-map", f"[{tag}]", "-map", "0:a?", "-t", f"{duration:.6f}",
-        "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p", "-r", output_fps,
-        "-fps_mode", "cfr", "-c:a", "copy", "-movflags", "+faststart",
-    ]
+    if alpha_only:
+        filters.append(f"[{tag}]format=yuva444p10le[outv]")
+        tag = "outv"
+    command += ["-filter_complex", ";".join(filters), "-map", f"[{tag}]"]
+    if not alpha_only:
+        command += ["-map", "0:a?"]
+    command += ["-t", f"{duration:.6f}"]
+    if alpha_only:
+        command += [
+            "-an", "-c:v", "prores_ks", "-profile:v", "4",
+            "-pix_fmt", "yuva444p10le", "-r", output_fps,
+            "-fps_mode", "cfr",
+        ]
+    else:
+        command += [
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-r", output_fps,
+            "-fps_mode", "cfr", "-c:a", "copy", "-movflags", "+faststart",
+        ]
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix=f".{destination.stem}-", suffix=destination.suffix,
@@ -2299,3 +2466,29 @@ def burn_graphics(
     finally:
         temporary.unlink(missing_ok=True)
     return destination
+
+
+def render_graphics_overlay(
+    picture: Path,
+    plan: GraphicsPlan,
+    destination: Path,
+    *,
+    work: Path,
+    subtitle_windows: list[tuple[float, float]] | None = None,
+    subtitle_boxes: list[tuple[float, float, int, int, int, int]] | None = None,
+    layout_evidence: dict[str, LayoutEvidence] | None = None,
+    beat_grid: "BeatGrid | None" = None,
+) -> Path:
+    """Render the exact animated graphics track as a transparent ProRes MOV."""
+
+    return burn_graphics(
+        picture,
+        plan,
+        destination,
+        work=work,
+        subtitle_windows=subtitle_windows,
+        subtitle_boxes=subtitle_boxes,
+        layout_evidence=layout_evidence,
+        beat_grid=beat_grid,
+        alpha_only=True,
+    )

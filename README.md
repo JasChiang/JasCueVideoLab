@@ -112,7 +112,8 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-設定 API key。程式不會自動讀 `.env`，請 export，或在啟動前自行 source：
+設定 API key。Web 與 CLI 會自動讀取目前工作目錄的 `.env`；如果 shell
+已經 export 同名變數，shell 的值優先、不會被 `.env` 覆蓋：
 
 ```bash
 export GEMINI_API_KEY='...'
@@ -358,6 +359,7 @@ Web 的 trim／reorder／字幕／字卡操作不會重新呼叫 Gemini。結構
 - Appearance：文字色、強調字、描邊、陰影、底板透明度、邊框、圓角與 padding。
 - Placement：自動留白、避開主體、刻意覆蓋主體、固定位置、自由位置、縮放與旋轉。
 - Motion：fade、rise、slide left／right、進出時間與距離。
+- Music sync：可把進場完成點吸附到成片實際聽到的 accent 或 downbeat；只做小幅局部校正，沒有鄰近節點時保留原時間。
 - Layering：z-index、允許／避免字卡彼此重疊。
 
 Gemini 只選擇語意層的 `family`、`surface`、`motion`、`composition` 與出現鏡頭；本機 resolver 依字型、實際文字長度、畫面比例、SAM 主體、字幕 keepout 和多幀對比決定像素。過長的自動字卡可以換成相容的較寬 template；人工鎖定的卡不會被偷偷改版。
@@ -375,6 +377,8 @@ montagewright graphics CUT/ render
 ```
 
 `approve` 是明確人工核准：它會複製當下精確文字、建立 digest，並將來源記為 `human_review`。修改核准文字後必須重新核准，不能沿用舊 digest。
+
+`render` 會同時產生燒錄版與 `graphics-overlay.mov`。後者是含完整進出動畫的透明 ProRes 4444 圖層，可在 NLE 中保留為獨立上層；字卡仍以 `graphics.json` 為可編輯來源。
 
 ## 字幕
 
@@ -410,9 +414,9 @@ montagewright render RUSHES/ \
 montagewright timeline CUT/ --flavour both --rushes RUSHES/
 ```
 
-Timeline 指回原始素材並保留 handles、來源時間、裁切 keyframes、marker 與 laid music audio。Premiere 使用 XMEML，Final Cut 使用 FCPXML。
+Timeline 指回原始素材並保留 handles、來源時間、裁切 keyframes、marker 與 laid music audio。若已輸出 `graphics-overlay.mov`，Premiere XMEML 與 Final Cut FCPXML 也會把它放在主畫面上層。Premiere 使用 XMEML，Final Cut 使用 FCPXML。
 
-目前 NLE 匯出不會建立原生可編輯的 Premiere／Final Cut 字卡物件；需要像素一致時請使用 baked graphics master。這項限制也適用於原生字幕圖層。
+透明 overlay 可移動、裁切、關閉或整軌替換，且畫面與 Web／CLI 輸出一致；但它不是 MOGRT／Motion Template，因此文字、字型和底板不能在 Premiere／Final Cut 的原生文字檢查器逐項修改。要改內容與設計仍回到 Web／`graphics.json` 後重輸 overlay。這項限制也適用於原生字幕圖層。
 
 ## 產出內容
 
@@ -426,6 +430,7 @@ CUT/
   deliverable-subtitled.mp4          燒錄字幕版（若產生）
   deliverable-graphics.mp4           燒錄字卡版（若產生）
   deliverable-graphics-subtitled.mp4 字卡＋字幕合併版（若產生）
+  graphics-overlay.mov               透明 ProRes 4444 字卡軌（若產生）
   report.json                        決策、驗收、降級、成本與錯誤
   segments/                          每顆已渲染鏡頭與 handles
   work/
@@ -450,10 +455,10 @@ CUT/
 
 - 目前使用 Google Gemini API key；尚未提供 Vertex AI backend 切換。
 - `--review` 目前審查的是主要剪輯成片，字卡軌是在 review loop 後 materialize；Gemini 還不能在同一輪 review 中直接提出結構化字卡修正。
-- 字卡 `music_sync` 已有 schema，但尚未驅動 production 動畫；字卡動畫 easing 目前固定為 linear。
+- 字卡 `music_sync` 已可在本機對齊 accent／downbeat；目前只同步進場完成點，尚未提供逐字、逐行或連續音訊反應動畫。字卡動畫 easing 目前固定為 linear。
 - Web 可檢查裁切框與運鏡，但尚未提供完整的 source-time crop keyframe editor。
 - Web 互動預覽不是 WebGL renderer；精準結果仍由 Pillow／FFmpeg production compiler 產生。這保證輸出一致，但第一次編譯複雜字卡仍可能需要短暫等待。
-- NLE timeline 目前不含原生可編輯字卡／字幕物件。
+- NLE timeline 會帶透明字卡軌，但目前不會建立原生可逐字編輯的 Premiere／Final Cut 字卡或字幕物件。
 - SAM 追蹤品質仍取決於 seed、遮擋、鏡頭切換與素材清晰度；對焦前後、拍攝準備動作與真正 authored camera motion 仍需要可靠的 usable-window 分析。
 
 ## 專案結構

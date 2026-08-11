@@ -125,6 +125,7 @@ class BeatGrid:
             if cue.kind == "section_boundary"
         }
 
+
     def cuttable(self) -> tuple[Cue, ...]:
         return tuple(cue for cue in self.cues if cue.kind in CUTTABLE)
 
@@ -209,6 +210,51 @@ class BeatGrid:
             cue for cue in self.cuttable() if cue.time_seconds > seconds + 1e-6
         ]
         return later[0] if later else None
+
+
+def beat_grid_payload(grid: BeatGrid) -> dict:
+    """A small, stable film-clock artifact shared by Web and CLI graphics."""
+
+    return {
+        "version": 1,
+        "bpm": grid.bpm,
+        "meter": grid.meter,
+        "duration_seconds": grid.duration_seconds,
+        "cues": [
+            {
+                "cue_id": cue.cue_id,
+                "time_seconds": cue.time_seconds,
+                "kind": cue.kind,
+                "strength": cue.strength,
+            }
+            for cue in grid.cues
+        ],
+    }
+
+
+def beat_grid_from_payload(payload: dict) -> BeatGrid:
+    """Read the runtime format written beside a rendered cut."""
+
+    return BeatGrid(
+        bpm=float(payload["bpm"]),
+        meter=int(payload.get("meter") or 4),
+        cues=tuple(
+            Cue(
+                cue_id=str(entry["cue_id"]),
+                time_seconds=float(entry["time_seconds"]),
+                kind=str(entry["kind"]),
+                strength=float(entry.get("strength") or 0.0),
+            )
+            for entry in payload.get("cues", [])
+        ),
+        duration_seconds=float(payload.get("duration_seconds") or 0.0),
+    )
+
+
+def read_runtime_beat_grid(path: Path) -> BeatGrid | None:
+    if not path.exists():
+        return None
+    return beat_grid_from_payload(json.loads(path.read_text(encoding="utf-8")))
 
 
 def shots_in(path: Path, *, threshold: float = 0.3) -> list[tuple[float, float]]:

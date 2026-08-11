@@ -160,6 +160,7 @@ def to_xmeml(
     height: int,
     fps: int | None = None,
     music: Path | None = None,
+    graphics: Path | None = None,
 ) -> str:
     """FCP7 XML: what Premiere and Resolve open without complaint.
 
@@ -253,6 +254,27 @@ def to_xmeml(
                 f"<in>{start_frame}</in><out>{end_frame}</out></marker>"
             )
     total_frames = boundaries[-1][1] if boundaries else 0
+    graphics_track = ""
+    if graphics is not None and Path(graphics).exists():
+        graphic_path = Path(graphics)
+        graphics_track = (
+            '<track><clipitem id="graphics-overlay">'
+            f'<name>{escape(graphic_path.stem)}</name>'
+            f'<duration>{total_frames}</duration>'
+            f'<rate><timebase>{fps}</timebase><ntsc>FALSE</ntsc></rate>'
+            f'<start>0</start><end>{total_frames}</end>'
+            f'<in>0</in><out>{total_frames}</out>'
+            '<file id="graphics-overlay-file">'
+            f'<name>{escape(graphic_path.name)}</name>'
+            f'<pathurl>{escape(graphic_path.resolve().as_uri())}</pathurl>'
+            f'<duration>{total_frames}</duration>'
+            f'<rate><timebase>{fps}</timebase><ntsc>FALSE</ntsc></rate>'
+            '<media><video><samplecharacteristics>'
+            f'<width>{width}</width><height>{height}</height>'
+            '<alphatype>straight</alphatype>'
+            '</samplecharacteristics></video></media></file>'
+            '</clipitem></track>'
+        )
     audio_track = "<audio/>"
     if music is not None and Path(music).exists():
         music_path = Path(music)
@@ -277,7 +299,8 @@ def to_xmeml(
         f"<media><video><format><samplecharacteristics>"
         f"<width>{width}</width><height>{height}</height>"
         f"</samplecharacteristics></format>"
-        f"<track>{''.join(items)}</track></video>{audio_track}</media>"
+        f"<track>{''.join(items)}</track>{graphics_track}</video>"
+        f"{audio_track}</media>"
         f"{''.join(markers)}</sequence></xmeml>\n"
     )
 
@@ -291,6 +314,7 @@ def to_fcpxml(
     height: int,
     fps: int | None = None,
     music: Path | None = None,
+    graphics: Path | None = None,
 ) -> str:
     """FCPXML: what Final Cut reads properly."""
 
@@ -447,6 +471,24 @@ def to_fcpxml(
             f'duration="{rational_frames(total_frames)}" audioRole="music"/>'
         )
 
+    graphic_layer = ""
+    if graphics is not None and Path(graphics).exists():
+        graphic_id = f"r{len(assets) + 2}"
+        graphic_path = Path(graphics)
+        assets[graphic_id] = (
+            f'<asset id="{graphic_id}" name="{html.escape(graphic_path.stem)}" '
+            f'start="0s" hasVideo="1" format="r1" '
+            f'duration="{rational_frames(total_frames)}">'
+            f'<media-rep kind="original-media" '
+            f'src="{html.escape(graphic_path.resolve().as_uri())}"/>'
+            '</asset>'
+        )
+        graphic_layer = (
+            f'<asset-clip name="{html.escape(graphic_path.stem)}" '
+            f'ref="{graphic_id}" lane="1" offset="0s" start="0s" '
+            f'duration="{rational_frames(total_frames)}" videoRole="titles"/>'
+        )
+
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE fcpxml>\n<fcpxml version="1.9"><resources>'
@@ -470,7 +512,7 @@ def to_fcpxml(
         f'<library><event name="{html.escape(name)}">'
         f'<project name="{html.escape(name)}"><sequence format="r1" '
         f'duration="{rational_frames(total_frames)}" tcStart="0s">'
-        f"<spine>{''.join(clips)}{bed}</spine></sequence></project>"
+        f"<spine>{''.join(clips)}{graphic_layer}{bed}</spine></sequence></project>"
         "</event></library></fcpxml>\n"
     )
 
@@ -488,12 +530,20 @@ def write_timelines(
 
     premiere = output_dir / f"{name}.xml"
     finalcut = output_dir / f"{name}.fcpxml"
+    graphics = output_dir / "graphics-overlay.mov"
+    graphics = graphics if graphics.exists() else None
     premiere.write_text(
-        to_xmeml(plan, report, name=name, width=width, height=height),
+        to_xmeml(
+            plan, report, name=name, width=width, height=height,
+            graphics=graphics,
+        ),
         encoding="utf-8",
     )
     finalcut.write_text(
-        to_fcpxml(plan, report, name=name, width=width, height=height),
+        to_fcpxml(
+            plan, report, name=name, width=width, height=height,
+            graphics=graphics,
+        ),
         encoding="utf-8",
     )
     return premiere, finalcut
