@@ -45,6 +45,7 @@ AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".aiff", ".MP3", ".M4
 # a dict to look up -- and the lookup silently returned nothing.
 ASPECTS = {"9:16": 9 / 16, "16:9": 16 / 9, "1:1": 1.0, "4:5": 4 / 5}
 PAGE = Path(__file__).resolve().parent / "web" / "index.html"
+SUBTITLE_FONT_LOCK = threading.Lock()
 
 # Runs live somewhere they survive a restart. They were in a temp directory
 # keyed by an in-memory dict, so closing the server threw away every finished
@@ -357,6 +358,7 @@ def _graphics_layout_evidence(run: Run, plan: Any) -> dict:
     """Map durable SAM boxes through the delivered crop for a cue window."""
 
     from montagewright.graphics import LayoutEvidence
+    from montagewright.reframe import interpolate_crop_keyframes
 
     work = run.output / "work"
     crops_path = work / "crops.json"
@@ -366,23 +368,6 @@ def _graphics_layout_evidence(run: Run, plan: Any) -> dict:
         crops = json.loads(crops_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-
-    def crop_at(keys: list[dict], seconds: float) -> dict | None:
-        if not keys:
-            return None
-        before, after = keys[0], keys[-1]
-        for left, right in zip(keys, keys[1:]):
-            if float(left["at"]) <= seconds <= float(right["at"]):
-                before, after = left, right
-                break
-        span = float(after["at"]) - float(before["at"])
-        share = 0.0 if span <= 0 else max(
-            0.0, min(1.0, (seconds - float(before["at"])) / span)
-        )
-        return {
-            key: float(before[key]) + (float(after[key]) - float(before[key])) * share
-            for key in ("x", "y", "w", "h")
-        }
 
     evidence = {}
     report_tracks = (run.report() or {}).get("subject_tracks", {})
@@ -409,7 +394,7 @@ def _graphics_layout_evidence(run: Run, plan: Any) -> dict:
                 (float(sample.get("centre_x", 0)) + half_w) * 1000,
                 (float(sample.get("centre_y", 0)) + half_h) * 1000,
             ]
-            crop = crop_at(keys, relative)
+            crop = interpolate_crop_keyframes(keys, relative)
             if crop is None or crop["w"] <= 0 or crop["h"] <= 0:
                 continue
             x0, y0, x1, y1 = (float(value) / 1000.0 for value in raw)
@@ -430,6 +415,79 @@ def _graphics_layout_evidence(run: Run, plan: Any) -> dict:
                 source="sam2.1_report_track",
             )
     return evidence
+
+
+def _subtitle_render_choices(run: Run) -> tuple[str, str]:
+    """The last explicit subtitle look/font, with CLI values as fallback."""
+
+    saved = run.output / "work" / "subtitle-render.json"
+    try:
+        payload = json.loads(saved.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    look_name = str(payload.get("look") or "")
+    font = str(payload.get("font") or "")
+    if not look_name and "--subtitle-look" in run.command:
+        look_name = run.command[run.command.index("--subtitle-look") + 1]
+    if not font and "--subtitle-font" in run.command:
+        font = run.command[run.command.index("--subtitle-font") + 1]
+    if look_name not in {"plain", "speakers", "spoken", "plate"}:
+        look_name = "plain"
+    return look_name, font
+
+
+def _video_display_size(picture: Path) -> tuple[int, int]:
+    """Read display dimensions without hashing a multi-gigabyte master."""
+
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries",
+            "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+            "-of", "json", str(picture),
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    streams = json.loads(completed.stdout).get("streams", [])
+    if not streams:
+        raise ValueError(f"no video stream in {picture.name}")
+    stream = streams[0]
+    width, height = int(stream["width"]), int(stream["height"])
+    rotation = int(float(stream.get("tags", {}).get("rotate", 0) or 0))
+    for side_data in stream.get("side_data_list", []):
+        if "rotation" in side_data:
+            rotation = int(float(side_data["rotation"] or 0))
+            break
+    if abs(rotation) % 180 == 90:
+        width, height = height, width
+    return width, height
+
+
+def _prepare_run_subtitle_track(
+    run: Run, picture: Path, *, dimensions: tuple[int, int] | None = None,
+):
+    from montagewright import subtitles as typeset
+    from montagewright.subtitles import (
+        PreparedSubtitleTrack, look, prepare_overlays,
+    )
+
+    lines = _subtitle_lines(run)
+    if not lines:
+        return PreparedSubtitleTrack(())
+    width, height = dimensions or _video_display_size(picture)
+    aspect = (run.report() or {}).get("direction", {}).get("aspect", "9:16")
+    look_name, font = _subtitle_render_choices(run)
+    with SUBTITLE_FONT_LOCK:
+        was, typeset.CHOSEN = typeset.CHOSEN, (font or None)
+        try:
+            return prepare_overlays(
+                lines, aspect=aspect,
+                width=width, height=height,
+                work=run.output / "work" / "graphics-subtitle-render",
+                style=look(look_name), words=_subtitle_words(run),
+            )
+        finally:
+            typeset.CHOSEN = was
 
 
 class _AlreadyHave(Exception):
@@ -1593,18 +1651,29 @@ def create_app() -> FastAPI:
         )
         if clean is None:
             raise HTTPException(404, "this run has no finished cut")
-        subtitles = [
-            (line.starts_seconds, line.ends_seconds)
-            for line in _subtitle_lines(run)
-        ]
+        merged_graphics = run.output / "deliverable-graphics-subtitled.mp4"
         try:
+            subtitle_track = _prepare_run_subtitle_track(run, clean)
+            subtitles = subtitle_track.windows
+            subtitle_boxes = subtitle_track.boxes
+            subtitle_overlays = list(subtitle_track.overlays)
+            destination = (
+                merged_graphics if subtitle_overlays
+                else run.output / "deliverable-graphics.mp4"
+            )
             made = burn_graphics(
-                clean, plan, run.output / "deliverable-graphics.mp4",
+                clean, plan, destination,
                 work=run.output / "work" / "graphics-render",
                 subtitle_windows=subtitles,
+                subtitle_boxes=subtitle_boxes,
+                subtitle_overlays=subtitle_overlays,
                 layout_evidence=_graphics_layout_evidence(run, plan),
             )
-        except (RuntimeError, ValueError) as error:
+            if not subtitle_overlays:
+                merged_graphics.unlink(missing_ok=True)
+        except (
+            OSError, RuntimeError, ValueError, subprocess.CalledProcessError,
+        ) as error:
             raise HTTPException(422, str(error))
         return JSONResponse({
             "file": made.name,
@@ -1622,16 +1691,18 @@ def create_app() -> FastAPI:
         """Compile one card with the production Pillow renderer for the UI."""
 
         import hashlib
+        from functools import partial
+        from starlette.concurrency import run_in_threadpool
         from montagewright.graphics import (
             GRAPHICS_RENDERER_VERSION, GraphicsPlan, _layout_frames,
+            _swept_rect,
             compile_graphic,
         )
-        from montagewright.measure.media import probe_video
 
         run = _run(run_id)
         try:
             plan = GraphicsPlan.model_validate(await request.json())
-            cue = next(
+            next(
                 cue for cue in plan.cues if cue.graphic_id == graphic_id
             )
         except (ValueError, StopIteration) as error:
@@ -1646,78 +1717,167 @@ def create_app() -> FastAPI:
         )
         if picture is None:
             raise HTTPException(404, "no picture available for graphics preview")
-        shape = probe_video(picture).video
-        width, height = int(shape.display_width), int(shape.display_height)
+        width, height = await run_in_threadpool(_video_display_size, picture)
         picture_stat = picture.stat()
-        subtitles = [
-            (line.starts_seconds, line.ends_seconds)
-            for line in _subtitle_lines(run)
-        ]
-        overlaps_subtitles = any(
-            cue.at_seconds < sub_end
-            and cue.at_seconds + cue.duration_seconds > sub_start
-            for sub_start, sub_end in subtitles
-        )
-        evidence = _graphics_layout_evidence(run, plan).get(graphic_id)
+        try:
+            subtitle_track = await run_in_threadpool(partial(
+                _prepare_run_subtitle_track, run, picture,
+                dimensions=(width, height),
+            ))
+        except (OSError, RuntimeError, ValueError) as error:
+            raise HTTPException(422, f"subtitle layout is unavailable: {error}")
+        subtitle_boxes_all = subtitle_track.boxes
+        evidence_map = _graphics_layout_evidence(run, plan)
         digest = hashlib.sha256(
             json.dumps(
                 {
-                    "cue": cue.model_dump(mode="json"),
-                    "brand": plan.brand.model_dump(mode="json"),
-                    "facts": [
-                        plan.fact(cue.primary_fact_id).model_dump(mode="json"),
-                        *(
-                            [plan.fact(cue.secondary_fact_id).model_dump(mode="json")]
-                            if cue.secondary_fact_id else []
-                        ),
-                    ],
+                    "target_graphic_id": graphic_id,
+                    "plan": plan.model_dump(mode="json"),
                     "width": width, "height": height,
                     "picture": {
                         "size": picture_stat.st_size,
                         "mtime_ns": picture_stat.st_mtime_ns,
                     },
                     "renderer_version": GRAPHICS_RENDERER_VERSION,
-                    "subtitle_keepout": overlaps_subtitles,
+                    "subtitle_keepout": subtitle_boxes_all,
                     "evidence": {
-                        "subject_boxes": evidence.subject_boxes,
-                        "source": evidence.source,
-                    } if evidence else None,
+                        key: {
+                            "subject_boxes": item.subject_boxes,
+                            "source": item.source,
+                        }
+                        for key, item in evidence_map.items()
+                    },
                 },
                 ensure_ascii=False, sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()
         preview_dir = run.output / "work" / "graphics-preview"
-        preview_path = preview_dir / f"{digest}.png"
         metadata_path = preview_dir / f"{digest}.json"
         try:
-            metadata = (
-                json.loads(metadata_path.read_text(encoding="utf-8"))
-                if preview_path.exists() and metadata_path.exists() else None
-            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            cached_urls = [
+                item.get("url", "")
+                for item in metadata.get("joint_layout", {}).values()
+            ]
+            if not cached_urls or not all(
+                url and (preview_dir / Path(url).name).is_file()
+                for url in cached_urls
+            ):
+                metadata = None
         except (OSError, ValueError, TypeError):
             metadata = None
         if metadata is None:
-            card, metadata = compile_graphic(
-                cue, plan, width=width, height=height, into=preview_path,
-                frames=(
-                    _layout_frames(picture, cue)
-                    if cue.position == "auto" else None
-                ),
-                evidence=evidence,
-                forbidden_positions=(
-                    {"lower_left", "lower_right"}
-                    if overlaps_subtitles else set()
-                ),
-            )
+            plan_order = {
+                item.graphic_id: index for index, item in enumerate(plan.cues)
+            }
+            eligible = [
+                item for item in plan.cues
+                if item.status == "approved" or item.graphic_id == graphic_id
+            ]
+            # Layout only the temporal collision component containing the
+            # target. A title at 00:03 cannot affect one at 01:10, and
+            # recompiling the whole film on every keystroke blocks the editor.
+            component = {graphic_id}
+            changed = True
+            while changed:
+                changed = False
+                members = [item for item in eligible if item.graphic_id in component]
+                for item in eligible:
+                    if item.graphic_id in component:
+                        continue
+                    if any(
+                        item.at_seconds < other.at_seconds + other.duration_seconds
+                        and item.at_seconds + item.duration_seconds > other.at_seconds
+                        for other in members
+                    ):
+                        component.add(item.graphic_id)
+                        changed = True
+            preview_cues = [
+                item for item in eligible if item.graphic_id in component
+            ]
+            # Preview the exact joint solution this plan will use once the
+            # selected draft is approved, so approval cannot swap two cards.
+            preview_cues.sort(key=lambda item: (
+                item.position == "auto", plan_order[item.graphic_id]
+            ))
+            earlier: list[tuple[Any, Any]] = []
+            card = metadata = None
+            joint_layout: dict[str, dict] = {}
+            try:
+                for current in preview_cues:
+                    current_boxes = [
+                        (left, top, wide, tall)
+                        for start, end, left, top, wide, tall in subtitle_boxes_all
+                        if current.at_seconds < end
+                        and current.at_seconds + current.duration_seconds > start
+                    ]
+                    overlapping = [
+                        (other, other_card) for other, other_card in earlier
+                        if current.at_seconds
+                        < other.at_seconds + other.duration_seconds
+                        and current.at_seconds + current.duration_seconds
+                        > other.at_seconds
+                        and (
+                            current.collision_policy == "avoid"
+                            or other.collision_policy == "avoid"
+                        )
+                    ]
+                    keepouts = [*current_boxes, *(
+                        _swept_rect(other, other_card, width, height)
+                        for other, other_card in overlapping
+                    )]
+                    child_digest = hashlib.sha256(
+                        f"{digest}:{current.graphic_id}".encode("utf-8")
+                    ).hexdigest()
+                    current_path = preview_dir / f"{child_digest}.png"
+                    frames = await run_in_threadpool(
+                        _layout_frames, picture, current
+                    )
+                    current_card, current_metadata = await run_in_threadpool(
+                        partial(
+                            compile_graphic, current, plan,
+                            width=width, height=height, into=current_path,
+                            frames=frames,
+                            evidence=evidence_map.get(current.graphic_id),
+                            forbidden_positions=set(), keepout_rects=keepouts,
+                        )
+                    )
+                    current_metadata.update({
+                        "z_index": (
+                            current.z_index if current.z_index is not None
+                            else plan_order[current.graphic_id]
+                        ),
+                        "plan_order": plan_order[current.graphic_id],
+                        "card_width": current_card.width,
+                        "card_height": current_card.height,
+                        "left": current_card.left,
+                        "top": current_card.top,
+                        "avoids_graphic_ids": [
+                            other.graphic_id for other, _ in overlapping
+                        ],
+                        "url": (
+                            f"/api/runs/{run_id}/graphics-preview-file/"
+                            f"{child_digest}.png"
+                        ),
+                    })
+                    joint_layout[current.graphic_id] = dict(current_metadata)
+                    if current.graphic_id == graphic_id:
+                        card, metadata = current_card, current_metadata
+                    earlier.append((current, current_card))
+            except (OSError, RuntimeError, ValueError) as error:
+                raise HTTPException(422, f"graphic preview is invalid: {error}")
+            if card is None or metadata is None:
+                raise HTTPException(422, "graphic preview could not be compiled")
             from montagewright.measure.storage import write_json
 
             metadata.update({
                 "card_width": card.width, "card_height": card.height,
                 "left": card.left, "top": card.top,
+                "joint_layout": joint_layout,
             })
             write_json(metadata_path, metadata)
         return JSONResponse({
-            "url": f"/api/runs/{run_id}/graphics-preview-file/{digest}.png",
+            "url": metadata["joint_layout"][graphic_id]["url"],
             "frame_width": width, "frame_height": height,
             **metadata,
         })
@@ -1734,7 +1894,9 @@ def create_app() -> FastAPI:
     @app.get("/api/runs/{run_id}/graphics-burned")
     def graphics_burned(run_id: str):
         run = _run(run_id)
-        made = run.output / "deliverable-graphics.mp4"
+        made = run.output / "deliverable-graphics-subtitled.mp4"
+        if not made.exists():
+            made = run.output / "deliverable-graphics.mp4"
         if not made.exists():
             raise HTTPException(404, "graphics have not been rendered")
         return FileResponse(
@@ -1815,17 +1977,24 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "this run has no finished cut")
         aspect = (run.report() or {}).get("direction", {}).get("aspect", "9:16")
         # Set for this render only; the next one asks again.
-        was, typeset.CHOSEN = typeset.CHOSEN, (font or None)
-        try:
-            made = burn(
-                source, said, run.output / "deliverable-subtitled.mp4",
-                aspect=aspect, work=run.output / "work" / "subs",
-                style=looks_like(look), words=_subtitle_words(run),
-            )
-        except NoFontHere as error:
-            raise HTTPException(422, str(error))
-        finally:
-            typeset.CHOSEN = was
+        with SUBTITLE_FONT_LOCK:
+            was, typeset.CHOSEN = typeset.CHOSEN, (font or None)
+            try:
+                made = burn(
+                    source, said, run.output / "deliverable-subtitled.mp4",
+                    aspect=aspect, work=run.output / "work" / "subs",
+                    style=looks_like(look), words=_subtitle_words(run),
+                )
+            except NoFontHere as error:
+                raise HTTPException(422, str(error))
+            finally:
+                typeset.CHOSEN = was
+        from montagewright.measure.storage import write_json
+
+        write_json(
+            run.output / "work" / "subtitle-render.json",
+            {"look": look, "font": font},
+        )
         return JSONResponse({
             "file": made.name, "lines": len(said), "aspect": aspect,
             "look": look,

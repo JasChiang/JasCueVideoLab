@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -35,7 +36,7 @@ GraphicKind = Literal[
 ]
 MotionPreset = Literal["none", "fade", "rise", "slide_left", "slide_right"]
 PositionHint = Literal[
-    "auto", "top", "upper_left", "upper_right", "lower_left",
+    "auto", "manual", "top", "upper_left", "upper_right", "lower_left",
     "lower_right", "center",
 ]
 CompositionIntent = Literal[
@@ -43,6 +44,7 @@ CompositionIntent = Literal[
     "foreground_plate",
 ]
 BackgroundTreatment = Literal["auto", "none", "plate"]
+AdaptiveMode = Literal["auto", "strict"]
 CueStatus = Literal["draft", "approved"]
 TextAlignment = Literal["auto", "left", "center", "right"]
 StylePreset = Literal[
@@ -51,7 +53,7 @@ StylePreset = Literal[
 ]
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
-GRAPHICS_RENDERER_VERSION = 2
+GRAPHICS_RENDERER_VERSION = 6
 
 
 class CopyFact(Local):
@@ -113,6 +115,7 @@ class GraphicStyle(Local):
     """
 
     preset: StylePreset = "custom"
+    contrast_mode: AdaptiveMode = "auto"
     primary_color: str = ""
     secondary_color: str = ""
     accent_color: str = ""
@@ -141,6 +144,20 @@ class GraphicStyle(Local):
     exit_seconds: float | None = Field(default=None, ge=0.05, le=2.0)
     motion_distance: float | None = Field(default=None, ge=0.0, le=240.0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_visual_overrides_are_not_silently_adaptive(cls, value):
+        if not isinstance(value, dict) or "contrast_mode" in value:
+            return value
+        if not value:
+            return {"contrast_mode": "auto"}
+        # A serialized v1 style was authored before automatic visual
+        # mutation existed. Its intent cannot be inferred from whether each
+        # value happens to equal today's default, so preserve it wholesale.
+        # A cue with no style field still uses default_factory and opts into
+        # the new automatic contract.
+        return {**value, "contrast_mode": "strict"}
+
     @model_validator(mode="after")
     def colours_are_empty_or_hex(self) -> "GraphicStyle":
         for field in (
@@ -154,6 +171,16 @@ class GraphicStyle(Local):
             if not HEX.match(getattr(self, field)):
                 raise ValueError(f"{field} must be #RRGGBB")
         return self
+
+
+class GraphicTransform(Local):
+    """User-authored final-picture transform in resolution-independent units."""
+
+    x: float = Field(default=0.5, ge=0.0, le=1.0)
+    y: float = Field(default=0.5, ge=0.0, le=1.0)
+    scale: float = Field(default=1.0, ge=0.25, le=4.0)
+    rotation_degrees: float = Field(default=0.0, ge=-180.0, le=180.0)
+    locked: bool = False
 
 
 class GraphicCue(Local):
@@ -174,17 +201,48 @@ class GraphicCue(Local):
     background: BackgroundTreatment = "auto"
     motion: MotionPreset = "rise"
     music_sync: Literal["none", "accent", "downbeat"] = "none"
+    z_index: int | None = Field(default=None, ge=-100, le=100)
+    collision_policy: Literal["avoid", "allow"] = "avoid"
+    transform: GraphicTransform = Field(default_factory=GraphicTransform)
     editor_note: str = Field(default="", max_length=500)
     style: GraphicStyle = Field(default_factory=GraphicStyle)
     status: CueStatus = "draft"
 
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_background_choice_is_strict(cls, value):
+        if not isinstance(value, dict) or "style" in value:
+            return value
+        if value.get("background") in {"none", "plate"}:
+            return {**value, "style": {"contrast_mode": "strict"}}
+        return value
+
 
 class GraphicsPlan(Local):
-    version: Literal["montagewright-graphics-v1"] = "montagewright-graphics-v1"
+    version: Literal[
+        "montagewright-graphics-v1", "montagewright-graphics-v2"
+    ] = "montagewright-graphics-v2"
     revision: int = Field(default=0, ge=0)
     brand: BrandKit = Field(default_factory=BrandKit)
     facts: list[CopyFact] = Field(default_factory=list)
     cues: list[GraphicCue] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_v1_overlap_semantics(cls, value):
+        if not isinstance(value, dict) or value.get("version") != "montagewright-graphics-v1":
+            return value
+        cues = [
+            (
+                {**cue, "collision_policy": "allow"}
+                if isinstance(cue, dict) and "collision_policy" not in cue
+                else cue
+            )
+            for cue in value.get("cues", [])
+        ]
+        return {
+            **value, "version": "montagewright-graphics-v2", "cues": cues,
+        }
 
     @model_validator(mode="after")
     def references_are_unique_and_real(self) -> "GraphicsPlan":
@@ -365,16 +423,30 @@ def validate_for_render(
                 problems.append(
                     f"{cue.graphic_id}: lower graphic overlaps subtitles"
                 )
-    ordered = sorted(active, key=lambda cue: cue.at_seconds)
-    for index, cue in enumerate(ordered):
-        simultaneous = [
-            other for other in ordered[index + 1:]
-            if other.at_seconds < cue.at_seconds + cue.duration_seconds
-        ]
-        if len(simultaneous) > 1:
-            problems.append(
-                f"{cue.graphic_id}: more than two graphics are visible together"
+    events = sorted(
+        [
+            (time, edge, cue.graphic_id)
+            for cue in active
+            for time, edge in (
+                (cue.at_seconds, 1),
+                (cue.at_seconds + cue.duration_seconds, -1),
             )
+        ],
+        # End before start makes windows half-open: [start, end).
+        key=lambda event: (event[0], event[1]),
+    )
+    visible: set[str] = set()
+    for _, edge, graphic_id in events:
+        if edge < 0:
+            visible.discard(graphic_id)
+        else:
+            visible.add(graphic_id)
+            if len(visible) > 2:
+                problems.append(
+                    "more than two graphics are visible together: "
+                    + ", ".join(sorted(visible))
+                )
+                break
     return problems
 
 
@@ -422,6 +494,8 @@ class DrawnGraphic:
     top: int
     width: int
     height: int
+    text_mask_path: Path | None = None
+    backing_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -435,13 +509,69 @@ class LayoutEvidence:
     source: str = "visual_complexity_proxy"
 
 
+def _apply_authored_transform(
+    cue: GraphicCue, card: DrawnGraphic, width: int, height: int
+) -> DrawnGraphic:
+    """Apply scale/rotation to all renderer evidence, then resolve manual XY."""
+
+    from PIL import Image
+
+    transform = cue.transform
+    paths = [card.path, card.text_mask_path, card.backing_path]
+    images = [
+        Image.open(path).convert("L" if index == 1 else "RGBA")
+        if path is not None else None
+        for index, path in enumerate(paths)
+    ]
+    if transform.scale < 1:
+        images = [
+            image.resize(
+                (
+                    max(1, round(image.width * transform.scale)),
+                    max(1, round(image.height * transform.scale)),
+                ),
+                resample=Image.Resampling.LANCZOS,
+            ) if image is not None else None
+            for image in images
+        ]
+    if transform.rotation_degrees:
+        images = [
+            image.rotate(
+                -transform.rotation_degrees, expand=True,
+                resample=Image.Resampling.BICUBIC, fillcolor=(0 if index == 1 else (0, 0, 0, 0)),
+            ) if image is not None else None
+            for index, image in enumerate(images)
+        ]
+    for path, image in zip(paths, images):
+        if path is not None and image is not None:
+            image.save(path)
+    rendered = images[0]
+    assert rendered is not None
+    left, top = card.left, card.top
+    if cue.position == "manual":
+        left = round(transform.x * width - rendered.width / 2)
+        top = round(transform.y * height - rendered.height / 2)
+    else:
+        spec = TEMPLATES[cue.template]
+        position = cue.position if cue.position != "auto" else spec.default_position
+        left, top = _placements(
+            width, height, rendered.width, rendered.height
+        ).get(position, _placements(
+            width, height, rendered.width, rendered.height
+        )[spec.default_position])
+    return replace(
+        card, left=left, top=top,
+        width=rendered.width, height=rendered.height,
+    )
+
+
 def _placements(
     width: int, height: int, card_width: int, card_height: int
 ) -> dict[str, tuple[int, int]]:
     side = round(width * 0.075)
     top_safe = round(height * 0.09)
     bottom_safe = round(height * (0.25 if width < height else 0.10))
-    return {
+    positions = {
         "top": ((width - card_width) // 2, top_safe),
         "upper_left": (side, top_safe),
         "upper_right": (width - side - card_width, top_safe),
@@ -452,6 +582,14 @@ def _placements(
         "center": (
             (width - card_width) // 2, (height - card_height) // 2
         ),
+    }
+    # A manually enlarged card must never be clipped by the delivery frame.
+    return {
+        name: (
+            max(0, min(left, width - card_width)),
+            max(0, min(top, height - card_height)),
+        )
+        for name, (left, top) in positions.items()
     }
 
 
@@ -464,6 +602,7 @@ def resolve_auto_position(
     frame_height: int,
     evidence: LayoutEvidence | None = None,
     forbidden_positions: set[str] | None = None,
+    keepout_rects: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[DrawnGraphic, dict[str, float]]:
     """Choose a stable low-detail region over several final-picture frames."""
 
@@ -493,6 +632,11 @@ def resolve_auto_position(
     scores: dict[str, float] = {}
     for name in candidates:
         left, top = positions[name]
+        motion_safe = _place_for_motion_safe(
+            cue, replace(card, left=left, top=top),
+            frame_width, frame_height,
+        )
+        left, top = motion_safe.left, motion_safe.top
         right = min(frame_width, left + card.width)
         bottom = min(frame_height, top + card.height)
         details: list[float] = []
@@ -518,9 +662,22 @@ def resolve_auto_position(
             or cue.composition == "foreground_plate"
         )
         score = max(details) + (0.0 if plate else max(brightness) * 0.10)
-        candidate = (left, top, right - left, bottom - top)
-        overlap = sum(_box_overlap(candidate, box, frame_width, frame_height)
-                      for box in proof.subject_boxes)
+        candidate = _swept_rect(
+            cue, replace(card, left=left, top=top),
+            frame_width, frame_height,
+        )
+        keepout_overlap = max(
+            (_rect_overlap(candidate, rect) for rect in (keepout_rects or [])),
+            default=0.0,
+        )
+        score += keepout_overlap * 5000.0
+        # Sampling frequency and cue duration must not make the same subject
+        # geometrically more important. Use worst-frame occupancy, not a sum.
+        overlap = max(
+            (_box_overlap(candidate, box, frame_width, frame_height)
+             for box in proof.subject_boxes),
+            default=0.0,
+        )
         if cue.composition in {"auto", "avoid_subject"}:
             score += overlap * 500.0
         elif cue.composition == "overlap_subject":
@@ -530,6 +687,18 @@ def resolve_auto_position(
         scores[name] = round(score, 4)
     chosen = min(candidates, key=lambda name: (scores[name], candidates.index(name)))
     left, top = positions[chosen]
+    motion_safe = _place_for_motion_safe(
+        cue, replace(card, left=left, top=top), frame_width, frame_height
+    )
+    left, top = motion_safe.left, motion_safe.top
+    chosen_rect = _swept_rect(
+        cue, replace(card, left=left, top=top),
+        frame_width, frame_height,
+    )
+    if any(_rect_overlap(chosen_rect, rect) > 0.01 for rect in (keepout_rects or [])):
+        raise ValueError(
+            f"{cue.graphic_id}: no automatic position clears subtitle/safe-area keepouts"
+        )
     return replace(card, left=max(0, left), top=max(0, top)), scores
 
 
@@ -548,12 +717,237 @@ def _box_overlap(
     return overlap_width * overlap_height / max(1.0, wide * tall)
 
 
+def _rect_overlap(
+    candidate: tuple[int, int, int, int], other: tuple[int, int, int, int]
+) -> float:
+    left, top, wide, tall = candidate
+    o_left, o_top, o_wide, o_tall = other
+    overlap_width = max(0, min(left + wide, o_left + o_wide) - max(left, o_left))
+    overlap_height = max(0, min(top + tall, o_top + o_tall) - max(top, o_top))
+    intersection = overlap_width * overlap_height
+    return intersection / max(1, min(wide * tall, o_wide * o_tall))
+
+
+def _motion_distance_pixels(
+    cue: GraphicCue, frame_width: int, frame_height: int
+) -> int:
+    if cue.style.motion_distance is not None:
+        return round(cue.style.motion_distance * frame_height / 1080.0)
+    if cue.motion == "rise":
+        return round(frame_height * 0.025)
+    if cue.motion in {"slide_left", "slide_right"}:
+        return round(frame_width * 0.06)
+    return 0
+
+
+def _swept_rect(
+    cue: GraphicCue, card: DrawnGraphic,
+    frame_width: int, frame_height: int,
+) -> tuple[int, int, int, int]:
+    distance = _motion_distance_pixels(cue, frame_width, frame_height)
+    left, top, wide, tall = card.left, card.top, card.width, card.height
+    if cue.motion == "rise":
+        tall += distance
+    elif cue.motion == "slide_left":
+        wide += distance
+    elif cue.motion == "slide_right":
+        left -= distance
+        wide += distance
+    return left, top, wide, tall
+
+
+def _place_for_motion_safe(
+    cue: GraphicCue, card: DrawnGraphic, width: int, height: int
+) -> DrawnGraphic:
+    side = round(width * 0.075)
+    top_safe = round(height * 0.09)
+    bottom = height - round(height * (0.25 if width < height else 0.10))
+    distance = _motion_distance_pixels(cue, width, height)
+    min_left, max_left = side, width - side - card.width
+    min_top, max_top = top_safe, bottom - card.height
+    if cue.motion == "rise":
+        max_top -= distance
+    elif cue.motion == "slide_left":
+        max_left -= distance
+    elif cue.motion == "slide_right":
+        min_left += distance
+    if min_left > max_left or min_top > max_top:
+        raise ValueError(
+            f"{cue.graphic_id}: card plus entrance motion cannot fit inside "
+            "the delivery safe area; reduce its size or motion distance"
+        )
+    if cue.position == "manual" and (
+        card.left < min_left or card.left > max_left
+        or card.top < min_top or card.top > max_top
+    ):
+        raise ValueError(
+            f"{cue.graphic_id}: manual position or its entrance motion falls "
+            "outside the delivery safe area; move or resize it"
+        )
+    return replace(
+        card,
+        left=max(min_left, min(card.left, max_left)),
+        top=max(min_top, min(card.top, max_top)),
+    )
+
+
+def resolve_graphic_animation(
+    cue: GraphicCue, card: DrawnGraphic, width: int, height: int
+) -> dict:
+    enter = (
+        min(cue.style.entrance_seconds, cue.duration_seconds * 0.4)
+        if cue.style.entrance_seconds is not None
+        else min(0.45, max(0.16, cue.duration_seconds * 0.12))
+    )
+    leave = (
+        min(cue.style.exit_seconds, cue.duration_seconds * 0.3)
+        if cue.style.exit_seconds is not None
+        else min(0.32, max(0.12, cue.duration_seconds * 0.08))
+    )
+    distance = _motion_distance_pixels(cue, width, height)
+    from_left, from_top = card.left, card.top
+    if cue.motion == "rise":
+        from_top += distance
+    elif cue.motion == "slide_left":
+        from_left += distance
+    elif cue.motion == "slide_right":
+        from_left -= distance
+    return {
+        "start_seconds": cue.at_seconds,
+        "end_seconds": cue.at_seconds + cue.duration_seconds,
+        "enter_seconds": enter,
+        "leave_seconds": leave,
+        "from_left": from_left,
+        "from_top": from_top,
+        "settled_left": card.left,
+        "settled_top": card.top,
+        "fade": cue.motion != "none",
+        "easing": "linear",
+    }
+
+
+def _relative_luminance(rgb: tuple[int, int, int]) -> float:
+    channels = []
+    for value in rgb:
+        channel = value / 255.0
+        channels.append(
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+        )
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
+
+
+def _contrast_ratio(one: tuple[int, int, int], other: tuple[int, int, int]) -> float:
+    bright, dark = sorted((_relative_luminance(one), _relative_luminance(other)), reverse=True)
+    return (bright + 0.05) / (dark + 0.05)
+
+
+def measured_text_contrast(
+    card: DrawnGraphic,
+    frames: list,
+    *,
+    cue: GraphicCue | None = None,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+    outline_width: float = 0.0,
+    outline_rgb: tuple[int, int, int] = (0, 0, 0),
+) -> float | None:
+    """Low-percentile glyph/background contrast across sampled final frames."""
+
+    from PIL import Image
+
+    if not frames or card.text_mask_path is None or card.backing_path is None:
+        return None
+    glyph = Image.open(card.path).convert("RGBA")
+    mask = Image.open(card.text_mask_path).convert("L")
+    backing = Image.open(card.backing_path).convert("RGBA")
+    maximum_ink = mask.getextrema()[1]
+    if maximum_ink <= 0:
+        raise ValueError("graphic text mask contains no auditable glyph pixels")
+    ink_threshold = max(8, round(maximum_ink * 0.75))
+    points = [
+        (x, y)
+        for y in range(card.height)
+        for x in range(card.width)
+        if mask.getpixel((x, y)) >= ink_threshold
+    ]
+    if not points:
+        return None
+    # A deterministic even sample bounds work for long multi-line cards.
+    stride = max(1, len(points) // 4000)
+    points = points[::stride]
+    ratios: list[float] = []
+    sample_shares = _layout_sample_shares(cue) if cue is not None else (0.03, 0.5, 0.97)
+    animation = (
+        resolve_graphic_animation(
+            cue, card, frame_width or frames[0].width,
+            frame_height or frames[0].height,
+        ) if cue is not None else None
+    )
+    for frame_index, frame in enumerate(frames):
+        sample_share = sample_shares[
+            min(frame_index, len(sample_shares) - 1)
+        ]
+        at_left, at_top = card.left, card.top
+        if animation is not None:
+            elapsed = cue.duration_seconds * sample_share
+            progress = min(1.0, max(
+                0.0, elapsed / max(0.001, animation["enter_seconds"])
+            ))
+            at_left = round(
+                animation["settled_left"]
+                + (animation["from_left"] - animation["settled_left"])
+                * (1 - progress)
+            )
+            at_top = round(
+                animation["settled_top"]
+                + (animation["from_top"] - animation["settled_top"])
+                * (1 - progress)
+            )
+        picture = frame.convert("RGB")
+        for x, y in points:
+            px, py = at_left + x, at_top + y
+            if not (0 <= px < picture.width and 0 <= py < picture.height):
+                ratios.append(1.0)
+                continue
+            base = picture.getpixel((px, py))
+            under = backing.getpixel((x, y))
+            alpha = under[3] / 255.0
+            background = tuple(round(under[index] * alpha + base[index] * (1 - alpha)) for index in range(3))
+            foreground = glyph.getpixel((x, y))[:3]
+            direct = _contrast_ratio(foreground, background)
+            if outline_width >= 1.5:
+                outline_chain = min(
+                    _contrast_ratio(foreground, outline_rgb),
+                    _contrast_ratio(outline_rgb, background),
+                )
+                direct = max(direct, outline_chain)
+            ratios.append(direct)
+    ratios.sort()
+    # Isolated antialias pixels should not fail an otherwise readable title,
+    # while the weakest substantial patch still must be legible.
+    return round(ratios[max(0, int(len(ratios) * 0.05) - 1)], 3)
+
+
+def _layout_sample_shares(cue: GraphicCue) -> tuple[float, float, float]:
+    enter = (
+        min(cue.style.entrance_seconds, cue.duration_seconds * 0.4)
+        if cue.style.entrance_seconds is not None
+        else min(0.45, max(0.16, cue.duration_seconds * 0.12))
+    )
+    # Always inspect halfway through the actual entrance. A percentage such
+    # as 3% misses a 0.45s slide on a long 30s title entirely.
+    entrance_midpoint = min(0.49, enter * 0.5 / cue.duration_seconds)
+    return entrance_midpoint, 0.5, 0.97
+
+
 def _layout_frames(picture: Path, cue: GraphicCue) -> list:
     from io import BytesIO
     from PIL import Image
 
     frames = []
-    for share in (0.12, 0.5, 0.88):
+    for share in _layout_sample_shares(cue):
         at = cue.at_seconds + cue.duration_seconds * share
         made = subprocess.run(
             [
@@ -575,6 +969,7 @@ def draw_graphic(
     width: int,
     height: int,
     into: Path,
+    render_scale: float = 1.0,
 ) -> DrawnGraphic:
     """Lay out the fully visible hero frame before any motion is applied."""
 
@@ -586,7 +981,7 @@ def draw_graphic(
         raise ValueError(f"unknown graphic template: {cue.template}")
     style = cue.style
     align = spec.align if style.align == "auto" else style.align
-    unit = height / 1080.0
+    unit = height / 1080.0 * render_scale
     foreground = style.primary_color or plan.brand.foreground
     secondary_colour = style.secondary_color or plan.brand.secondary
     accent = style.accent_color or plan.brand.accent
@@ -601,10 +996,17 @@ def draw_graphic(
     if unknown:
         raise ValueError(f"no glyph for {unknown}")
 
-    card_width = min(
-        round(width * 0.96),
+    side_safe = round(width * 0.075)
+    base_card_width = min(
         round(width * spec.width * style.max_width_scale),
+        width - side_safe * 2,
     )
+    card_width = round(base_card_width * render_scale)
+    if card_width > width - side_safe * 2:
+        raise ValueError(
+            f"{cue.graphic_id}: uniform scale needs a {card_width}px card but "
+            f"only {width - side_safe * 2}px fits inside the safe frame"
+        )
     pad_x = round(style.padding_x * unit)
     pad_y = round(style.padding_y * unit)
     stroke_width = round(style.stroke_width * unit)
@@ -617,20 +1019,29 @@ def draw_graphic(
     )
     text_room = card_width - (pad_x + stroke_width + shadow_room) * 2
     title = _fit(
-        primary, asked=round(height * spec.title_height * style.primary_scale),
+        primary, asked=round(
+            height * spec.title_height * style.primary_scale * render_scale
+        ),
         room=text_room,
         font_path=plan.brand.display_font_path or plan.brand.font_path,
     )
     secondary_face = (
         _fit(
             secondary,
-            asked=round(height * spec.secondary_height * style.secondary_scale),
+            asked=round(
+                height * spec.secondary_height * style.secondary_scale
+                * render_scale
+            ),
             room=text_room, font_path=plan.brand.font_path,
         )
         if secondary else None
     )
-    title_spacing = round(height * 0.009 * style.line_spacing)
-    secondary_spacing = round(height * 0.007 * style.line_spacing)
+    title_spacing = round(
+        height * 0.009 * style.line_spacing * render_scale
+    )
+    secondary_spacing = round(
+        height * 0.007 * style.line_spacing * render_scale
+    )
     measure = ImageDraw.Draw(Image.new("L", (1, 1)))
     title_box = measure.multiline_textbbox(
         (0, 0), primary, font=title, spacing=title_spacing,
@@ -650,14 +1061,23 @@ def draw_graphic(
         )[1]
         if secondary_face else 0
     )
-    gap = round(height * 0.010) if secondary else 0
-    rule = round(height * 0.005) if spec.rule else 0
+    gap = round(height * 0.010 * render_scale) if secondary else 0
+    rule = round(height * 0.005 * render_scale) if spec.rule else 0
     card_height = (
         pad_y * 2 + title_height + secondary_height + gap + rule
         + shadow_room * 2 + stroke_width * 2
     )
+    top_safe = round(height * 0.09)
+    bottom_safe = round(height * (0.25 if width < height else 0.10))
+    if card_height > height - top_safe - bottom_safe:
+        raise ValueError(
+            f"{cue.graphic_id}: graphic is {card_height}px tall but only "
+            f"{height - top_safe - bottom_safe}px fits inside the safe frame"
+        )
     canvas = Image.new("RGBA", (card_width, card_height), (0, 0, 0, 0))
+    text_mask = Image.new("L", (card_width, card_height), 0)
     pen = ImageDraw.Draw(canvas)
+    mask_pen = ImageDraw.Draw(text_mask)
 
     plate = spec.plate if cue.background == "auto" else cue.background != "none"
     if cue.composition == "foreground_plate":
@@ -685,9 +1105,10 @@ def draw_graphic(
             (pad_x, pad_y, pad_x + round(card_width * 0.13), pad_y + rule),
             fill=(*_rgb(accent), 255),
         )
+    backing = canvas.copy()
     y = (
         pad_y + shadow_room + stroke_width + rule
-        + (round(height * 0.010) if rule else 0)
+        + (round(height * 0.010 * render_scale) if rule else 0)
     )
     title_width = title_box[2] - title_box[0]
     if align == "center":
@@ -719,6 +1140,11 @@ def draw_graphic(
             target, text, font=face, spacing=spacing, align=align,
             fill=(*_rgb(colour), 255), stroke_width=stroke_width,
             stroke_fill=(*_rgb(style.stroke_color), 255),
+        )
+        # Interior glyph pixels only. The contrast auditor deliberately does
+        # not let a large translucent plate hide unreadable foreground text.
+        mask_pen.multiline_text(
+            target, text, font=face, spacing=spacing, align=align, fill=255,
         )
         if emphasis:
             line_y = at_y
@@ -781,7 +1207,14 @@ def draw_graphic(
     left, top = positions.get(position, positions[spec.default_position])
     into.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(into)
-    return DrawnGraphic(into, max(0, left), max(0, top), card_width, card_height)
+    mask_path = into.with_name(f"{into.stem}-text-mask.png")
+    backing_path = into.with_name(f"{into.stem}-backing.png")
+    text_mask.save(mask_path)
+    backing.save(backing_path)
+    return DrawnGraphic(
+        into, max(0, left), max(0, top), card_width, card_height,
+        mask_path, backing_path,
+    )
 
 
 def compile_graphic(
@@ -794,12 +1227,23 @@ def compile_graphic(
     frames: list | None = None,
     evidence: LayoutEvidence | None = None,
     forbidden_positions: set[str] | None = None,
+    keepout_rects: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[DrawnGraphic, dict]:
     """Compile pixels and placement once for both preview and delivery."""
 
+    if not frames or len(frames) < 3:
+        raise ValueError(
+            f"{cue.graphic_id}: only {len(frames or [])}/3 picture samples "
+            "were decoded; contrast cannot be verified, so rendering is stopped"
+        )
     card = draw_graphic(
-        cue, plan, width=width, height=height, into=into
+        cue, plan, width=width, height=height, into=into,
+        # Small cards are typeset at full resolution then reduced once; this
+        # keeps the font fitter's minimum legible size while preserving a
+        # true uniform transform. Enlarged cards are rerasterized sharply.
+        render_scale=max(1.0, cue.transform.scale),
     )
+    card = _apply_authored_transform(cue, card, width, height)
     report = {
         "resolved_left": card.left, "resolved_top": card.top,
         "resolved_position": (
@@ -809,30 +1253,108 @@ def compile_graphic(
         "frame_width": width, "frame_height": height,
         "card_width": card.width, "card_height": card.height,
         "scores": {}, "fallback_plate": False,
+        "contrast_ratio": None, "contrast_adjustments": [],
         "evidence": evidence.source if evidence else "visual_complexity_proxy",
     }
-    if cue.position != "auto":
-        return card, report
-    card, scores = resolve_auto_position(
-        cue, card, frames or [], frame_width=width, frame_height=height,
-        evidence=evidence, forbidden_positions=forbidden_positions or set(),
-    )
-    fallback_plate = (
-        min(scores.values()) > 55.0
-        and cue.background == "auto"
-        and not TEMPLATES[cue.template].plate
-    )
-    if fallback_plate:
-        plated = draw_graphic(
-            cue.model_copy(update={"background": "plate"}), plan,
-            width=width, height=height, into=into,
+    scores: dict[str, float] = {}
+    if cue.position == "auto":
+        card, scores = resolve_auto_position(
+            cue, card, frames or [], frame_width=width, frame_height=height,
+            evidence=evidence, forbidden_positions=forbidden_positions or set(),
+            keepout_rects=keepout_rects,
         )
-        card = replace(plated, left=card.left, top=card.top)
+    card = _place_for_motion_safe(cue, card, width, height)
+    ratio = measured_text_contrast(
+        card, frames or [], cue=cue, frame_width=width, frame_height=height,
+        outline_width=round(
+            cue.style.stroke_width * height / 1080.0 * cue.transform.scale
+        ),
+        outline_rgb=_rgb(cue.style.stroke_color),
+    )
+    adjustments: list[str] = []
+    fallback_plate = False
+    if ratio is None:
+        raise ValueError(
+            f"{cue.graphic_id}: text contrast could not be audited"
+        )
+    if ratio is not None and ratio < 4.5:
+        if cue.style.contrast_mode != "auto":
+            raise ValueError(
+                f"{cue.graphic_id}: strict colours measure only "
+                f"{ratio:.2f}:1 contrast; change the text, outline or plate"
+            )
+        # A neutral accessibility fallback, not an inferred brand. It is
+        # intentionally local and deterministic so preview and export agree.
+        fallback_style = cue.style.model_copy(update={
+            "primary_color": "#FFFFFF",
+            "secondary_color": "#FFFFFF",
+            "emphasis_color": "#FFFFFF",
+            "plate_color": "#000000",
+            "plate_alpha": 235,
+            "stroke_color": "#000000",
+            "stroke_width": max(2.0, cue.style.stroke_width),
+        })
+        fallback_cue = cue.model_copy(update={
+            "background": "plate", "style": fallback_style,
+        })
+        fallback = draw_graphic(
+            fallback_cue, plan, width=width, height=height, into=into,
+            render_scale=max(1.0, fallback_cue.transform.scale),
+        )
+        fallback = _apply_authored_transform(
+            fallback_cue, fallback, width, height
+        )
+        card = fallback
+        if cue.position == "auto":
+            card, scores = resolve_auto_position(
+                fallback_cue, card, frames, frame_width=width,
+                frame_height=height, evidence=evidence,
+                forbidden_positions=forbidden_positions or set(),
+                keepout_rects=keepout_rects,
+            )
+        card = _place_for_motion_safe(cue, card, width, height)
+        ratio = measured_text_contrast(
+            card, frames or [], cue=fallback_cue,
+            frame_width=width, frame_height=height,
+            outline_width=round(
+                fallback_style.stroke_width * height / 1080.0
+                * fallback_cue.transform.scale
+            ),
+            outline_rgb=_rgb(fallback_style.stroke_color),
+        )
+        fallback_plate = True
+        adjustments.extend(["white_text", "dark_plate", "outline"])
+        if ratio is None:
+            raise ValueError(
+                f"{cue.graphic_id}: automatic contrast fallback could not be audited"
+            )
+        if ratio is not None and ratio < 4.5:
+            raise ValueError(
+                f"{cue.graphic_id}: automatic contrast fallback still "
+                f"measures only {ratio:.2f}:1"
+            )
+    card = replace(
+        card,
+        left=max(0, min(card.left, width - card.width)),
+        top=max(0, min(card.top, height - card.height)),
+    )
+    swept = _swept_rect(cue, card, width, height)
+    if any(_rect_overlap(swept, rect) > 0.01 for rect in (keepout_rects or [])):
+        raise ValueError(
+            f"{cue.graphic_id}: graphic or its entrance motion crosses a subtitle/safe-area keepout"
+        )
     report.update({
         "resolved_left": card.left, "resolved_top": card.top,
-        "resolved_position": min(scores, key=lambda name: scores[name]),
+        "resolved_position": (
+            min(scores, key=lambda name: scores[name])
+            if scores else cue.position
+        ),
         "card_width": card.width, "card_height": card.height,
         "scores": scores, "fallback_plate": fallback_plate,
+        "contrast_ratio": ratio, "contrast_adjustments": adjustments,
+        "authored_transform": cue.transform.model_dump(mode="json"),
+        "authored_style": cue.style.model_dump(mode="json"),
+        "animation": resolve_graphic_animation(cue, card, width, height),
     })
     return card, report
 
@@ -844,6 +1366,8 @@ def burn_graphics(
     *,
     work: Path,
     subtitle_windows: list[tuple[float, float]] | None = None,
+    subtitle_boxes: list[tuple[float, float, int, int, int, int]] | None = None,
+    subtitle_overlays: list | None = None,
     layout_evidence: dict[str, LayoutEvidence] | None = None,
 ) -> Path:
     """Composite approved graphics and keep the clean picture untouched."""
@@ -853,9 +1377,15 @@ def burn_graphics(
 
     shape = probe_video(picture).video
     width, height = int(shape.display_width), int(shape.display_height)
+    rate = shape.average_frame_rate or shape.real_frame_rate
+    output_fps = (
+        f"{rate.numerator}/{rate.denominator}"
+        if rate is not None and rate.denominator else "30/1"
+    )
     duration = probe_duration(picture)
     problems = validate_for_render(
-        plan, duration_seconds=duration, subtitle_windows=subtitle_windows
+        plan, duration_seconds=duration,
+        subtitle_windows=(None if subtitle_boxes is not None else subtitle_windows),
     )
     if problems:
         raise ValueError("; ".join(problems))
@@ -863,53 +1393,86 @@ def burn_graphics(
     if not cues:
         raise ValueError("no approved graphics to render")
 
+    plan_order = {cue.graphic_id: index for index, cue in enumerate(plan.cues)}
+    layout_cues = sorted(
+        cues, key=lambda item: (item.position == "auto", plan_order[item.graphic_id])
+    )
     drawn = []
     layout_report: dict[str, dict] = {}
-    for cue in cues:
+    for cue in layout_cues:
         overlaps_subtitles = bool(subtitle_windows and any(
             cue.at_seconds < sub_end
             and cue.at_seconds + cue.duration_seconds > sub_start
             for sub_start, sub_end in subtitle_windows
         ))
         evidence = (layout_evidence or {}).get(cue.graphic_id)
+        cue_keepouts = [
+            (left, top, wide, tall)
+            for sub_start, sub_end, left, top, wide, tall in (subtitle_boxes or [])
+            if cue.at_seconds < sub_end
+            and cue.at_seconds + cue.duration_seconds > sub_start
+        ]
+        overlapping_graphics = [
+            (other, other_card)
+            for other, other_card in drawn
+            if cue.at_seconds < other.at_seconds + other.duration_seconds
+            and cue.at_seconds + cue.duration_seconds > other.at_seconds
+            and (
+                cue.collision_policy == "avoid"
+                or other.collision_policy == "avoid"
+            )
+        ]
+        cue_keepouts.extend(
+            _swept_rect(other, other_card, width, height)
+            for other, other_card in overlapping_graphics
+        )
         card, compiled = compile_graphic(
             cue, plan, width=width, height=height,
             into=work / f"{cue.graphic_id}.png",
-            frames=_layout_frames(picture, cue) if cue.position == "auto" else None,
+            frames=_layout_frames(picture, cue),
             evidence=evidence,
             forbidden_positions=(
                 {"lower_left", "lower_right"}
-                if overlaps_subtitles else set()
+                if overlaps_subtitles and subtitle_boxes is None else set()
             ),
+            keepout_rects=cue_keepouts,
         )
-        if cue.position == "auto":
-            layout_report[cue.graphic_id] = compiled
+        compiled.update({
+            "z_index": (
+                cue.z_index if cue.z_index is not None
+                else plan_order[cue.graphic_id]
+            ),
+            "avoids_graphic_ids": [
+                other.graphic_id for other, _ in overlapping_graphics
+            ],
+        })
+        layout_report[cue.graphic_id] = compiled
         drawn.append((cue, card))
+    drawn.sort(key=lambda item: (
+        item[0].z_index
+        if item[0].z_index is not None
+        else plan_order[item[0].graphic_id],
+        plan_order[item[0].graphic_id],
+    ))
     work.mkdir(parents=True, exist_ok=True)
-    (work / "layout.json").write_text(
-        json.dumps(layout_report, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                "-i", str(picture)]
     for _, card in drawn:
-        command += ["-loop", "1", "-framerate", "30", "-i", str(card.path)]
+        command += [
+            "-loop", "1", "-framerate", output_fps,
+            "-i", str(card.path),
+        ]
+    for overlay in subtitle_overlays or []:
+        command += ["-i", str(overlay.path)]
 
     filters: list[str] = []
     tag = "0:v"
     for index, (cue, card) in enumerate(drawn):
-        since = cue.at_seconds
-        until = cue.at_seconds + cue.duration_seconds
-        enter = (
-            min(cue.style.entrance_seconds, cue.duration_seconds * 0.4)
-            if cue.style.entrance_seconds is not None
-            else min(0.45, max(0.16, cue.duration_seconds * 0.12))
-        )
-        leave = (
-            min(cue.style.exit_seconds, cue.duration_seconds * 0.3)
-            if cue.style.exit_seconds is not None
-            else min(0.32, max(0.12, cue.duration_seconds * 0.08))
-        )
+        animation = resolve_graphic_animation(cue, card, width, height)
+        since = animation["start_seconds"]
+        until = animation["end_seconds"]
+        enter = animation["enter_seconds"]
+        leave = animation["leave_seconds"]
         overlay_tag = f"g{index}"
         if cue.motion == "none":
             filters.append(f"[{index + 1}:v]format=rgba[{overlay_tag}]")
@@ -923,34 +1486,52 @@ def burn_graphics(
         progress = (
             f"min(max((t-{since:.3f})/{enter:.3f},0),1)"
         )
-        x, y = str(card.left), str(card.top)
-        distance = (
-            round(cue.style.motion_distance * height / 1080.0)
-            if cue.style.motion_distance is not None else None
-        )
-        if cue.motion == "rise":
-            travel = distance if distance is not None else round(height * .025)
-            y = f"{card.top}+{travel}*(1-{progress})"
-        elif cue.motion == "slide_left":
-            travel = distance if distance is not None else round(width * .06)
-            x = f"{card.left}+{travel}*(1-{progress})"
-        elif cue.motion == "slide_right":
-            travel = distance if distance is not None else round(width * .06)
-            x = f"{card.left}-{travel}*(1-{progress})"
+        dx = animation["from_left"] - animation["settled_left"]
+        dy = animation["from_top"] - animation["settled_top"]
+        x = f"{animation['settled_left']}+{dx}*(1-{progress})"
+        y = f"{animation['settled_top']}+{dy}*(1-{progress})"
         next_tag = f"v{index}"
         filters.append(
             f"[{tag}][{overlay_tag}]overlay=x='{x}':y='{y}':"
-            f"enable='between(t,{since:.3f},{until:.3f})'[{next_tag}]"
+            f"enable='gte(t,{since:.3f})*lt(t,{until:.3f})'[{next_tag}]"
+        )
+        tag = next_tag
+    for index, overlay in enumerate(subtitle_overlays or []):
+        input_index = 1 + len(drawn) + index
+        overlay_tag = f"s{index}"
+        filters.append(f"[{input_index}:v]format=rgba[{overlay_tag}]")
+        next_tag = f"sv{index}"
+        filters.append(
+            f"[{tag}][{overlay_tag}]overlay={overlay.left}:{overlay.top}:"
+            f"enable='gte(t,{overlay.starts_seconds:.3f})*"
+            f"lt(t,{overlay.ends_seconds:.3f})'[{next_tag}]"
         )
         tag = next_tag
     command += [
         "-filter_complex", ";".join(filters),
         "-map", f"[{tag}]", "-map", "0:a?", "-t", f"{duration:.6f}",
         "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
-        str(destination),
+        "-pix_fmt", "yuv420p", "-r", output_fps,
+        "-fps_mode", "cfr", "-c:a", "copy", "-movflags", "+faststart",
     ]
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip().splitlines()[-1])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination.stem}-", suffix=destination.suffix,
+        dir=destination.parent, delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    command.append(str(temporary))
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True)
+        if completed.returncode != 0:
+            lines = completed.stderr.strip().splitlines()
+            raise RuntimeError(
+                lines[-1] if lines else "ffmpeg graphics compositor failed"
+            )
+        temporary.replace(destination)
+        from montagewright.measure.storage import write_json
+
+        write_json(work / "layout.json", layout_report)
+    finally:
+        temporary.unlink(missing_ok=True)
     return destination

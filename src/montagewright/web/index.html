@@ -318,11 +318,45 @@
       1px 1px 0 rgba(0,0,0,.85), -1px -1px 0 rgba(0,0,0,.85),
       1px -1px 0 rgba(0,0,0,.85), -1px 1px 0 rgba(0,0,0,.85);
   }
-  .graphic-preview {
-    position: absolute; z-index: 3; pointer-events: none; box-sizing: border-box;
-    max-width: 72%; color: white; line-height: 1.05;
+  .graphic-preview-layer {
+    position: absolute; inset: 0; z-index: 3; pointer-events: none;
   }
-  .graphic-preview.plate {
+  .graphic-preview-card {
+    position: absolute; z-index: 3; pointer-events: none; box-sizing: border-box;
+    color: white; line-height: 1.05;
+  }
+  .graphic-preview-card.selected {
+    pointer-events: auto; cursor: move; outline: 1px solid #77b7ff;
+    outline-offset: 3px; touch-action: none;
+  }
+  .graphic-preview-card.locked { cursor: not-allowed; }
+  .graphic-preview-card.invalid {
+    outline: 2px solid #ef4f4f; outline-offset: 4px;
+  }
+  .graphic-handle {
+    position: absolute; width: 12px; height: 12px; border-radius: 50%;
+    background: #fff; border: 2px solid #2688ff; box-shadow: 0 1px 4px #0008;
+    z-index: 5;
+  }
+  .graphic-handle.scale { right: -9px; bottom: -9px; cursor: nwse-resize; }
+  .graphic-handle.rotate { left: calc(50% - 6px); top: -28px; cursor: grab; }
+  .graphic-handle.rotate::after {
+    content: ''; position: absolute; left: 4px; top: 10px; width: 1px;
+    height: 16px; background: #77b7ff;
+  }
+  .graphic-live-surface {
+    width: max-content; max-width: 100%; height: auto; box-sizing: border-box;
+    white-space: pre-line; font-family: -apple-system, BlinkMacSystemFont,
+      "Noto Sans TC", sans-serif; font-weight: 850; line-height: 1.05;
+  }
+  .graphic-live-secondary { margin-top: .3em; font-size: .48em; opacity: .9; }
+  .graphic-snap-guide {
+    position:absolute; z-index:99; background:#55aaff; pointer-events:none;
+    box-shadow:0 0 2px #001b;
+  }
+  .graphic-snap-guide.vertical { width:1px; top:0; bottom:0; }
+  .graphic-snap-guide.horizontal { height:1px; left:0; right:0; }
+  .graphic-preview-card.plate {
     background: rgba(17,19,24,.82); border-radius: 10px; padding: 10px 14px;
   }
   .graphic-preview .gp-rule { width: 18%; height: 3px; background: #ffd65a; margin-bottom: 8px; }
@@ -963,7 +997,7 @@
             <video id="raw-next" playsinline muted preload="auto" class="waiting"></video>
           </div>
           <div class="cropbox hide" id="cropbox"></div>
-          <div class="graphic-preview hide" id="graphic-preview"></div>
+          <div class="graphic-preview-layer hide" id="graphic-preview"></div>
           <div class="burnt hide" id="burnt"></div>
         </div>
         <div class="warn hide" id="crop-warn">這一輪沒有留下裁切紀錄，框是事後從素材卡重算的，不等於實際裁切</div>
@@ -1608,13 +1642,17 @@ function showBurnt() {
 
 // Editorial graphics are not subtitles. They have their own copy provenance,
 // templates, motion and approval state, but use the same editing gestures.
-let graphicsPlan = { version: 'montagewright-graphics-v1', revision: 0, brand: {}, facts: [], cues: [] };
+let graphicsPlan = { version: 'montagewright-graphics-v2', revision: 0, brand: {}, facts: [], cues: [] };
 let graphics = [], graphicTemplates = [], graphicPicked = -1;
+let graphicApprovalInFlight = false;
 let graphicResolvedLayout = {};
 let briefCandidates = [], briefInstructions = [], briefDigest = '';
-let compiledGraphicPreview = null, graphicPreviewTimer = null;
-let graphicPreviewRequest = 0;
-let graphicPreviewPending = '';
+let compiledGraphicPreviews = {}, graphicPreviewTimer = null;
+let graphicPreviewRequests = {}, graphicPreviewPending = new Map();
+let graphicPreviewEpoch = 0;
+let graphicPreviewDirty = new Set(), graphicInteraction = null;
+let graphicPreviewErrors = {};
+let graphicPreviewModes = {};
 
 function graphicText(cue, which = 'primary') {
   const id = which === 'primary' ? cue.primary_fact_id : cue.secondary_fact_id;
@@ -1638,7 +1676,7 @@ async function loadGraphics() {
     briefInstructions = data.brief_instructions || [];
     briefDigest = data.brief_sha256 || '';
   } catch (error) {
-    graphicsPlan = { version: 'montagewright-graphics-v1', revision: 0, brand: {}, facts: [], cues: [] };
+    graphicsPlan = { version: 'montagewright-graphics-v2', revision: 0, brand: {}, facts: [], cues: [] };
     graphics = []; graphicTemplates = []; graphicResolvedLayout = {};
     briefCandidates = []; briefInstructions = []; briefDigest = '';
   }
@@ -1661,7 +1699,37 @@ function paintGraphics() {
   }
 }
 
+function graphicAnchorAt(seconds) {
+  let cursor = 0;
+  for (const block of blocks) {
+    const end = cursor + block.seconds;
+    if (seconds >= cursor && seconds < end) return {block, start: cursor, end};
+    cursor = end;
+  }
+  return null;
+}
+
+function reanchorGraphicCue(cue) {
+  const found = graphicAnchorAt(cue.at_seconds);
+  const anchor = found?.block;
+  if (!anchor) {
+    cue.anchor_clip_id = '';
+    cue.anchor_offset_seconds = 0;
+    return false;
+  }
+  cue.anchor_clip_id = anchor.clip_id || '';
+  cue.anchor_offset_seconds = Math.max(0, cue.at_seconds - found.start);
+  const fits = cue.at_seconds + cue.duration_seconds
+    <= found.end + .01;
+  if (!fits) {
+    cue.anchor_clip_id = '';
+    cue.anchor_offset_seconds = 0;
+  }
+  return fits;
+}
+
 function dragGraphic(event, index) {
+  if (graphicApprovalInFlight) return;
   if (!(index >= 0 && index < graphicsPlan.cues.length)) return;
   event.preventDefault();
   const cue = graphicsPlan.cues[index], block = event.currentTarget;
@@ -1680,6 +1748,7 @@ function dragGraphic(event, index) {
     } else if (edge === 'right') {
       cue.duration_seconds = Math.max(.2, startDuration + delta);
     } else cue.at_seconds = Math.max(0, startAt + delta);
+    reanchorGraphicCue(cue);
     refreshGraphicsFromPlan();
   };
   const up = () => {
@@ -1738,7 +1807,10 @@ function paintGraphicList() {
 function selectGraphic(i) {
   if (!(i >= 0 && i < graphics.length)) return;
   graphicPicked = i; cue = -1;
-  const target = graphics[i].at_seconds + 0.01;
+  // Land after the entrance so selecting an animated card never presents an
+  // almost-transparent first frame while the user is trying to edit it.
+  const target = graphics[i].at_seconds
+    + Math.min(graphics[i].duration_seconds * .5, .65);
   let elapsed = 0;
   for (let shot = 0; shot < blocks.length; shot++) {
     if (target >= elapsed && target < elapsed + blocks[shot].seconds) {
@@ -1765,6 +1837,7 @@ function graphicOptions(values, selected) {
 
 const graphicStyleDefaults = {
   preset: 'custom', primary_color: '', secondary_color: '', accent_color: '',
+  contrast_mode: 'auto',
   plate_color: '', plate_alpha: null, align: 'auto', primary_scale: 1,
   secondary_scale: 1, line_spacing: 1, max_width_scale: 1,
   padding_x: 28, padding_y: 19, corner_radius: null,
@@ -1811,6 +1884,7 @@ function inspectGraphic() {
   const one = graphics[graphicPicked], box = $('graphic-inspector');
   if (!one || !box) return;
   const style = styleOfGraphic(one);
+  const geometryLocked = one.transform?.locked ? 'disabled' : '';
   const templates = graphicTemplates
     .filter(t => (t.kinds || []).includes(one.kind))
     .map(t => [t.template_id, t.label]);
@@ -1836,10 +1910,19 @@ function inspectGraphic() {
         ['soft_shadow','柔陰影'],['colour_label','彩色標籤'],
         ['tech_frame','科技細框'],['bold_pop','粗框立體字']
       ], style.preset)}</select>
-      <span>位置</span><select id="graphic-position" class="wide">${graphicOptions([
-        ['auto','多幀自動'],['top','上方'],['upper_left','左上'],['upper_right','右上'],
+      <span>可讀性補救</span><select id="graphic-contrast-mode" class="wide">${graphicOptions([
+        ['auto','不足時自動補救'],['strict','保留人工值，不足則停止輸出']
+      ], style.contrast_mode)}</select>
+      <span>位置</span><select id="graphic-position" class="wide" ${geometryLocked}>${graphicOptions([
+        ['auto','多幀自動'],['manual','自由位置'],['top','上方'],['upper_left','左上'],['upper_right','右上'],
         ['lower_left','左下'],['lower_right','右下'],['center','中央']
       ], one.position)}</select>
+      <span>水平位置</span><input id="graphic-transform-x" type="range" min="0" max="1" step="0.001" value="${one.transform?.x ?? .5}" ${geometryLocked}>
+      <span>垂直位置</span><input id="graphic-transform-y" type="range" min="0" max="1" step="0.001" value="${one.transform?.y ?? .5}" ${geometryLocked}>
+      <span>整體縮放</span><input id="graphic-transform-scale" type="range" min="0.25" max="4" step="0.01" value="${one.transform?.scale ?? 1}" ${geometryLocked}>
+      <span>旋轉角度</span><input id="graphic-transform-rotation" type="number" min="-180" max="180" step="0.1" value="${one.transform?.rotation_degrees ?? 0}" ${geometryLocked}>
+      <span>位置鎖定</span><label class="wide"><input id="graphic-transform-locked" type="checkbox" ${one.transform?.locked ? 'checked' : ''}> 鎖定，避免誤拖</label>
+      <span></span><button type="button" id="graphic-restore-auto" class="ghost wide">恢復自動排版</button>
       <span>構圖</span><select id="graphic-composition" class="wide">${graphicOptions([
         ['auto','自動判斷'],['negative_space','放在留白'],['avoid_subject','避開主體（需 SAM）'],
         ['overlap_subject','刻意壓主體'],['foreground_plate','前景底板']
@@ -1847,6 +1930,10 @@ function inspectGraphic() {
       <span>背景</span><select id="graphic-background" class="wide">${graphicOptions([
         ['auto','依模板'],['none','透明'],['plate','局部底板']
       ], one.background)}</select>
+      <span>圖層</span><input id="graphic-z-index" type="number" min="-100" max="100" value="${one.z_index ?? ''}" placeholder="依時間軸順序">
+      <span>字卡互相避讓</span><select id="graphic-collision-policy" class="wide">${graphicOptions([
+        ['avoid','避開其他字卡'],['allow','可重疊（雙方都允許時）']
+      ], one.collision_policy || 'avoid')}</select>
       <span>動畫</span><select id="graphic-motion" class="wide">${graphicOptions([
         ['none','直接出現'],['fade','淡入淡出'],['rise','向上進場'],
         ['slide_left','向左進場'],['slide_right','向右進場']
@@ -1890,7 +1977,10 @@ function inspectGraphic() {
       <p class="why">輸出為另一支影片，乾淨母版保留。草稿不會被燒入。</p></section>`;
   for (const id of ['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
     'graphic-until','graphic-status','graphic-note','graphic-template','graphic-position',
+    'graphic-transform-x','graphic-transform-y','graphic-transform-scale',
+    'graphic-transform-rotation','graphic-transform-locked',
     'graphic-composition','graphic-background','graphic-motion','graphic-style-preset',
+    'graphic-contrast-mode','graphic-z-index','graphic-collision-policy',
     'graphic-align','graphic-primary-scale','graphic-secondary-scale',
     'graphic-line-spacing','graphic-width-scale','graphic-padding-x','graphic-padding-y',
     'graphic-fg','graphic-secondary-colour','graphic-emphasis-text','graphic-accent',
@@ -1901,12 +1991,18 @@ function inspectGraphic() {
     'graphic-motion-distance']) {
     const control = $(id);
     control.onchange = updateGraphicFromInspector;
-    if (control.type === 'range' || control.type === 'color') {
+    if (control.type === 'range' || control.type === 'color'
+        || control.type === 'number' || control.tagName === 'TEXTAREA') {
       control.oninput = updateGraphicFromInspector;
     }
     control.onkeydown = (e) => e.stopPropagation();
   }
   $('graphic-burn').onclick = burnGraphics;
+  $('graphic-restore-auto').onclick = () => {
+    $('graphic-position').value = 'auto';
+    $('graphic-transform-locked').checked = false;
+    updateGraphicFromInspector({target: $('graphic-position')});
+  };
 }
 
 function editableGraphicFact(cue, which) {
@@ -2006,11 +2102,15 @@ async function updateGraphicFromInspector(event) {
     && !['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
       'graphic-until','graphic-status','graphic-note','graphic-template',
       'graphic-position','graphic-composition','graphic-background',
-      'graphic-motion','graphic-style-preset'].includes(event.target.id);
+      'graphic-motion','graphic-style-preset','graphic-contrast-mode',
+      'graphic-z-index','graphic-collision-policy','graphic-transform-x',
+      'graphic-transform-y','graphic-transform-scale',
+      'graphic-transform-rotation','graphic-transform-locked'].includes(event.target.id);
   if (styleControl) $('graphic-style-preset').value = 'custom';
   let style = {
     ...graphicStyleDefaults, ...(cue.style || {}),
     preset: styleControl ? 'custom' : selectedPreset,
+    contrast_mode: $('graphic-contrast-mode').value,
     align: $('graphic-align').value,
     primary_scale: +$('graphic-primary-scale').value,
     secondary_scale: +$('graphic-secondary-scale').value,
@@ -2068,43 +2168,81 @@ async function updateGraphicFromInspector(event) {
     };
     delete style.background;
   }
+  if (event?.target?.id === 'graphic-transform-x'
+      || event?.target?.id === 'graphic-transform-y') {
+    $('graphic-position').value = 'manual';
+  }
+  if (event?.target?.id === 'graphic-transform-scale'
+      || event?.target?.id === 'graphic-transform-rotation') {
+    preserveGraphicCenterAsManual(cue);
+    $('graphic-position').value = 'manual';
+    $('graphic-transform-x').value = cue.transform.x;
+    $('graphic-transform-y').value = cue.transform.y;
+  }
   Object.assign(cue, {
     kind, at_seconds: at,
     duration_seconds: Math.max(.2, until - at), status,
     template, position: $('graphic-position').value,
     composition: $('graphic-composition').value,
     background, motion: $('graphic-motion').value,
+    z_index: $('graphic-z-index').value === ''
+      ? null : +$('graphic-z-index').value,
+    collision_policy: $('graphic-collision-policy').value,
+    transform: {
+      x: +$('graphic-transform-x').value,
+      y: +$('graphic-transform-y').value,
+      scale: +$('graphic-transform-scale').value,
+      rotation_degrees: +$('graphic-transform-rotation').value,
+      locked: $('graphic-transform-locked').checked,
+    },
     editor_note: $('graphic-note').value.trim(),
     style,
   });
-  refreshGraphicsFromPlan(); saveGraphics();
+  reanchorGraphicCue(cue);
+  const previewMode = event?.target?.id?.startsWith('graphic-transform-')
+    || event?.target?.id === 'graphic-position' ? 'transform' : 'content';
+  refreshGraphicsFromPlan(previewMode); saveGraphics();
   if (event?.target?.id === 'graphic-kind'
-      || event?.target?.id === 'graphic-style-preset') inspectGraphic();
+      || event?.target?.id === 'graphic-style-preset'
+      || event?.target?.id === 'graphic-transform-locked') inspectGraphic();
   if (explicitApproval) {
+    graphicApprovalInFlight = true;
+    $('graphic-inspector').querySelectorAll('input,select,textarea,button')
+      .forEach(control => { control.disabled = true; });
     const saved = await saveGraphicsNow();
-    if (!saved) { $('graphic-status').value = 'draft'; return; }
-    const got = await fetch(
-      `/api/runs/${runId}/approve-graphic/${encodeURIComponent(cue.graphic_id)}`,
-      {method: 'POST', headers: {'Content-Type': 'application/json'},
-       body: JSON.stringify({revision: graphicsPlan.revision})},
-    );
+    if (!saved) {
+      graphicApprovalInFlight = false; inspectGraphic(); return;
+    }
+    let got;
+    try {
+      got = await fetch(
+        `/api/runs/${runId}/approve-graphic/${encodeURIComponent(cue.graphic_id)}`,
+        {method: 'POST', headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({revision: graphicsPlan.revision})},
+      );
+    } catch (error) {
+      graphicApprovalInFlight = false; inspectGraphic();
+      $('strip-note').textContent = '字卡核准失敗：網路連線中斷';
+      return;
+    }
     const answer = await got.json();
     if (!got.ok) {
-      $('graphic-status').value = 'draft';
+      graphicApprovalInFlight = false; inspectGraphic();
       $('strip-note').textContent = `字卡核准失敗：${answer.detail || '請重新整理'}`;
       return;
     }
     graphicsPlan = answer;
+    graphicApprovalInFlight = false;
     refreshGraphicsFromPlan(); inspectGraphic();
     $('strip-note').textContent = '字卡已明確核准';
   }
 }
 
-function refreshGraphicsFromPlan() {
+function refreshGraphicsFromPlan(previewMode = 'content') {
   graphics = graphicsPlan.cues.map(cue => ({
     ...cue, primary_text: graphicText(cue), secondary_text: graphicText(cue, 'secondary'),
   }));
-  scheduleGraphicPreview();
+  scheduleGraphicPreview(previewMode);
   paintGraphics(); paintGraphicList(); showGraphicPreview();
 }
 
@@ -2148,126 +2286,335 @@ function graphicEmphasisMarkup(text, needle, colour) {
   return `${esc(text.slice(0, at))}<span style="color:${esc(colour)}">${esc(needle)}</span>${esc(text.slice(at + needle.length))}`;
 }
 
-function scheduleGraphicPreview() {
-  clearTimeout(graphicPreviewTimer);
-  compiledGraphicPreview = null;
-  graphicPreviewPending = '';
-  if (!(graphicPicked >= 0 && graphicPicked < graphicsPlan.cues.length)) return;
-  const cue = graphicsPlan.cues[graphicPicked];
-  graphicPreviewPending = cue.graphic_id;
-  const requestNumber = ++graphicPreviewRequest;
-  graphicPreviewTimer = setTimeout(async () => {
-    try {
-      const got = await fetch(`/api/runs/${runId}/graphics-preview/${encodeURIComponent(cue.graphic_id)}`, {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(graphicsPlan),
-      });
-      const answer = await got.json();
-      if (!got.ok) throw new Error(answer.detail || '無法編譯字卡預覽');
-      if (requestNumber !== graphicPreviewRequest) return;
-      compiledGraphicPreview = {...answer, graphic_id: cue.graphic_id};
-      graphicPreviewPending = '';
-      showGraphicPreview();
-    } catch (error) {
-      if (requestNumber === graphicPreviewRequest) {
-        graphicPreviewPending = '';
-        $('strip-note').textContent = `字卡預覽失敗：${error.message}`;
-      }
+async function requestGraphicPreview(cue) {
+  const id = cue.graphic_id;
+  if ((compiledGraphicPreviews[id] && !graphicPreviewDirty.has(id))
+      || graphicPreviewPending.has(id)) return;
+  const epoch = graphicPreviewEpoch;
+  const requestNumber = (graphicPreviewRequests[id] || 0) + 1;
+  graphicPreviewRequests[id] = requestNumber;
+  graphicPreviewPending.set(id, requestNumber);
+  try {
+    const got = await fetch(`/api/runs/${runId}/graphics-preview/${encodeURIComponent(id)}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(graphicsPlan),
+    });
+    const answer = await got.json();
+    if (!got.ok) throw new Error(answer.detail || '無法編譯字卡預覽');
+    if (epoch !== graphicPreviewEpoch
+        || graphicPreviewRequests[id] !== requestNumber) return;
+    const joint = answer.joint_layout || {[id]: answer};
+    for (const [jointId, made] of Object.entries(joint)) {
+      compiledGraphicPreviews[jointId] = {
+        ...answer, ...made, graphic_id: jointId, joint_layout: joint,
+      };
+      graphicPreviewDirty.delete(jointId);
+      delete graphicPreviewModes[jointId];
+      delete graphicPreviewErrors[jointId];
     }
-  }, 140);
+    delete graphicPreviewErrors[id];
+    showGraphicPreview();
+  } catch (error) {
+    if (epoch === graphicPreviewEpoch
+        && graphicPreviewRequests[id] === requestNumber) {
+      graphicPreviewErrors[id] = error.message;
+      $('strip-note').textContent = `字卡預覽失敗：${error.message}`;
+      showGraphicPreview();
+    }
+  } finally {
+    if (graphicPreviewPending.get(id) === requestNumber)
+      graphicPreviewPending.delete(id);
+    if (epoch !== graphicPreviewEpoch && graphicPreviewDirty.has(id)
+        && graphicsPlan.cues[graphicPicked]?.graphic_id === id
+        && !graphicPreviewTimer) {
+      graphicPreviewTimer = setTimeout(() => {
+        graphicPreviewTimer = null;
+        requestGraphicPreview(graphicsPlan.cues[graphicPicked]);
+      }, 180);
+    }
+  }
+}
+
+function invalidateGraphicPreviews() {
+  clearTimeout(graphicPreviewTimer);
+  graphicPreviewTimer = null;
+  graphicPreviewEpoch += 1;
+  compiledGraphicPreviews = {};
+  graphicPreviewDirty.clear();
+  graphicPreviewErrors = {};
+  graphicPreviewModes = {};
+  graphicPreviewPending.clear();
+}
+
+function scheduleGraphicPreview(mode = 'content') {
+  if (!(graphicPicked >= 0 && graphicPicked < graphicsPlan.cues.length)) return;
+  clearTimeout(graphicPreviewTimer);
+  graphicPreviewEpoch += 1;
+  for (const cue of graphicsPlan.cues) graphicPreviewDirty.add(cue.graphic_id);
+  const cue = graphicsPlan.cues[graphicPicked];
+  graphicPreviewModes[cue.graphic_id] = mode;
+  showGraphicPreview();
+  graphicPreviewTimer = setTimeout(() => {
+    graphicPreviewTimer = null;
+    requestGraphicPreview(cue);
+  }, 180);
+}
+
+function liveGraphicMarkup(cue) {
+  const style = styleOfGraphic(cue);
+  const primary = graphicText(cue), secondary = graphicText(cue, 'secondary');
+  const foreground = style.primary_color || graphicsPlan.brand.foreground || '#FFFFFF';
+  const secondaryColour = style.secondary_color || graphicsPlan.brand.secondary || '#D9DCE3';
+  const plate = cue.background === 'plate' || cue.composition === 'foreground_plate';
+  const plateColour = style.plate_color || graphicsPlan.brand.plate || '#111318';
+  const alpha = (style.plate_alpha ?? graphicsPlan.brand.plate_alpha ?? 205) / 255;
+  const shadow = `${style.shadow_offset_x}px ${style.shadow_offset_y}px ${style.shadow_blur}px ${style.shadow_color}`;
+  const align = style.align === 'auto'
+    ? (['hero_center','center_stack','stat_badge'].includes(cue.template) ? 'center' : 'left')
+    : style.align;
+  return `<div class="graphic-live-surface" style="color:${esc(foreground)};text-align:${esc(align)};font-size:${style.primary_scale}em;padding:${style.padding_y / 54}em ${style.padding_x / 54}em;background:${plate ? `rgba(${parseInt(plateColour.slice(1,3),16)},${parseInt(plateColour.slice(3,5),16)},${parseInt(plateColour.slice(5,7),16)},${alpha})` : 'transparent'};border-radius:${(style.corner_radius ?? 0) / 54}em;-webkit-text-stroke:${style.stroke_width / 54}em ${esc(style.stroke_color)};text-shadow:${shadow}"><div>${graphicEmphasisMarkup(primary, style.emphasis_text, style.emphasis_color || style.accent_color || '#FFFFFF')}</div>${secondary ? `<div class="graphic-live-secondary" style="color:${esc(secondaryColour)};font-size:${style.secondary_scale * .48}em">${esc(secondary)}</div>` : ''}</div>`;
+}
+
+function preserveGraphicCenterAsManual(cue) {
+  if (cue.position === 'manual') return;
+  const made = compiledGraphicPreviews[cue.graphic_id];
+  if (made?.animation && made.frame_width && made.frame_height) {
+    cue.transform = {
+      ...{x:.5,y:.5,scale:1,rotation_degrees:0,locked:false},
+      ...(cue.transform || {}),
+      x: (made.animation.settled_left + made.card_width / 2) / made.frame_width,
+      y: (made.animation.settled_top + made.card_height / 2) / made.frame_height,
+    };
+  }
+  cue.position = 'manual';
+}
+
+function beginGraphicCanvasGesture(event, id, mode = 'move') {
+  const index = graphicsPlan.cues.findIndex(cue => cue.graphic_id === id);
+  const cue = graphicsPlan.cues[index];
+  if (!cue || cue.transform?.locked || graphicApprovalInFlight
+      || graphicInteraction) return;
+  event.preventDefault(); event.stopPropagation();
+  graphicPicked = index;
+  if (mode === 'scale' || mode === 'rotate') preserveGraphicCenterAsManual(cue);
+  cue.transform = {...{x:.5,y:.5,scale:1,rotation_degrees:0,locked:false}, ...(cue.transform || {})};
+  const video = $('video'), bounds = video.getBoundingClientRect();
+  const start = {...cue.transform}, startX = event.clientX, startY = event.clientY;
+  const card = event.currentTarget.closest('.graphic-preview-card');
+  const center = card.getBoundingClientRect();
+  const cx = center.left + center.width / 2, cy = center.top + center.height / 2;
+  if (mode === 'move' && cue.position !== 'manual') {
+    start.x = (cx - bounds.left) / Math.max(1, bounds.width);
+    start.y = (cy - bounds.top) / Math.max(1, bounds.height);
+    cue.transform.x = start.x; cue.transform.y = start.y;
+  }
+  const startAngle = Math.atan2(startY - cy, startX - cx) * 180 / Math.PI;
+  const pointerId = event.pointerId;
+  graphicInteraction = {id, mode, pointerId};
+  card.setPointerCapture?.(pointerId);
+  const move = next => {
+    if (next.pointerId !== pointerId) return;
+    if (mode === 'move') {
+      let x = start.x + (next.clientX - startX) / Math.max(1, bounds.width);
+      let y = start.y + (next.clientY - startY) / Math.max(1, bounds.height);
+      const thresholdX = 9 / Math.max(1, bounds.width);
+      const thresholdY = 9 / Math.max(1, bounds.height);
+      if (Math.abs(x - .5) < thresholdX) x = .5;
+      if (Math.abs(y - .5) < thresholdY) y = .5;
+      cue.transform.x = Math.max(0, Math.min(1, x));
+      cue.transform.y = Math.max(0, Math.min(1, y));
+      cue.position = 'manual';
+    } else if (mode === 'scale') {
+      const startDistance = Math.max(16, Math.hypot(startX - cx, startY - cy));
+      cue.transform.scale = Math.max(.25, Math.min(4,
+        start.scale * Math.hypot(next.clientX - cx, next.clientY - cy) / startDistance));
+    } else {
+      const angle = Math.atan2(next.clientY - cy, next.clientX - cx) * 180 / Math.PI;
+      let rotation = start.rotation_degrees + angle - startAngle;
+      for (const snap of [-180,-90,-45,0,45,90,180]) {
+        if (Math.abs(rotation - snap) < 3) rotation = snap;
+      }
+      cue.transform.rotation_degrees = Math.max(-180, Math.min(180, rotation));
+    }
+    graphicPreviewDirty.add(id);
+    graphicPreviewModes[id] = 'transform';
+    graphics = graphicsPlan.cues.map(one => ({...one,
+      primary_text: graphicText(one), secondary_text: graphicText(one, 'secondary')}));
+    showGraphicPreview();
+    const x = $('graphic-transform-x'), y = $('graphic-transform-y');
+    if (x) x.value = cue.transform.x; if (y) y.value = cue.transform.y;
+    if ($('graphic-transform-scale')) $('graphic-transform-scale').value = cue.transform.scale;
+    if ($('graphic-transform-rotation')) $('graphic-transform-rotation').value = cue.transform.rotation_degrees.toFixed(1);
+    if ($('graphic-position')) $('graphic-position').value = cue.position;
+  };
+  let finished = false;
+  const up = next => {
+    if (finished || (next?.pointerId != null && next.pointerId !== pointerId)) return;
+    finished = true;
+    card.removeEventListener('pointermove', move);
+    card.removeEventListener('pointerup', up);
+    card.removeEventListener('pointercancel', up);
+    card.removeEventListener('lostpointercapture', up);
+    if (card.hasPointerCapture?.(pointerId)) card.releasePointerCapture(pointerId);
+    graphicInteraction = null;
+    scheduleGraphicPreview('transform'); saveGraphics(); paintGraphics(); paintGraphicList();
+  };
+  card.addEventListener('pointermove', move);
+  card.addEventListener('pointerup', up);
+  card.addEventListener('pointercancel', up);
+  card.addEventListener('lostpointercapture', up);
 }
 
 function showGraphicPreview() {
-  const box = $('graphic-preview'), video = $('video');
-  if (!box || !video || peeking || !video.videoWidth) { box?.classList.add('hide'); return; }
+  const layer = $('graphic-preview'), video = $('video');
+  if (!layer || !video || peeking || !video.videoWidth) {
+    layer?.classList.add('hide'); return;
+  }
   const at = video.currentTime || 0;
+  const active = graphics.filter(one => one.status === 'approved'
+    && at >= one.at_seconds && at < one.at_seconds + one.duration_seconds);
   const selected = graphics[graphicPicked];
-  const one = selected && at >= selected.at_seconds
-    && at < selected.at_seconds + selected.duration_seconds
-    ? selected
-    : graphics.find(g => g.status === 'approved'
-      && at >= g.at_seconds && at < g.at_seconds + g.duration_seconds);
-  if (!one) { box.classList.add('hide'); return; }
+  if (selected && selected.status !== 'approved'
+      && at >= selected.at_seconds
+      && at < selected.at_seconds + selected.duration_seconds) active.push(selected);
+  if (!active.length) { layer.innerHTML = ''; layer.classList.add('hide'); return; }
+  if (!graphicPreviewTimer && !graphicInteraction) {
+    const target = active.find(cue => cue.graphic_id === selected?.graphic_id)
+      || active[0];
+    if (target) requestGraphicPreview(target);
+  }
   const shown = video.getBoundingClientRect(), holder = $('frame').getBoundingClientRect();
-  const positions = {
-    top: [.5,.10], upper_left: [.08,.10], upper_right: [.92,.10],
-    lower_left: [.08,.72], lower_right: [.92,.72], center: [.5,.48],
-  };
-  const template = graphicTemplates.find(t => t.template_id === one.template) || {};
-  const style = styleOfGraphic(one);
-  const resolved = graphicResolvedLayout[one.graphic_id];
-  if (graphicPreviewPending === one.graphic_id) {
-    box.classList.add('hide');
-    return;
+  const draftJoint = selected?.status !== 'approved'
+    ? compiledGraphicPreviews[selected.graphic_id]?.joint_layout : null;
+  const ready = active.map(one => {
+    const made = compiledGraphicPreviews[one.graphic_id];
+    const synthetic = one.graphic_id === selected?.graphic_id && !made ? {
+      synthetic: true, frame_width: video.videoWidth, frame_height: video.videoHeight,
+      card_width: video.videoWidth * .55, card_height: video.videoHeight * .14,
+      z_index: one.z_index || 0, plan_order: graphicPicked,
+      authored_transform: {x:.5,y:.5,scale:1,rotation_degrees:0},
+      animation: {start_seconds:one.at_seconds,
+        end_seconds:one.at_seconds + one.duration_seconds,
+        enter_seconds:.001,leave_seconds:.001,from_left:video.videoWidth*.225,
+        from_top:video.videoHeight*.2,settled_left:video.videoWidth*.225,
+        settled_top:video.videoHeight*.2,fade:false},
+    } : null;
+    return [one, made && draftJoint?.[one.graphic_id]
+      ? {...made, ...draftJoint[one.graphic_id]} : (made || synthetic)];
+  }).filter(([, made]) => made?.animation).sort((left, right) =>
+    (left[1].z_index - right[1].z_index)
+      || (left[1].plan_order - right[1].plan_order));
+  const wanted = new Set(ready.map(([one]) => one.graphic_id));
+  for (const child of [...layer.querySelectorAll('.graphic-preview-card')]) {
+    if (!wanted.has(child.dataset.graphicId)) child.remove();
   }
-  if (compiledGraphicPreview?.graphic_id === one.graphic_id) {
-    const made = compiledGraphicPreview;
-    const left = made.resolved_left ?? made.left;
-    const top = made.resolved_top ?? made.top;
-    box.className = 'graphic-preview';
-    box.style.left = `${shown.left - holder.left + shown.width * left / made.frame_width}px`;
-    box.style.top = `${shown.top - holder.top + shown.height * top / made.frame_height}px`;
-    box.style.width = `${shown.width * made.card_width / made.frame_width}px`;
-    box.style.height = `${shown.height * made.card_height / made.frame_height}px`;
-    box.style.maxWidth = 'none'; box.style.padding = '0';
-    box.style.border = 'none'; box.style.background = 'transparent';
-    box.style.transform = 'none'; box.style.textShadow = 'none';
-    box.innerHTML = `<img src="${esc(made.url)}" alt="" style="display:block;width:100%;height:100%">`;
-    box.classList.remove('hide');
-    return;
+  for (const [one, made] of ready) {
+    let card = layer.querySelector(`[data-graphic-id="${CSS.escape(one.graphic_id)}"]`);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'graphic-preview-card';
+      card.dataset.graphicId = one.graphic_id;
+      const image = document.createElement('img');
+      image.alt = ''; image.style.cssText = 'display:block;width:100%;height:100%';
+      image.className = 'graphic-exact-image';
+      card.appendChild(image);
+      card.addEventListener('pointerdown', event => {
+        if (!event.target.closest('.graphic-handle'))
+          beginGraphicCanvasGesture(event, card.dataset.graphicId, 'move');
+      });
+      layer.appendChild(card);
+    }
+    // appendChild also moves an existing node, making equal-z tie breaks
+    // follow plan order rather than whichever preview request returned first.
+    layer.appendChild(card);
+    const image = card.querySelector('.graphic-exact-image');
+    if (made.url && image.src !== new URL(made.url, location.href).href)
+      image.src = made.url;
+    let animation = made.animation;
+    if (graphicPreviewDirty.has(one.graphic_id)) {
+      const liveStyle = styleOfGraphic(one);
+      const distance = liveStyle.motion_distance == null
+        ? (one.motion === 'rise' ? made.frame_height * .025 : made.frame_width * .06)
+        : liveStyle.motion_distance * made.frame_height / 1080;
+      const settledLeft = animation.settled_left, settledTop = animation.settled_top;
+      animation = {...animation,
+        start_seconds: one.at_seconds,
+        end_seconds: one.at_seconds + one.duration_seconds,
+        enter_seconds: liveStyle.entrance_seconds == null
+          ? Math.min(.45, Math.max(.16, one.duration_seconds * .12))
+          : Math.min(liveStyle.entrance_seconds, one.duration_seconds * .4),
+        leave_seconds: liveStyle.exit_seconds == null
+          ? Math.min(.32, Math.max(.12, one.duration_seconds * .08))
+          : Math.min(liveStyle.exit_seconds, one.duration_seconds * .3),
+        fade: one.motion !== 'none',
+        from_left: settledLeft + (one.motion === 'slide_left' ? distance : one.motion === 'slide_right' ? -distance : 0),
+        from_top: settledTop + (one.motion === 'rise' ? distance : 0),
+      };
+    }
+    const enter = Math.max(.001, animation.enter_seconds);
+    const leave = Math.max(.001, animation.leave_seconds);
+    const progress = Math.max(0, Math.min(1, (at - animation.start_seconds) / enter));
+    const remaining = Math.max(0, Math.min(1, (animation.end_seconds - at) / leave));
+    let left = animation.settled_left
+      + (animation.from_left - animation.settled_left) * (1 - progress);
+    let top = animation.settled_top
+      + (animation.from_top - animation.settled_top) * (1 - progress);
+    const transform = {...{x:.5,y:.5,scale:1,rotation_degrees:0,locked:false}, ...(one.transform || {})};
+    const authored = {...{x:.5,y:.5,scale:1,rotation_degrees:0}, ...(made.authored_transform || {})};
+    const scaleDelta = transform.scale / Math.max(.001, authored.scale);
+    const rotationDelta = transform.rotation_degrees - authored.rotation_degrees;
+    const cardWidth = made.card_width * scaleDelta;
+    const cardHeight = made.card_height * scaleDelta;
+    if (one.position === 'manual' && graphicPreviewDirty.has(one.graphic_id)) {
+      const settledLeft = transform.x * made.frame_width - cardWidth / 2;
+      const settledTop = transform.y * made.frame_height - cardHeight / 2;
+      left = settledLeft
+        + (animation.from_left - animation.settled_left) * (1 - progress);
+      top = settledTop
+        + (animation.from_top - animation.settled_top) * (1 - progress);
+    }
+    card.style.left = `${shown.left - holder.left + shown.width * left / made.frame_width}px`;
+    card.style.top = `${shown.top - holder.top + shown.height * top / made.frame_height}px`;
+    card.style.width = `${shown.width * cardWidth / made.frame_width}px`;
+    card.style.height = `${shown.height * cardHeight / made.frame_height}px`;
+    const dirtyMode = graphicPreviewModes[one.graphic_id];
+    card.style.fontSize = `${shown.height * .055
+      * (dirtyMode === 'content' ? transform.scale : 1)}px`;
+    card.style.transform = `rotate(${dirtyMode === 'content'
+      ? transform.rotation_degrees : rotationDelta}deg)`;
+    card.style.opacity = animation.fade ? `${Math.min(progress, remaining)}` : '1';
+    card.style.zIndex = `${3 + (made.z_index || 0)}`;
+    const isSelected = one.graphic_id === selected?.graphic_id;
+    card.classList.toggle('selected', isSelected);
+    card.classList.toggle('locked', !!transform.locked);
+    card.classList.toggle('invalid', !!graphicPreviewErrors[one.graphic_id]);
+    card.title = graphicPreviewErrors[one.graphic_id] || '';
+    const dirty = graphicPreviewDirty.has(one.graphic_id) || made.synthetic;
+    let live = card.querySelector('.graphic-live-surface-wrap');
+    if (dirty && isSelected && dirtyMode === 'content') {
+      if (!live) {
+        live = document.createElement('div');
+        live.className = 'graphic-live-surface-wrap';
+        live.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%';
+        card.appendChild(live);
+      }
+      live.innerHTML = liveGraphicMarkup(one);
+      image.style.visibility = 'hidden';
+    } else {
+      live?.remove(); image.style.visibility = 'visible';
+    }
+    for (const handle of [...card.querySelectorAll('.graphic-handle')]) handle.remove();
+    if (isSelected && !transform.locked) {
+      for (const mode of ['scale','rotate']) {
+        const handle = document.createElement('span');
+        handle.className = `graphic-handle ${mode}`;
+        handle.addEventListener('pointerdown', event =>
+          beginGraphicCanvasGesture(event, one.graphic_id, mode));
+        card.appendChild(handle);
+      }
+    }
   }
-  const position = one.position === 'auto' ? (template.default_position || 'upper_left') : one.position;
-  const [x,y] = positions[position] || positions.upper_left;
-  const hasPlate = one.background === 'plate' || resolved?.fallback_plate
-    || one.composition === 'foreground_plate'
-    || (one.background === 'auto' && template.plate);
-  const align = style.align === 'auto' ? (template.align || 'left') : style.align;
-  box.className = `graphic-preview ${hasPlate ? 'plate' : ''} ${align === 'center' ? 'center' : ''}`;
-  box.style.textAlign = align;
-  box.style.color = style.primary_color || graphicsPlan.brand.foreground || '#FFFFFF';
-  const plateAlpha = style.plate_alpha ?? graphicsPlan.brand.plate_alpha ?? 205;
-  box.style.backgroundColor = hasPlate
-    ? `${style.plate_color || graphicsPlan.brand.plate || '#111318'}${Math.round(plateAlpha / 17).toString(16).repeat(2)}`
-    : 'transparent';
-  const px = shown.height / 1080;
-  box.style.padding = hasPlate ? `${style.padding_y * px}px ${style.padding_x * px}px` : '0';
-  box.style.borderRadius = `${(style.corner_radius ?? (graphicsPlan.brand.corner_radius || .18) * 100) * px}px`;
-  box.style.border = hasPlate && style.plate_border_width
-    ? `${style.plate_border_width * px}px solid ${style.plate_border_color}` : 'none';
-  const shadows = [];
-  if (style.stroke_width) {
-    const s = Math.max(.5, style.stroke_width * px);
-    for (const [sx,sy] of [[-s,-s],[0,-s],[s,-s],[-s,0],[s,0],[-s,s],[0,s],[s,s]])
-      shadows.push(`${sx}px ${sy}px 0 ${style.stroke_color}`);
-  }
-  if (style.shadow_opacity) {
-    const alpha = (style.shadow_opacity / 255).toFixed(3);
-    const [r,g,b] = (style.shadow_color.match(/[A-Fa-f0-9]{2}/g) || ['00','00','00']).map(v => parseInt(v,16));
-    shadows.push(`${style.shadow_offset_x * px}px ${style.shadow_offset_y * px}px ${style.shadow_blur * px}px rgba(${r},${g},${b},${alpha})`);
-  }
-  box.style.textShadow = shadows.join(',');
-  const accent = style.emphasis_color || style.accent_color || graphicsPlan.brand.accent || '#FFFFFF';
-  box.innerHTML = `${one.template === 'editorial_rule' ? `<div class="gp-rule" style="background:${esc(style.accent_color || graphicsPlan.brand.accent || '#FFFFFF')}"></div>` : ''}
-    <div class="gp-primary">${graphicEmphasisMarkup(one.primary_text, style.emphasis_text, accent)}</div>${one.secondary_text
-      ? `<div class="gp-secondary" style="color:${esc(style.secondary_color || graphicsPlan.brand.secondary || '#D9DCE3')}">${graphicEmphasisMarkup(one.secondary_text, style.emphasis_text, accent)}</div>` : ''}`;
-  box.style.lineHeight = `${1.05 * style.line_spacing}`;
-  box.style.maxWidth = `${Math.min(.96, (template.width || .72) * style.max_width_scale) * 100}%`;
-  box.style.fontSize = `${shown.height * (template.title_height || .046) * style.primary_scale}px`;
-  const secondaryRatio = ((template.secondary_height || .023) * style.secondary_scale)
-    / ((template.title_height || .046) * style.primary_scale);
-  box.querySelector('.gp-secondary')?.style.setProperty('font-size', `${secondaryRatio}em`);
-  if (resolved?.frame_width && resolved?.frame_height) {
-    box.style.left = `${shown.left - holder.left + shown.width * resolved.resolved_left / resolved.frame_width}px`;
-    box.style.top = `${shown.top - holder.top + shown.height * resolved.resolved_top / resolved.frame_height}px`;
-    box.style.width = `${shown.width * resolved.card_width / resolved.frame_width}px`;
-    box.style.transform = 'none';
-  } else {
-    box.style.left = `${shown.left - holder.left + shown.width * x}px`;
-    box.style.top = `${shown.top - holder.top + shown.height * y}px`;
-    box.style.width = '';
-    box.style.transform = `translate(${x > .7 ? '-100%' : x > .3 ? '-50%' : '0'}, ${y > .6 ? '-100%' : y > .3 ? '-50%' : '0'})`;
-  }
-  box.classList.remove('hide');
+  layer.classList.toggle('hide', !ready.length);
 }
 
 async function burnGraphics() {
@@ -2303,12 +2650,13 @@ function addGraphicAtPlayhead(approvedFactId = '') {
   const template = graphicTemplates.find(t => (t.kinds || []).includes(kind))?.template_id
     || (kind === 'product_name' ? 'product_plate' : 'editorial_rule');
   const now = $('video').currentTime || 0;
-  const anchor = blocks.find(block => now >= block.at && now < block.at + block.seconds)
-    || blocks[picked];
+  const found = graphicAnchorAt(now);
+  const anchor = found?.block || blocks[picked];
+  const anchorStart = found?.start ?? 0;
   graphicsPlan.cues.push({
     graphic_id: id, kind, primary_fact_id: factId,
     secondary_fact_id: '', anchor_clip_id: anchor?.clip_id || '',
-    anchor_offset_seconds: Math.max(0, now - (anchor?.at || now)), at_seconds: now,
+    anchor_offset_seconds: Math.max(0, now - anchorStart), at_seconds: now,
     duration_seconds: 2.5, template, position: 'auto',
     composition: 'auto', background: 'auto', motion: 'rise',
     music_sync: 'none', style: {...graphicStyleDefaults},
@@ -2335,13 +2683,14 @@ function addBriefCandidate(candidateId, variantIndex = -1) {
     approved: false, approved_by: null,
   });
   const now = $('video').currentTime || 0;
-  const anchor = blocks.find(block => now >= block.at && now < block.at + block.seconds)
-    || blocks[picked];
+  const found = graphicAnchorAt(now);
+  const anchor = found?.block || blocks[picked];
+  const anchorStart = found?.start ?? 0;
   const lines = 1 + (secondaryText ? secondaryText.split('\n').length : 0);
   graphicsPlan.cues.push({
     graphic_id: id, kind: candidate.kind, primary_fact_id: primaryId,
     secondary_fact_id: secondaryId, anchor_clip_id: anchor?.clip_id || '',
-    anchor_offset_seconds: Math.max(0, now - (anchor?.at || now)), at_seconds: now,
+    anchor_offset_seconds: Math.max(0, now - anchorStart), at_seconds: now,
     duration_seconds: Math.min(5.5, 2.2 + lines * .45),
     template: candidate.template, position: candidate.position || 'auto',
     composition: 'auto', background: 'auto', motion: 'rise',
@@ -2565,6 +2914,7 @@ function saveSubs() {
         });
         if (moved) { paintSubs(); paintCues(); }
       }
+      invalidateGraphicPreviews(); showGraphicPreview();
     } catch (error) { /* the lines are still on screen */ }
   }, 400);
 }
@@ -2735,6 +3085,7 @@ $('recut').addEventListener('click', async () => {
   if (!res.ok) { $('strip-note').textContent = '失敗：' + (await res.text()).slice(0, 120); return; }
   const out = await res.json();
   $('video').src = `/api/runs/${runId}/video?t=` + Date.now();
+  invalidateGraphicPreviews();
   blocksWere = JSON.parse(JSON.stringify(blocks));
   $('strip-note').textContent = `已重新輸出：${out.shots} 顆、${out.seconds.toFixed(1)}s`;
   $('recut').classList.add('hide');
@@ -4032,6 +4383,8 @@ for (const when of ['loadedmetadata', 'loadeddata', 'seeked', 'canplay']) {
 addEventListener('resize', () => { forgetPlacement(); drawCrop(); });
 $('video').addEventListener('loadedmetadata', showBurnt);
 $('video').addEventListener('timeupdate', showBurnt);
+for (const eventName of ['timeupdate','seeked','loadedmetadata'])
+  $('video').addEventListener(eventName, showGraphicPreview);
 addEventListener('resize', showBurnt);
 </script>
 </body>

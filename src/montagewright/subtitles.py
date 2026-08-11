@@ -85,6 +85,41 @@ class Style:
     size_scale: float = 1.0
 
 
+@dataclass(frozen=True)
+class TimedOverlay:
+    path: Path
+    left: int
+    top: int
+    starts_seconds: float
+    ends_seconds: float
+    width: int
+    height: int
+    cue_index: int
+    state_index: int
+
+
+@dataclass(frozen=True)
+class PreparedSubtitleTrack:
+    overlays: tuple[TimedOverlay, ...]
+
+    @property
+    def windows(self) -> list[tuple[float, float]]:
+        return [
+            (overlay.starts_seconds, overlay.ends_seconds)
+            for overlay in self.overlays
+        ]
+
+    @property
+    def boxes(self) -> list[tuple[float, float, int, int, int, int]]:
+        return [
+            (
+                overlay.starts_seconds, overlay.ends_seconds,
+                overlay.left, overlay.top, overlay.width, overlay.height,
+            )
+            for overlay in self.overlays
+        ]
+
+
 def palette_for(lines, style: Style) -> dict[str, tuple[int, int, int]]:
     """A colour per speaker, assigned in the order they first talk.
 
@@ -554,6 +589,27 @@ def draw_line(
     return into, max(0, left), max(0, top)
 
 
+def layout_boxes(
+    lines: Sequence,
+    *,
+    aspect: str,
+    width: int,
+    height: int,
+    work: Path,
+    style: Style | None = None,
+) -> list[tuple[float, float, int, int, int, int]]:
+    """Return the renderer's actual timed subtitle rectangles.
+
+    Graphics layout consumes these exact Pillow bounds instead of treating
+    the entire lower third as occupied whenever any subtitle is present.
+    """
+
+    return prepare_overlays(
+        lines, aspect=aspect, width=width, height=height,
+        work=work, style=style,
+    ).boxes
+
+
 def spans_in(text: str, words, at: float, until: float):
     """Match a cue's characters to the words that were measured.
 
@@ -586,6 +642,70 @@ def spans_in(text: str, words, at: float, until: float):
     return marks if len(marks) >= 2 else []
 
 
+def prepare_overlays(
+    lines: Sequence,
+    *,
+    aspect: str,
+    width: int,
+    height: int,
+    work: Path,
+    style: Style | None = None,
+    words=None,
+) -> PreparedSubtitleTrack:
+    """Compile subtitle pixels once for either subtitle-only or mixed output."""
+
+    area = safe_area(aspect)
+    face = _face(max(12, round(height * area.text_height)))
+    room = round(width * (1 - area.side_margin * 2))
+    lines = split_cues(lines, face, room)
+    style = style or Style()
+    palette = palette_for(lines, style)
+    unknown = cannot_spell("".join(line.text for line in lines))
+    if unknown:
+        print(
+            f"subtitles: no glyph for {unknown} — they will be empty boxes",
+            flush=True,
+        )
+
+    drawn: list[TimedOverlay] = []
+    for index, line in enumerate(lines):
+        ink = palette.get(getattr(line, "speaker", "")) or style.fill
+        states: list[tuple[int, float, float]] = [
+            (0, line.starts_seconds, line.ends_seconds)
+        ]
+        if style.spoken is not None and words:
+            marks = spans_in(
+                line.text, words, line.starts_seconds, line.ends_seconds
+            )
+            if marks:
+                states = []
+                upto, since = 0, line.starts_seconds
+                for reached, when in marks:
+                    if when > since:
+                        states.append((upto, since, when))
+                    upto, since = reached, when
+                states.append((upto, since, line.ends_seconds))
+        for part, (upto, since, until) in enumerate(states):
+            if until <= since:
+                continue
+            made = draw_line(
+                line.text, width=width, height=height, area=area,
+                into=work / f"sub-{index:04d}-{part:03d}.png",
+                style=style, ink=ink, said_upto=upto,
+            )
+            if made is not None:
+                from PIL import Image
+
+                path, left, top = made
+                with Image.open(path) as image:
+                    wide, tall = image.size
+                drawn.append(TimedOverlay(
+                    path, left, top, float(since), float(until),
+                    wide, tall, index, part,
+                ))
+    return PreparedSubtitleTrack(tuple(drawn))
+
+
 def burn(
     picture: Path,
     lines: Sequence,
@@ -609,77 +729,38 @@ def burn(
     # display_*, not coded_*: the coded size is padded to the macroblock
     # grid, and a subtitle placed against padding sits a few pixels off.
     width, height = int(shape.display_width), int(shape.display_height)
-    area = safe_area(aspect)
-
-    # Split before drawing: the transcript's lines are sentences, and a
-    # sentence is not a cue.
-    face = _face(max(12, round(height * area.text_height)))
-    room = round(width * (1 - area.side_margin * 2))
-    lines = split_cues(lines, face, room)
-
-    style = style or Style()
-    palette = palette_for(lines, style)
-    unknown = cannot_spell("".join(line.text for line in lines))
-    if unknown:
-        print(
-            f"subtitles: no glyph for {unknown} — they will be empty boxes",
-            flush=True,
-        )
-
-    drawn = []
-    for index, line in enumerate(lines):
-        ink = palette.get(getattr(line, "speaker", "")) or style.fill
-
-        # One picture per cue, unless the words were measured and the line
-        # is meant to fill as it is said -- then one per character, each
-        # shown for exactly as long as that character took.
-        states: list[tuple[int, float, float]] = [
-            (0, line.starts_seconds, line.ends_seconds)
-        ]
-        if style.spoken is not None and words:
-            marks = spans_in(
-                line.text, words, line.starts_seconds, line.ends_seconds
-            )
-            if marks:
-                states = []
-                upto, since = 0, line.starts_seconds
-                for reached, when in marks:
-                    if when > since:
-                        states.append((upto, since, when))
-                    upto, since = reached, when
-                states.append((upto, since, line.ends_seconds))
-
-        for part, (upto, since, until) in enumerate(states):
-            if until <= since:
-                continue
-            made = draw_line(
-                line.text, width=width, height=height, area=area,
-                into=work / f"sub-{index:04d}-{part:03d}.png",
-                style=style, ink=ink, said_upto=upto,
-            )
-            if made is not None:
-                drawn.append((made, since, until))
-    if not drawn:
+    rate = shape.average_frame_rate or shape.real_frame_rate
+    output_fps = (
+        f"{rate.numerator}/{rate.denominator}"
+        if rate is not None and rate.denominator else "30/1"
+    )
+    prepared = prepare_overlays(
+        lines, aspect=aspect, width=width, height=height, work=work,
+        style=style, words=words,
+    )
+    if not prepared.overlays:
         raise ValueError("no lines with anything on them")
 
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                "-i", str(picture)]
-    for (path, _, _), _, _ in drawn:
-        command += ["-i", str(path)]
+    for overlay in prepared.overlays:
+        command += ["-i", str(overlay.path)]
 
     steps, tag = [], "0:v"
-    for index, ((_, left, top), since, until) in enumerate(drawn):
+    for index, overlay in enumerate(prepared.overlays):
         nxt = f"v{index}"
         steps.append(
-            f"[{tag}][{index + 1}:v]overlay={left}:{top}:"
-            f"enable='between(t,{since:.3f},{until:.3f})'[{nxt}]"
+            f"[{tag}][{index + 1}:v]overlay={overlay.left}:{overlay.top}:"
+            f"enable='gte(t,{overlay.starts_seconds:.3f})*"
+            f"lt(t,{overlay.ends_seconds:.3f})'[{nxt}]"
         )
         tag = nxt
     command += [
         "-filter_complex", ";".join(steps),
         "-map", f"[{tag}]", "-map", "0:a?",
         "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p", "-c:a", "copy", str(destination),
+        "-pix_fmt", "yuv420p", "-r", output_fps,
+        "-fps_mode", "cfr", "-c:a", "copy", str(destination),
     ]
     subprocess.run(command, check=True)
     return destination

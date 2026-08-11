@@ -19,6 +19,7 @@ import json
 import shutil
 import subprocess
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from montagewright.executor import RenderPlan, Segment
@@ -184,6 +185,8 @@ def probe_duration(path: Path) -> float:
 def _render_segment(
     segment: Segment, destination: Path, *, video_encoder: str,
     output_size: tuple[int, int] = (1080, 1920),
+    output_fps: int = 30,
+    output_frames: int | None = None,
 ) -> tuple[Path, "Handles"]:
     """Cut one shot, cropping if the plan asked for it."""
 
@@ -209,6 +212,17 @@ def _render_segment(
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)
         filters.append(f"crop={width}:{height}:{x}:{y}")
         filters.append(f"scale={output_size[0]}:{output_size[1]}")
+    # Mixed 23.976/25/29.97/30/60 footage becomes one explicit CFR editing
+    # timeline before concat. Editorial times remain seconds; this is the
+    # single boundary where they are quantised to deliverable frames.
+    filters.append(f"fps=fps={output_fps}:round=near")
+    handle_filters = list(filters)
+    if output_frames is not None:
+        filters.extend([
+            "tpad=stop_mode=clone:stop_duration=1",
+            f"trim=end_frame={output_frames}",
+            "setpts=PTS-STARTPTS",
+        ])
 
     # The delivered segment is cut exactly. Handles are written alongside it
     # as their own file, so a transition or a nudge has material without the
@@ -242,9 +256,14 @@ def _render_segment(
     command += [
         "-c:v", video_encoder, "-b:v", "12M",
         "-c:a", "aac", "-b:a", "192k",
-        "-pix_fmt", "yuv420p",
-        str(destination),
+        "-pix_fmt", "yuv420p", "-r", str(output_fps), "-fps_mode", "cfr",
     ]
+    if output_frames is not None:
+        command += [
+            "-frames:v", str(output_frames),
+            "-t", f"{output_frames / output_fps:.9f}",
+        ]
+    command.append(str(destination))
     _run(command)
 
     if head > 0.0 or tail > 0.0:
@@ -256,12 +275,13 @@ def _render_segment(
                 "-to", f"{segment.out_seconds + tail:.6f}",
                 "-i", str(segment.source.path),
             ]
-            + (["-vf", ",".join(filters)] if filters else [])
+            + (["-vf", ",".join(handle_filters)] if handle_filters else [])
             + audio
             + [
                 "-c:v", video_encoder, "-b:v", "12M",
                 "-c:a", "aac", "-b:a", "192k",
-                "-pix_fmt", "yuv420p", str(spare),
+                "-pix_fmt", "yuv420p", "-r", str(output_fps),
+                "-fps_mode", "cfr", str(spare),
             ]
         )
     return destination, Handles(head_seconds=head, tail_seconds=tail)
@@ -521,11 +541,28 @@ def render(
     video_encoder = _encoder("h264_videotoolbox", "libx264")
 
     segment_paths: list[tuple[Path, "Handles", float]] = []
+    elapsed_seconds = Decimal("0")
+    allocated_frames = 0
     for index, segment in enumerate(plan.segments):
+        elapsed_seconds += Decimal(str(segment.duration_seconds))
+        end_frame = int(
+            (elapsed_seconds * plan.output_fps).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+        segment_frames = end_frame - allocated_frames
+        if segment_frames < 1:
+            raise RenderError(
+                f"{segment.clip_id} is shorter than one {plan.output_fps} fps "
+                "timeline frame"
+            )
+        allocated_frames = end_frame
         destination = segment_dir / f"{index:03d}-{segment.clip_id}.mp4"
         rendered, handles = _render_segment(
             segment, destination, video_encoder=video_encoder,
             output_size=plan.output_size,
+            output_fps=plan.output_fps,
+            output_frames=segment_frames,
         )
         segment_paths.append((rendered, handles, segment.duration_seconds))
 

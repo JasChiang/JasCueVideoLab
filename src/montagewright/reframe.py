@@ -1454,6 +1454,31 @@ def _eased(start: float, end: float, at: float, span: float) -> str:
     return f"{start:.3f}+({delta:.3f})*({unit}*{unit}*(3-2*{unit}))"
 
 
+def interpolate_crop_keyframes(
+    keys: list[dict], seconds: float, *, ease: bool = True
+) -> dict | None:
+    """Numeric twin of the ffmpeg crop path used by evidence consumers."""
+
+    if not keys:
+        return None
+    before, after = keys[0], keys[-1]
+    for left, right in zip(keys, keys[1:]):
+        if float(left["at"]) <= seconds <= float(right["at"]):
+            before, after = left, right
+            break
+    span = float(after["at"]) - float(before["at"])
+    share = 0.0 if span <= 0 else max(
+        0.0, min(1.0, (seconds - float(before["at"])) / span)
+    )
+    if ease:
+        share = share * share * (3.0 - 2.0 * share)
+    return {
+        key: float(before[key])
+        + (float(after[key]) - float(before[key])) * share
+        for key in ("x", "y", "w", "h")
+    }
+
+
 def _axis_expression(
     path: CropPath, pick, scale: int, *, ease: bool = True
 ) -> str:

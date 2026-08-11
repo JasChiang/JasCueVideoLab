@@ -12,6 +12,7 @@ from montagewright.graphics import (
     GraphicsPlan,
     LayoutEvidence,
     burn_graphics,
+    compile_graphic,
     minimum_read_seconds,
     validate_for_render,
     validate_brief_authority,
@@ -148,6 +149,21 @@ def test_explicit_lower_position_collides_with_subtitles():
     assert any("overlaps subtitles" in fault for fault in faults)
 
 
+def test_concurrency_validation_uses_real_active_sets_not_pairwise_overlap():
+    plan = GraphicsPlan(
+        facts=[fact("a", "A"), fact("b", "B"), fact("c", "C")],
+        cues=[
+            cue(graphic_id="a", primary_fact_id="a", at_seconds=0, duration_seconds=10),
+            cue(graphic_id="b", primary_fact_id="b", at_seconds=0, duration_seconds=1),
+            cue(graphic_id="c", primary_fact_id="c", at_seconds=9, duration_seconds=1),
+        ],
+    )
+
+    faults = validate_for_render(plan, duration_seconds=10)
+
+    assert not any("more than two" in fault for fault in faults)
+
+
 def test_auto_layout_chooses_quiet_side_across_frames(tmp_path: Path):
     from PIL import Image, ImageDraw
 
@@ -221,6 +237,183 @@ def test_graphics_burn_to_a_separate_deliverable(tmp_path: Path):
     assert (tmp_path / "work" / "layout.json").exists()
 
 
+def test_single_pass_composites_two_cards_subtitles_and_audio(tmp_path: Path):
+    import json
+    import subprocess
+    from montagewright.subtitles import prepare_overlays
+    from montagewright.transcript import Line
+
+    source = tmp_path / "clean-with-audio.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=0x283040:s=360x640:d=3:r=30000/1001",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", str(source),
+    ], check=True)
+    track = prepare_overlays([
+        Line("first line", 0.3, 1.0),
+        Line("second line", 1.4, 2.2),
+    ], aspect="9:16", width=360, height=640, work=tmp_path / "subs")
+    plan = GraphicsPlan(
+        facts=[fact("one", "First"), fact("two", "Second")],
+        cues=[
+                cue(
+                    graphic_id="g00", primary_fact_id="one",
+                    kind="callout", template="stat_badge", position="auto",
+                    at_seconds=.25, duration_seconds=2.5, z_index=5,
+                ),
+                cue(
+                    graphic_id="g01", primary_fact_id="two",
+                    kind="callout", template="stat_badge", position="auto",
+                    at_seconds=.25, duration_seconds=2.5, z_index=-1,
+                ),
+        ],
+    )
+    destination = tmp_path / "combined.mp4"
+
+    burn_graphics(
+        source, plan, destination, work=tmp_path / "graphics",
+        subtitle_windows=track.windows, subtitle_boxes=track.boxes,
+        subtitle_overlays=list(track.overlays),
+    )
+
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries",
+        "format=duration:stream=codec_type,avg_frame_rate", "-of", "json",
+        str(destination),
+    ], check=True, capture_output=True, text=True)
+    media = json.loads(probe.stdout)
+    assert {stream["codec_type"] for stream in media["streams"]} == {"video", "audio"}
+    assert float(media["format"]["duration"]) == pytest.approx(3.0, abs=0.05)
+    video = next(stream for stream in media["streams"] if stream["codec_type"] == "video")
+    assert video["avg_frame_rate"] == "30000/1001"
+    layout = json.loads((tmp_path / "graphics" / "layout.json").read_text())
+    assert layout["g00"]["z_index"] == 5
+    assert layout["g01"]["z_index"] == -1
+    assert layout["g01"]["avoids_graphic_ids"] == ["g00"]
+    assert len(track.overlays) == 2
+    assert track.boxes[0][2:] == (
+        track.overlays[0].left, track.overlays[0].top,
+        track.overlays[0].width, track.overlays[0].height,
+    )
+
+
+def test_failed_compositor_keeps_previous_delivery_atomic(
+    tmp_path: Path, monkeypatch
+):
+    import subprocess
+    import montagewright.graphics as graphics
+
+    source = tmp_path / "clean.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=black:s=360x640:d=3:r=30",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True)
+    destination = tmp_path / "final.mp4"
+    destination.write_bytes(b"previous-good-delivery")
+    original = graphics.subprocess.run
+
+    def fail_only_the_compositor(command, *args, **kwargs):
+        if "-filter_complex" in command:
+            return subprocess.CompletedProcess(command, 1, "", "")
+        return original(command, *args, **kwargs)
+
+    monkeypatch.setattr(graphics.subprocess, "run", fail_only_the_compositor)
+    plan = GraphicsPlan(facts=[fact()], cues=[cue(duration_seconds=2.0)])
+
+    with pytest.raises(RuntimeError, match="compositor failed"):
+        burn_graphics(source, plan, destination, work=tmp_path / "work")
+
+    assert destination.read_bytes() == b"previous-good-delivery"
+    assert not list(tmp_path.glob(".final-*.mp4"))
+
+
+def test_auto_contrast_repairs_white_text_on_white_picture(tmp_path: Path):
+    from PIL import Image
+
+    plan = GraphicsPlan(
+        facts=[fact(text="看得見的白字")],
+        cues=[cue(
+            template="editorial_rule", background="none",
+            style=GraphicStyle(contrast_mode="auto"),
+        )],
+    )
+    _, report = compile_graphic(
+        plan.cues[0], plan, width=360, height=640,
+        into=tmp_path / "card.png",
+        frames=[Image.new("RGB", (360, 640), "white") for _ in range(3)],
+    )
+
+    assert report["fallback_plate"] is True
+    assert report["contrast_ratio"] >= 4.5
+    assert "dark_plate" in report["contrast_adjustments"]
+
+
+def test_strict_unreadable_colours_fail_closed(tmp_path: Path):
+    from PIL import Image
+
+    plan = GraphicsPlan(
+        facts=[fact(text="不能偷偷更改")],
+        cues=[cue(
+            template="editorial_rule", background="none",
+            style=GraphicStyle(
+                primary_color="#FFFFFF", contrast_mode="strict"
+            ),
+        )],
+    )
+    with pytest.raises(ValueError, match="contrast"):
+        compile_graphic(
+            plan.cues[0], plan, width=360, height=640,
+            into=tmp_path / "locked.png",
+            frames=[Image.new("RGB", (360, 640), "white") for _ in range(3)],
+        )
+
+
+def test_high_contrast_outline_can_remain_plate_free(tmp_path: Path):
+    from PIL import Image
+
+    plan = GraphicsPlan(
+        facts=[fact(text="描邊字")],
+        cues=[cue(
+            template="editorial_rule", background="none",
+            style=GraphicStyle(
+                primary_color="#FFFFFF", stroke_color="#000000",
+                stroke_width=5,
+            ),
+        )],
+    )
+    _, report = compile_graphic(
+        plan.cues[0], plan, width=360, height=640,
+        into=tmp_path / "outlined.png",
+        frames=[Image.new("RGB", (360, 640), "white") for _ in range(3)],
+    )
+
+    assert report["fallback_plate"] is False
+    assert report["contrast_ratio"] >= 4.5
+
+
+def test_enlarged_card_stays_inside_safe_frame(tmp_path: Path):
+    from montagewright.graphics import draw_graphic
+
+    plan = GraphicsPlan(
+        facts=[fact(text="大型標題")],
+        cues=[cue(
+            template="hero_center", position="upper_left",
+            style=GraphicStyle(max_width_scale=1.25),
+        )],
+    )
+    card = draw_graphic(
+        plan.cues[0], plan, width=1080, height=1920,
+        into=tmp_path / "wide.png",
+    )
+
+    assert card.left >= 0 and card.top >= 0
+    assert card.left + card.width <= 1080
+    assert card.top + card.height <= 1920
+
+
 def test_multiline_center_and_end_templates_render(tmp_path: Path):
     from montagewright.graphics import draw_graphic
 
@@ -255,6 +448,175 @@ def test_old_graphics_json_without_style_gets_safe_defaults():
     assert loaded.style == GraphicStyle()
     assert loaded.style.stroke_width == 0
     assert loaded.style.shadow_opacity == 0
+
+
+def test_old_graphics_json_gets_resolution_independent_transform_defaults():
+    loaded = GraphicCue.model_validate({
+        "graphic_id": "legacy", "kind": "product_name",
+        "primary_fact_id": "name", "status": "draft",
+    })
+
+    assert loaded.transform.x == loaded.transform.y == 0.5
+    assert loaded.transform.scale == 1.0
+    assert loaded.transform.rotation_degrees == 0.0
+    assert loaded.transform.locked is False
+
+
+def test_manual_transform_places_scaled_rotated_card_by_its_centre(tmp_path: Path):
+    from PIL import Image
+
+    transformed = cue(
+        position="manual", motion="none",
+        transform={"x": 0.5, "y": 0.4, "scale": 0.75,
+                   "rotation_degrees": 5},
+        background="none",
+    )
+    plan = GraphicsPlan(facts=[fact(text="自由拖曳")], cues=[transformed])
+    card, report = compile_graphic(
+        transformed, plan, width=1080, height=1920,
+        into=tmp_path / "manual.png",
+        frames=[Image.new("RGB", (1080, 1920), "black") for _ in range(3)],
+    )
+
+    assert card.left + card.width / 2 == pytest.approx(1080 * 0.5, abs=1)
+    assert card.top + card.height / 2 == pytest.approx(1920 * 0.4, abs=1)
+    assert report["authored_transform"]["scale"] == 0.75
+    assert report["authored_transform"]["rotation_degrees"] == 5
+    assert Image.open(card.path).size == Image.open(card.text_mask_path).size
+    assert Image.open(card.path).size == Image.open(card.backing_path).size
+
+
+def test_locked_manual_transform_fails_instead_of_silently_moving(tmp_path: Path):
+    from PIL import Image
+
+    locked = cue(
+        position="manual", motion="none",
+        transform={"x": 0.0, "y": 0.0, "locked": True},
+    )
+    plan = GraphicsPlan(facts=[fact()], cues=[locked])
+
+    with pytest.raises(ValueError, match="manual position"):
+        compile_graphic(
+            locked, plan, width=1080, height=1920,
+            into=tmp_path / "locked-position.png",
+            frames=[Image.new("RGB", (1080, 1920), "black") for _ in range(3)],
+        )
+
+
+def test_fixed_anchor_is_recomputed_after_scale_and_rotation(tmp_path: Path):
+    from PIL import Image
+
+    transformed = cue(
+        position="upper_right", motion="none",
+        transform={"scale": 0.7, "rotation_degrees": 12},
+    )
+    plan = GraphicsPlan(facts=[fact()], cues=[transformed])
+    card, _ = compile_graphic(
+        transformed, plan, width=1080, height=1920,
+        into=tmp_path / "anchored.png",
+        frames=[Image.new("RGB", (1080, 1920), "black") for _ in range(3)],
+    )
+
+    assert card.left + card.width == 1080 - round(1080 * 0.075)
+    assert card.top == round(1920 * 0.09)
+
+
+def test_tiny_rotated_glyph_never_skips_contrast_audit(tmp_path: Path):
+    from PIL import Image
+
+    tiny = cue(
+        template="stat_badge", kind="callout", motion="none",
+        background="none", transform={"scale": 0.25, "rotation_degrees": 15},
+        style=GraphicStyle(
+            primary_scale=0.55, primary_color="#FFFFFF",
+            contrast_mode="strict",
+        ),
+    )
+    plan = GraphicsPlan(facts=[fact(text="I")], cues=[tiny])
+
+    with pytest.raises(ValueError, match="contrast"):
+        compile_graphic(
+            tiny, plan, width=360, height=640,
+            into=tmp_path / "tiny.png",
+            frames=[Image.new("RGB", (360, 640), "white") for _ in range(3)],
+        )
+
+
+def test_scaled_away_outline_cannot_claim_contrast_it_did_not_render(
+    tmp_path: Path,
+):
+    from PIL import Image
+
+    tiny = cue(
+        template="stat_badge", kind="callout", motion="none",
+        background="none", transform={"scale": 0.25},
+        style=GraphicStyle(
+            primary_scale=0.55, primary_color="#FFFFFF",
+            stroke_color="#000000", stroke_width=2,
+            contrast_mode="strict",
+        ),
+    )
+    plan = GraphicsPlan(facts=[fact(text="I")], cues=[tiny])
+
+    with pytest.raises(ValueError, match="contrast"):
+        compile_graphic(
+            tiny, plan, width=360, height=640,
+            into=tmp_path / "no-physical-outline.png",
+            frames=[Image.new("RGB", (360, 640), "white") for _ in range(3)],
+        )
+
+
+def test_uniform_scale_fails_instead_of_squashing_width_only(tmp_path: Path):
+    from PIL import Image
+
+    huge = cue(transform={"scale": 3.0}, motion="none")
+    plan = GraphicsPlan(facts=[fact()], cues=[huge])
+
+    with pytest.raises(ValueError, match="uniform scale"):
+        compile_graphic(
+            huge, plan, width=1080, height=1920,
+            into=tmp_path / "huge.png",
+            frames=[Image.new("RGB", (1080, 1920), "black") for _ in range(3)],
+        )
+
+
+def test_collision_overlap_is_symmetric_for_large_and_small_cards():
+    from montagewright.graphics import _rect_overlap
+
+    small = (100, 100, 20, 20)
+    large = (0, 0, 240, 240)
+
+    assert _rect_overlap(small, large) == 1.0
+    assert _rect_overlap(large, small) == 1.0
+
+
+def test_long_cue_contrast_samples_inside_actual_entrance():
+    from montagewright.graphics import _layout_sample_shares
+
+    long_title = cue(duration_seconds=30, motion="slide_left")
+    first, middle, last = _layout_sample_shares(long_title)
+
+    assert first * long_title.duration_seconds == pytest.approx(0.225)
+    assert (middle, last) == (0.5, 0.97)
+
+
+def test_v1_graphics_preserve_legacy_overlap_order():
+    loaded = GraphicsPlan.model_validate({
+        "version": "montagewright-graphics-v1",
+        "facts": [fact().model_dump(mode="json")],
+        "cues": [cue().model_dump(mode="json", exclude={"collision_policy"})],
+    })
+
+    assert loaded.version == "montagewright-graphics-v2"
+    assert loaded.cues[0].collision_policy == "allow"
+
+
+def test_legacy_explicit_colours_do_not_gain_silent_auto_fallback():
+    loaded = GraphicStyle.model_validate({
+        "primary_color": "#FFFFFF", "stroke_width": 4,
+    })
+
+    assert loaded.contrast_mode == "strict"
 
 
 def test_adjustable_outline_shadow_border_and_emphasis_render(tmp_path: Path):
@@ -398,26 +760,85 @@ def test_web_preview_uses_the_production_card_compiler(tmp_path: Path):
         )
         subprocess.run([
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", "color=c=black:s=360x640:d=1:r=30",
+            "-f", "lavfi", "-i", "color=c=black:s=360x640:d=4:r=30",
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
             str(here / "out" / "deliverable.mp4"),
         ], check=True)
         payload = GraphicsPlan(
-            facts=[fact()], cues=[cue(
-                status="draft", style=GraphicStyle(
-                    preset="outlined", stroke_width=6,
+            facts=[fact(), fact("second", "A much longer second card")],
+            cues=[
+                cue(
+                    status="draft", style=GraphicStyle(
+                        preset="outlined", stroke_width=6,
+                    ),
                 ),
-            )],
+                cue(
+                    graphic_id="g01", primary_fact_id="second",
+                    status="draft", position="upper_right",
+                ),
+            ],
         ).model_dump(mode="json")
         client = TestClient(web.create_app())
 
         compiled = client.post(
             "/api/runs/r1/graphics-preview/g00", json=payload
         )
+        second = client.post(
+            "/api/runs/r1/graphics-preview/g01", json=payload
+        )
 
         assert compiled.status_code == 200
+        assert second.status_code == 200
+        assert compiled.json()["url"] != second.json()["url"]
+        assert client.get(compiled.json()["url"]).content != client.get(
+            second.json()["url"]
+        ).content
         assert compiled.json()["card_width"] > 0
         assert client.get(compiled.json()["url"]).headers["content-type"] == "image/png"
+
+        joint = GraphicsPlan(
+            facts=[fact(), fact("second", "Second")],
+            cues=[
+                cue(status="approved", position="auto"),
+                cue(
+                    graphic_id="g01", primary_fact_id="second",
+                    status="draft", position="upper_right",
+                ),
+            ],
+        )
+        before = client.post(
+            "/api/runs/r1/graphics-preview/g01",
+            json=joint.model_dump(mode="json"),
+        )
+        joint = joint.model_copy(update={
+            "cues": [joint.cues[0], joint.cues[1].model_copy(
+                update={"status": "approved"}
+            )],
+        })
+        after = client.post(
+            "/api/runs/r1/graphics-preview/g01",
+            json=joint.model_dump(mode="json"),
+        )
+        assert before.status_code == after.status_code == 200
+        for graphic_id in ("g00", "g01"):
+            assert before.json()["joint_layout"][graphic_id]["animation"] == (
+                after.json()["joint_layout"][graphic_id]["animation"]
+            )
+
+        strict = GraphicsPlan(
+            facts=[fact()], cues=[cue(
+                status="draft", template="editorial_rule",
+                background="none", style=GraphicStyle(
+                    primary_color="#000000", contrast_mode="strict",
+                ),
+            )],
+        )
+        blocked = client.post(
+            "/api/runs/r1/graphics-preview/g00",
+            json=strict.model_dump(mode="json"),
+        )
+        assert blocked.status_code == 422
+        assert "contrast" in blocked.json()["detail"]
     finally:
         web.RUNS_ROOT = was
         web.RUNS.pop("r1", None)
@@ -562,3 +983,15 @@ def test_durable_sam_track_becomes_cue_window_layout_evidence(tmp_path: Path):
     assert found["g00"].subject_boxes[0] == pytest.approx(
         (0.3, 0.2, 0.4, 0.6)
     )
+
+
+def test_layout_evidence_uses_the_same_smoothstep_as_rendered_crop():
+    from montagewright.reframe import interpolate_crop_keyframes
+
+    crop = interpolate_crop_keyframes([
+        {"at": 0.0, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        {"at": 1.0, "x": 1.0, "y": 0.0, "w": 1.0, "h": 1.0},
+    ], 0.25)
+
+    assert crop is not None
+    assert crop["x"] == pytest.approx(0.15625)

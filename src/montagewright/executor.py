@@ -152,6 +152,9 @@ class RenderPlan:
     segments: list[Segment]
     # Pixels, not "whatever the first crop happened to measure".
     output_size: tuple[int, int] = (1080, 1920)
+    # One CFR timeline for every source. Source FPS is observation, not a
+    # property that may leak across cuts into a concatenated deliverable.
+    output_fps: int = 30
     # Where in the track the bed starts, carried from the EDL so the renderer
     # does not have to know about planning to lay music that is not the intro.
     music_from_seconds: float = 0.0
@@ -220,6 +223,7 @@ def plan_render(
     target_aspect: float | None = None,
     crop_paths: "dict[str, CropPath] | None" = None,
     output_size: "tuple[int, int] | None" = None,
+    output_fps: int = 30,
 ) -> RenderPlan:
     """Compile an EDL into segments. Never returns fewer than it was given.
 
@@ -229,6 +233,8 @@ def plan_render(
     useful for telling an execution bug apart from a planning one.
     """
 
+    if output_fps not in {24, 25, 30, 50, 60}:
+        raise ValueError("output_fps must be one of 24, 25, 30, 50 or 60")
     segments: list[Segment] = []
     degradations: list[DegradationStep] = []
     notes: list[str] = []
@@ -276,6 +282,7 @@ def plan_render(
         degradations=degradations,
         notes=notes,
         output_size=output_size or delivery_size(target_aspect or 9 / 16),
+        output_fps=output_fps,
         music_from_seconds=getattr(edl, "music_from_seconds", 0.0),
         music_spans=list(getattr(edl, "music_spans", []) or []),
     )
