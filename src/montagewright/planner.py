@@ -643,30 +643,64 @@ def decide_rhythm(
         },
         "response_format": structured_json(_rhythm_schema(clip_ids)),
     }
-
-    interaction = ask(
-        client, ledger=ledger, budget_stage="rhythm", **request
-    )
-    payload = _parse(interaction, what="rhythm pass")
-    decisions = {
-        entry["clip_id"]: entry for entry in payload.get("decisions", [])
-    }
-
-    missing = set(clip_ids) - set(decisions)
-    if missing:
-        raise PlannerError(
-            f"the rhythm pass skipped {sorted(missing)}; every shot needs a "
-            "decision because a missing one silently keeps its placeholder "
-            "length"
+    usage_total = Usage(0, 0, 0)
+    attempt_input = request_input
+    coverage_faults: tuple[str, ...] = ()
+    for attempt in range(2):
+        request["input"] = attempt_input
+        interaction = ask(
+            client, ledger=ledger, budget_stage="rhythm", **request
         )
+        used = Usage.from_interaction(interaction)
+        usage_total = Usage(
+            usage_total.input_tokens + used.input_tokens,
+            usage_total.output_tokens + used.output_tokens,
+            usage_total.thought_tokens + used.thought_tokens,
+        )
+        payload = _parse(interaction, what="rhythm pass")
+        decisions = {
+            entry["clip_id"]: entry
+            for entry in payload.get("decisions", [])
+        }
 
-    return (
-        _apply(
+        missing = set(clip_ids) - set(decisions)
+        if missing:
+            raise PlannerError(
+                f"the rhythm pass skipped {sorted(missing)}; every shot needs "
+                "a decision because a missing one silently keeps its "
+                "placeholder length"
+            )
+
+        candidate = _apply(
             edl, decisions,
             payload.get("music_from_seconds"),
             payload.get("music_spans"),
-        ),
-        Usage.from_interaction(interaction),
+        )
+        from montagewright.coverage import edl_coverage_audit
+
+        coverage = edl_coverage_audit(candidate, target_seconds)
+        coverage_faults = coverage.faults
+        if target_seconds <= 0 or not coverage_faults:
+            return candidate, usage_total
+        if attempt == 0:
+            attempt_input = request_input + [{
+                "type": "text",
+                "text": (
+                    "## 上一版節奏沒有足夠的內容證據，請重做完整節奏\n\n"
+                    "以下秒數由本機依逐字稿聲音與畫面任務重算。"
+                    "只能在已選內容真正能支持的範圍內改長度；不可把"
+                    " speaker、B-roll 或靜態畫面一起拉長來湊總秒數。"
+                    "若這組 shots 本身不足，仍請給最自然、無死空氣的"
+                    "版本，本機會把它交回結構選片重規劃。\n\n- "
+                    + "\n- ".join(coverage_faults)
+                    + "\n\n上一版答案：\n"
+                    + json.dumps(payload, ensure_ascii=False)
+                ),
+            }]
+    raise PlannerError(
+        "rhythm cannot satisfy the target with evidence from the selected "
+        "shots; structural selection must add content or shorten the target: "
+        + "; ".join(coverage_faults)
     )
 
 
@@ -1030,6 +1064,10 @@ class MaterialItem:
     # windows out of a talking head by how it looks, which is how a cut lands
     # in the middle of an answer.
     speech: tuple[str, ...] = ()
+    # Exact canonical transcript clock. `speech` is deliberately formatted
+    # for a human/model prompt and rounded to tenths; arithmetic must never
+    # parse that presentation string back into a timeline.
+    audio_spans: tuple[tuple[str, float, float], ...] = ()
 
 
 def _direction_schema() -> dict[str, Any]:
@@ -1577,6 +1615,8 @@ def _selection_schema(
                                 "speaker", "primary_action",
                                 "illustrative_broll", "reaction",
                                 "establishing", "transition",
+                                "punchline_hold", "end_hold",
+                                "title_read", "music_montage",
                             ],
                             "description": (
                                 "為什麼此刻要看這個畫面，獨立於原音是否保留。"
@@ -1586,6 +1626,11 @@ def _selection_schema(
                                 "只拿人物畫面覆蓋別段聲音要用 reaction 或 "
                                 "illustrative_broll；描述那句"
                                 "內容的產品畫面可填 illustrative_broll。"
+                                "可獨立完成的可見動作用 primary_action；"
+                                "刻意讓笑點落地用 punchline_hold；只有最後一顆"
+                                "可用 end_hold；必須讓觀眾讀完畫面文字用"
+                                " title_read；由音樂與多顆視覺共同推進、不是"
+                                "延長單顆畫面時才用 music_montage。"
                             ),
                         },
                         "audio_reason": {
@@ -2066,6 +2111,18 @@ def select_shots(
                     f"{span_id} from {voice_source}; use the same source or "
                     "change picture_role to reaction/illustrative_broll"
                 )
+        # A numerically correct duration is not necessarily a film.  Prove
+        # that every requested second is carried by canonical speech,
+        # retained synchronous/ambient sound, or a bounded visual task.  This
+        # catches the common failure where a short selection is inflated by
+        # leaving dead air after every speaker shot, without privileging any
+        # particular genre or source folder.
+        from montagewright.coverage import selection_coverage_audit
+
+        coverage = selection_coverage_audit(
+            chosen, usable, float(direction.get("target_seconds") or 0.0)
+        )
+        faults.extend(coverage.faults)
         faults.extend(sequence_disagreements(chosen.get("shots") or []))
         if not faults:
             break

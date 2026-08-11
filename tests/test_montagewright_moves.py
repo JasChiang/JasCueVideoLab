@@ -5886,3 +5886,254 @@ def test_a_sample_is_the_same_clips_every_time_and_spread_across_the_shoot():
     for total, n in ((74, 12), (5, 5), (7, 3), (3, 10)):
         got = pick(total, min(n, total))
         assert max(got) < total and len(set(got)) == len(got), (total, n)
+
+
+def test_timeline_coverage_rejects_speaker_tails_used_as_duration_filler():
+    """Nine plausible pauses are still nine pauses, not ten seconds of film."""
+
+    from montagewright.coverage import selection_coverage_audit
+    from montagewright.planner import MaterialItem
+
+    material = []
+    shots = []
+    audio = []
+    for index in range(9):
+        source_id = f"S{index:02d}"
+        span_id = f"t{index:02d}"
+        material.append(MaterialItem(
+            source_id=source_id,
+            duration_seconds=10.0,
+            summary="answer",
+            speech=(f"`{span_id}` 0.0-5.6s speaker: answer",),
+        ))
+        shots.append({
+            "source_id": source_id,
+            "seconds_needed": 60.0 / 9.0,
+            "picture_role": "speaker",
+            "audio_role": "discard",
+        })
+        audio.append({
+            "audio_span_id": span_id,
+            "starts_at_shot_index": index,
+            "offset_seconds": 0.0,
+        })
+
+    audit = selection_coverage_audit(
+        {"shots": shots, "audio_assignments": audio}, material, 60.0
+    )
+    assert audit.duration_seconds == pytest.approx(60.0)
+    assert audit.supported_seconds == pytest.approx(53.1)
+    assert any("not longer holds" in fault for fault in audit.faults)
+    assert sum("natural lead/tail" in fault for fault in audit.faults) == 9
+
+
+def test_timeline_coverage_is_generic_to_visual_and_audio_evidence():
+    """Products, reactions and end cards use the same proof as interviews."""
+
+    from montagewright.coverage import selection_coverage_audit
+    from montagewright.planner import MaterialItem
+
+    material = [MaterialItem(
+        source_id="PRODUCT", duration_seconds=20.0, summary="folding action",
+        action=("phone unfolds 0.0-8.0s",),
+    )]
+    action = selection_coverage_audit({
+        "shots": [{
+            "source_id": "PRODUCT", "seconds_needed": 8.0,
+            "picture_role": "primary_action", "audio_role": "discard",
+        }],
+        "audio_assignments": [],
+    }, material, 8.0)
+    assert not action.faults
+    assert action.supported_seconds == pytest.approx(8.0)
+
+    padded_broll = selection_coverage_audit({
+        "shots": [{
+            "source_id": "PRODUCT", "seconds_needed": 8.0,
+            "picture_role": "illustrative_broll", "audio_role": "discard",
+        }],
+        "audio_assignments": [],
+    }, material, 8.0)
+    assert any("B-roll" in fault for fault in padded_broll.faults)
+
+    detail = selection_coverage_audit({
+        "shots": [{
+            "source_id": "PRODUCT", "seconds_needed": 3.0,
+            "picture_role": "illustrative_broll", "audio_role": "discard",
+        }],
+        "audio_assignments": [],
+    }, material, 3.0)
+    assert not detail.faults
+
+    intentional = selection_coverage_audit({
+        "shots": [
+            {
+                "source_id": "PRODUCT", "seconds_needed": 1.2,
+                "picture_role": "reaction", "audio_role": "discard",
+            },
+            {
+                "source_id": "PRODUCT", "seconds_needed": 1.4,
+                "picture_role": "end_hold", "audio_role": "discard",
+            },
+        ],
+        "audio_assignments": [],
+    }, material, 2.6)
+    assert not intentional.faults
+
+
+def test_resolved_edl_coverage_uses_the_same_contract_as_selection():
+    from montagewright.coverage import edl_coverage_audit
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    edl = EDL(
+        project_id="coverage",
+        clips=[Clip(
+            clip_id="k00", source_id="VOICE",
+            approx_in_seconds=0.0, approx_out_seconds=5.0,
+            picture_role="speaker", audio_role="discard",
+        )],
+        audio_clips=[AudioClip(
+            audio_id="a00", source_id="VOICE",
+            in_seconds=0.0, out_seconds=3.0,
+            starts_at_clip_id="k00", offset_seconds=0.0,
+            role="narrative", completion="complete_thought",
+        )],
+    )
+    audit = edl_coverage_audit(edl, 5.0)
+    assert audit.supported_seconds == pytest.approx(3.3)
+    assert any("natural lead/tail" in fault for fault in audit.faults)
+
+
+def test_only_the_last_shot_may_claim_an_end_hold():
+    from montagewright.coverage import selection_coverage_audit
+    from montagewright.planner import MaterialItem
+
+    material = [MaterialItem(source_id="A", duration_seconds=5, summary="")]
+    audit = selection_coverage_audit({
+        "shots": [
+            {"source_id": "A", "seconds_needed": 1.0,
+             "picture_role": "end_hold", "audio_role": "discard"},
+            {"source_id": "A", "seconds_needed": 1.0,
+             "picture_role": "primary_action", "audio_role": "discard"},
+        ],
+        "audio_assignments": [],
+    }, material, 2.0)
+    assert any("only valid on the final shot" in fault for fault in audit.faults)
+
+
+def test_independent_sync_audio_is_timeline_coverage_too():
+    """The generic audit is not synonymous with interview narration."""
+
+    from montagewright.coverage import edl_coverage_audit
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    edl = EDL(
+        project_id="sync-action",
+        clips=[Clip(
+            clip_id="k00", source_id="PICTURE",
+            approx_in_seconds=0.0, approx_out_seconds=2.0,
+            picture_role="illustrative_broll", audio_role="discard",
+        )],
+        audio_clips=[AudioClip(
+            audio_id="a00", source_id="SOUND",
+            in_seconds=4.0, out_seconds=6.0,
+            starts_at_clip_id="k00", offset_seconds=0.0,
+            role="sync_action", completion="complete_action_sound",
+        )],
+    )
+    audit = edl_coverage_audit(edl, 2.0)
+    assert not audit.faults
+    assert audit.supported_seconds == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("role", ["primary_action", "music_montage"])
+def test_a_role_name_cannot_launder_a_static_minute(role):
+    from montagewright.coverage import selection_coverage_audit
+    from montagewright.planner import MaterialItem
+
+    audit = selection_coverage_audit({
+        "shots": [{
+            "source_id": "STATIC", "seconds_needed": 60.0,
+            "picture_role": role, "audio_role": "discard",
+        }],
+        "audio_assignments": [],
+    }, [MaterialItem(
+        source_id="STATIC", duration_seconds=60.0, summary="still product"
+    )], 60.0)
+    assert audit.supported_seconds <= 4.0
+    assert audit.faults
+
+
+def test_an_audio_role_name_cannot_launder_a_static_minute():
+    from montagewright.coverage import selection_coverage_audit
+    from montagewright.planner import MaterialItem
+
+    audit = selection_coverage_audit({
+        "shots": [{
+            "source_id": "STATIC", "seconds_needed": 60.0,
+            "picture_role": "illustrative_broll",
+            "audio_role": "ambient_texture",
+        }],
+        "audio_assignments": [],
+    }, [MaterialItem(
+        source_id="STATIC", duration_seconds=60.0, summary="still product"
+    )], 60.0)
+    assert audit.supported_seconds <= 6.0
+    assert audit.faults
+
+
+def test_coverage_uses_exact_audio_spans_not_rounded_prompt_copy():
+    from montagewright.coverage import selection_coverage_audit
+    from montagewright.planner import MaterialItem
+
+    material = [MaterialItem(
+        source_id="VOICE", duration_seconds=2.0, summary="answer",
+        speech=("`t00` 0.0-1.0s speaker: rounded",),
+        audio_spans=(("t00", 0.0, 1.049),),
+    )]
+    audit = selection_coverage_audit({
+        "shots": [{
+            "source_id": "VOICE", "seconds_needed": 1.349,
+            "picture_role": "speaker", "audio_role": "discard",
+        }],
+        "audio_assignments": [{
+            "audio_span_id": "t00", "starts_at_shot_index": 0,
+            "offset_seconds": 0.0,
+        }],
+    }, material, 1.349)
+    assert not audit.faults
+    assert audit.supported_seconds == pytest.approx(1.349)
+
+
+def test_coverage_rejects_large_over_delivery_too():
+    from montagewright.coverage import selection_coverage_audit
+    from montagewright.planner import MaterialItem
+
+    audit = selection_coverage_audit({
+        "shots": [{
+            "source_id": "MOVE", "seconds_needed": 100.0,
+            "picture_role": "primary_action", "audio_role": "discard",
+        }],
+        "audio_assignments": [],
+    }, [MaterialItem(
+        source_id="MOVE", duration_seconds=100.0, summary="continuous move",
+        camera_moves=True,
+    )], 60.0)
+    assert any("over by 40.00s" in fault for fault in audit.faults)
+
+
+def test_missing_picture_role_is_bounded_not_assumed_to_be_action():
+    from montagewright.coverage import selection_coverage_audit
+    from montagewright.planner import MaterialItem
+
+    audit = selection_coverage_audit({
+        "shots": [{
+            "source_id": "LEGACY", "seconds_needed": 10.0,
+            "audio_role": "discard",
+        }],
+        "audio_assignments": [],
+    }, [MaterialItem(
+        source_id="LEGACY", duration_seconds=10.0, summary="old cache"
+    )], 10.0)
+    assert audit.supported_seconds == pytest.approx(3.0)
+    assert audit.faults

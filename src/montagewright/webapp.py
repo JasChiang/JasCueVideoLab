@@ -1556,6 +1556,11 @@ def create_app() -> FastAPI:
                     str(current_blocks[index].get("picture_role", "primary_action"))
                     if current_blocks else str(shot.get("picture_role", "primary_action"))
                 ),
+                "coverage_claim_seconds": (
+                    current_blocks[index].get("coverage_claim_seconds")
+                    if current_blocks
+                    else shot.get("coverage_claim_seconds")
+                ),
                 "in_seconds": (
                     float(current_blocks[index]["in_seconds"])
                     if current_blocks
@@ -1695,6 +1700,9 @@ def create_app() -> FastAPI:
                 ),
                 picture_role=entry.get(
                     "picture_role", plan.get("picture_role", "primary_action")
+                ),
+                coverage_claim_seconds=entry.get(
+                    "coverage_claim_seconds", plan.get("coverage_claim_seconds")
                 ),
                 reframe=reframe_of(plan),
             ))
@@ -1974,6 +1982,7 @@ def create_app() -> FastAPI:
                         "audio_role": segment.audio_role,
                         "audio_completion": segment.audio_completion,
                         "picture_role": segment.picture_role,
+                        "coverage_claim_seconds": segment.coverage_claim_seconds,
                     }
                     for index, (segment, (start, end)) in enumerate(
                         zip(plan.segments, frame_spans, strict=True)

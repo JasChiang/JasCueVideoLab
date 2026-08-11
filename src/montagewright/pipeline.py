@@ -165,6 +165,9 @@ class Report:
     # beat-led length -- and the result was a third of the intended film with
     # nobody reporting the gap.
     target_seconds: float | None = None
+    coverage_seconds: float | None = None
+    unsupported_seconds: float | None = None
+    coverage_details: list[dict] = field(default_factory=list)
     moves_too_short: dict[str, str] = field(default_factory=dict)
     rhythm_decisions: dict[str, dict] = field(default_factory=dict)
     # Enlargement actually applied per shot. Reported as a number because
@@ -1632,6 +1635,33 @@ def run(
     edl, pacing_notes = _audit_static_holds(edl, max_static_seconds)
     report.plan_disagreements.extend(pacing_notes)
     report.plan_disagreements.extend(_resolved_sequence_disagreements(edl))
+    # Release gate: the sequence and rhythm passes already had a chance to
+    # repair this.  At the resolved source clock we only verify; silently
+    # trimming here would move music, subtitles and every downstream frame.
+    from montagewright.coverage import (
+        TimelineCoverageError, edl_coverage_audit,
+    )
+
+    coverage = edl_coverage_audit(edl, target_seconds)
+    report.coverage_seconds = round(coverage.supported_seconds, 3)
+    report.unsupported_seconds = round(coverage.unsupported_seconds, 3)
+    report.coverage_details = [
+        {
+            "clip_id": entry.clip_id,
+            "picture_role": entry.picture_role,
+            "seconds": round(entry.seconds, 3),
+            "audio_seconds": round(entry.audio_seconds, 3),
+            "visual_only_seconds": round(entry.visual_only_seconds, 3),
+            "supported_seconds": round(entry.supported_seconds, 3),
+        }
+        for entry in coverage.entries
+    ]
+    if target_seconds > 0 and coverage.faults:
+        raise TimelineCoverageError(
+            "final timeline contains duration without content evidence; "
+            "selection/rhythm must be structurally replanned: "
+            + "; ".join(coverage.faults)
+        )
     # Rhythm now fixes the picture timeline, so this is the first point where
     # a return to the speaker after B-roll can be mapped to the exact progress
     # of the continuing audio assignment.  It must precede SAM/reframing.
@@ -1723,6 +1753,7 @@ def run(
                 "audio_role": segment.audio_role,
                 "audio_completion": segment.audio_completion,
                 "picture_role": segment.picture_role,
+                "coverage_claim_seconds": segment.coverage_claim_seconds,
             }
             for index, (segment, (start, end)) in enumerate(
                 zip(plan.segments, frame_spans, strict=True)

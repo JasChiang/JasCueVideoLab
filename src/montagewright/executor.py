@@ -151,6 +151,7 @@ class Segment:
     audio_role: str = "auto"
     audio_completion: str = "none"
     picture_role: str = "primary_action"
+    coverage_claim_seconds: float | None = None
     # The stretch of the source this segment may not leave, when the card
     # named one. The renderer writes handles either side of every cut so an
     # editor opening the timeline can pull a shot longer; those were bounded
@@ -343,6 +344,7 @@ def plan_render(
                 audio_role=clip.audio_role,
                 audio_completion=clip.audio_completion,
                 picture_role=clip.picture_role,
+                coverage_claim_seconds=clip.coverage_claim_seconds,
                 usable_from_seconds=clip.usable_from_seconds,
                 usable_to_seconds=clip.usable_to_seconds,
             )

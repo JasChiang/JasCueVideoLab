@@ -623,6 +623,20 @@ def command_render(args: argparse.Namespace) -> int:
                 motion=tuple(motion_of(source_id) or ()),
                 crop_width=min(1.0, ASPECTS[args.aspect] / _aspect(proxy)),
                 speech=_speech_lines(source_id, transcripts.get(source_id)),
+                audio_spans=tuple(
+                    (
+                        span_id,
+                        float(span["in_seconds"]),
+                        float(span["out_seconds"]),
+                    )
+                    for span_id, span in (
+                        _audio_spans_for_source(
+                            source_id, transcripts[source_id]
+                        )
+                        if transcripts.get(source_id)
+                        else {}
+                    ).items()
+                ),
             )
         )
 
@@ -1805,6 +1819,7 @@ def _edl_from_selection(
                 audio_role=shot.get("audio_role", "auto"),
                 audio_completion=shot.get("audio_completion", "none"),
                 picture_role=shot.get("picture_role", "primary_action"),
+                coverage_claim_seconds=shot.get("coverage_claim_seconds"),
                 reframe=reframe,
                 # Carried on the clip so the layers after this one can see
                 # it. Rhythm stretches shots to land on beats and the
@@ -1974,6 +1989,9 @@ def _write_report(output: Path, **parts) -> None:
         "duration_seconds": round(parts["result"].duration_seconds, 3),
         "target_seconds": report.target_seconds,
         "duration_shortfall_seconds": report.duration_shortfall,
+        "coverage_seconds": report.coverage_seconds,
+        "unsupported_seconds": report.unsupported_seconds,
+        "coverage_details": report.coverage_details,
         "moves_too_short": report.moves_too_short,
         "spend": report.spend(),
         "spend_all_attempts": (

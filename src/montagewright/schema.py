@@ -34,7 +34,8 @@ AudioRole = Literal[
 ]
 PictureRole = Literal[
     "speaker", "primary_action", "illustrative_broll", "reaction",
-    "establishing", "transition",
+    "establishing", "transition", "punchline_hold", "end_hold",
+    "title_read", "music_montage",
 ]
 AudioCompletion = Literal[
     "none", "complete_thought", "complete_action_sound", "intentional_cut"
@@ -444,6 +445,14 @@ class Clip(ModelFacing):
     picture_role: PictureRole = Field(
         default="primary_action",
         description="Why this source is visible during this editorial beat.",
+    )
+    coverage_claim_seconds: float | None = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Locally measured visual evidence available to this shot. The "
+            "planner may name a role but may not author this duration."
+        ),
     )
     reframe: Reframe | None = Field(
         default=None,
