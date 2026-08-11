@@ -1815,7 +1815,7 @@ def test_a_block_carries_the_shot_it_came_from() -> None:
         Path(__file__).resolve().parents[1]
         / "src" / "montagewright" / "webapp.py"
     ).read_text(encoding="utf-8")
-    assert '"index": index,' in source
+    assert 'current_blocks[index]["selection_index"]' in source
 
 
 def test_the_reel_says_whether_its_boxes_are_the_render_s_or_a_rebuild(
@@ -2856,13 +2856,26 @@ def test_the_zoom_budget_guards_the_size_that_is_actually_delivered() -> None:
 
 def test_a_segment_is_scaled_to_the_delivery_not_to_its_own_crop() -> None:
     from pathlib import Path
+    from montagewright.executor import CropBox
+    from montagewright.reframe import (
+        CropPath, Keyframe, ffmpeg_crop_filters,
+    )
 
     renderer = (
         Path(__file__).resolve().parents[1]
         / "src" / "montagewright" / "renderer.py"
     ).read_text(encoding="utf-8")
-    # Both paths -- the moving crop and the still one -- land on one size.
+    # The still path is explicit in renderer; moving paths are now compiled
+    # by the shared filter builder because zoom needs perspective rather than
+    # crop's init-only w/h options. Both still land on one delivery size.
     assert renderer.count('f"scale={output_size[0]}:{output_size[1]}"') == 2
+    moving = CropPath([
+        Keyframe(0, CropBox(.34, 0, .32, 1)),
+        Keyframe(2, CropBox(.40, .17, .21, .66)),
+    ])
+    assert ffmpeg_crop_filters(
+        moving, 3840, 2160, (1080, 1920)
+    )[-1] == "scale=1080:1920"
     assert "keyframes[0].crop.to_pixels(" not in renderer
 
 
@@ -2993,7 +3006,9 @@ def test_final_cut_will_parse_what_we_write() -> None:
     assert named == {"position", "scale"}
     for one in adjusts[1].iter("param"):
         frames = list(one.iter("keyframe"))
-        assert len(frames) == 2
+        # Production uses smoothstep. Dense output-frame keys preserve that
+        # curve in an NLE instead of delegating to its different interpolation.
+        assert len(frames) == 91
         assert all(f.get("time") and f.get("value") for f in frames)
 
 
@@ -3792,13 +3807,12 @@ def test_the_timeline_is_written_from_what_the_render_did():
     # And says so when there is no record, rather than quietly guessing.
     assert "will differ from the film" in exporting
 
-    # The interface rebuilds per shot, because it also serves a recut and a
-    # recut changes lengths -- a stored path is a set of times, so it holds
-    # only while the shot is as long as it was.
+    # A recut preserves the recorded source-time curve, shifting its original
+    # interpolation domain rather than rebuilding without SAM.
     rebuilding = inspect.getsource(webapp.create_app)
     rebuilding = rebuilding[rebuilding.index("stored = read_crops("):]
     rebuilding = rebuilding[: rebuilding.index("plan = plan_render(")]
-    assert 'abs(covered - float(entry["seconds"])) <= 0.05' in rebuilding
+    assert "retime_crop_path(" in rebuilding
     assert "if stale:" in rebuilding
 
 

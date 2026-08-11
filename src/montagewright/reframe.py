@@ -1434,7 +1434,9 @@ def build_crop_path(
     return path
 
 
-def _eased(start: float, end: float, at: float, span: float) -> str:
+def _eased(
+    start: float, end: float, at: float, span: float, *, clock: str = "t"
+) -> str:
     """A smoothstep ramp between two values, as an ffmpeg expression.
 
     Linear interpolation, which this used first, gives constant velocity with
@@ -1450,7 +1452,7 @@ def _eased(start: float, end: float, at: float, span: float) -> str:
 
     delta = end - start
     # 3u^2 - 2u^3 over the segment's own normalised time.
-    unit = f"clip((t-{at:.3f})/{span:.6f},0,1)"
+    unit = f"clip(({clock}-{at:.3f})/{span:.6f},0,1)"
     return f"{start:.3f}+({delta:.3f})*({unit}*{unit}*(3-2*{unit}))"
 
 
@@ -1479,8 +1481,36 @@ def interpolate_crop_keyframes(
     }
 
 
+def retime_crop_path(
+    path: CropPath, *, old_in_seconds: float, new_in_seconds: float,
+    new_duration_seconds: float,
+) -> CropPath:
+    """Trim or extend a recorded path without inventing new tracking.
+
+    A crop path is relative to its old shot, while a recut changes the source
+    window. Shift the original interpolation domain through source time and
+    retain its easing; keys outside the new window are deliberate and the
+    evaluator holds the nearest endpoint. This preserves a follow for
+    gain-only recuts and honest head or tail trims instead of silently
+    rebuilding it as a static crop.
+    """
+
+    del new_duration_seconds  # the renderer naturally holds beyond last key
+    shift = new_in_seconds - old_in_seconds
+    # Keep the original interpolation domain. Cropping the old curve and
+    # easing again over a shorter span changes its velocity and even its
+    # midpoint. Negative or post-out key times are intentional: evaluating
+    # the same curve at new-relative t is exactly old-relative t + shift;
+    # ffmpeg holds the nearest endpoint outside the measured range.
+    return CropPath([
+        Keyframe(frame.seconds - shift, frame.crop)
+        for frame in path.keyframes
+    ])
+
+
 def _axis_expression(
-    path: CropPath, pick, scale: int, *, ease: bool = True
+    path: CropPath, pick, scale: int, *, ease: bool = True,
+    clock: str = "t",
 ) -> str:
     """Piecewise expression for one axis over the whole shot."""
 
@@ -1491,23 +1521,23 @@ def _axis_expression(
         end = pick(later.crop) * scale
         span = max(later.seconds - earlier.seconds, 1e-6)
         ramp = (
-            _eased(start, end, earlier.seconds, span)
+            _eased(start, end, earlier.seconds, span, clock=clock)
             if ease
-            else f"{start:.3f}+({end - start:.3f})*(t-{earlier.seconds:.3f})/{span:.6f}"
+            else f"{start:.3f}+({end - start:.3f})*({clock}-{earlier.seconds:.3f})/{span:.6f}"
         )
         expression = (
-            f"if(between(t,{earlier.seconds:.3f},{later.seconds:.3f}),"
+            f"if(between({clock},{earlier.seconds:.3f},{later.seconds:.3f}),"
             f"{ramp},{expression})"
         )
     last = path.keyframes[-1]
     return (
-        f"if(gte(t,{last.seconds:.3f}),{pick(last.crop) * scale:.3f},"
+        f"if(gte({clock},{last.seconds:.3f}),{pick(last.crop) * scale:.3f},"
         f"{expression})"
     )
 
 
 def ffmpeg_crop_expression(
-    path: CropPath, width: int, height: int
+    path: CropPath, width: int, height: int, *, clock: str = "t"
 ) -> tuple[str, str, str, str]:
     """Render a path as a crop filter's four arguments.
 
@@ -1523,11 +1553,70 @@ def ffmpeg_crop_expression(
 
     # Crop extents must stay even for chroma subsampling, and must not run off
     # the frame at any point in the ramp.
-    w_expr = f"floor(min({_axis_expression(path, lambda c: c.width, width)},{width})/2)*2"
-    h_expr = f"floor(min({_axis_expression(path, lambda c: c.height, height)},{height})/2)*2"
-    x_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.x, width)},{width}-out_w))/2)*2"
-    y_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.y, height)},{height}-out_h))/2)*2"
+    w_expr = f"floor(min({_axis_expression(path, lambda c: c.width, width, clock=clock)},{width})/2)*2"
+    h_expr = f"floor(min({_axis_expression(path, lambda c: c.height, height, clock=clock)},{height})/2)*2"
+    x_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.x, width, clock=clock)},{width}-out_w))/2)*2"
+    y_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.y, height, clock=clock)},{height}-out_h))/2)*2"
     return w_expr, h_expr, x_expr, y_expr
+
+
+def ffmpeg_crop_filters(
+    path: CropPath, width: int, height: int,
+    output_size: tuple[int, int], *, output_fps: int = 30,
+    clock_offset_seconds: float = 0.0,
+) -> list[str]:
+    """Build filters that really execute pan, tilt *and* zoom per frame.
+
+    FFmpeg's crop x/y expressions are evaluated per frame, but crop w/h are
+    normally configured only once. Feeding a changing width into `crop`
+    therefore rendered pans correctly while silently freezing push-ins and
+    pull-outs at their opening size. For a zoom we map the changing authored
+    rectangle to a fixed canvas with the perspective filter; all four
+    authored coordinates are consequently evaluated on the same clock.
+    """
+
+    output_width, output_height = output_size
+    first = path.keyframes[0].crop
+    zooms = any(
+        abs(frame.crop.width - first.width) > 1e-6
+        or abs(frame.crop.height - first.height) > 1e-6
+        for frame in path.keyframes[1:]
+    )
+    if not zooms:
+        clock = (
+            "t" if abs(clock_offset_seconds) < 1e-9
+            else f"(t-{clock_offset_seconds:.6f})"
+        )
+        w_expr, h_expr, x_expr, y_expr = ffmpeg_crop_expression(
+            path, width, height, clock=clock,
+        )
+        return [
+            f"crop=w='{w_expr}':h='{h_expr}':x='{x_expr}':y='{y_expr}'",
+            f"scale={output_width}:{output_height}",
+        ]
+
+    clock = f"(on/{output_fps}-{clock_offset_seconds:.6f})"
+    left = _axis_expression(path, lambda crop: crop.x, 1, clock=clock)
+    top = _axis_expression(path, lambda crop: crop.y, 1, clock=clock)
+    right = _axis_expression(
+        path, lambda crop: crop.x + crop.width, 1, clock=clock
+    )
+    bottom = _axis_expression(
+        path, lambda crop: crop.y + crop.height, 1, clock=clock
+    )
+    # perspective(source) maps the authored rectangle to the four corners of
+    # a fixed-size source canvas and supports per-frame corner expressions.
+    # The following scale changes only that fixed canvas into delivery pixels,
+    # so the encoder never sees a changing frame size.
+    return [
+        "perspective="
+        f"x0='({left})*W':y0='({top})*H':"
+        f"x1='({right})*W':y1='({top})*H':"
+        f"x2='({left})*W':y2='({bottom})*H':"
+        f"x3='({right})*W':y3='({bottom})*H':"
+        "sense=source:eval=frame:interpolation=cubic",
+        f"scale={output_width}:{output_height}",
+    ]
 
 
 def observations_from_sam(

@@ -1209,7 +1209,7 @@ def command_render(args: argparse.Namespace) -> int:
         try:
             from montagewright.subtitles import as_cues
 
-            wide, tall = (1920, 1080) if aspect >= 1.0 else (1080, 1920)
+            wide, tall = plan.output_size
             said = as_cues(said, args.aspect, wide, tall)
         except Exception:
             pass
@@ -1255,18 +1255,18 @@ def command_render(args: argparse.Namespace) -> int:
         payload = json.loads(
             (output / "report.json").read_text(encoding="utf-8")
         )
-        width, height = (
-            (1920, 1080) if ASPECTS[args.aspect] >= 1.0 else (1080, 1920)
-        )
+        width, height = plan.output_size
         for flavour, suffix, build in (
             ("premiere", "xml", to_xmeml),
             ("finalcut", "fcpxml", to_fcpxml),
         ):
             if args.timeline in {flavour, "both"}:
                 path = output / f"timeline.{suffix}"
+                laid_bed = output / "bed-as-laid.m4a"
                 path.write_text(
                     build(plan, payload, name=output.name,
-                          width=width, height=height, music=args.music),
+                          width=width, height=height,
+                          music=laid_bed if laid_bed.exists() else args.music),
                     encoding="utf-8",
                 )
                 print(f"timeline    {path}", flush=True)
@@ -1892,7 +1892,7 @@ def command_timeline(args: argparse.Namespace) -> int:
             cards=cards, checkpoint=None, client=None,
         )
     plan = plan_render(edl, sources, target_aspect=aspect, crop_paths=paths)
-    width, height = (1920, 1080) if aspect >= 1.0 else (1080, 1920)
+    width, height = plan.output_size
     for flavour, suffix, build in (
         ("premiere", "xml", to_xmeml), ("finalcut", "fcpxml", to_fcpxml)
     ):

@@ -995,3 +995,110 @@ def test_layout_evidence_uses_the_same_smoothstep_as_rendered_crop():
 
     assert crop is not None
     assert crop["x"] == pytest.approx(0.15625)
+
+
+def test_canvas_card_click_enters_text_edit_and_compare_reflows_overlay():
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "function editGraphicFromCanvas(id)" in page
+    assert "editor.focus({preventScroll: true})" in page
+    assert "editor.select()" in page
+    assert "if (!moved) {\n      editGraphicFromCanvas(id);" in page
+    assert "requestAnimationFrame(() => {\n    forgetPlacement(); drawCrop(); showBurnt(); showGraphicPreview();" in page
+    assert "new ResizeObserver(() =>" in page
+
+
+def test_graphics_track_click_seeks_to_the_point_that_was_clicked():
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "function graphicTrackTargetAtClientX(cue, clientX)" in page
+    assert "const pointed = (clientX - reel.left) / scale;" in page
+    assert "selectGraphic(index, graphicTrackTargetAtClientX(cue, next.clientX));" in page
+    assert "if (Math.abs(next.clientX - startX) < 2) return;" in page
+    assert "function selectGraphic(i, seekSeconds = null)" in page
+    assert "const target = seekSeconds == null" in page
+
+
+def test_web_graphics_show_copy_provenance_and_create_stable_anchors():
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    for label in (
+        "Brief 原文", "Brief 候選", "畫面辨識", "語音逐字稿",
+        "Gemini 草稿", "手動輸入",
+    ):
+        assert label in page
+    assert page.count("anchor_selection_index: anchor?.index ?? null") == 2
+
+
+def test_current_timeline_uses_the_renderers_cumulative_frame_clock(
+    tmp_path: Path,
+):
+    import json
+    import montagewright.webapp as web
+
+    run = web.Run("r1", tmp_path / "r1")
+    work = run.output / "work"
+    work.mkdir(parents=True)
+    (run.output / "report.json").write_text(json.dumps({
+        "selection": {"shots": [{}, {}]},
+    }), encoding="utf-8")
+    (work / "current-timeline.json").write_text(json.dumps({
+        "version": "montagewright-current-timeline-v1",
+        "revision": 0,
+        "output_fps": 30,
+        "shots": [
+            {"selection_index": 0, "in_seconds": 0, "seconds": .515},
+            {"selection_index": 1, "in_seconds": 0, "seconds": .515},
+        ],
+    }), encoding="utf-8")
+
+    current = web._current_timeline(run)
+
+    assert current["shots"][0]["start_frame"] == 0
+    assert current["shots"][0]["frame_count"] == 15
+    assert current["shots"][0]["seconds"] == .5
+    assert current["shots"][1]["start_frame"] == 15
+    assert current["shots"][1]["frame_count"] == 16
+    assert current["shots"][1]["seconds"] == pytest.approx(16 / 30)
+    import inspect
+
+    timeline_source = inspect.getsource(web.create_app)
+    assert '"at": round(cursor, 3)' not in timeline_source
+    assert '"seconds": round(seconds, 3)' not in timeline_source
+
+
+def test_graphics_filter_timing_keeps_sub_frame_precision():
+    import inspect
+    import montagewright.graphics as graphics
+
+    source = inspect.getsource(graphics.burn_graphics)
+    assert "since:.9f" in source
+    assert "until:.9f" in source
+    assert "overlay.starts_seconds:.9f" in source
+    assert "overlay.ends_seconds:.9f" in source
+
+
+def test_saving_graphics_invalidates_every_previous_graphics_delivery(
+    tmp_path: Path,
+):
+    import montagewright.webapp as web
+
+    run = web.Run("r1", tmp_path / "r1")
+    layout = run.output / "work" / "graphics-render" / "layout.json"
+    layout.parent.mkdir(parents=True)
+    layout.write_text("{}", encoding="utf-8")
+    made = [
+        run.output / "deliverable-graphics.mp4",
+        run.output / "deliverable-graphics-subtitled.mp4",
+    ]
+    for path in made:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stale")
+
+    web._invalidate_graphics_delivery(run)
+
+    assert not layout.exists()
+    assert all(not path.exists() for path in made)

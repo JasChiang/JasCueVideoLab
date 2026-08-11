@@ -1954,7 +1954,7 @@ def test_the_page_says_which_part_of_the_track_was_used():
     page = (root / "web" / "index.html").read_text(encoding="utf-8")
     written = (root / "cli.py").read_text(encoding="utf-8")
 
-    assert '"music_from_seconds": float(edl.get("music_from_seconds")' in served
+    assert 'current.get("music_from_seconds"' in served
     assert '"music_from_seconds": getattr(plan, "music_from_seconds"' in written
     assert "function musicName()" in page
     assert "音樂 · 從" in page

@@ -19,10 +19,10 @@ import json
 import shutil
 import subprocess
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
-from montagewright.executor import RenderPlan, Segment
+from montagewright.executor import RenderPlan, Segment, allocate_timeline_frames
+from montagewright.reframe import ffmpeg_crop_filters
 
 # Short-form platforms normalise to roughly this; matching it here means the
 # cut sounds the same locally as it will after upload.
@@ -190,33 +190,44 @@ def _render_segment(
 ) -> tuple[Path, "Handles"]:
     """Cut one shot, cropping if the plan asked for it."""
 
-    filters: list[str] = []
     source = segment.source
+    first = segment.usable_from_seconds
+    last = segment.usable_to_seconds or source.duration_seconds
+    head = min(HANDLE_SECONDS, max(0.0, segment.in_seconds - first))
+    tail = min(HANDLE_SECONDS, max(0.0, last - segment.out_seconds))
+
+    # Establish the delivery clock before any frame-evaluated crop motion.
+    # In particular, perspective's `on` counter follows the frames it sees;
+    # putting CFR after it made identical authored moves run at different
+    # speeds for 24, 30 and 60 fps sources.
+    filters: list[str] = [f"fps=fps={output_fps}:round=near"]
     if segment.crop_path is not None and not segment.crop_path.is_static:
         # A following camera. The x expression is evaluated per frame, so the
         # motion lives in the same filter as the crop rather than in a
         # separate command stream.
-        from montagewright.reframe import ffmpeg_crop_expression
-
-        w_expr, h_expr, x_expr, y_expr = ffmpeg_crop_expression(
-            segment.crop_path, source.width, source.height
-        )
-        filters.append(
-            f"crop=w='{w_expr}':h='{h_expr}':x='{x_expr}':y='{y_expr}'"
-        )
-        # A zoom changes the crop size per frame, so the output has to be
-        # pinned to one resolution or the encoder sees a stream that changes
-        # shape mid-shot.
-        filters.append(f"scale={output_size[0]}:{output_size[1]}")
+        filters.extend(ffmpeg_crop_filters(
+            segment.crop_path, source.width, source.height, output_size,
+            output_fps=output_fps,
+        ))
     elif segment.crop is not None:
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)
         filters.append(f"crop={width}:{height}:{x}:{y}")
         filters.append(f"scale={output_size[0]}:{output_size[1]}")
-    # Mixed 23.976/25/29.97/30/60 footage becomes one explicit CFR editing
-    # timeline before concat. Editorial times remain seconds; this is the
-    # single boundary where they are quantised to deliverable frames.
-    filters.append(f"fps=fps={output_fps}:round=near")
-    handle_filters = list(filters)
+    # Mixed 23.976/25/29.97/30/60 footage is now already on one explicit CFR
+    # editing timeline. Editorial times remain seconds; this is the single
+    # boundary where they are quantised to deliverable frames.
+    handle_filters = [f"fps=fps={output_fps}:round=near"]
+    if segment.crop_path is not None and not segment.crop_path.is_static:
+        handle_filters.extend(ffmpeg_crop_filters(
+            segment.crop_path, source.width, source.height, output_size,
+            output_fps=output_fps, clock_offset_seconds=head,
+        ))
+    elif segment.crop is not None:
+        x, y, width, height = segment.crop.to_pixels(source.width, source.height)
+        handle_filters.extend([
+            f"crop={width}:{height}:{x}:{y}",
+            f"scale={output_size[0]}:{output_size[1]}",
+        ])
     if output_frames is not None:
         filters.extend([
             "tpad=stop_mode=clone:stop_duration=1",
@@ -238,10 +249,6 @@ def _render_segment(
     # camera still being aimed, and half a second after it is often somebody
     # saying "again". A handle exists to be pulled, so one that opens onto a
     # reset is worse than none.
-    first = segment.usable_from_seconds
-    last = segment.usable_to_seconds or source.duration_seconds
-    head = min(HANDLE_SECONDS, max(0.0, segment.in_seconds - first))
-    tail = min(HANDLE_SECONDS, max(0.0, last - segment.out_seconds))
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         # Seeking before -i decodes from the preceding keyframe, which is both
@@ -541,22 +548,19 @@ def render(
     video_encoder = _encoder("h264_videotoolbox", "libx264")
 
     segment_paths: list[tuple[Path, "Handles", float]] = []
-    elapsed_seconds = Decimal("0")
-    allocated_frames = 0
-    for index, segment in enumerate(plan.segments):
-        elapsed_seconds += Decimal(str(segment.duration_seconds))
-        end_frame = int(
-            (elapsed_seconds * plan.output_fps).quantize(
-                Decimal("1"), rounding=ROUND_HALF_UP
-            )
-        )
-        segment_frames = end_frame - allocated_frames
+    boundaries = allocate_timeline_frames(
+        [segment.duration_seconds for segment in plan.segments],
+        plan.output_fps,
+    )
+    for index, (segment, (start_frame, end_frame)) in enumerate(
+        zip(plan.segments, boundaries)
+    ):
+        segment_frames = end_frame - start_frame
         if segment_frames < 1:
             raise RenderError(
                 f"{segment.clip_id} is shorter than one {plan.output_fps} fps "
                 "timeline frame"
             )
-        allocated_frames = end_frame
         destination = segment_dir / f"{index:03d}-{segment.clip_id}.mp4"
         rendered, handles = _render_segment(
             segment, destination, video_encoder=video_encoder,

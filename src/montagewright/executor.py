@@ -21,6 +21,7 @@ safe option takes it every time.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from typing import TYPE_CHECKING
@@ -37,6 +38,39 @@ if TYPE_CHECKING:  # a runtime import would make the two modules circular
 CROP_MARGIN = 0.05
 
 
+def seconds_to_frames(
+    seconds: float | Decimal, fps: int | float | Decimal,
+) -> int:
+    """One half-up conversion for every delivered/NLE frame address."""
+
+    return max(0, int(
+        (Decimal(str(seconds)) * Decimal(str(fps))).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    ))
+
+
+def allocate_timeline_frames(
+    durations: list[float], fps: int,
+) -> list[tuple[int, int]]:
+    """Quantise one timeline, not each shot independently.
+
+    The renderer and both NLE writers must share these exact boundaries.
+    Rounding every duration separately creates gaps or extra frames whenever
+    several fractional-frame shots are placed next to one another.
+    """
+
+    elapsed = Decimal("0")
+    start = 0
+    allocated = []
+    for duration in durations:
+        elapsed += Decimal(str(duration))
+        end = seconds_to_frames(elapsed, fps)
+        allocated.append((start, end))
+        start = end
+    return allocated
+
+
 @dataclass(frozen=True)
 class Source:
     """A resolved input file and the facts needed to place cuts in it."""
@@ -46,6 +80,9 @@ class Source:
     duration_seconds: float
     width: int
     height: int
+    # Rational source clock, kept as text so 30000/1001 never becomes a
+    # lossy decimal before NLE export.
+    native_fps: str = "30/1"
 
     @property
     def aspect_ratio(self) -> float:

@@ -242,15 +242,188 @@ def _transcript_map(run) -> dict:
     }
 
 
+def _current_timeline(run: Run) -> dict:
+    """The committed edit revision, or legacy-empty when none was made."""
+
+    path = run.output / "work" / "current-timeline.json"
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if value.get("version") != "montagewright-current-timeline-v1":
+            raise ValueError("unknown version")
+        shots = value["shots"]
+        if not isinstance(shots, list) or not shots:
+            raise ValueError("shots must be a non-empty list")
+        original = (run.report() or {}).get("selection", {}).get("shots", [])
+        for shot in shots:
+            selection = int(shot["selection_index"])
+            if not 0 <= selection < len(original):
+                raise ValueError(f"selection_index {selection} is out of range")
+            if float(shot["seconds"]) <= 0:
+                raise ValueError("shot duration must be positive")
+        # The public film is CFR and the renderer allocates frame boundaries
+        # cumulatively.  Expose that same clock to Web anchors and every
+        # recut consumer; authored fractional seconds are not the rendered
+        # shot boundaries (for example .515s at 30fps becomes 15 frames).
+        from montagewright.executor import allocate_timeline_frames
+
+        fps = int(value.get("output_fps") or 30)
+        boundaries = allocate_timeline_frames(
+            [float(shot["seconds"]) for shot in shots], fps
+        )
+        value["shots"] = [
+            {
+                **shot,
+                "start_frame": start,
+                "frame_count": end - start,
+                "seconds": (end - start) / fps,
+            }
+            for shot, (start, end) in zip(shots, boundaries, strict=True)
+        ]
+        return value
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        # This file is the commit record for the public MP4. Falling back to
+        # report.json would silently put the UI/NLE/subtitles on an old cut.
+        raise HTTPException(422, f"current timeline is unreadable: {error}")
+
+
+def _invalidate_graphics_delivery(run: Run) -> None:
+    """A saved copy/design change makes every prior graphics export stale."""
+
+    for name in (
+        "deliverable-graphics.mp4",
+        "deliverable-graphics-subtitled.mp4",
+    ):
+        (run.output / name).unlink(missing_ok=True)
+    (run.output / "work" / "graphics-render" / "layout.json").unlink(
+        missing_ok=True
+    )
+
+
+def _timeline_blocks(run: Run) -> list[dict]:
+    """Stable selection identities and source windows for the current cut."""
+
+    current = _current_timeline(run)
+    if current:
+        return [dict(one) for one in current["shots"]]
+    report = run.report() or {}
+    shots = report.get("selection", {}).get("shots", [])
+    rhythm = report.get("rhythm", {})
+    resolved = report.get("source_motion_details", {})
+    return [
+        {
+            "selection_index": index,
+            "in_seconds": float(
+                (resolved.get(f"k{index:02d}", {}).get("window") or
+                 [shot.get("start_seconds", 0.0)])[0]
+            ),
+            "seconds": float((
+                lambda window: window[1] - window[0]
+                if len(window) >= 2 else
+                rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)
+            )(resolved.get(f"k{index:02d}", {}).get("window") or [])),
+            "gain_db": 0.0,
+        }
+        for index, shot in enumerate(shots)
+    ]
+
+
+def _retime_graphics_for_current_cut(
+    run: Run, old_blocks: list[dict], blocks: list[dict],
+) -> None:
+    """Resolve stable shot anchors onto a newly committed timeline."""
+
+    from montagewright.graphics import GraphicsPlan
+    from montagewright.measure.storage import write_json
+
+    path = run.output / "work" / "graphics.json"
+    if not path.exists():
+        return
+    plan = GraphicsPlan.model_validate_json(path.read_text(encoding="utf-8"))
+    positions = {}
+    cursor = 0.0
+    for reel_index, block in enumerate(blocks):
+        positions[int(block["selection_index"])] = (
+            reel_index, cursor, block
+        )
+        cursor += float(block["seconds"])
+    cues = []
+    for cue in plan.cues:
+        match = re.fullmatch(r"k(\d+)", cue.anchor_clip_id or "")
+        old_reel_index = int(match.group(1)) if match else -1
+        old_block = (
+            old_blocks[old_reel_index]
+            if 0 <= old_reel_index < len(old_blocks) else None
+        )
+        selection_index = (
+            int(cue.anchor_selection_index)
+            if cue.anchor_selection_index is not None
+            else (
+                int(old_block["selection_index"])
+                if old_block is not None else -1
+            )
+        )
+        placed = positions.get(selection_index)
+        changes = {}
+        if placed is not None and old_block is not None:
+            new_reel_index, timeline_at, block = placed
+            source_at = (
+                float(old_block["in_seconds"]) + cue.anchor_offset_seconds
+            )
+            new_offset = source_at - float(block["in_seconds"])
+            remaining = float(block["seconds"]) - new_offset
+            if new_offset >= 0.0 and remaining >= cue.duration_seconds:
+                changes.update({
+                    "anchor_clip_id": f"k{new_reel_index:02d}",
+                    "anchor_selection_index": selection_index,
+                    "anchor_offset_seconds": round(new_offset, 6),
+                    "at_seconds": round(timeline_at + new_offset, 6),
+                })
+            else:
+                placed = None
+        if placed is None:
+            changes.update({
+                "status": "draft",
+                "editor_note": (
+                    cue.editor_note + "；" if cue.editor_note else ""
+                ) + "重新剪輯後原錨點已不在成片內，請重新放置",
+            })
+        cues.append(cue.model_copy(update=changes))
+    updated = plan.model_copy(update={
+        "revision": plan.revision + 1,
+        "cues": cues,
+    })
+    write_json(path, updated.model_dump(mode="json"))
+
+
+def _current_cut_decisions(run: Run) -> tuple[list[dict], dict[str, dict]]:
+    """Selection and rhythm that the public MP4 currently represents."""
+
+    report = run.report() or {}
+    original = report.get("selection", {}).get("shots", [])
+    current = _current_timeline(run)
+    blocks = current.get("shots") or []
+    if not blocks:
+        return original, report.get("rhythm", {})
+    shots = []
+    rhythm = {}
+    for index, block in enumerate(blocks):
+        shot = dict(original[int(block["selection_index"])])
+        shot["start_seconds"] = float(block["in_seconds"])
+        shots.append(shot)
+        rhythm[f"k{index:02d}"] = {"seconds": float(block["seconds"])}
+    return shots, rhythm
+
+
 def _subtitle_words(run) -> "list":
     """The measured words, on the cut's own clock."""
 
     from montagewright.transcript import words_against_cut
 
-    report = run.report() or {}
+    shots, rhythm = _current_cut_decisions(run)
     return words_against_cut(
-        report.get("selection", {}).get("shots", []),
-        report.get("rhythm", {}),
+        shots, rhythm,
         _transcript_map(run),
     )
 
@@ -284,10 +457,9 @@ def _subtitle_lines(run, *, edits: bool = True) -> "list":
                 for one in saved
             ]
 
-    report = run.report() or {}
+    shots, rhythm = _current_cut_decisions(run)
     return against_cut(
-        report.get("selection", {}).get("shots", []),
-        report.get("rhythm", {}),
+        shots, rhythm,
         _transcript_map(run),
     )
 
@@ -314,7 +486,6 @@ def _retimed(run, kept: list[dict]) -> list[dict]:
     from montagewright.backfill import across_lines
     from montagewright.transcript import words_against_cut
 
-    report = run.report() or {}
     # Narrowly caught on purpose. A card that is missing or unreadable is a
     # normal thing to meet and means "no measured words here". Anything
     # else -- a shape that changed under this, a name that moved -- should
@@ -322,11 +493,8 @@ def _retimed(run, kept: list[dict]) -> list[dict]:
     # re-timing into edits that silently keep whatever times they arrived
     # with, which looks exactly like working.
     try:
-        words = words_against_cut(
-            report.get("selection", {}).get("shots", []),
-            report.get("rhythm", {}),
-            _transcript_map(run),
-        )
+        shots, rhythm = _current_cut_decisions(run)
+        words = words_against_cut(shots, rhythm, _transcript_map(run))
     except (OSError, ValueError, KeyError):
         return kept
     if not words or not kept:
@@ -370,20 +538,61 @@ def _graphics_layout_evidence(run: Run, plan: Any) -> dict:
         return {}
 
     evidence = {}
-    report_tracks = (run.report() or {}).get("subject_tracks", {})
+    report_payload = run.report() or {}
+    report_tracks = report_payload.get("subject_tracks", {})
+    source_motion_details = report_payload.get("source_motion_details", {})
+    current = _current_timeline(run)
+    current_blocks = current.get("shots") or []
+    selection_to_reel = {
+        int(block["selection_index"]): index
+        for index, block in enumerate(current_blocks)
+    }
+    original_shots = (run.report() or {}).get("selection", {}).get(
+        "shots", []
+    )
     for cue in plan.cues:
         clip_id = cue.anchor_clip_id
-        keys = crops.get(clip_id, [])
+        stable_index = cue.anchor_selection_index
+        reel_index = (
+            selection_to_reel.get(int(stable_index), -1)
+            if stable_index is not None else -1
+        )
+        crop_clip_id = (
+            f"k{reel_index:02d}" if reel_index >= 0 else clip_id
+        )
+        track_clip_id = (
+            f"k{int(stable_index):02d}"
+            if stable_index is not None else clip_id
+        )
+        keys = crops.get(crop_clip_id, [])
         if not clip_id or not keys:
             continue
-        durable = report_tracks.get(clip_id, [])
+        durable = report_tracks.get(track_clip_id, [])
         if not durable:
             continue
         window_start = cue.anchor_offset_seconds
         window_end = window_start + cue.duration_seconds
+        source_shift = 0.0
+        if (
+            stable_index is not None and reel_index >= 0
+            and int(stable_index) < len(original_shots)
+        ):
+            origin_window = source_motion_details.get(
+                track_clip_id, {}
+            ).get("window") or []
+            tracking_origin = (
+                float(origin_window[0]) if origin_window
+                else float(original_shots[int(stable_index)].get(
+                    "start_seconds", 0.0
+                ))
+            )
+            source_shift = (
+                float(current_blocks[reel_index]["in_seconds"])
+                - tracking_origin
+            )
         boxes = []
         for sample in durable:
-            relative = float(sample.get("seconds", 0))
+            relative = float(sample.get("seconds", 0)) - source_shift
             if not window_start - 0.05 <= relative <= window_end + 0.05:
                 continue
             half_w = float(sample.get("width", 0)) / 2.0
@@ -828,8 +1037,20 @@ def create_app() -> FastAPI:
 
         run = _run(run_id)
         report = run.report() or {}
-        shots = report.get("selection", {}).get("shots", [])
+        original_shots = report.get("selection", {}).get("shots", [])
+        shots = original_shots
         rhythm = report.get("rhythm", {})
+        current = _current_timeline(run)
+        current_blocks = current.get("shots") or []
+        if current_blocks:
+            shots = [
+                original_shots[int(one["selection_index"])]
+                for one in current_blocks
+            ]
+            rhythm = {
+                f"k{index:02d}": {"seconds": float(one["seconds"])}
+                for index, one in enumerate(current_blocks)
+            }
         verdicts = report.get("shots", {})
         motion = report.get("motion", {})
         source_motion_details = report.get("source_motion_details", {})
@@ -909,6 +1130,10 @@ def create_app() -> FastAPI:
         blocks, cursor = [], 0.0
         for index, shot in enumerate(shots):
             key = f"k{index:02d}"
+            source_key = (
+                f"k{int(current_blocks[index]['selection_index']):02d}"
+                if current_blocks else key
+            )
             seconds = float(rhythm.get(key, {}).get("seconds", 0.0))
             source_id = shot.get("source_id", "")
             blocks.append({
@@ -917,20 +1142,39 @@ def create_app() -> FastAPI:
                 # endpoint is keyed by. Its position in the reel is not the
                 # same number the moment anything is reordered or dropped,
                 # and peeking at the take asked for /source/undefined.
-                "index": index,
+                "index": (
+                    int(current_blocks[index]["selection_index"])
+                    if current_blocks else index
+                ),
                 # Where the crop actually sat, keyframe by keyframe. Without
                 # it "it followed the subject" is a claim in a report; with
                 # it you can watch the box move over the original.
                 "crop": crops.get(key, []),
                 "source_id": source_id,
-                "at": round(cursor, 3),
-                "seconds": round(seconds, 3),
-                "in_seconds": float(shot.get("start_seconds", 0.0)),
+                # Keep the exact frame-derived clock. Rounding every block
+                # independently makes the Web reel drift from the CFR film
+                # again after current-timeline already resolved its frames.
+                "at": cursor,
+                "seconds": seconds,
+                "gain_db": (
+                    float(current_blocks[index].get("gain_db", 0.0))
+                    if current_blocks else 0.0
+                ),
+                "in_seconds": (
+                    float(current_blocks[index]["in_seconds"])
+                    if current_blocks
+                    else float(
+                        (source_motion_details.get(key, {}).get("window") or
+                         [shot.get("start_seconds", 0.0)])[0]
+                    )
+                ),
                 "source_seconds": round(found[source_id], 3),
                 "subject": subject_of(shot),
                 "camera_move": move_of_shot(shot),
-                "motion": motion.get(key, {}),
-                "source_motion_details": source_motion_details.get(key, {}),
+                "motion": motion.get(source_key, {}),
+                "source_motion_details": source_motion_details.get(
+                    source_key, {}
+                ),
                 # Every stop, not only the first. A shot that settles on
                 # three watches in turn was showing one name and the word
                 # "pan", in the panel whose job is saying what was planned.
@@ -944,8 +1188,8 @@ def create_app() -> FastAPI:
                     for one in looks_of(shot)
                 ],
                 "why": shot.get("why", ""),
-                "delivered": verdicts.get(key, {}).get("delivered"),
-                "note": verdicts.get(key, {}).get("note", ""),
+                "delivered": verdicts.get(source_key, {}).get("delivered"),
+                "note": verdicts.get(source_key, {}).get("note", ""),
             })
             cursor += seconds
         # Where the bed came from. The rhythm pass decides it and nothing
@@ -954,8 +1198,15 @@ def create_app() -> FastAPI:
         # that it is audible.
         edl = report.get("edl") or {}
         return JSONResponse({
-            "music_from_seconds": float(edl.get("music_from_seconds") or 0.0),
-            "music_spans": edl.get("music_spans") or [],
+            "revision": int(current.get("revision", 0)),
+            "music_from_seconds": float(
+                current.get("music_from_seconds",
+                            edl.get("music_from_seconds")) or 0.0
+            ),
+            "music_spans": (
+                current.get("music_spans")
+                if current else edl.get("music_spans") or []
+            ),
             "blocks": blocks,
             "seconds": round(cursor, 3),
             # Whether these boxes are what the render used or the best that
@@ -983,24 +1234,18 @@ def create_app() -> FastAPI:
         from montagewright.pipeline import (
             Report, follow_subjects, probe, read_crops,
         )
-        from montagewright.reframe import CropPath
+        from montagewright.reframe import CropPath, retime_crop_path
         from montagewright.schema import EDL, Clip, reframe_of
 
         report = run.report() or {}
         original = report.get("selection", {}).get("shots", [])
         rhythm = report.get("rhythm", {})
+        current = _current_timeline(run)
         if wanted is None:
-            wanted = [
-                {
-                    "index": i,
-                    "in_seconds": float(shot.get("start_seconds", 0.0)),
-                    "seconds": float(
-                        rhythm.get(f"k{i:02d}", {}).get("seconds", 0.0)
-                    ),
-                    "gain_db": 0.0,
-                }
-                for i, shot in enumerate(original)
-            ]
+            wanted = current.get("shots") or _timeline_blocks(run)
+            for one in wanted:
+                if "index" not in one:
+                    one["index"] = int(one["selection_index"])
         aspect = ASPECTS.get(
             report.get("direction", {}).get("aspect", "9:16"), 9 / 16
         )
@@ -1035,27 +1280,56 @@ def create_app() -> FastAPI:
                 energy_intent=plan.get("energy", "medium"),
                 reframe=reframe_of(plan),
             ))
-        edl = EDL(project_id=run.run_id, clips=clips)
+        recorded_edl = report.get("edl") or {}
+        edl = EDL(
+            project_id=run.run_id,
+            clips=clips,
+            music_from_seconds=float(
+                recorded_edl.get("music_from_seconds") or 0.0
+            ),
+            music_spans=recorded_edl.get("music_spans") or [],
+        )
         # What the render actually did, where it still applies. Rebuilding
         # is the same arithmetic for a held frame and is not for anything
         # that followed a subject: that path came out of a mask propagation
         # nothing here can repeat, so the timeline was being written from a
         # guess at what the film did.
         #
-        # Per shot rather than all or nothing, because this also serves a
-        # recut, and a recut changes lengths. A stored path is a set of
-        # times, so it is only the answer while the shot is still as long as
-        # it was when the path was made; where it is not, that one shot is
-        # rebuilt and the rest still come off the record.
+        # Per shot rather than all or nothing. A recorded path is a function
+        # of source time: trim it through that clock and hold a measured end
+        # if a handle extends beyond it. Never replace motion with a guessed
+        # static crop merely because its last SAM sample precedes shot-out.
         stored = read_crops(run.output / "work" / "crops.json")
+        previous = current.get("shots") or []
         paths: dict[str, CropPath] = {}
         stale = []
         for index, entry in enumerate(wanted):
             here = f"k{index:02d}"
-            was = stored.get(f"k{int(entry['index']):02d}")
-            covered = was.keyframes[-1].seconds if was and was.keyframes else -1.0
-            if was and abs(covered - float(entry["seconds"])) <= 0.05:
-                paths[here] = was
+            selection_index = int(entry["index"])
+            match = next(
+                (
+                    (old_index, old)
+                    for old_index, old in enumerate(previous)
+                    if int(old.get("selection_index", -1)) == selection_index
+                ),
+                None,
+            )
+            if match is not None:
+                old_index, old = match
+                was = stored.get(f"k{old_index:02d}")
+                old_in = float(old["in_seconds"])
+            else:
+                was = stored.get(f"k{selection_index:02d}")
+                old_in = float(
+                    original[selection_index].get("start_seconds", 0.0)
+                )
+            if was is not None:
+                paths[here] = retime_crop_path(
+                    was,
+                    old_in_seconds=old_in,
+                    new_in_seconds=float(entry["in_seconds"]),
+                    new_duration_seconds=float(entry["seconds"]),
+                )
             else:
                 stale.append(here)
         if stale:
@@ -1067,12 +1341,39 @@ def create_app() -> FastAPI:
                 if clip_id in rebuilt:
                     paths[clip_id] = rebuilt[clip_id]
         plan = plan_render(
-            edl, sources, target_aspect=aspect, crop_paths=paths
+            edl, sources, target_aspect=aspect, crop_paths=paths,
+            output_size=(
+                tuple(current["output_size"])
+                if current.get("output_size") else None
+            ),
+            output_fps=int(current.get("output_fps") or 30),
         )
         # A shot somebody turned down stays turned down through a re-cut.
         for segment in plan.segments:
             segment.gain_db = gains.get(segment.clip_id, 0.0)
-        return plan, report, aspect
+        # NLE markers and every other consumer of this rebuilt plan must read
+        # reasons from the shot now at that position, not kNN of the original
+        # reel. Keep report.json immutable and project a current view here.
+        projected = dict(report)
+        projected_selection = dict(report.get("selection") or {})
+        projected_selection["shots"] = [
+            original[int(entry["index"])] for entry in wanted
+        ]
+        projected["selection"] = projected_selection
+        projected["rhythm"] = {
+            f"k{index:02d}": {
+                **(rhythm.get(f"k{int(entry['index']):02d}") or {}),
+                "seconds": float(entry["seconds"]),
+            }
+            for index, entry in enumerate(wanted)
+        }
+        projected["shots"] = {
+            f"k{index:02d}": (report.get("shots") or {}).get(
+                f"k{int(entry['index']):02d}", {}
+            )
+            for index, entry in enumerate(wanted)
+        }
+        return plan, projected, aspect
 
     @app.post("/api/runs/{run_id}/recut")
     async def recut(run_id: str, request: Request) -> JSONResponse:
@@ -1087,9 +1388,32 @@ def create_app() -> FastAPI:
         from montagewright.renderer import render as render_cut
 
         run = _run(run_id)
-        wanted = (await request.json()).get("shots", [])
+        payload = await request.json()
+        wanted = payload.get("shots", [])
         if not wanted:
             raise HTTPException(400, "nothing left to cut")
+        old_blocks = _timeline_blocks(run)
+        current_revision = int(_current_timeline(run).get("revision", 0))
+        if int(payload.get("base_revision", current_revision)) != current_revision:
+            raise HTTPException(
+                409, "the timeline changed in another editor; reload first"
+            )
+        old_shape = [
+            (
+                int(one["selection_index"]),
+                round(float(one["in_seconds"]), 6),
+                round(float(one["seconds"]), 6),
+            )
+            for one in old_blocks
+        ]
+        new_shape = [
+            (
+                int(one["index"]), round(float(one["in_seconds"]), 6),
+                round(float(one["seconds"]), 6),
+            )
+            for one in wanted
+        ]
+        structural_change = old_shape != new_shape
         plan, report, _ = _rebuild(run, wanted)
 
         # The bed and whether the voice survives were decided when the run
@@ -1099,21 +1423,138 @@ def create_app() -> FastAPI:
         if "--music" in run.command:
             candidate = Path(run.command[run.command.index("--music") + 1])
             music = candidate if candidate.exists() else None
-        result = render_cut(
-            plan, run.output, music=music, keep_segments=True,
-            keep_voice=bool(
-                list((default_library() / "transcripts").glob("*.json"))
-            ),
-            under_speech=str(
-                report.get("direction", {}).get("music_under_speech") or "duck"
-            ),
-        )
+        # A failed recut must not destroy the last good film. Render the whole
+        # revision beside it, verify it, then switch the public artifacts.
+        # Rendering directly into run.output let an ffmpeg failure truncate
+        # deliverable.mp4 while the endpoint merely returned an error.
+        staging_root = run.output / "work"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(
+            prefix=".recut-", dir=staging_root
+        ))
+        try:
+            result = render_cut(
+                plan, staging, music=music, keep_segments=True,
+                # Speech is a property of this run, never of whatever
+                # unrelated transcripts happen to exist in the library.
+                keep_voice=(
+                    "--speech" not in run.command
+                    or run.command[run.command.index("--speech") + 1]
+                    != "never"
+                ) and bool(_transcript_map(run)),
+                under_speech=str(
+                    report.get("direction", {}).get("music_under_speech")
+                    or "duck"
+                ),
+            )
+            if probe_duration(result.deliverable) <= 0:
+                raise RuntimeError("the recut produced no readable video")
+
+            from montagewright.measure.storage import write_json
+            from montagewright.pipeline import write_crops
+            from montagewright.reframe import CropPath, Keyframe
+
+            recorded_paths = {}
+            for segment in plan.segments:
+                path = segment.crop_path
+                if path is None and segment.crop is not None:
+                    path = CropPath([
+                        Keyframe(0.0, segment.crop),
+                        Keyframe(segment.duration_seconds, segment.crop),
+                    ])
+                if path is not None:
+                    recorded_paths[segment.clip_id] = path
+            write_crops(recorded_paths, staging / "work" / "crops.json")
+            from montagewright.executor import allocate_timeline_frames
+
+            frame_spans = allocate_timeline_frames(
+                [one.duration_seconds for one in plan.segments],
+                plan.output_fps,
+            )
+            manifest = {
+                "version": "montagewright-current-timeline-v1",
+                "revision": current_revision + 1,
+                "output_fps": plan.output_fps,
+                "output_size": list(plan.output_size),
+                "music_from_seconds": plan.music_from_seconds,
+                "music_spans": plan.music_spans,
+                "shots": [
+                    {
+                        "selection_index": int(wanted[index]["index"]),
+                        "in_seconds": segment.in_seconds,
+                        "start_frame": start,
+                        "frame_count": end - start,
+                        "seconds": (end - start) / plan.output_fps,
+                        "gain_db": segment.gain_db,
+                    }
+                    for index, (segment, (start, end)) in enumerate(
+                        zip(plan.segments, frame_spans, strict=True)
+                    )
+                ],
+            }
+            write_json(
+                staging / "work" / "current-timeline.json", manifest
+            )
+
+            for name in ("picture.mp4", "deliverable.mp4", "preview.mp4"):
+                os.replace(staging / name, run.output / name)
+            laid = staging / "bed-as-laid.m4a"
+            if laid.exists():
+                os.replace(laid, run.output / laid.name)
+            # Segments are not a public endpoint, so switch them after the
+            # three playable artifacts are safely in place.
+            old_segments = run.output / "segments"
+            new_segments = staging / "segments"
+            retired = run.output / ".segments-before-recut"
+            if retired.exists():
+                shutil.rmtree(retired)
+            if old_segments.exists():
+                os.replace(old_segments, retired)
+            os.replace(new_segments, old_segments)
+            shutil.rmtree(retired, ignore_errors=True)
+            (run.output / "work").mkdir(parents=True, exist_ok=True)
+            for name in ("crops.json", "current-timeline.json"):
+                os.replace(staging / "work" / name, run.output / "work" / name)
+            if structural_change:
+                subtitles = run.output / "work" / "subtitles.json"
+                if subtitles.exists():
+                    # Edited subtitle cues have no source anchor in v1. Keep
+                    # the user's copy recoverable, but never burn its old
+                    # absolute times onto a different running order.
+                    shutil.copy2(
+                        subtitles,
+                        run.output / "work" / "subtitles-before-recut.json",
+                    )
+                    subtitles.unlink()
+                _retime_graphics_for_current_cut(
+                    run, old_blocks, manifest["shots"]
+                )
+            # These all encode absolute timing or the previous running order.
+            # They are derived and will be rebuilt from current-timeline.json.
+            for name in (
+                "timeline.xml", "timeline.fcpxml", "subtitles.srt",
+                "deliverable-subtitled.mp4", "deliverable-graphics.mp4",
+                "deliverable-graphics-subtitled.mp4",
+            ):
+                (run.output / name).unlink(missing_ok=True)
+            for wave in run.output.glob("wave-*.png"):
+                wave.unlink(missing_ok=True)
+            for cache in (
+                run.output / "work" / "graphics-preview",
+                run.output / "work" / "graphics-render",
+                run.output / "work" / "graphics-subtitle-render",
+            ):
+                shutil.rmtree(cache, ignore_errors=True)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
         # What was rendered, from the plan that rendered it. This read a
         # name belonging to the rebuild's own scope, so a recut that had
         # already re-encoded every segment raised on the way to saying so.
         return JSONResponse({
             "seconds": round(result.duration_seconds, 3),
             "shots": len(plan.segments),
+            "revision": current_revision + 1,
+            "subtitles_reset": structural_change,
         })
 
     @app.get("/api/runs/{run_id}/transcripts")
@@ -1257,12 +1698,15 @@ def create_app() -> FastAPI:
             # again, and everything it needs is already written down.
             from montagewright.timeline import to_fcpxml, to_xmeml
 
-            plan, report, aspect = _rebuild(run)
-            width, height = (1920, 1080) if aspect >= 1.0 else (1080, 1920)
+            plan, report, _ = _rebuild(run)
+            width, height = plan.output_size
             # The bed this cut was laid over, so the timeline carries it
             # too rather than opening as a silent film.
-            bed = None
-            if "--music" in run.command:
+            bed = (
+                run.output / "bed-as-laid.m4a"
+                if (run.output / "bed-as-laid.m4a").exists() else None
+            )
+            if bed is None and "--music" in run.command:
                 maybe = Path(run.command[run.command.index("--music") + 1])
                 bed = maybe if maybe.exists() else None
             build = to_xmeml if flavour == "premiere" else to_fcpxml
@@ -1527,6 +1971,7 @@ def create_app() -> FastAPI:
         from montagewright.measure.storage import write_json
 
         write_json(destination, plan)
+        _invalidate_graphics_delivery(run)
         return JSONResponse({
             "facts": len(plan.facts), "cues": len(plan.cues),
             "warnings": warnings, "revision": plan.revision,
@@ -1604,6 +2049,7 @@ def create_app() -> FastAPI:
         except ValueError as error:
             raise HTTPException(422, f"cannot approve graphic: {error}")
         write_json(destination, plan)
+        _invalidate_graphics_delivery(run)
         return JSONResponse(plan.model_dump(mode="json"))
 
     @app.post("/api/runs/{run_id}/burn-graphics")
@@ -2024,8 +2470,20 @@ def create_app() -> FastAPI:
         run = _run(run_id)
         timed = _subtitle_lines(run)
         aspect = (run.report() or {}).get("direction", {}).get("aspect", "9:16")
+        picture = next(
+            (
+                run.output / name
+                for name in ("picture.mp4", "deliverable.mp4")
+                if (run.output / name).exists()
+            ),
+            None,
+        )
+        width, height = (
+            _video_display_size(picture) if picture is not None
+            else ((1920, 1080) if aspect == "16:9" else (1080, 1920))
+        )
         try:
-            timed = as_cues(timed, aspect, 1080, 1920)
+            timed = as_cues(timed, aspect, width, height)
         except NoFontHere:
             # Without a font there is nothing to measure against, and a long
             # cue in a file is better than no file.

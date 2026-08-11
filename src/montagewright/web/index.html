@@ -322,14 +322,13 @@
     position: absolute; inset: 0; z-index: 3; pointer-events: none;
   }
   .graphic-preview-card {
-    position: absolute; z-index: 3; pointer-events: none; box-sizing: border-box;
-    color: white; line-height: 1.05;
+    position: absolute; z-index: 3; pointer-events: auto; box-sizing: border-box;
+    color: white; line-height: 1.05; cursor: pointer; touch-action: none;
   }
   .graphic-preview-card.selected {
-    pointer-events: auto; cursor: move; outline: 1px solid #77b7ff;
-    outline-offset: 3px; touch-action: none;
+    cursor: move; outline: 1px solid #77b7ff; outline-offset: 3px;
   }
-  .graphic-preview-card.locked { cursor: not-allowed; }
+  .graphic-preview-card.locked { cursor: text; }
   .graphic-preview-card.invalid {
     outline: 2px solid #ef4f4f; outline-offset: 4px;
   }
@@ -708,6 +707,7 @@
     position: absolute; top: 5px; height: 27px; padding: 3px 7px;
     box-sizing: border-box; overflow: hidden; white-space: nowrap;
     text-overflow: ellipsis; border-radius: 4px; cursor: pointer;
+    touch-action: none;
     color: var(--ink); background: color-mix(in srgb, var(--accent) 17%, var(--panel));
     border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--line));
     font-size: 11px;
@@ -1355,6 +1355,7 @@ async function openRun(id, where) {
 }
 
 let blocks = [], blocksWere = [], picked = -1, lastReport = null;
+let timelineRevision = 0;
 // Both at once. peeking stays true so the take keeps loading and the box
 // keeps being drawn; this only says the cut is on screen as well.
 let beside = false;
@@ -1473,6 +1474,7 @@ async function showStrip() {
   // reordered or dropped anything, after which every panel read out another
   // shot's reasoning and the recut asked to re-cut the wrong take.
   blocks = data.blocks;
+  timelineRevision = data.revision || 0;
   cropsAre = data.crops_are || 'recorded';
   safeArea = data.safe_area || null;
   $('crop-warn').classList.toggle('hide', cropsAre !== 'rebuilt');
@@ -1660,6 +1662,22 @@ function graphicText(cue, which = 'primary') {
   return fact?.exact_text || '';
 }
 
+function graphicFactSourceLabel(factId) {
+  const fact = (graphicsPlan.facts || []).find(one => one.fact_id === factId);
+  return ({
+    user: '手動輸入',
+    brief_exact: 'Brief 原文',
+    brief_candidate: 'Brief 候選',
+    onscreen: '畫面辨識',
+    transcript: '語音逐字稿',
+    model_draft: 'Gemini 草稿',
+  })[fact?.source_kind] || '來源未標示';
+}
+
+function graphicSourceLabel(cue) {
+  return graphicFactSourceLabel(cue.primary_fact_id);
+}
+
 async function loadGraphics() {
   try {
     const got = await fetch(`/api/runs/${runId}/graphics-track`);
@@ -1694,9 +1712,17 @@ function paintGraphics() {
       title="${esc(one.primary_text)}">${esc(one.primary_text)}</div>`;
   }).join('');
   for (const block of lane.querySelectorAll('.graphic-block')) {
-    block.onclick = () => selectGraphic(+block.dataset.i);
     block.onpointerdown = (event) => dragGraphic(event, +block.dataset.i);
   }
+}
+
+function graphicTrackTargetAtClientX(cue, clientX) {
+  const reel = $('reel').getBoundingClientRect();
+  const pointed = (clientX - reel.left) / scale;
+  // The right edge is exclusive in both the Web preview and renderer.
+  // Keep a click on that edge inside the card it visibly belongs to.
+  return Math.max(cue.at_seconds, Math.min(
+    cue.at_seconds + cue.duration_seconds - .001, pointed));
 }
 
 function graphicAnchorAt(seconds) {
@@ -1714,15 +1740,18 @@ function reanchorGraphicCue(cue) {
   const anchor = found?.block;
   if (!anchor) {
     cue.anchor_clip_id = '';
+    cue.anchor_selection_index = null;
     cue.anchor_offset_seconds = 0;
     return false;
   }
   cue.anchor_clip_id = anchor.clip_id || '';
+  cue.anchor_selection_index = anchor.index;
   cue.anchor_offset_seconds = Math.max(0, cue.at_seconds - found.start);
   const fits = cue.at_seconds + cue.duration_seconds
     <= found.end + .01;
   if (!fits) {
     cue.anchor_clip_id = '';
+    cue.anchor_selection_index = null;
     cue.anchor_offset_seconds = 0;
   }
   return fits;
@@ -1735,11 +1764,16 @@ function dragGraphic(event, index) {
   const cue = graphicsPlan.cues[index], block = event.currentTarget;
   delete graphicResolvedLayout[cue.graphic_id];
   const startX = event.clientX, startAt = cue.at_seconds;
+  const pointerId = event.pointerId;
   const startDuration = cue.duration_seconds;
   const edge = event.offsetX < 8 ? 'left'
     : event.offsetX > block.clientWidth - 8 ? 'right' : 'move';
   graphicPicked = index;
+  let changed = false;
   const move = (next) => {
+    if (next.pointerId !== pointerId) return;
+    if (Math.abs(next.clientX - startX) < 2) return;
+    changed = true;
     const delta = Math.round(((next.clientX - startX) / scale) * 20) / 20;
     if (edge === 'left') {
       const end = startAt + startDuration;
@@ -1751,13 +1785,20 @@ function dragGraphic(event, index) {
     reanchorGraphicCue(cue);
     refreshGraphicsFromPlan();
   };
-  const up = () => {
+  const up = (next) => {
+    if (next.pointerId !== pointerId) return;
     window.removeEventListener('pointermove', move);
     window.removeEventListener('pointerup', up);
-    selectGraphic(index); saveGraphics();
+    window.removeEventListener('pointercancel', up);
+    if (changed) {
+      selectGraphic(index); saveGraphics();
+    } else {
+      selectGraphic(index, graphicTrackTargetAtClientX(cue, next.clientX));
+    }
   };
   window.addEventListener('pointermove', move);
   window.addEventListener('pointerup', up, { once: true });
+  window.addEventListener('pointercancel', up, { once: true });
 }
 
 function paintGraphicList() {
@@ -1797,20 +1838,21 @@ function paintGraphicList() {
     <div class="graphic-row ${i === graphicPicked ? 'on' : ''}" data-i="${i}">
       <div class="graphic-copy">${esc(one.primary_text)}</div>
       <span class="tag ${one.status === 'approved' ? 'ok' : ''}">${one.status === 'approved' ? '核准' : '草稿'}</span>
-      <div class="graphic-meta">${esc(one.kind)} · ${one.at_seconds.toFixed(2)}–${(one.at_seconds + one.duration_seconds).toFixed(2)}s · ${esc(one.template)}</div>
+      <div class="graphic-meta">${esc(graphicSourceLabel(one))} · ${esc(one.kind)} · ${one.at_seconds.toFixed(2)}–${(one.at_seconds + one.duration_seconds).toFixed(2)}s · ${esc(one.template)}</div>
     </div>`).join('') : '<p class="why">還沒有字卡。可在播放頭新增，乾淨母版不會被覆寫。</p>';
   for (const row of list.querySelectorAll('.graphic-row')) {
     row.onclick = () => selectGraphic(+row.dataset.i);
   }
 }
 
-function selectGraphic(i) {
+function selectGraphic(i, seekSeconds = null) {
   if (!(i >= 0 && i < graphics.length)) return;
   graphicPicked = i; cue = -1;
   // Land after the entrance so selecting an animated card never presents an
   // almost-transparent first frame while the user is trying to edit it.
-  const target = graphics[i].at_seconds
-    + Math.min(graphics[i].duration_seconds * .5, .65);
+  const target = seekSeconds == null
+    ? graphics[i].at_seconds + Math.min(graphics[i].duration_seconds * .5, .65)
+    : seekSeconds;
   let elapsed = 0;
   for (let shot = 0; shot < blocks.length; shot++) {
     if (target >= elapsed && target < elapsed + blocks[shot].seconds) {
@@ -1889,7 +1931,10 @@ function inspectGraphic() {
     .filter(t => (t.kinds || []).includes(one.kind))
     .map(t => [t.template_id, t.label]);
   box.innerHTML = `
+    <div class="why">第一行 · ${esc(graphicFactSourceLabel(one.primary_fact_id))}</div>
     <textarea id="graphic-primary" class="cue-text" spellcheck="false">${esc(one.primary_text)}</textarea>
+    <div class="why">第二行 · ${esc(one.secondary_fact_id
+      ? graphicFactSourceLabel(one.secondary_fact_id) : '尚未輸入')}</div>
     <textarea id="graphic-secondary" class="cue-text" spellcheck="false" placeholder="第二行，可留空">${esc(one.secondary_text || '')}</textarea>
     <section class="ins-part"><h4>內容與時間</h4><div class="pairs">
       <span>類型</span><select id="graphic-kind" class="wide">${graphicOptions([
@@ -2198,7 +2243,8 @@ async function updateGraphicFromInspector(event) {
     editor_note: $('graphic-note').value.trim(),
     style,
   });
-  reanchorGraphicCue(cue);
+  if (event?.target?.id === 'graphic-at'
+      || event?.target?.id === 'graphic-until') reanchorGraphicCue(cue);
   const previewMode = event?.target?.id?.startsWith('graphic-transform-')
     || event?.target?.id === 'graphic-position' ? 'transform' : 'content';
   refreshGraphicsFromPlan(previewMode); saveGraphics();
@@ -2389,31 +2435,51 @@ function preserveGraphicCenterAsManual(cue) {
   cue.position = 'manual';
 }
 
+function editGraphicFromCanvas(id) {
+  const index = graphicsPlan.cues.findIndex(cue => cue.graphic_id === id);
+  if (index < 0) return;
+  selectGraphic(index);
+  requestAnimationFrame(() => {
+    const editor = $('graphic-primary');
+    if (!editor) return;
+    editor.focus({preventScroll: true});
+    editor.select();
+  });
+}
+
 function beginGraphicCanvasGesture(event, id, mode = 'move') {
   const index = graphicsPlan.cues.findIndex(cue => cue.graphic_id === id);
   const cue = graphicsPlan.cues[index];
-  if (!cue || cue.transform?.locked || graphicApprovalInFlight
-      || graphicInteraction) return;
+  if (!cue || graphicApprovalInFlight || graphicInteraction) return;
   event.preventDefault(); event.stopPropagation();
   graphicPicked = index;
-  if (mode === 'scale' || mode === 'rotate') preserveGraphicCenterAsManual(cue);
   cue.transform = {...{x:.5,y:.5,scale:1,rotation_degrees:0,locked:false}, ...(cue.transform || {})};
   const video = $('video'), bounds = video.getBoundingClientRect();
   const start = {...cue.transform}, startX = event.clientX, startY = event.clientY;
   const card = event.currentTarget.closest('.graphic-preview-card');
   const center = card.getBoundingClientRect();
   const cx = center.left + center.width / 2, cy = center.top + center.height / 2;
-  if (mode === 'move' && cue.position !== 'manual') {
-    start.x = (cx - bounds.left) / Math.max(1, bounds.width);
-    start.y = (cy - bounds.top) / Math.max(1, bounds.height);
-    cue.transform.x = start.x; cue.transform.y = start.y;
-  }
   const startAngle = Math.atan2(startY - cy, startX - cx) * 180 / Math.PI;
   const pointerId = event.pointerId;
   graphicInteraction = {id, mode, pointerId};
   card.setPointerCapture?.(pointerId);
+  let moved = false;
   const move = next => {
     if (next.pointerId !== pointerId) return;
+    if (!moved && Math.hypot(next.clientX - startX, next.clientY - startY) < 4)
+      return;
+    if (cue.transform.locked) return;
+    if (!moved) {
+      moved = true;
+      if (mode === 'scale' || mode === 'rotate') {
+        preserveGraphicCenterAsManual(cue);
+        Object.assign(start, cue.transform);
+      } else if (cue.position !== 'manual') {
+        start.x = (cx - bounds.left) / Math.max(1, bounds.width);
+        start.y = (cy - bounds.top) / Math.max(1, bounds.height);
+        cue.transform.x = start.x; cue.transform.y = start.y;
+      }
+    }
     if (mode === 'move') {
       let x = start.x + (next.clientX - startX) / Math.max(1, bounds.width);
       let y = start.y + (next.clientY - startY) / Math.max(1, bounds.height);
@@ -2457,6 +2523,10 @@ function beginGraphicCanvasGesture(event, id, mode = 'move') {
     card.removeEventListener('lostpointercapture', up);
     if (card.hasPointerCapture?.(pointerId)) card.releasePointerCapture(pointerId);
     graphicInteraction = null;
+    if (!moved) {
+      editGraphicFromCanvas(id);
+      return;
+    }
     scheduleGraphicPreview('transform'); saveGraphics(); paintGraphics(); paintGraphicList();
   };
   card.addEventListener('pointermove', move);
@@ -2467,7 +2537,7 @@ function beginGraphicCanvasGesture(event, id, mode = 'move') {
 
 function showGraphicPreview() {
   const layer = $('graphic-preview'), video = $('video');
-  if (!layer || !video || peeking || !video.videoWidth) {
+  if (!layer || !video || (peeking && !beside) || !video.videoWidth) {
     layer?.classList.add('hide'); return;
   }
   const at = video.currentTime || 0;
@@ -2484,7 +2554,7 @@ function showGraphicPreview() {
     if (target) requestGraphicPreview(target);
   }
   const shown = video.getBoundingClientRect(), holder = $('frame').getBoundingClientRect();
-  const draftJoint = selected?.status !== 'approved'
+  const draftJoint = selected && selected.status !== 'approved'
     ? compiledGraphicPreviews[selected.graphic_id]?.joint_layout : null;
   const ready = active.map(one => {
     const made = compiledGraphicPreviews[one.graphic_id];
@@ -2588,7 +2658,8 @@ function showGraphicPreview() {
     card.classList.toggle('selected', isSelected);
     card.classList.toggle('locked', !!transform.locked);
     card.classList.toggle('invalid', !!graphicPreviewErrors[one.graphic_id]);
-    card.title = graphicPreviewErrors[one.graphic_id] || '';
+    card.title = graphicPreviewErrors[one.graphic_id]
+      || '點一下編輯文字；拖曳可移動字卡';
     const dirty = graphicPreviewDirty.has(one.graphic_id) || made.synthetic;
     let live = card.querySelector('.graphic-live-surface-wrap');
     if (dirty && isSelected && dirtyMode === 'content') {
@@ -2656,6 +2727,7 @@ function addGraphicAtPlayhead(approvedFactId = '') {
   graphicsPlan.cues.push({
     graphic_id: id, kind, primary_fact_id: factId,
     secondary_fact_id: '', anchor_clip_id: anchor?.clip_id || '',
+    anchor_selection_index: anchor?.index ?? null,
     anchor_offset_seconds: Math.max(0, now - anchorStart), at_seconds: now,
     duration_seconds: 2.5, template, position: 'auto',
     composition: 'auto', background: 'auto', motion: 'rise',
@@ -2690,6 +2762,7 @@ function addBriefCandidate(candidateId, variantIndex = -1) {
   graphicsPlan.cues.push({
     graphic_id: id, kind: candidate.kind, primary_fact_id: primaryId,
     secondary_fact_id: secondaryId, anchor_clip_id: anchor?.clip_id || '',
+    anchor_selection_index: anchor?.index ?? null,
     anchor_offset_seconds: Math.max(0, now - anchorStart), at_seconds: now,
     duration_seconds: Math.min(5.5, 2.2 + lines * .45),
     template: candidate.template, position: candidate.position || 'auto',
@@ -3077,7 +3150,7 @@ $('recut').addEventListener('click', async () => {
   $('strip-note').textContent = '重新輸出中…';
   const res = await fetch(`/api/runs/${runId}/recut`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ shots: blocks.map(b => ({
+    body: JSON.stringify({ base_revision: timelineRevision, shots: blocks.map(b => ({
       index: b.index, in_seconds: b.in_seconds, seconds: b.seconds,
       gain_db: b.gain_db || 0 })) }),
   });
@@ -3086,7 +3159,10 @@ $('recut').addEventListener('click', async () => {
   const out = await res.json();
   $('video').src = `/api/runs/${runId}/video?t=` + Date.now();
   invalidateGraphicPreviews();
-  blocksWere = JSON.parse(JSON.stringify(blocks));
+  // The server has committed one current timeline for the video, crop
+  // evidence and all later exports. Read that record back instead of
+  // keeping the browser's pre-render copy as a second source of truth.
+  await showStrip();
   $('strip-note').textContent = `已重新輸出：${out.shots} 顆、${out.seconds.toFixed(1)}s`;
   $('recut').classList.add('hide');
 });
@@ -4360,6 +4436,11 @@ function peek(on, both) {
   warmNext();
   mirrorRaw();
   drawCrop();
+  // Changing to two panes moves/resizes the finished picture without a
+  // window resize. Reproject overlays after flex layout has settled.
+  requestAnimationFrame(() => {
+    forgetPlacement(); drawCrop(); showBurnt(); showGraphicPreview();
+  });
 }
 
 $('see-cut').addEventListener('click', () => peek(false, false));
@@ -4380,7 +4461,12 @@ for (const when of ['loadedmetadata', 'loadeddata', 'seeked', 'canplay']) {
     drawCrop();
   }, true);
 }
-addEventListener('resize', () => { forgetPlacement(); drawCrop(); });
+addEventListener('resize', () => {
+  forgetPlacement(); drawCrop(); showBurnt(); showGraphicPreview();
+});
+new ResizeObserver(() => {
+  forgetPlacement(); drawCrop(); showBurnt(); showGraphicPreview();
+}).observe($('frame'));
 $('video').addEventListener('loadedmetadata', showBurnt);
 $('video').addEventListener('timeupdate', showBurnt);
 for (const eventName of ['timeupdate','seeked','loadedmetadata'])

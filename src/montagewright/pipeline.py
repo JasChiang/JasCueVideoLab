@@ -310,13 +310,16 @@ def probe(source_id: str, path: Path) -> Source:
             kept if kept.source_id == source_id
             else Source(source_id=source_id, path=kept.path,
                         duration_seconds=kept.duration_seconds,
-                        width=kept.width, height=kept.height)
+                        width=kept.width, height=kept.height,
+                        native_fps=kept.native_fps)
         )
 
     completed = subprocess.run(
         [
             "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height:format=duration",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,r_frame_rate:stream_tags=rotate:"
+            "stream_side_data=rotation:format=duration",
             "-of", "json", str(path),
         ],
         capture_output=True,
@@ -325,12 +328,41 @@ def probe(source_id: str, path: Path) -> Source:
     )
     payload = json.loads(completed.stdout)
     stream = payload["streams"][0]
+    rotation = int(float(
+        stream.get("tags", {}).get("rotate")
+        or next(
+            (
+                side.get("rotation", 0)
+                for side in stream.get("side_data_list", [])
+                if "rotation" in side
+            ),
+            0,
+        )
+        or 0
+    )) % 360
+    width, height = int(stream["width"]), int(stream["height"])
+    if rotation in {90, 270}:
+        width, height = height, width
+    from fractions import Fraction
+
+    native_fps = "30/1"
+    for candidate in (
+        stream.get("avg_frame_rate"), stream.get("r_frame_rate")
+    ):
+        try:
+            rate = Fraction(str(candidate))
+            if rate > 0:
+                native_fps = f"{rate.numerator}/{rate.denominator}"
+                break
+        except (ValueError, ZeroDivisionError):
+            continue
     found = Source(
         source_id=source_id,
         path=path,
         duration_seconds=float(payload["format"]["duration"]),
-        width=int(stream["width"]),
-        height=int(stream["height"]),
+        width=width,
+        height=height,
+        native_fps=native_fps,
     )
     if seen is not None:
         _PROBED[seen] = found
@@ -1541,5 +1573,38 @@ def run(
         plan, output_dir, music=music, keep_segments=True,
         keep_voice=keep_voice, under_speech=under_speech,
     )
+    # The resolved plan is the only truthful source for a later Web/CLI
+    # edit. Selection in-points precede action snapping and beat grounding;
+    # reconstructing from them made a zero-change recut select different
+    # source frames. Commit the exact rendered windows with the first film.
+    from montagewright.measure.storage import write_json
+    from montagewright.executor import allocate_timeline_frames
+
+    frame_spans = allocate_timeline_frames(
+        [segment.duration_seconds for segment in plan.segments],
+        plan.output_fps,
+    )
+
+    write_json(output_dir / "work" / "current-timeline.json", {
+        "version": "montagewright-current-timeline-v1",
+        "revision": 0,
+        "output_fps": plan.output_fps,
+        "output_size": list(plan.output_size),
+        "music_from_seconds": plan.music_from_seconds,
+        "music_spans": plan.music_spans,
+        "shots": [
+            {
+                "selection_index": index,
+                "in_seconds": segment.in_seconds,
+                "start_frame": start,
+                "frame_count": end - start,
+                "seconds": (end - start) / plan.output_fps,
+                "gain_db": segment.gain_db,
+            }
+            for index, (segment, (start, end)) in enumerate(
+                zip(plan.segments, frame_spans, strict=True)
+            )
+        ],
+    })
     report.delivered_seconds = round(result.duration_seconds, 2)
     return result, plan, report, edl

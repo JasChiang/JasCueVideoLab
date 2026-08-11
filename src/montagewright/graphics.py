@@ -192,6 +192,9 @@ class GraphicCue(Local):
     # retained so a later recut can re-resolve it rather than pretending an
     # old clock time still belongs to the same shot.
     anchor_clip_id: str = ""
+    # Stable identity in the original selection. anchor_clip_id is the
+    # current reel position used to address its crop/segment.
+    anchor_selection_index: int | None = Field(default=None, ge=0)
     anchor_offset_seconds: float = Field(default=0.0, ge=0.0)
     at_seconds: float = Field(default=0.0, ge=0.0)
     duration_seconds: float = Field(default=2.5, gt=0.0, le=30.0)
@@ -1479,12 +1482,12 @@ def burn_graphics(
         else:
             filters.append(
                 f"[{index + 1}:v]format=rgba,"
-                f"fade=t=in:st={since:.3f}:d={enter:.3f}:alpha=1,"
-                f"fade=t=out:st={until - leave:.3f}:d={leave:.3f}:alpha=1"
+                f"fade=t=in:st={since:.9f}:d={enter:.9f}:alpha=1,"
+                f"fade=t=out:st={until - leave:.9f}:d={leave:.9f}:alpha=1"
                 f"[{overlay_tag}]"
             )
         progress = (
-            f"min(max((t-{since:.3f})/{enter:.3f},0),1)"
+            f"min(max((t-{since:.9f})/{enter:.9f},0),1)"
         )
         dx = animation["from_left"] - animation["settled_left"]
         dy = animation["from_top"] - animation["settled_top"]
@@ -1493,7 +1496,7 @@ def burn_graphics(
         next_tag = f"v{index}"
         filters.append(
             f"[{tag}][{overlay_tag}]overlay=x='{x}':y='{y}':"
-            f"enable='gte(t,{since:.3f})*lt(t,{until:.3f})'[{next_tag}]"
+            f"enable='gte(t,{since:.9f})*lt(t,{until:.9f})'[{next_tag}]"
         )
         tag = next_tag
     for index, overlay in enumerate(subtitle_overlays or []):
@@ -1503,8 +1506,8 @@ def burn_graphics(
         next_tag = f"sv{index}"
         filters.append(
             f"[{tag}][{overlay_tag}]overlay={overlay.left}:{overlay.top}:"
-            f"enable='gte(t,{overlay.starts_seconds:.3f})*"
-            f"lt(t,{overlay.ends_seconds:.3f})'[{next_tag}]"
+            f"enable='gte(t,{overlay.starts_seconds:.9f})*"
+            f"lt(t,{overlay.ends_seconds:.9f})'[{next_tag}]"
         )
         tag = next_tag
     command += [
