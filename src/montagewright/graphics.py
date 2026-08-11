@@ -59,7 +59,7 @@ SurfaceTreatment = Literal[
 ]
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
-GRAPHICS_RENDERER_VERSION = 8
+GRAPHICS_RENDERER_VERSION = 9
 GRAPHIC_PRESET_REGISTRY_VERSION = 1
 
 
@@ -776,6 +776,31 @@ class DrawnGraphic:
     text_mask_path: Path | None = None
     backing_path: Path | None = None
     text_run_mask_paths: tuple[Path, ...] = ()
+    # The intended glyph colours without stroke, shadow or background.  The
+    # contrast audit must not infer a foreground colour from the composited
+    # card: after a small card is resampled, a black outline legitimately
+    # bleeds into white glyph pixels and looks like black-on-black evidence.
+    foreground_path: Path | None = None
+
+
+def _save_png_atomic(image, destination: Path) -> None:
+    """Publish one complete PNG or leave the previous file untouched."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=f".{destination.stem}-",
+            suffix=".png",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        image.save(temporary_path, format="PNG")
+        temporary_path.replace(destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -799,9 +824,9 @@ def _apply_authored_transform(
     transform = cue.transform
     paths = [
         card.path, card.text_mask_path, card.backing_path,
-        *card.text_run_mask_paths,
+        card.foreground_path, *card.text_run_mask_paths,
     ]
-    mask_indexes = {1, *range(3, len(paths))}
+    mask_indexes = {1, *range(4, len(paths))}
     images = [
         Image.open(path).convert("L" if index in mask_indexes else "RGBA")
         if path is not None else None
@@ -831,7 +856,7 @@ def _apply_authored_transform(
         ]
     for path, image in zip(paths, images):
         if path is not None and image is not None:
-            image.save(path)
+            _save_png_atomic(image, path)
     rendered = images[0]
     assert rendered is not None
     left, top = card.left, card.top
@@ -1027,17 +1052,64 @@ def _motion_distance_pixels(
     return 0
 
 
+def _feasible_graphic_motion(
+    cue: GraphicCue,
+    card: DrawnGraphic,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[str, int]:
+    """Resolve a family entrance that can exist inside the delivery safe area.
+
+    Curated families are starting points, so an automatic card may shorten a
+    travel or become a fade when its text nearly fills the safe width/height.
+    A manually positioned, locked, or strict card is authored geometry: do not
+    silently reinterpret it; the normal safe-area check will explain why it
+    cannot render.
+    """
+
+    requested = _motion_distance_pixels(cue, frame_width, frame_height)
+    if cue.motion not in {"rise", "slide_left", "slide_right"}:
+        return cue.motion, 0
+    if (
+        cue.position == "manual"
+        or cue.transform.locked
+        or cue.style.contrast_mode == "strict"
+    ):
+        return cue.motion, requested
+    side = round(frame_width * 0.075)
+    top_safe = round(frame_height * 0.09)
+    bottom = frame_height - round(
+        frame_height * (0.25 if frame_width < frame_height else 0.10)
+    )
+    capacity = (
+        bottom - top_safe - card.height
+        if cue.motion == "rise"
+        else frame_width - side * 2 - card.width
+    )
+    capacity = max(0, capacity)
+    if requested <= capacity:
+        return cue.motion, requested
+    # A two-pixel nudge is visually a fade with rounding noise. Calling it a
+    # fade also makes Web/FFmpeg reports honest about what will be delivered.
+    minimum_travel = max(2, round(frame_height * 0.008))
+    if capacity < minimum_travel:
+        return "fade", 0
+    return cue.motion, capacity
+
+
 def _swept_rect(
     cue: GraphicCue, card: DrawnGraphic,
     frame_width: int, frame_height: int,
 ) -> tuple[int, int, int, int]:
-    distance = _motion_distance_pixels(cue, frame_width, frame_height)
+    motion, distance = _feasible_graphic_motion(
+        cue, card, frame_width, frame_height
+    )
     left, top, wide, tall = card.left, card.top, card.width, card.height
-    if cue.motion == "rise":
+    if motion == "rise":
         tall += distance
-    elif cue.motion == "slide_left":
+    elif motion == "slide_left":
         wide += distance
-    elif cue.motion == "slide_right":
+    elif motion == "slide_right":
         left -= distance
         wide += distance
     return left, top, wide, tall
@@ -1049,14 +1121,14 @@ def _place_for_motion_safe(
     side = round(width * 0.075)
     top_safe = round(height * 0.09)
     bottom = height - round(height * (0.25 if width < height else 0.10))
-    distance = _motion_distance_pixels(cue, width, height)
+    motion, distance = _feasible_graphic_motion(cue, card, width, height)
     min_left, max_left = side, width - side - card.width
     min_top, max_top = top_safe, bottom - card.height
-    if cue.motion == "rise":
+    if motion == "rise":
         max_top -= distance
-    elif cue.motion == "slide_left":
+    elif motion == "slide_left":
         max_left -= distance
-    elif cue.motion == "slide_right":
+    elif motion == "slide_right":
         min_left += distance
     if min_left > max_left or min_top > max_top:
         raise ValueError(
@@ -1091,13 +1163,14 @@ def resolve_graphic_animation(
         if cue.style.exit_seconds is not None
         else min(0.32, max(0.12, cue.duration_seconds * 0.08))
     )
-    distance = _motion_distance_pixels(cue, width, height)
+    motion, distance = _feasible_graphic_motion(cue, card, width, height)
+    requested_distance = _motion_distance_pixels(cue, width, height)
     from_left, from_top = card.left, card.top
-    if cue.motion == "rise":
+    if motion == "rise":
         from_top += distance
-    elif cue.motion == "slide_left":
+    elif motion == "slide_left":
         from_left += distance
-    elif cue.motion == "slide_right":
+    elif motion == "slide_right":
         from_left -= distance
     return {
         "start_seconds": cue.at_seconds,
@@ -1108,7 +1181,11 @@ def resolve_graphic_animation(
         "from_top": from_top,
         "settled_left": card.left,
         "settled_top": card.top,
-        "fade": cue.motion != "none",
+        "fade": motion != "none",
+        "requested_motion": cue.motion,
+        "resolved_motion": motion,
+        "requested_motion_distance": requested_distance,
+        "resolved_motion_distance": distance,
         "easing": "linear",
     }
 
@@ -1147,6 +1224,10 @@ def measured_text_contrast(
     if not frames or card.text_mask_path is None or card.backing_path is None:
         return None
     glyph = Image.open(card.path).convert("RGBA")
+    foreground = (
+        Image.open(card.foreground_path).convert("RGBA")
+        if card.foreground_path is not None else None
+    )
     backing = Image.open(card.backing_path).convert("RGBA")
     mask_paths = (
         card.text_run_mask_paths
@@ -1213,11 +1294,19 @@ def measured_text_contrast(
                     round(under[index] * alpha + base[index] * (1 - alpha))
                     for index in range(3)
                 )
-                foreground = glyph.getpixel((x, y))[:3]
-                direct = _contrast_ratio(foreground, background)
+                # New cards carry the authored fill on a separate evidence
+                # layer.  Reading the composited RGBA here made a downsampled
+                # outline count as the glyph colour and rejected accessible
+                # white-on-black fallbacks.  Keep the old read path only for
+                # callers constructing a legacy DrawnGraphic by hand.
+                intended = (
+                    foreground.getpixel((x, y))[:3]
+                    if foreground is not None else glyph.getpixel((x, y))[:3]
+                )
+                direct = _contrast_ratio(intended, background)
                 if outline_width >= 1.5:
                     outline_chain = min(
-                        _contrast_ratio(foreground, outline_rgb),
+                        _contrast_ratio(intended, outline_rgb),
                         _contrast_ratio(outline_rgb, background),
                     )
                     direct = max(direct, outline_chain)
@@ -1245,23 +1334,64 @@ def _layout_sample_shares(cue: GraphicCue) -> tuple[float, float, float]:
     return entrance_midpoint, 0.5, 0.97
 
 
-def _layout_frames(picture: Path, cue: GraphicCue) -> list:
+def _layout_frames(
+    picture: Path,
+    cue: GraphicCue,
+    *,
+    cache_dir: Path | None = None,
+) -> list:
     from io import BytesIO
     from PIL import Image
 
+    picture_stat = picture.stat()
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
     frames = []
     for share in _layout_sample_shares(cue):
         at = cue.at_seconds + cue.duration_seconds * share
-        made = subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-ss", f"{at:.3f}", "-i", str(picture),
-                "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-",
-            ],
-            capture_output=True,
-        )
-        if made.returncode == 0 and made.stdout:
-            frames.append(Image.open(BytesIO(made.stdout)).convert("RGB"))
+        cached = None
+        if cache_dir is not None:
+            frame_digest = hashlib.sha256(
+                json.dumps({
+                    "picture": str(picture.resolve()),
+                    "size": picture_stat.st_size,
+                    "mtime_ns": picture_stat.st_mtime_ns,
+                    "at": round(at, 6),
+                }, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            cached = cache_dir / f"{frame_digest}.png"
+        try:
+            payload = cached.read_bytes() if cached and cached.is_file() else b""
+        except OSError:
+            payload = b""
+        if not payload:
+            made = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-ss", f"{at:.3f}", "-i", str(picture),
+                    "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-",
+                ],
+                capture_output=True,
+            )
+            payload = made.stdout if made.returncode == 0 else b""
+            if payload and cached is not None:
+                # Another preview may be compiling the same cue. Publish a
+                # complete PNG atomically so neither request can read a
+                # half-written cache entry.
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        dir=cache_dir, suffix=".png", delete=False
+                    ) as temporary:
+                        temporary.write(payload)
+                        temporary_path = Path(temporary.name)
+                    temporary_path.replace(cached)
+                except OSError:
+                    try:
+                        temporary_path.unlink(missing_ok=True)
+                    except (OSError, UnboundLocalError):
+                        pass
+        if payload:
+            frames.append(Image.open(BytesIO(payload)).convert("RGB"))
     return frames
 
 
@@ -1390,9 +1520,13 @@ def draw_graphic(
         )
     canvas = Image.new("RGBA", (card_width, card_height), (0, 0, 0, 0))
     text_mask = Image.new("L", (card_width, card_height), 0)
+    foreground_evidence = Image.new(
+        "RGBA", (card_width, card_height), (0, 0, 0, 0)
+    )
     line_masks = []
     pen = ImageDraw.Draw(canvas)
     mask_pen = ImageDraw.Draw(text_mask)
+    foreground_pen = ImageDraw.Draw(foreground_evidence)
     y = (
         pad_y + shadow_room + stroke_width + rule
         + (round(height * 0.010 * render_scale) if rule else 0)
@@ -1602,6 +1736,10 @@ def draw_graphic(
             fill=(*_rgb(colour), 255), stroke_width=stroke_width,
             stroke_fill=(*_rgb(style.stroke_color), 255),
         )
+        foreground_pen.multiline_text(
+            target, text, font=face, spacing=spacing, align=align,
+            fill=(*_rgb(colour), 255),
+        )
         # Interior glyph pixels only. The contrast auditor deliberately does
         # not let a large translucent plate hide unreadable foreground text.
         mask_pen.multiline_text(
@@ -1650,6 +1788,11 @@ def draw_graphic(
                         stroke_width=stroke_width,
                         stroke_fill=(*_rgb(style.stroke_color), 255),
                     )
+                    foreground_pen.text(
+                        (line_x + pen.textlength(prefix, font=face), line_y),
+                        emphasis, font=face,
+                        fill=(*_rgb(emphasis_colour), 255),
+                    )
                 line_box = pen.textbbox(
                     (0, 0), line or " ", font=face,
                     stroke_width=stroke_width,
@@ -1675,20 +1818,21 @@ def draw_graphic(
     position = cue.position if cue.position != "auto" else spec.default_position
     positions = _placements(width, height, card_width, card_height)
     left, top = positions.get(position, positions[spec.default_position])
-    into.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(into)
     mask_path = into.with_name(f"{into.stem}-text-mask.png")
     backing_path = into.with_name(f"{into.stem}-backing.png")
-    text_mask.save(mask_path)
-    backing.save(backing_path)
+    foreground_path = into.with_name(f"{into.stem}-foreground.png")
+    _save_png_atomic(canvas, into)
+    _save_png_atomic(text_mask, mask_path)
+    _save_png_atomic(backing, backing_path)
+    _save_png_atomic(foreground_evidence, foreground_path)
     run_mask_paths = []
     for index, line_mask in enumerate(line_masks):
         line_mask_path = into.with_name(f"{into.stem}-line-{index}.png")
-        line_mask.save(line_mask_path)
+        _save_png_atomic(line_mask, line_mask_path)
         run_mask_paths.append(line_mask_path)
     return DrawnGraphic(
         into, max(0, left), max(0, top), card_width, card_height,
-        mask_path, backing_path, tuple(run_mask_paths),
+        mask_path, backing_path, tuple(run_mask_paths), foreground_path,
     )
 
 
@@ -1711,13 +1855,51 @@ def compile_graphic(
             f"{cue.graphic_id}: only {len(frames or [])}/3 picture samples "
             "were decoded; contrast cannot be verified, so rendering is stopped"
         )
-    card = draw_graphic(
-        cue, plan, width=width, height=height, into=into,
-        # Small cards are typeset at full resolution then reduced once; this
-        # keeps the font fitter's minimum legible size while preserving a
-        # true uniform transform. Enlarged cards are rerasterized sharply.
-        render_scale=max(1.0, cue.transform.scale),
-    )
+    requested_template = cue.template
+    try:
+        card = draw_graphic(
+            cue, plan, width=width, height=height, into=into,
+            # Small cards are typeset at full resolution then reduced once;
+            # this keeps the font fitter's minimum legible size while
+            # preserving a true uniform transform. Enlarged cards are
+            # rerasterized sharply.
+            render_scale=max(1.0, cue.transform.scale),
+        )
+    except ValueError as error:
+        # A curated family is a semantic request, not permission to ship an
+        # impossible card.  When its inherited copy structure outgrows a
+        # compact template, choose the widest compatible role locally.  An
+        # explicitly locked/strict card remains authored and fails closed.
+        may_reflow = (
+            cue.style.preset in CURATED_GRAPHIC_FAMILY_IDS
+            and cue.style.contrast_mode == "auto"
+            and not cue.transform.locked
+            and "too long" in str(error)
+        )
+        alternatives = sorted(
+            (
+                spec for spec in TEMPLATES.values()
+                if cue.kind in spec.kinds and spec.template_id != cue.template
+            ),
+            key=lambda spec: spec.width,
+            reverse=True,
+        )
+        if not may_reflow or not alternatives:
+            raise
+        last_error: ValueError = error
+        for alternative in alternatives:
+            candidate = cue.model_copy(update={"template": alternative.template_id})
+            try:
+                card = draw_graphic(
+                    candidate, plan, width=width, height=height, into=into,
+                    render_scale=max(1.0, candidate.transform.scale),
+                )
+                cue = candidate
+                break
+            except ValueError as candidate_error:
+                last_error = candidate_error
+        else:
+            raise last_error
     card = _apply_authored_transform(cue, card, width, height)
     report = {
         "resolved_left": card.left, "resolved_top": card.top,
@@ -1779,7 +1961,9 @@ def compile_graphic(
                     forbidden_positions=forbidden_positions or set(),
                     keepout_rects=keepout_rects,
                 )
-            variant = _place_for_motion_safe(cue, variant, width, height)
+            variant = _place_for_motion_safe(
+                variant_cue, variant, width, height
+            )
             variant_ratio = measured_text_contrast(
                 variant, frames or [], cue=variant_cue,
                 frame_width=width, frame_height=height,
@@ -1859,11 +2043,20 @@ def compile_graphic(
             "stroke_width": 3.0,
         })
         if ratio < 4.5:
-            outlined, _outlined_cue, outlined_scores, outlined_ratio = (
-                compile_accessible_variant(
-                    outline_style, background=cue.background,
+            try:
+                outlined, _outlined_cue, outlined_scores, outlined_ratio = (
+                    compile_accessible_variant(
+                        outline_style, background=cue.background,
+                    )
                 )
-            )
+            except ValueError as error:
+                # An outline consumes horizontal room.  It is only the first
+                # automatic accessibility option, so copy that no longer fits
+                # must continue to the plate fallback instead of making an
+                # otherwise valid family/template fail rendering.
+                if "too long" not in str(error):
+                    raise
+                outlined_ratio = None
         else:
             outlined_ratio = None
         if ratio < 4.5 and outlined_ratio is not None and outlined_ratio >= 4.5:
@@ -1883,7 +2076,10 @@ def compile_graphic(
                 # The fallback owns its accessibility treatment. Reusing an
                 # authored extreme outline can swallow thin CJK glyphs and
                 # turn nominal white-on-black copy into black-on-black.
-                "stroke_width": 2.0,
+                # White copy on the owned opaque plate needs no outline.  A
+                # zero-width fallback also preserves the fitter's available
+                # room for long CJK/Latin copy.
+                "stroke_width": 0.0,
             })
             card, fallback_cue, scores, ratio = compile_accessible_variant(
                 fallback_style, background="plate",
@@ -1920,6 +2116,8 @@ def compile_graphic(
         "contrast_ratio": ratio, "contrast_adjustments": adjustments,
         "authored_transform": cue.transform.model_dump(mode="json"),
         "authored_style": cue.style.model_dump(mode="json"),
+        "requested_template": requested_template,
+        "resolved_template": cue.template,
         "animation": resolve_graphic_animation(cue, card, width, height),
     })
     return card, report

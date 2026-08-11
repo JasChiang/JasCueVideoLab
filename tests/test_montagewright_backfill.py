@@ -162,6 +162,16 @@ def test_an_edit_saved_from_the_browser_comes_back_on_the_measured_clock(
         web._transcript_map = cards
         client = TestClient(web.create_app())
 
+        stale = [
+            here / "out" / "deliverable-subtitled.mp4",
+            here / "out" / "deliverable-graphics.mp4",
+            here / "out" / "deliverable-graphics-subtitled.mp4",
+            here / "out" / "work" / "graphics-render" / "layout.json",
+        ]
+        for path in stale:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"old subtitle authority")
+
         # Somebody splits the line in two, keeping the old times on both.
         saved = client.put("/api/runs/r1/subtitle-track", json={"lines": [
             {"at": 0.0, "until": 1.3, "text": "在夏天"},
@@ -173,6 +183,7 @@ def test_an_edit_saved_from_the_browser_comes_back_on_the_measured_clock(
         assert [(one["at"], one["until"]) for one in back] == [
             (0.0, 0.6), (0.6, 1.3)
         ]
+        assert all(not path.exists() for path in stale)
     finally:
         web.RUNS_ROOT = was
         web._transcript_map = held

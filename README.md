@@ -1,182 +1,513 @@
-# montagewright
+# Montagewright
 
-丟一個資料夾的毛片進去，出來一支剪好的片，還有一份說明每個決定是怎麼來的報表。
+Montagewright 把一個毛片資料夾、可選的音樂與 Brief，整理成一支可交付的影片。
 
-```bash
-montagewright render RUSHES/ --brief BRIEF.md --music TRACK.mp3 \
-  --aspect 9:16 --review --output CUT/
-
-montagewright transcribe VIDEO.mp4        # 只要字幕，不重剪
-montagewright-web                         # 同一件事，網頁上看得到過程
-```
-
-![網頁介面](docs/images/web.jpg)
-
-## 做法
-
-如果有人想研究 AI 剪輯但沒什麼頭緒，這裡是我把雲端跟地端接起來的做法。整套東西的判斷只有一句話：看得懂才答得出來的問題交給模型，要量才知道的問題交給程式。
-
-畫面這邊，先把毛片壓成 proxy 讓 Gemini 整支連聲音看完，寫成一張 Clip Card。實際長這樣（省略了幾筆）：
-
-```jsonc
-{
-  "summary": "Cameras pan horizontally back and forth showing standing foldable phones (white and purple) against a white background.",
-  "composition": "horizontal",        // 內容橫向鋪開，會跟直式裁切打架
-  "usable_from_seconds": 0.0,
-  "usable_to_seconds": 27.2,          // 開頭在甩、結尾鏡頭移開的部分不算
-  "speech": "ambient",                // 不是 content，所以不會去做逐字稿
-  "camera_moves": true,
-  "camera_motion": "左右平移展示白與紫色兩款對折手機機背鏡頭模組與鉸鏈細節",
-  "subjects": [
-    { "label": "the white foldable phone",
-      "centre_x": 0.65, "centre_y": 0.52, "width": 0.45, "height": 0.9,
-      "moves": true, "at_seconds": 2.0 },
-    { "label": "the purple foldable phone", ... }
-  ],
-  "action": [
-    { "what": "the camera pans right showing the purple phone",
-      "starts_seconds": 2.5, "ends_seconds": 4.5 }, ...
-  ],
-  "needs": [
-    { "what": "crop", "why": "畫面左側有大量留白，若要進行直式構圖或聚焦產品需重新裁切置中" }
-  ]
-}
-```
-
-有幾個欄位是踩過坑之後才加的。`camera_motion` 是因為素材自己在動的時候，再疊一層數位運鏡兩邊會打架，不如框住不動讓它演完。`speech` 決定要不要為這支付一次逐字稿的錢，判準是「這顆的意思靠不靠聲音成立」，不是「有沒有人在講話」。主體的 `label` 一定要能跟旁邊長得像的東西分開（「左邊那台白色的」而不是「那台手機」），`at_seconds` 則是記下這個框是看第幾秒說的 —— 東西在動的時候，位置只在那一刻成立。
-
-卡片刻意不看 brief，所以只要素材沒變就一直有效，同一批素材想剪成別的主題不用再重看一遍。要重新構圖成 9:16 的話，再用 Gemini 的物件偵測抽幾張靜幀問「左邊那台深色手機」在哪，然後把那個框交給 SAM 2.1 往前後傳播，追出每一幀的位置。「哪一台是深色的」要看得懂畫面才答得出來，所以交給模型；「它在第幾格的哪個位置」則是量出來的，所以交給程式。
-
-聲音那邊的分工其實一樣，只是換成時間跟文字。Apple SpeechTranscriber（macOS 26 內建）每個字都有自己的起訖時間碼，還附一個信心值，這種東西只有真的去量音訊才會知道；但它中文常常聽錯，會掉字，也會出現同音字。Gemini 剛好反過來，它聽得懂在講什麼，可是你問它某句話是第幾秒到第幾秒，它就給你一個看起來很合理的數字。時間戳麻煩的地方在於錯的跟對的長得一模一樣，沒辦法用看的檢查出來。
-
-所以我的做法是讓 Gemini 獨立看一次影片先給一份逐字稿，再把正確的字回填到辨識器量到的時間上去。文字取自模型，時鐘完全來自辨識器，模型自己報的秒數一律不採用。
-
-還有一條是決定跟執行要分開。執行層碰到做不到的事，要降級並且記錄下來，但不能放棄素材，也不能自己改掉模型的決定。有一次它自作主張把靜止鏡頭換成橫向掃描，結果下一輪審查回報「掃過去了，字還是被切」，整個迴圈在跟自己打架。所以報表跟影片一樣是交付物，片子不好看的時候，才知道是哪一層判斷錯了。
-
-## 流程
-
-十二個階段，其中八個要付錢給 Gemini。行首的 `$` 是付費呼叫、`-` 是本機執行，`◈` 表示有內容定址快取，`〔〕` 是跑這一階的條件。
-
-```
--   毛片 → proxy  ◈
-    640px；已經剪過的長片先照場景切點拆回鏡頭
-    |
-$   Clip Card  ◈
-    每支素材一次，跨專案共用
-    |
--   Apple ASR  ◈  〔有人講話才跑〕
-    每字的起訖時間，整條線唯一的時鐘
-    |
-$   逐字修正  〔同上〕
-    看影片改同音字；它自己報的秒數不採用
-    |
-$   定調
-    片長、比例、哪些素材直接排除
-    |
-$   選片
-    用哪幾顆、進出點、每顆什麼運鏡
-    |
-$   節奏  〔有配樂才跑〕
-    聽音樂重寫長度，並記下哪些本來就不打算對拍
-    |
-$   主體定位  〔有運鏡才跑〕
-    抽靜態格問框，回傳 0..1000 座標
-    |
--   SAM 逐幀追蹤  〔同上〕
-    本機 propagation，算出每一格的裁切路徑
-    |
--   渲染
-    ffmpeg 分段 → 串接 → 混音
-    |
-$   審查  〔--review〕
-    看單顆 + 看整片；沒交付的那幾顆送回「主體定位」重跑
-    |
--   交付
-    mp4、字幕、report.json、FCPXML
-```
-
-有一點跟直覺不太一樣：定調跟選片並不是只讀卡片上的文字，它們會把所有 proxy 一起附上去重看一次，卡片在這裡只是索引。選片原本只讀文字摘要，改成附上影片之後，它從挑十一顆變成挑十七顆，而且講出了摘要裡根本沒有的東西。摘要畢竟是在還沒人知道這支片要講什麼的時候寫的。
-
-畫面配音樂的片，切點會對上實際量到的重音；以講話為主的片則是一顆鏡頭一句話，講完就切，長度完全由內容決定。不用先告訴它是哪一種，卡片會自己判斷。
-
-## 怎麼用
+它不只是「請模型列一份 EDL」：Gemini 負責理解素材、形成剪輯意圖與挑片；本機程式負責時間、節拍、逐幀追蹤、裁切可行性、字幕、字卡、渲染與驗收紀錄。最後除了影片，還會留下足以回答「為什麼這樣剪」的結構化報表。
 
 ```bash
-# 需要 Python 3.12 跟 ffmpeg
-uv sync                                    # 或 pip install -e .
-echo 'GEMINI_API_KEY=...' > .env && set -a && . ./.env && set +a
+montagewright render RUSHES/ \
+  --brief BRIEF.md \
+  --music MUSIC.mp3 \
+  --aspect 9:16 \
+  --seconds 90 \
+  --review \
+  --budget 5 \
+  --output CUT/
+```
 
-# 選配：逐幀跟拍要一份 SAM checkpoint（不放也能跑，只是不逐幀追）
-#   https://github.com/facebookresearch/sam2 → sam2.1_hiera_tiny.pt
+也可以直接開啟本機 Web 編輯器：
 
-# 選配：逐字稿需要 macOS 26，編一次 Swift 工具
-swiftc -parse-as-library -O -o tools/transcribe/transcribe \
+```bash
+montagewright-web
+# http://127.0.0.1:8765/
+```
+
+> 目前是積極開發中的本機剪輯工具，不是託管服務。素材、SAM 與 FFmpeg 都在執行 Montagewright 的電腦上處理；需要語意理解的影片與音訊會依工作階段上傳到 Gemini API。
+
+## 它現在能做什麼
+
+- 讓 Gemini 看完整 proxy，而不是只靠檔名或文字摘要挑片。
+- 產生可跨專案重用的 Clip Cards：內容、可用區段、原生運鏡、人物／產品、動作與語音角色。
+- 依 Brief、音樂、指定片長與比例決定方向、選片、順序、長度和鏡頭意圖。
+- 以本機量測把切點落到實際節拍，而不是採信模型猜的時間碼。
+- 預設使用 SAM 2.1 逐幀追蹤 Gemini 指定的主體；也可明確關閉 SAM。
+- 執行定鏡、橫移、直移、推近／拉遠、多落點、跟隨主體與沿用原素材運鏡。
+- 產生 SRT，或輸出 `plain`、`speakers`、`spoken`、`plate` 四種燒錄字幕。
+- 產生並編輯獨立字卡軌，支援多種版型、表面、字型、位置、層級與進出動畫。
+- 在 Web UI 檢查成片、原素材、裁切框、逐顆驗收、字幕、字卡、波形、成本與未採用素材。
+- 不再呼叫 Gemini，即可改進出點、順序、音量、字幕和字卡並重新輸出。
+- 選配逐顆與整片 Gemini review，將可定位的問題送回重規劃。
+- 輸出 Premiere XML／FCPXML、原始素材 handles、成本帳本與 `report.json`。
+
+## 核心原則
+
+### 語意交給模型，座標與時鐘交給程式
+
+| 問題 | 負責者 |
+| --- | --- |
+| 這支素材在拍什麼、是否可用 | Gemini 看影片 |
+| 哪個人／產品才是 Brief 指的主體 | Gemini |
+| 哪些鏡頭該出現、順序與剪輯理由 | Gemini |
+| 畫面應偏安靜、資訊密集或有方向感 | Gemini |
+| 主體每一幀實際在哪裡 | SAM 2.1 + 本機座標轉換 |
+| 節拍、重音與音訊時間 | 本機音訊分析 |
+| 裁切是否越界、要放大多少、能否完成運鏡 | 本機幾何與 renderer |
+| 字卡是否撞主體／字幕、文字是否可讀 | 本機多幀排版與對比稽核 |
+| 最後輸出的每一格 | FFmpeg |
+
+模型可以要求一種編輯行為，但不能捏造執行結果。本機做不到時會降級或停止，並把原因、量測與實際結果寫進報表。
+
+### 決策、執行與驗收分層
+
+Montagewright 分開保存：
+
+1. Gemini 原本想做什麼。
+2. 本機實際能做什麼。
+3. 最後是否真的交付了那個意圖。
+
+因此「計畫是推近、renderer 最後只能定住」不會在報表中仍被寫成成功推近。Web UI 也分別呈現原生素材運動、數位裁切運動與兩者疊加的結果。
+
+### 成本上限是停止條件，不是品質旋鈕
+
+`--budget` 是整輪工作的美元上限。每次付費呼叫送出前，Montagewright 會用最大輸出 token 先保留最壞情況預算；餘額不夠就不送出，留下當下最好的成片，而不是偷偷換成較差的判斷。
+
+目前 production model 固定為 `gemini-3.6-flash`，程式中的估價表為：
+
+| Token 類型 | 每百萬 token |
+| --- | ---: |
+| 新 input | US$1.50 |
+| cached input | US$0.15 |
+| output／thinking | US$7.50 |
+
+這是 Montagewright 用來做預算保留與報表的固定費率，不是 Google 帳戶的 quota。API 的 429 仍可能來自 rate limit、billing、shared project quota 或帳戶層級限制。
+
+## 安裝
+
+### 必要條件
+
+- Python `>=3.12,<3.13`
+- FFmpeg／ffprobe
+- Gemini API key
+- 建議：Apple Silicon Mac；SAM 2.1 與本機轉錄在這個環境最完整
+
+macOS 可先安裝 FFmpeg：
+
+```bash
+brew install ffmpeg
+```
+
+### Python 環境
+
+使用 uv：
+
+```bash
+uv sync
+```
+
+或使用一般 virtual environment：
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+設定 API key。程式不會自動讀 `.env`，請 export，或在啟動前自行 source：
+
+```bash
+export GEMINI_API_KEY='...'
+# GOOGLE_API_KEY 也可使用
+```
+
+### SAM 2.1（建議安裝）
+
+完整的主體跟隨需要 tracking 與 segmentation extras：
+
+```bash
+uv sync --extra tracking --extra segmentation
+# 或
+pip install -e '.[tracking,segmentation]'
+```
+
+將 checkpoint 放在預設位置：
+
+```text
+artifacts/models/sam2.1_hiera_tiny.pt
+```
+
+也可以每次明確指定：
+
+```bash
+montagewright render RUSHES/ \
+  --sam-checkpoint /path/to/sam2.1_hiera_tiny.pt \
+  --output CUT/
+```
+
+SAM 是預設路徑。找不到 checkpoint 時 CLI 會顯示詳細警告並退回 Gemini 的稀疏定位；只有在你確定不需要逐幀追蹤時才使用 `--no-sam-tracking`。
+
+### 本機逐字稿（macOS 26）
+
+Apple SpeechTranscriber 提供逐字時間碼；Gemini 負責校正文意，但不提供字幕時鐘。
+
+```bash
+swiftc -parse-as-library -O \
+  -o tools/transcribe/transcribe \
   tools/transcribe/Transcribe.swift
 ```
 
-最短的一次，素材夾進去、9:16 出來：
+沒有這個工具時，純 b-roll 剪輯仍可執行；需要語音內容與精準字幕的流程會受限。
+
+## 第一次剪輯
+
+最小命令：
 
 ```bash
-montagewright render ~/rushes --aspect 9:16 --output ~/cut
+montagewright render ~/Movies/rushes \
+  --aspect 9:16 \
+  --output ~/Movies/cut
 ```
 
-`--brief` 給的是意圖，不是分鏡表。寫「開頭三秒決定一切，每一顆都要有笑點或共鳴點」會比寫「第一顆用 A、第二顆用 B」有用得多，因為前者它會拿去當判斷依據，後者只是把你的工作抄一遍。
+較完整的 90 秒案例：
 
-| 選項 | |
-|---|---|
-| `--review` | 逐顆對照它自己的計畫，沒做到的重新規劃再跑一次。最值得開，也最貴，大概多三到四成 |
-| `--budget` | 總上限，包含重跑。碰到就停並交出當下最好的版本 |
-| `--timeline` | `premiere` / `finalcut` / `both`，預設不產生。指回原始素材，所以每顆前後都還能往外拉 |
-| `--subtitles` | 預設 `sidecar` 寫一份 SRT；`burn` 另外輸出燒好字的版本；`none` 不做 |
-| `--subtitle-look` | `plain` / `speakers`（每人一色）/ `spoken`（講到哪亮到哪）/ `plate`（加底色塊） |
-| `--speech` | 預設 `auto`，卡片說「聲音是內容」才做逐字稿，b-roll 不會被收費 |
-
-實測花費（Gemini 3.6 Flash）：
-
-| 這一輪 | 顆數 | 片長 | 花費 |
-|---|---|---|---|
-| 74 支毛片，第一次跑 | 10 | 34.9s | **$1.43** |
-| 同一批素材再剪一支 | 22 | 71.0s | **$0.55** |
-| 5 分半街訪，含逐字稿與重新規劃 | 13 | 48.6s | **$0.81** |
-| 同一支再剪一次 | 16 | 46.1s | **$0.46** |
-
-第一次最貴，之後就便宜很多，因為卡片跟逐字稿都是用檔案內容的 hash 快取的，素材沒變就整個階段跳過，proxy 也不用重新編碼。
-
-上傳的檔案另外用 Gemini File API 存 48 小時，同樣以內容 hash 當 key，所以第二次規劃呼叫不用重傳（實測 76 秒對上第一次的 600 秒）。不過省下來的是傳輸時間而不是 token —— 定調跟選片每次都會把那些 proxy 重看一遍，input token 照算。
-
-## 網頁介面
-
-`montagewright-web` 開在 `127.0.0.1:8765`，不用記參數，而且整個過程看得到。跑完會得到一個時間軸，點一顆就看到它原本打算怎麼拍、驗收又看到什麼，可以改進出點、換順序、刪掉再重新輸出，這一步不用錢，因為決定都還在，只是重排而已。
-
-比較實用的是可以檢查裁切跟追蹤是不是真的：切到「原素材＋裁切框」，它會用 proxy 播放並且把 9:16 的框畫在上面跟著時間軸走。字幕也可以在這裡改完再燒。
-
-## 會產出什麼
-
-- **`report.json`** —— 調性、每顆為什麼被選、為什麼是這個長度、每一筆降級跟造成它的量測數字、每個階段花多少錢
-- **`work/crops.json`** —— 每顆實際用的裁切路徑，逐個 keyframe。這是「它真的有跟拍」跟「報表說它有跟拍」的差別
-- **可編輯的時間軸** —— 指回原始素材檔案，每顆掛著 marker 寫明為什麼選它、哪裡降級、驗收看到什麼
-- **字幕 SRT** —— 時間已對齊成片，並標出每句是誰講的
-
-## 程式結構
-
+```bash
+montagewright render ~/Movies/rushes \
+  --brief ~/Movies/brief.md \
+  --music ~/Music/track.m4a \
+  --aspect 9:16 \
+  --seconds 90 \
+  --speech auto \
+  --subtitles burn \
+  --subtitle-look spoken \
+  --timeline both \
+  --review \
+  --budget 5 \
+  --output ~/Movies/cut
 ```
+
+先用少量素材驗證 prompt 或環境：
+
+```bash
+montagewright render ~/Movies/rushes \
+  --sample 12 \
+  --seconds 20 \
+  --budget 1 \
+  --output ~/Movies/test-cut
+```
+
+`--sample N` 會在整個資料夾中做固定、可重現的分散取樣，不是永遠拿前 N 支；同樣的素材仍可命中 Clip Card cache。
+
+### 常用 render 選項
+
+| 選項 | 行為 |
+| --- | --- |
+| `--brief FILE` | 創意方向、必要資訊與可選的核准字卡文字 |
+| `--music FILE` | 配樂；節奏階段會聽音樂並以本機 beat grid 落點 |
+| `--music-map FILE` | 使用已鎖定的音樂分析結果 |
+| `--aspect` | `16:9`、`1:1`、`4:5`、`9:16` |
+| `--seconds N` | 硬性的目標片長；不要只把秒數寫在 prose Brief 裡 |
+| `--sample N` | 只分析固定抽樣的 N 支素材 |
+| `--review` | 增加逐顆與整片 Gemini review；較慢、也較貴 |
+| `--budget USD` | 整輪成本上限，預設 US$5 |
+| `--speech auto\|never` | 自動只轉錄「語音構成內容」的素材，或完全不轉錄 |
+| `--subtitles` | `none`、`sidecar`、`burn` |
+| `--subtitle-look` | `plain`、`speakers`、`spoken`、`plate` |
+| `--timeline` | `none`、`premiere`、`finalcut`、`both` |
+| `--library DIR` | 共用 Clip Cards 與 transcripts 的位置 |
+| `--upload-cache DIR` | 共用已上傳 Gemini media URI 的內容定址快取 |
+
+完整選項以程式為準：
+
+```bash
+montagewright render --help
+```
+
+## Brief 怎麼被使用
+
+Brief 是判斷依據，不是要求使用者手寫 EDL。適合描述：
+
+- 影片目的、觀眾與語氣。
+- 必須涵蓋或不能出現的內容。
+- 片長與平台限制；片長仍建議同時使用 `--seconds`。
+- 哪些資訊適合做成字卡。
+- 字卡可以避開主體、刻意壓住哪個元素，或跟內容／音樂哪個事件同步。
+
+一般 Markdown prose 會同時提供給剪輯規劃，並由本機抽出「可能適合做字卡」的候選。候選永遠是草稿：Gemini 可以選擇時機和設計方向，但不能把 prose 自己提升成已核准、可直接燒入的文字。
+
+```markdown
+# 方向
+
+90 秒新品總覽。開頭要快，產品規格要清楚，但不要每顆都像規格表。
+
+Galaxy Watch Ultra2
+EN13319 國際潛水標準認證
+40m
+
+（畫面：避開手錶本體；字卡節奏偏安靜）
+```
+
+### 明確核准可直接輸出的字
+
+如果某段文字必須逐字照用，可加入一個 `montagewright-approved-copy` JSON fence：
+
+````markdown
+```montagewright-approved-copy
+{
+  "version": 1,
+  "items": [
+    {
+      "copy_id": "launch-title",
+      "text": "Galaxy Z Fold 系列",
+      "allowed_kinds": ["opening_title"]
+    },
+    {
+      "copy_id": "water-rating",
+      "text": "EN13319 國際潛水標準認證",
+      "allowed_kinds": ["feature"]
+    }
+  ]
+}
+```
+````
+
+這個區塊會被當成使用者明確核准的 immutable copy。Gemini 可以引用 `copy_id`、安排時間與設計家族，但不能改字。普通 Brief、OCR、逐字稿或模型草稿都必須經過 Web／CLI 人工核准，才能成為可輸出的 `human_review` copy。
+
+## 實際流程
+
+`$` 代表 Gemini 付費呼叫，`◈` 代表可由內容 hash 命中快取。
+
+```text
+    rushes
+      │
+  -   proxy / scene split ◈
+      │
+  $   Clip Cards ◈              每支素材一次；刻意不看 Brief
+      │
+  -   Apple ASR ◈               只有 speech=content 才需要
+  $   transcript correction     只改文字，不採用模型時間碼
+      │
+  $   direction                 全部 proxy + 音樂 + Brief
+      │
+  $   selection                 挑片、順序、運鏡、字卡候選
+      │
+  $   rhythm                    有音樂時決定鏡頭長度與意圖
+      │
+  $   semantic grounding        確認要追哪個主體／落點
+  -   SAM 2.1 propagation       逐幀位置與 mask
+  -   crop compiler             可行裁切路徑與降級
+  -   FFmpeg render             segment → concat → mix
+      │
+  $   shot + cut review         只有 --review
+      │
+  -   report / subtitles / NLE / Web artifacts
+```
+
+Clip Card 故意不讀 Brief，因為素材沒有變時，同一張卡應能服務不同剪輯。Direction 與 Selection 則會再看 proxy，而不是只讀摘要；這是為了讓模型能針對當次 Brief 判斷摘要沒有記下來的視覺細節。
+
+## Web UI
+
+```bash
+montagewright-web
+```
+
+預設位置是 [http://127.0.0.1:8765/](http://127.0.0.1:8765/)。可用環境變數調整：
+
+```bash
+export MONTAGEWRIGHT_RUNS="$HOME/.cache/montagewright/runs"
+export MONTAGEWRIGHT_HOST=127.0.0.1
+export MONTAGEWRIGHT_PORT=8877
+montagewright-web
+```
+
+Web 介面包含：
+
+- **鏡頭**：逐顆查看選片理由、原計畫、實際運動、驗收與降級；可改進出點、音量、順序與刪除鏡頭。
+- **預覽工作區**：切換成片、原素材＋裁切框與並排模式，確認原生運鏡和數位裁切沒有混淆。
+- **字卡**：點時間軸或畫面字卡即可選取；雙擊畫面文字可直接編輯主文字。
+- **逐字稿**：修改字幕 copy 與 timing，再輸出燒錄版。
+- **沒用的**：查看未入選素材與原因。
+- **花費**：查看各 Gemini 階段與累計成本。
+- **匯出**：重新輸出目前成片、字幕版、字卡版或 NLE timeline。
+
+Web 的 trim／reorder／字幕／字卡操作不會重新呼叫 Gemini。結構性 recut 會建立新的 current-timeline revision，重新對齊或失效與新版時間軸不一致的字卡、字幕與 preview 衍生檔，避免畫面已換但下載仍是舊版本。
+
+## 字卡系統
+
+字卡的 source of truth 是 `work/graphics.json`，不是 PNG。PNG 是 production renderer 編譯出的透明圖層，讓 Web 精準預覽與 FFmpeg 輸出使用完全相同的字型、斷行、底板、描邊與幾何。
+
+拖曳時 Web 先用輕量的互動預覽保持流暢；停止操作後再取得精準 PNG。暫時性的解碼／快取錯誤會重試並標成「上一次有效預覽」；真正的對比、越界或碰撞問題才會顯示「需要調整」。
+
+### 設計能力
+
+目前有八個 curated design families：
+
+- 極簡編輯
+- YouTube 強調
+- 雜誌專題
+- 社群貼紙
+- 資訊下標
+- 電影標題
+- 運動娛樂
+- 柔和生活
+
+可再獨立組合：
+
+- 內容角色：開場主標、章節、產品名、功能／規格、重點標註、結尾卡。
+- Template：主視覺、產品銘牌、規格徽章、置中多行、多行規格、結尾 roster 等。
+- Surface：透明、實色、pill、split、ribbon、sticker、highlight、outline、glass／霧面、editorial。
+- Typography：project display／body font、主副標比例、行距、block gap、對齊、最大寬度。
+- Appearance：文字色、強調字、描邊、陰影、底板透明度、邊框、圓角與 padding。
+- Placement：自動留白、避開主體、刻意覆蓋主體、固定位置、自由位置、縮放與旋轉。
+- Motion：fade、rise、slide left／right、進出時間與距離。
+- Layering：z-index、允許／避免字卡彼此重疊。
+
+Gemini 只選擇語意層的 `family`、`surface`、`motion`、`composition` 與出現鏡頭；本機 resolver 依字型、實際文字長度、畫面比例、SAM 主體、字幕 keepout 和多幀對比決定像素。過長的自動字卡可以換成相容的較寬 template；人工鎖定的卡不會被偷偷改版。
+
+### CLI 字卡工作流
+
+Web 與 CLI 共用同一份 GraphicsPlan、核准規則與 production renderer：
+
+```bash
+montagewright graphics CUT/ inspect
+montagewright graphics CUT/ preview --graphic-id g03
+montagewright graphics CUT/ approve --graphic-id g03
+montagewright graphics CUT/ validate
+montagewright graphics CUT/ render
+```
+
+`approve` 是明確人工核准：它會複製當下精確文字、建立 digest，並將來源記為 `human_review`。修改核准文字後必須重新核准，不能沿用舊 digest。
+
+## 字幕
+
+只做逐字稿，不重剪：
+
+```bash
+montagewright transcribe VIDEO.mp4 \
+  --locale zh-TW \
+  --output transcript.json
+```
+
+或處理整個資料夾：
+
+```bash
+montagewright transcribe RUSHES/ --budget 2
+```
+
+字幕時鐘來自本機辨識器，Gemini 只做文字校正。燒錄字幕與字卡會由同一個 compositor 合成，字幕位於 graphics 上層，並使用實際字幕 bbox 作為字卡排版 keepout。
+
+## NLE timeline
+
+在 render 時要求：
+
+```bash
+montagewright render RUSHES/ \
+  --timeline both \
+  --output CUT/
+```
+
+或對既有輸出重新產生：
+
+```bash
+montagewright timeline CUT/ --flavour both --rushes RUSHES/
+```
+
+Timeline 指回原始素材並保留 handles、來源時間、裁切 keyframes、marker 與 laid music audio。Premiere 使用 XMEML，Final Cut 使用 FCPXML。
+
+目前 NLE 匯出不會建立原生可編輯的 Premiere／Final Cut 字卡物件；需要像素一致時請使用 baked graphics master。這項限制也適用於原生字幕圖層。
+
+## 產出內容
+
+主要檔案會依選項略有不同：
+
+```text
+CUT/
+  deliverable.mp4                    最終混音成片
+  picture.mp4                        未加音樂 bed 的畫面 master
+  preview.mp4                        Web／Gemini review 用預覽
+  deliverable-subtitled.mp4          燒錄字幕版（若產生）
+  deliverable-graphics.mp4           燒錄字卡版（若產生）
+  deliverable-graphics-subtitled.mp4 字卡＋字幕合併版（若產生）
+  report.json                        決策、驗收、降級、成本與錯誤
+  segments/                          每顆已渲染鏡頭與 handles
+  work/
+    current-timeline.json            Web recut 後的 current truth
+    crops.json                       實際裁切 keyframes
+    subtitles.json                   人工字幕修改
+    graphics.json                    字卡計畫、copy facts 與 revision
+    graphics-render/                 字卡編譯結果與 layout report
+```
+
+`report.json` 是交付物，不只是 debug log。即使後續階段失敗，CLI 也會盡可能先寫下已完成的方向、選片、成本、審查與停止原因。
+
+## Cache 與重跑
+
+- Proxy、Clip Cards、transcripts 與 SAM artifacts 以內容和執行契約定址。
+- 同一批素材換 Brief，不需要重做 Brief-free Clip Cards。
+- Gemini File API URI 會放在共用 upload cache；素材未變時可避免重傳，但新的規劃仍會計算 input token。
+- SAM cache 會檢查 checkpoint、implementation revision、shot window、seed 與 source fingerprint；不相符就拒絕沿用。
+- Web preview PNG 與 metadata 原子發布，並驗證 signature；損壞 cache 不會被當成成功預覽。
+
+## 已知限制
+
+- 目前使用 Google Gemini API key；尚未提供 Vertex AI backend 切換。
+- `--review` 目前審查的是主要剪輯成片，字卡軌是在 review loop 後 materialize；Gemini 還不能在同一輪 review 中直接提出結構化字卡修正。
+- 字卡 `music_sync` 已有 schema，但尚未驅動 production 動畫；字卡動畫 easing 目前固定為 linear。
+- Web 可檢查裁切框與運鏡，但尚未提供完整的 source-time crop keyframe editor。
+- Web 互動預覽不是 WebGL renderer；精準結果仍由 Pillow／FFmpeg production compiler 產生。這保證輸出一致，但第一次編譯複雜字卡仍可能需要短暫等待。
+- NLE timeline 目前不含原生可編輯字卡／字幕物件。
+- SAM 追蹤品質仍取決於 seed、遮擋、鏡頭切換與素材清晰度；對焦前後、拍攝準備動作與真正 authored camera motion 仍需要可靠的 usable-window 分析。
+
+## 專案結構
+
+```text
 src/montagewright/
-  clipcard.py     每支素材的卡片
-  transcript.py   逐字稿（本機辨識 + Gemini 修正）
-  backfill.py     把校正過的字回填到辨識器的時間上
-  planner.py      定調、選片、節奏、主體定位、重新規劃
-  capabilities.py 執行層做得到跟做不到的事，同時餵給 prompt 跟 dispatcher
-  reframe.py      裁切路徑
-  executor.py     EDL → 渲染計畫
-  renderer.py     ffmpeg
-  review.py       逐顆驗收 + 成片審查
-  timeline.py     FCPXML / Premiere XML
-  subtitles.py    安全區、斷行、把字燒進畫面
-  webapp.py       網頁介面
-  measure/        量測：SAM 追蹤、音樂分析、場景偵測、幾何
-  prompts/        所有 prompt，繁體中文
+  brief.py        Brief、核准 copy 與初始字卡計畫
+  clipcard.py     素材語意分析與 Clip Cards
+  transcript.py  本機 ASR + Gemini 文字校正
+  backfill.py     將校正文字回填到本機 word clock
+  planner.py      Direction、Selection、Rhythm、Grounding、Replan
+  schema.py       模型輸出與剪輯契約
+  grounding.py    將意圖落到節拍與可行 source window
+  capabilities.py 執行能力與 prompt 共用描述
+  reframe.py      裁切路徑、插值與手動 retime
+  pipeline.py     Semantic intent → 本機執行層
+  executor.py     EDL → RenderPlan
+  renderer.py     FFmpeg segments、concat 與混音
+  review.py       逐顆與整片 Gemini review
+  graphics.py     字卡 schema、design resolver 與 compositor
+  subtitles.py    字幕 layout、樣式與 compositor
+  timeline.py     XMEML／FCPXML
+  cost.py         預算保留、計價與 ledger
+  webapp.py       FastAPI 與 Web editing API
+  web/            單頁剪輯介面
+  measure/        SAM、音樂、場景、影像與幾何量測
+  prompts/        Production prompts（繁體中文）
 ```
 
-`measure/` 以外的都在做決定，`measure/` 裡的都在算數字。有一個測試守著這條線：任何 `measure/` 裡的程式 import 上層都會失敗。
+`measure/` 只負責量測，不應反向依賴規劃／渲染層；測試會守住這條 dependency boundary。
 
-撞出來的坑寫在 [`docs/lessons.md`](docs/lessons.md)，大部分屬於「東西沒壞但答案是錯的」那一類。舊版設計文件在 `docs/history/`。
+## 開發與驗證
+
+```bash
+source .venv/bin/activate
+pytest -q
+```
+
+只跑字卡相關測試：
+
+```bash
+pytest -q \
+  tests/test_graphics.py \
+  tests/test_graphics_cli.py \
+  tests/test_graphics_resolver.py \
+  tests/test_brief_graphics_contract.py
+```
+
+檢查 CLI surface：
+
+```bash
+montagewright --help
+montagewright render --help
+montagewright graphics --help
+```
+
+設計背景與踩過的坑在 [`docs/lessons.md`](docs/lessons.md)，過去的架構提案保留在 [`docs/history/`](docs/history/)。它們是歷史資料；目前行為一律以程式、schema、CLI `--help` 與本 README 為準。

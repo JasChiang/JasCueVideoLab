@@ -46,6 +46,10 @@ AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".aiff", ".MP3", ".M4
 ASPECTS = {"9:16": 9 / 16, "16:9": 16 / 9, "1:1": 1.0, "4:5": 4 / 5}
 PAGE = Path(__file__).resolve().parent / "web" / "index.html"
 SUBTITLE_FONT_LOCK = threading.Lock()
+_GRAPHICS_LOCKS_GUARD = threading.Lock()
+_GRAPHICS_STATE_LOCKS: dict[str, threading.Lock] = {}
+_GRAPHICS_PREVIEW_LOCKS: dict[str, threading.Lock] = {}
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 # Runs live somewhere they survive a restart. They were in a temp directory
 # keyed by an in-memory dict, so closing the server threw away every finished
@@ -310,6 +314,174 @@ def _invalidate_graphics_delivery(run: Run) -> None:
         (run.output / name).unlink(missing_ok=True)
     (run.output / "work" / "graphics-render" / "layout.json").unlink(
         missing_ok=True
+    )
+
+
+def _invalidate_subtitle_delivery(run: Run) -> None:
+    """A subtitle edit invalidates every artifact that embeds its old text.
+
+    A graphics-only file is included deliberately.  The public graphics
+    endpoint falls back to it when the combined file is absent; retaining it
+    after captions are added or changed would make that fallback look like a
+    current combined export.  Graphics pixels can be rebuilt from the saved
+    plan, while an incorrectly labelled delivery cannot be repaired by its
+    viewer.
+    """
+
+    for name in (
+        "deliverable-subtitled.mp4",
+        "deliverable-graphics.mp4",
+        "deliverable-graphics-subtitled.mp4",
+    ):
+        (run.output / name).unlink(missing_ok=True)
+    (run.output / "work" / "graphics-render" / "layout.json").unlink(
+        missing_ok=True
+    )
+
+
+def _keyed_graphics_lock(
+    locks: dict[str, threading.Lock], key: str,
+) -> threading.Lock:
+    """Return one process-local writer lock for a durable server resource."""
+
+    with _GRAPHICS_LOCKS_GUARD:
+        return locks.setdefault(key, threading.Lock())
+
+
+def _graphics_state_lock(run: Run) -> threading.Lock:
+    return _keyed_graphics_lock(
+        _GRAPHICS_STATE_LOCKS,
+        str((run.output / "work" / "graphics.json").resolve()),
+    )
+
+
+def _graphics_preview_lock(metadata_path: Path) -> threading.Lock:
+    return _keyed_graphics_lock(
+        _GRAPHICS_PREVIEW_LOCKS, str(metadata_path.resolve())
+    )
+
+
+def _cached_preview_png_is_valid(path: Path) -> bool:
+    """A cache hit must name a complete PNG, not merely an existing inode."""
+
+    try:
+        with path.open("rb") as cached:
+            return cached.read(len(_PNG_SIGNATURE)) == _PNG_SIGNATURE
+    except FileNotFoundError:
+        return False
+
+
+def _load_graphics_preview_cache(
+    metadata_path: Path, preview_dir: Path, graphic_id: str,
+) -> dict | None:
+    """Load a complete content-addressed preview or report a cache miss.
+
+    Malformed or incomplete records are recoverable misses and are rebuilt.
+    An operating-system I/O error is different: retrying the same write while
+    storage is unavailable can overwrite useful evidence, so callers surface
+    it as a temporary service failure instead.
+    """
+
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    metadata = None
+    try:
+        candidate = json.loads(raw)
+        if isinstance(candidate, dict):
+            metadata = candidate
+    except (ValueError, TypeError):
+        return None
+    if metadata is None:
+        return None
+    joint = metadata.get("joint_layout")
+    if not isinstance(joint, dict) or graphic_id not in joint:
+        return None
+    for item in joint.values():
+        if not isinstance(item, dict):
+            return None
+        filename = Path(str(item.get("url") or "")).name
+        if not re.fullmatch(r"[0-9a-f]{64}\.png", filename):
+            return None
+        if not _cached_preview_png_is_valid(preview_dir / filename):
+            return None
+    return metadata
+
+
+def _graphics_preview_problem(
+    status_code: int,
+    error_code: str,
+    message: str,
+    *,
+    field: str = "preview",
+    suggested_patch: dict[str, Any] | None = None,
+) -> HTTPException:
+    """A stable machine-readable error shared by editor retry/repair paths."""
+
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "error_code": error_code,
+            "message": message,
+            "field": field,
+            "suggested_patch": suggested_patch or {},
+        },
+    )
+
+
+def _graphics_validation_problem(
+    error: ValueError, graphic_id: str,
+) -> HTTPException:
+    """Translate renderer validation into a minimal actionable contract."""
+
+    message = str(error)
+    lowered = message.lower()
+    prefix = f"cues.{graphic_id}"
+    if "contrast" in lowered:
+        return _graphics_preview_problem(
+            422, "GRAPHIC_CONTRAST_FAILED", message,
+            field=f"{prefix}.style.contrast_mode",
+            suggested_patch={"contrast_mode": "auto"},
+        )
+    if "subject evidence" in lowered:
+        return _graphics_preview_problem(
+            422, "GRAPHIC_SUBJECT_EVIDENCE_REQUIRED", message,
+            field=f"{prefix}.composition",
+            suggested_patch={"composition": "auto", "position": "auto"},
+        )
+    if any(word in lowered for word in (
+        "safe area", "safe-area", "keepout", "outside", "position clears",
+    )):
+        return _graphics_preview_problem(
+            422, "GRAPHIC_PLACEMENT_UNSAFE", message,
+            field=f"{prefix}.position",
+            suggested_patch={"position": "auto"},
+        )
+    if "glyph" in lowered:
+        return _graphics_preview_problem(
+            422, "GRAPHIC_GLYPH_UNSUPPORTED", message,
+            field=f"{prefix}.primary_fact_id",
+            suggested_patch={"action": "edit_copy_or_choose_font"},
+        )
+    if any(word in lowered for word in (
+        "too long", "too tall", "cannot fit", "only", "needs a",
+    )):
+        return _graphics_preview_problem(
+            422, "GRAPHIC_CONTENT_DOES_NOT_FIT", message,
+            field=prefix,
+            suggested_patch={"action": "reduce_copy_scale_or_motion"},
+        )
+    if "template" in lowered:
+        return _graphics_preview_problem(
+            422, "GRAPHIC_TEMPLATE_INVALID", message,
+            field=f"{prefix}.template",
+            suggested_patch={"action": "choose_compatible_template"},
+        )
+    return _graphics_preview_problem(
+        422, "GRAPHIC_VALIDATION_FAILED", message,
+        field=prefix,
+        suggested_patch={"action": "review_graphic_settings"},
     )
 
 
@@ -2012,6 +2184,12 @@ def create_app() -> FastAPI:
                     409,
                     "字卡已在另一個視窗更新；請重新整理後再修改",
                 )
+        elif plan.revision != 0:
+            # Revision is assigned by this server. A client cannot create a
+            # new authority record at an arbitrary future revision.
+            raise HTTPException(
+                409, "字卡尚未建立；請以 revision 0 重新儲存"
+            )
         trusted_human = {
             fact.fact_id: fact for fact in stored_plan.facts
             if fact.approved_by == "human_review"
@@ -2051,6 +2229,14 @@ def create_app() -> FastAPI:
             fact.fact_id: fact for fact in authority
             if fact.source_kind != "user"
         }
+        # Facts already committed by this server remain server-owned evidence
+        # on later revisions. Without this, a legitimate OCR/transcript/model
+        # fact can be loaded but the next ordinary style edit rejects it as a
+        # forgery even when the bytes are unchanged.
+        trusted_non_user.update({
+            fact.fact_id: fact for fact in stored_plan.facts
+            if fact.source_kind != "user"
+        })
         candidate_path = run.output / "work" / "brief-candidates.json"
         try:
             if candidate_path.exists():
@@ -2098,11 +2284,39 @@ def create_app() -> FastAPI:
             validate_for_render(plan, duration_seconds=duration)
             if duration else []
         )
-        plan = plan.model_copy(update={"revision": plan.revision + 1})
         from montagewright.measure.storage import write_json
+        from starlette.concurrency import run_in_threadpool
 
-        write_json(destination, plan)
-        _invalidate_graphics_delivery(run)
+        submitted_revision = plan.revision
+        lock = _graphics_state_lock(run)
+        await run_in_threadpool(lock.acquire)
+        try:
+            try:
+                current_revision = (
+                    GraphicsPlan.model_validate_json(
+                        destination.read_text(encoding="utf-8")
+                    ).revision
+                    if destination.exists() else 0
+                )
+            except (OSError, ValueError) as error:
+                raise HTTPException(
+                    422, f"stored graphics are unreadable: {error}"
+                )
+            if submitted_revision != current_revision:
+                raise HTTPException(
+                    409,
+                    "字卡已在另一個視窗更新；請重新整理後再修改",
+                )
+            plan = plan.model_copy(update={"revision": current_revision + 1})
+            try:
+                write_json(destination, plan)
+                _invalidate_graphics_delivery(run)
+            except OSError as error:
+                raise HTTPException(
+                    503, f"graphics storage is temporarily unavailable: {error}"
+                )
+        finally:
+            lock.release()
         return JSONResponse({
             "facts": len(plan.facts), "cues": len(plan.cues),
             "warnings": warnings, "revision": plan.revision,
@@ -2179,8 +2393,32 @@ def create_app() -> FastAPI:
             })
         except ValueError as error:
             raise HTTPException(422, f"cannot approve graphic: {error}")
-        write_json(destination, plan)
-        _invalidate_graphics_delivery(run)
+        from starlette.concurrency import run_in_threadpool
+
+        lock = _graphics_state_lock(run)
+        await run_in_threadpool(lock.acquire)
+        try:
+            try:
+                current_revision = GraphicsPlan.model_validate_json(
+                    destination.read_text(encoding="utf-8")
+                ).revision
+            except (OSError, ValueError) as error:
+                raise HTTPException(
+                    422, f"stored graphics are unreadable: {error}"
+                )
+            if current_revision != wanted_revision:
+                raise HTTPException(
+                    409, "字卡已在另一個視窗更新；請重新整理後再核准"
+                )
+            try:
+                write_json(destination, plan)
+                _invalidate_graphics_delivery(run)
+            except OSError as error:
+                raise HTTPException(
+                    503, f"graphics storage is temporarily unavailable: {error}"
+                )
+        finally:
+            lock.release()
         return JSONResponse(plan.model_dump(mode="json"))
 
     @app.post("/api/runs/{run_id}/burn-graphics")
@@ -2279,11 +2517,24 @@ def create_app() -> FastAPI:
         run = _run(run_id)
         try:
             plan = GraphicsPlan.model_validate(await request.json())
-            next(
-                cue for cue in plan.cues if cue.graphic_id == graphic_id
+        except ValueError as error:
+            field = "plan"
+            errors = getattr(error, "errors", lambda: [])()
+            if errors:
+                field = ".".join(str(part) for part in errors[0].get("loc", ()))
+            raise _graphics_preview_problem(
+                422, "GRAPHICS_PLAN_INVALID", str(error), field=field,
+                suggested_patch={"action": "correct_field"},
             )
-        except (ValueError, StopIteration) as error:
-            raise HTTPException(422, f"graphic preview is invalid: {error}")
+        try:
+            next(cue for cue in plan.cues if cue.graphic_id == graphic_id)
+        except StopIteration:
+            raise _graphics_preview_problem(
+                422, "GRAPHIC_NOT_FOUND",
+                f"no graphic named {graphic_id} exists in this plan",
+                field="graphic_id",
+                suggested_patch={"action": "select_existing_graphic"},
+            )
         picture = next(
             (
                 run.output / name
@@ -2294,15 +2545,21 @@ def create_app() -> FastAPI:
         )
         if picture is None:
             raise HTTPException(404, "no picture available for graphics preview")
-        width, height = await run_in_threadpool(_video_display_size, picture)
-        picture_stat = picture.stat()
         try:
+            width, height = await run_in_threadpool(_video_display_size, picture)
+            picture_stat = picture.stat()
             subtitle_track = await run_in_threadpool(partial(
                 _prepare_run_subtitle_track, run, picture,
                 dimensions=(width, height),
             ))
-        except (OSError, RuntimeError, ValueError) as error:
-            raise HTTPException(422, f"subtitle layout is unavailable: {error}")
+        except (
+            OSError, RuntimeError, ValueError, subprocess.SubprocessError,
+        ) as error:
+            raise _graphics_preview_problem(
+                503, "PREVIEW_SOURCE_UNAVAILABLE", str(error),
+                field="preview.source",
+                suggested_patch={"action": "retry"},
+            )
         subtitle_boxes_all = subtitle_track.boxes
         evidence_map = _graphics_layout_evidence(run, plan)
         digest = hashlib.sha256(
@@ -2331,19 +2588,16 @@ def create_app() -> FastAPI:
         preview_dir = run.output / "work" / "graphics-preview"
         metadata_path = preview_dir / f"{digest}.json"
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            cached_urls = [
-                item.get("url", "")
-                for item in metadata.get("joint_layout", {}).values()
-            ]
-            if not cached_urls or not all(
-                url and (preview_dir / Path(url).name).is_file()
-                for url in cached_urls
-            ):
-                metadata = None
-        except (OSError, ValueError, TypeError):
-            metadata = None
-        if metadata is None:
+            metadata = _load_graphics_preview_cache(
+                metadata_path, preview_dir, graphic_id
+            )
+        except OSError as error:
+            raise _graphics_preview_problem(
+                503, "PREVIEW_CACHE_UNAVAILABLE", str(error),
+                field="preview.cache",
+                suggested_patch={"action": "retry"},
+            )
+        async def compile_missing_preview() -> dict:
             plan_order = {
                 item.graphic_id: index for index, item in enumerate(plan.cues)
             }
@@ -2380,36 +2634,55 @@ def create_app() -> FastAPI:
             earlier: list[tuple[Any, Any]] = []
             card = metadata = None
             joint_layout: dict[str, dict] = {}
-            try:
-                for current in preview_cues:
-                    current_boxes = [
-                        (left, top, wide, tall)
-                        for start, end, left, top, wide, tall in subtitle_boxes_all
-                        if current.at_seconds < end
-                        and current.at_seconds + current.duration_seconds > start
-                    ]
-                    overlapping = [
-                        (other, other_card) for other, other_card in earlier
-                        if current.at_seconds
-                        < other.at_seconds + other.duration_seconds
-                        and current.at_seconds + current.duration_seconds
-                        > other.at_seconds
-                        and (
-                            current.collision_policy == "avoid"
-                            or other.collision_policy == "avoid"
-                        )
-                    ]
-                    keepouts = [*current_boxes, *(
-                        _swept_rect(other, other_card, width, height)
-                        for other, other_card in overlapping
-                    )]
-                    child_digest = hashlib.sha256(
-                        f"{digest}:{current.graphic_id}".encode("utf-8")
-                    ).hexdigest()
-                    current_path = preview_dir / f"{child_digest}.png"
-                    frames = await run_in_threadpool(
-                        _layout_frames, picture, current
+            for current in preview_cues:
+                current_boxes = [
+                    (left, top, wide, tall)
+                    for start, end, left, top, wide, tall in subtitle_boxes_all
+                    if current.at_seconds < end
+                    and current.at_seconds + current.duration_seconds > start
+                ]
+                overlapping = [
+                    (other, other_card) for other, other_card in earlier
+                    if current.at_seconds
+                    < other.at_seconds + other.duration_seconds
+                    and current.at_seconds + current.duration_seconds
+                    > other.at_seconds
+                    and (
+                        current.collision_policy == "avoid"
+                        or other.collision_policy == "avoid"
                     )
+                ]
+                keepouts = [*current_boxes, *(
+                    _swept_rect(other, other_card, width, height)
+                    for other, other_card in overlapping
+                )]
+                child_digest = hashlib.sha256(
+                    f"{digest}:{current.graphic_id}".encode("utf-8")
+                ).hexdigest()
+                current_path = preview_dir / f"{child_digest}.png"
+                try:
+                    frames = await run_in_threadpool(
+                        partial(
+                            _layout_frames, picture, current,
+                            cache_dir=preview_dir / "frames",
+                        )
+                    )
+                except (
+                    OSError, RuntimeError, subprocess.SubprocessError,
+                ) as error:
+                    raise _graphics_preview_problem(
+                        503, "PREVIEW_FRAME_DECODE_FAILED", str(error),
+                        field="preview.source",
+                        suggested_patch={"action": "retry"},
+                    )
+                if len(frames) < 3:
+                    raise _graphics_preview_problem(
+                        503, "PREVIEW_FRAME_DECODE_FAILED",
+                        f"only {len(frames)}/3 picture samples were decoded",
+                        field="preview.source",
+                        suggested_patch={"action": "retry"},
+                    )
+                try:
                     current_card, current_metadata = await run_in_threadpool(
                         partial(
                             compile_graphic, current, plan,
@@ -2419,32 +2692,45 @@ def create_app() -> FastAPI:
                             forbidden_positions=set(), keepout_rects=keepouts,
                         )
                     )
-                    current_metadata.update({
-                        "z_index": (
-                            current.z_index if current.z_index is not None
-                            else plan_order[current.graphic_id]
-                        ),
-                        "plan_order": plan_order[current.graphic_id],
-                        "card_width": current_card.width,
-                        "card_height": current_card.height,
-                        "left": current_card.left,
-                        "top": current_card.top,
-                        "avoids_graphic_ids": [
-                            other.graphic_id for other, _ in overlapping
-                        ],
-                        "url": (
-                            f"/api/runs/{run_id}/graphics-preview-file/"
-                            f"{child_digest}.png"
-                        ),
-                    })
-                    joint_layout[current.graphic_id] = dict(current_metadata)
-                    if current.graphic_id == graphic_id:
-                        card, metadata = current_card, current_metadata
-                    earlier.append((current, current_card))
-            except (OSError, RuntimeError, ValueError) as error:
-                raise HTTPException(422, f"graphic preview is invalid: {error}")
+                except ValueError as error:
+                    raise _graphics_validation_problem(
+                        error, current.graphic_id
+                    )
+                except (OSError, RuntimeError) as error:
+                    raise _graphics_preview_problem(
+                        503, "PREVIEW_RENDER_UNAVAILABLE", str(error),
+                        field="preview.renderer",
+                        suggested_patch={"action": "retry"},
+                    )
+                current_metadata.update({
+                    "z_index": (
+                        current.z_index if current.z_index is not None
+                        else plan_order[current.graphic_id]
+                    ),
+                    "plan_order": plan_order[current.graphic_id],
+                    "card_width": current_card.width,
+                    "card_height": current_card.height,
+                    "left": current_card.left,
+                    "top": current_card.top,
+                    "avoids_graphic_ids": [
+                        other.graphic_id for other, _ in overlapping
+                    ],
+                    "url": (
+                        f"/api/runs/{run_id}/graphics-preview-file/"
+                        f"{child_digest}.png"
+                    ),
+                })
+                joint_layout[current.graphic_id] = dict(current_metadata)
+                if current.graphic_id == graphic_id:
+                    card, metadata = current_card, current_metadata
+                earlier.append((current, current_card))
             if card is None or metadata is None:
-                raise HTTPException(422, "graphic preview could not be compiled")
+                raise _graphics_preview_problem(
+                    422, "GRAPHIC_NOT_COMPILED",
+                    "graphic preview could not be compiled",
+                    field=f"cues.{graphic_id}",
+                    suggested_patch={"action": "review_graphic_settings"},
+                )
             from montagewright.measure.storage import write_json
 
             metadata.update({
@@ -2452,7 +2738,35 @@ def create_app() -> FastAPI:
                 "left": card.left, "top": card.top,
                 "joint_layout": joint_layout,
             })
-            write_json(metadata_path, metadata)
+            try:
+                write_json(metadata_path, metadata)
+            except OSError as error:
+                raise _graphics_preview_problem(
+                    503, "PREVIEW_CACHE_UNAVAILABLE", str(error),
+                    field="preview.cache",
+                    suggested_patch={"action": "retry"},
+                )
+            return metadata
+
+        if metadata is None:
+            lock = _graphics_preview_lock(metadata_path)
+            await run_in_threadpool(lock.acquire)
+            try:
+                # A second request may have completed while this one waited.
+                try:
+                    metadata = _load_graphics_preview_cache(
+                        metadata_path, preview_dir, graphic_id
+                    )
+                except OSError as error:
+                    raise _graphics_preview_problem(
+                        503, "PREVIEW_CACHE_UNAVAILABLE", str(error),
+                        field="preview.cache",
+                        suggested_patch={"action": "retry"},
+                    )
+                if metadata is None:
+                    metadata = await compile_missing_preview()
+            finally:
+                lock.release()
         # Preview files outlive the in-memory run alias that first compiled
         # them.  A server restart may reopen the same output directory under
         # its durable run id; never return the stale alias embedded in cached
@@ -2478,9 +2792,30 @@ def create_app() -> FastAPI:
         if not re.fullmatch(r"[0-9a-f]{64}\.png", filename):
             raise HTTPException(404, "no such graphics preview")
         path = _run(run_id).output / "work" / "graphics-preview" / filename
-        if not path.exists():
-            raise HTTPException(404, "no such graphics preview")
-        return FileResponse(path, media_type="image/png")
+        try:
+            valid = _cached_preview_png_is_valid(path)
+        except OSError as error:
+            raise _graphics_preview_problem(
+                503, "PREVIEW_CACHE_UNAVAILABLE", str(error),
+                field="preview.cache",
+                suggested_patch={"action": "retry"},
+            )
+        if not valid:
+            if not path.exists():
+                raise HTTPException(404, "no such graphics preview")
+            raise _graphics_preview_problem(
+                503, "PREVIEW_CACHE_CORRUPT",
+                "the cached preview is not a complete PNG",
+                field="preview.cache",
+                suggested_patch={"action": "regenerate_preview"},
+            )
+        # The filename is the SHA-256 content digest. It can be cached forever;
+        # a changed card receives a different URL instead of mutating this one.
+        return FileResponse(
+            path,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
 
     @app.get("/api/runs/{run_id}/graphics-burned")
     def graphics_burned(run_id: str):
@@ -2521,10 +2856,19 @@ def create_app() -> FastAPI:
         kept.sort(key=lambda one: one["at"])
         kept = _retimed(run, kept)
         destination = run.output / "work" / "subtitles.json"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        from montagewright.measure.storage import write_json
+
+        try:
+            # Publish the new subtitle authority atomically before retiring
+            # outputs that contain the old text. A failed save leaves the last
+            # known-good delivery intact; a successful one can never coexist
+            # with a stale subtitle/graphics composite.
+            write_json(destination, kept)
+            _invalidate_subtitle_delivery(run)
+        except OSError as error:
+            raise HTTPException(
+                503, f"subtitle storage is temporarily unavailable: {error}"
+            )
         # The re-timed lines go back, not just a count. The browser sent the
         # times the lines used to have; if it keeps them it will draw the
         # captions at moments the server has already moved them off.

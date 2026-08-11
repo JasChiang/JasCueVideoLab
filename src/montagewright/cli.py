@@ -8,6 +8,7 @@ deliverable as much as the file is.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -747,7 +748,8 @@ def command_render(args: argparse.Namespace) -> int:
         _selection_schema(
             offered_ids, min_shots=min_shots, max_shots=max_shots,
             graphic_candidate_ids=[
-                one.candidate_id for one in brief_document.candidates
+                one.candidate_id
+                for one in brief_document.graphics_candidates()
             ],
         ),
     )
@@ -762,6 +764,7 @@ def command_render(args: argparse.Namespace) -> int:
         selection, usage_selection = select_shots(
             material, direction, brief=brief, cache=cache, client=client,
             ledger=ledger,
+            graphic_candidates=brief_document.graphics_candidates(),
         )
         _decide(work, "selection", chose, selection)
     else:
@@ -1932,6 +1935,144 @@ def command_timeline(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_graphics(args: argparse.Namespace) -> int:
+    """Inspect and finish the same graphics track the Web editor uses."""
+
+    from montagewright.graphics import (
+        CopyFact,
+        GraphicsPlan,
+        _layout_frames,
+        burn_graphics,
+        compile_graphic,
+        validate_brief_authority,
+        validate_for_render,
+    )
+    from montagewright.measure.media import probe_video
+    from montagewright.measure.storage import write_json
+    from montagewright.renderer import probe_duration
+
+    output = args.output.expanduser().resolve()
+    plan_path = output / "work" / "graphics.json"
+    if not plan_path.exists():
+        raise SystemExit(f"no graphics track at {plan_path}")
+    plan = GraphicsPlan.model_validate_json(plan_path.read_text(encoding="utf-8"))
+    clean = next(
+        (output / name for name in ("deliverable.mp4", "picture.mp4")
+         if (output / name).exists()),
+        None,
+    )
+
+    if args.action == "inspect":
+        for cue in plan.cues:
+            primary = plan.fact(cue.primary_fact_id)
+            print(
+                f"{cue.graphic_id:18s} {cue.status:8s} "
+                f"{cue.at_seconds:7.2f}-{cue.at_seconds + cue.duration_seconds:7.2f} "
+                f"{cue.kind:14s} {cue.style.preset:20s} {primary.exact_text}",
+                flush=True,
+            )
+        return 0
+
+    if args.action == "approve":
+        if not args.graphic_id:
+            raise SystemExit("graphics approve requires --graphic-id")
+        try:
+            cue = next(one for one in plan.cues if one.graphic_id == args.graphic_id)
+        except StopIteration:
+            raise SystemExit(f"unknown graphic id {args.graphic_id}") from None
+        facts = list(plan.facts)
+        updates: dict[str, str] = {}
+        for which, fact_id in (
+            ("primary", cue.primary_fact_id),
+            ("secondary", cue.secondary_fact_id),
+        ):
+            if not fact_id:
+                continue
+            source = plan.fact(fact_id)
+            approved_id = f"user.{cue.graphic_id}.{which}"
+            approved = CopyFact(
+                fact_id=approved_id,
+                exact_text=source.exact_text,
+                source_kind="user",
+                source_reference=f"cli-review:{source.fact_id}",
+                source_sha256=source.source_sha256,
+                text_sha256=hashlib.sha256(
+                    source.exact_text.encode("utf-8")
+                ).hexdigest(),
+                allowed_kinds=[cue.kind],
+                confidence=source.confidence,
+                approved=True,
+                approved_by="human_review",
+            )
+            facts = [one for one in facts if one.fact_id != approved_id]
+            facts.append(approved)
+            updates[f"{which}_fact_id"] = approved_id
+        approved_cue = cue.model_copy(update={**updates, "status": "approved"})
+        plan = GraphicsPlan(
+            version=plan.version,
+            revision=plan.revision + 1,
+            brand=plan.brand,
+            facts=facts,
+            cues=[approved_cue if one.graphic_id == cue.graphic_id else one
+                  for one in plan.cues],
+        )
+        write_json(plan_path, plan)
+        print(f"approved    {cue.graphic_id}", flush=True)
+        return 0
+
+    if clean is None:
+        raise SystemExit("this output has no finished clean picture")
+    duration = probe_duration(clean)
+    problems = validate_for_render(plan, duration_seconds=duration)
+    approved_manifest = output / "work" / "approved-copy.json"
+    authority = []
+    if approved_manifest.exists():
+        authority = [
+            CopyFact.model_validate(one)
+            for one in json.loads(
+                approved_manifest.read_text(encoding="utf-8")
+            ).get("facts", [])
+        ]
+    validate_brief_authority(plan, authority)
+    if problems:
+        for problem in problems:
+            print(f"invalid     {problem}", flush=True)
+        return 2
+    if args.action == "validate":
+        print(
+            f"valid       {sum(one.status == 'approved' for one in plan.cues)} "
+            "approved graphics",
+            flush=True,
+        )
+        return 0
+
+    if args.action == "preview":
+        if not args.graphic_id:
+            raise SystemExit("graphics preview requires --graphic-id")
+        try:
+            cue = next(one for one in plan.cues if one.graphic_id == args.graphic_id)
+        except StopIteration:
+            raise SystemExit(f"unknown graphic id {args.graphic_id}") from None
+        shape = probe_video(clean).video
+        width, height = int(shape.display_width), int(shape.display_height)
+        preview_dir = output / "work" / "graphics-cli-preview"
+        frames = _layout_frames(clean, cue, cache_dir=preview_dir / "frames")
+        made, _ = compile_graphic(
+            cue, plan, width=width, height=height,
+            into=preview_dir / f"{cue.graphic_id}.png", frames=frames,
+        )
+        print(f"preview     {made.path}", flush=True)
+        return 0
+
+    destination = output / "deliverable-graphics.mp4"
+    made = burn_graphics(
+        clean, plan, destination,
+        work=output / "work" / "graphics-render",
+    )
+    print(f"graphics    {made}", flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="montagewright")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2048,6 +2189,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     lay.add_argument("--library", type=Path)
     lay.set_defaults(handler=command_timeline)
+
+    graphics = sub.add_parser(
+        "graphics", help="Inspect, approve, validate, preview or render graphics"
+    )
+    graphics.add_argument("output", type=Path)
+    graphics.add_argument(
+        "action", choices=["inspect", "approve", "validate", "preview", "render"]
+    )
+    graphics.add_argument("--graphic-id")
+    graphics.set_defaults(handler=command_graphics)
 
     args = parser.parse_args(argv)
     return args.handler(args)

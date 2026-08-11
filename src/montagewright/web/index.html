@@ -84,6 +84,10 @@
     display: block; padding: 8px 10px; border-radius: 7px;
     color: var(--ink); text-decoration: none; font-size: 13px;
   }
+  .drop button.item {
+    width: 100%; border: 0; background: transparent; text-align: left;
+    font: inherit; cursor: pointer;
+  }
   .drop .item:hover { background: var(--sunk); }
   .drop .sep { height: 1px; background: var(--hair); margin: 6px 4px; }
   .drop .why { margin: 6px 10px 4px; font-size: 11.5px; }
@@ -363,11 +367,39 @@
   .graphic-preview-card.invalid {
     outline: 2px solid #ef4f4f; outline-offset: 4px;
   }
+  .graphic-preview-card.transient {
+    outline: 1px dashed #d49a32; outline-offset: 4px;
+  }
+  .graphic-preview-error {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    box-sizing: border-box; padding: 10px 14px; border-radius: 7px;
+    border: 1px dashed rgba(255,255,255,.72);
+    background: rgba(35,22,22,.88); color: #fff;
+    font-size: 12px; font-weight: 650; line-height: 1.35; text-align: center;
+  }
+  .graphic-inline-editor {
+    position: absolute; inset: 0; z-index: 12; box-sizing: border-box;
+    width: 100%; height: 100%; min-width: 0; min-height: 0; resize: none;
+    padding: 12px; border: 1px solid #77b7ff; border-radius: 6px;
+    outline: none; background: rgba(18,20,24,.92); color: #fff;
+    font: 650 1em/1.15 ui-sans-serif, system-ui, sans-serif;
+    text-align: inherit; white-space: pre-wrap; touch-action: manipulation;
+  }
   .graphic-preview-status {
     position: absolute; right: 12px; top: 12px; z-index: 9;
     padding: 5px 9px; border-radius: 999px; background: rgba(23,25,29,.88);
     box-shadow: 0 3px 12px rgba(0,0,0,.18); backdrop-filter: blur(8px);
     color: #fff; font-size: 11px; font-weight: 620; pointer-events: none;
+  }
+  .graphic-preview-status.validation { background: rgba(126,38,38,.94); }
+  .graphic-preview-status.transient,
+  .graphic-preview-status.stale { background: rgba(91,67,25,.94); }
+  .graphic-preview-stale-badge {
+    position: absolute; right: 0; top: -27px; z-index: 8;
+    max-width: min(250px, 90vw); padding: 4px 7px; border-radius: 5px;
+    background: rgba(91,67,25,.94); color: #fff; font-size: 10px;
+    font-weight: 650; line-height: 1.25; white-space: nowrap;
+    box-shadow: 0 2px 8px rgba(0,0,0,.2); pointer-events: none;
   }
   .graphic-handle {
     position: absolute; width: 12px; height: 12px; border-radius: 50%;
@@ -514,6 +546,39 @@
     display: block; margin-top: 2px; color: var(--dim); font-size: 9.5px;
     line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .graphic-readiness {
+    display: grid; grid-template-columns: auto minmax(0,1fr) auto;
+    gap: 7px 9px; align-items: center; margin: 0 0 10px;
+    padding: 9px 10px; border: 1px solid var(--hair); border-radius: 9px;
+    background: var(--sunk);
+  }
+  .graphic-readiness-badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 22px; padding: 2px 8px; border-radius: 999px;
+    background: color-mix(in srgb, #2f7d58 16%, var(--panel));
+    color: #236744; font-size: 10.5px; font-weight: 700; white-space: nowrap;
+  }
+  .graphic-readiness-badge.updating,
+  .graphic-readiness-badge.transient {
+    background: color-mix(in srgb, #c58b25 17%, var(--panel)); color: #8a5d12;
+  }
+  .graphic-readiness-badge.validation {
+    background: color-mix(in srgb, #c84c45 15%, var(--panel)); color: #a23731;
+  }
+  .graphic-readiness-copy { min-width: 0; color: var(--soft); font-size: 11.5px; line-height: 1.35; }
+  .graphic-readiness button { padding: 5px 8px; font-size: 10.5px; }
+  .graphic-readiness details { grid-column: 1 / -1; font-size: 10.5px; color: var(--dim); }
+  .graphic-readiness details summary { cursor: pointer; }
+  .graphic-readiness details p { margin: 5px 0 0; overflow-wrap: anywhere; }
+  .graphic-choice {
+    grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr;
+    gap: 5px; padding: 3px; border: 1px solid var(--line);
+    border-radius: 9px; background: var(--sunk);
+  }
+  .graphic-choice button { padding: 7px 8px; border-color: transparent; background: transparent; color: var(--soft); }
+  .graphic-choice button.on { background: var(--panel); color: var(--ink); border-color: var(--line); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .graphic-quick-help { margin: 0 0 9px; color: var(--dim); font-size: 11px; line-height: 1.4; }
+  .graphic-advanced-design { margin-top: 12px; }
   .graphic-project-style {
     grid-column: 1 / -1; padding: 9px 10px; border: 1px solid var(--hair);
     border-radius: 9px; background: var(--sunk);
@@ -1239,6 +1304,7 @@
       <button class="ghost" id="export">匯出 ▾</button>
       <div class="drop hide" id="export-drop">
         <a class="item" id="dl-film" href="#" download>成片（完整畫質）</a>
+        <button type="button" class="item" id="export-graphics">產生成片＋字卡</button>
         <a class="item hide" id="dl-burned" href="#" download>成片＋燒好的字幕</a>
         <a class="item hide" id="dl-srt" href="#" download>字幕檔 SRT</a>
         <div class="sep"></div>
@@ -2038,6 +2104,10 @@ let graphicPreviewEpoch = 0;
 let graphicPreviewDirty = new Set(), graphicInteraction = null;
 let graphicPreviewErrors = {};
 let graphicPreviewModes = {};
+let graphicPrewarmTimer = null;
+let graphicPreviewPixelPromises = new Map();
+let graphicPreviewRetryTimers = {}, graphicPreviewRetryAttempts = {};
+let graphicLastCanvasClick = {id: '', at: 0};
 
 function graphicText(cue, which = 'primary') {
   const id = which === 'primary' ? cue.primary_fact_id : cue.secondary_fact_id;
@@ -2091,6 +2161,7 @@ async function loadGraphics() {
     briefCandidates = []; briefInstructions = []; briefDigest = '';
   }
   paintGraphics(); paintGraphicList(); showGraphicPreview();
+  scheduleGraphicPreviewPrewarm();
 }
 
 function paintGraphics() {
@@ -2233,15 +2304,35 @@ function paintGraphicList() {
     );
   }
   $('graphic-count').textContent = graphics.length ? `${graphics.length} 張` : '';
-  list.innerHTML = graphics.length ? graphics.map((one, i) => `
-    <div class="graphic-row ${i === graphicPicked ? 'on' : ''}" data-i="${i}">
+  list.innerHTML = graphics.length ? graphics.map((one, i) => {
+    const issue = graphicPreviewIssue(one.graphic_id);
+    const badge = issue?.kind === 'validation' ? ['no','需修正']
+      : issue?.kind === 'transient' ? ['warn','預覽暫停']
+      : one.status === 'approved' ? ['ok','核准'] : ['','草稿'];
+    return `
+    <div class="graphic-row ${i === graphicPicked ? 'on' : ''}" data-i="${i}" data-graphic-id="${esc(one.graphic_id)}">
       <div class="graphic-copy">${esc(one.primary_text)}</div>
-      <span class="tag ${one.status === 'approved' ? 'ok' : ''}">${one.status === 'approved' ? '核准' : '草稿'}</span>
+      <span class="tag ${badge[0]}">${badge[1]}</span>
       <div class="graphic-meta">${esc(graphicSourceLabel(one))} · ${esc(one.kind)} · ${one.at_seconds.toFixed(2)}–${(one.at_seconds + one.duration_seconds).toFixed(2)}s · ${esc(one.template)}</div>
-    </div>`).join('') : '<p class="why">還沒有字卡。可在播放頭新增，乾淨母版不會被覆寫。</p>';
+    </div>`;
+  }).join('') : '<p class="why">還沒有字卡。可在播放頭新增，乾淨母版不會被覆寫。</p>';
   for (const row of list.querySelectorAll('.graphic-row')) {
     row.onclick = () => selectGraphic(+row.dataset.i);
   }
+}
+
+function syncGraphicListReadiness(id) {
+  const row = $('graphic-list')?.querySelector(
+    `[data-graphic-id="${CSS.escape(id)}"]`);
+  const cue = graphicsPlan.cues.find(one => one.graphic_id === id);
+  const tag = row?.querySelector('.tag');
+  if (!cue || !tag) return;
+  const issue = graphicPreviewIssue(id);
+  tag.className = 'tag';
+  if (issue?.kind === 'validation') { tag.classList.add('no'); tag.textContent = '需修正'; }
+  else if (issue?.kind === 'transient') { tag.classList.add('warn'); tag.textContent = '預覽暫停'; }
+  else if (cue.status === 'approved') { tag.classList.add('ok'); tag.textContent = '核准'; }
+  else tag.textContent = '草稿';
 }
 
 function selectGraphic(i, seekSeconds = null) {
@@ -2293,8 +2384,12 @@ function graphicFontOptions(selected) {
     ).join('');
 }
 
-function graphicFamilyCards(selected) {
-  return Object.values(graphicStylePresets).filter(one => one.curated_family).map(one => {
+function graphicFamilyCards(selected, limit = null) {
+  const families = Object.values(graphicStylePresets)
+    .filter(one => one.curated_family)
+    .sort((left, right) => Number(right.preset_id === selected)
+      - Number(left.preset_id === selected));
+  return (limit == null ? families : families.slice(0, limit)).map(one => {
     const style = one.style || {};
     const plate = style.plate_color || '#24262B';
     const fg = style.primary_color || '#FFFFFF';
@@ -2325,6 +2420,67 @@ function styleOfGraphic(one) {
   return {...graphicStyleDefaults, ...(one?.style || {})};
 }
 
+function graphicPreviewIssue(id) {
+  const issue = graphicPreviewErrors[id];
+  if (!issue) return null;
+  return typeof issue === 'string'
+    ? {kind: 'validation', message: issue, status: 422} : issue;
+}
+
+function friendlyGraphicPreviewIssue(issue) {
+  if (!issue) return '';
+  if (issue.kind === 'transient')
+    return '精準預覽暫時無法更新；畫面若有字卡，會明確標成上一次有效預覽。';
+  if (/contrast/i.test(issue.message))
+    return '文字與背景對比不足，這組設定目前不能安全輸出。';
+  if (/safe-area|keepout/i.test(issue.message))
+    return '字卡或進出動畫碰到字幕／安全區。';
+  if (/too long|one-line/i.test(issue.message))
+    return '文字超出目前版面結構可容納的寬度。';
+  return '目前設定沒有通過正式輸出檢查。';
+}
+
+function resetGraphicPlacementControls() {
+  $('graphic-position').value = 'auto';
+  $('graphic-composition').value = 'auto';
+  $('graphic-transform-x').value = '.5';
+  $('graphic-transform-y').value = '.5';
+  $('graphic-transform-scale').value = '1';
+  $('graphic-transform-rotation').value = '0';
+  $('graphic-transform-locked').checked = false;
+}
+
+function syncGraphicInspectorReadiness() {
+  const cue = graphicsPlan.cues[graphicPicked];
+  const badge = $('graphic-readiness-badge'), copy = $('graphic-readiness-copy');
+  const action = $('graphic-readiness-action'), detail = $('graphic-readiness-detail');
+  const technical = $('graphic-readiness-technical');
+  if (!cue || !badge || !copy || !action || !detail || !technical) return;
+  const id = cue.graphic_id, issue = graphicPreviewIssue(id);
+  const pending = graphicPreviewPending.has(id);
+  const dirty = graphicPreviewDirty.has(id);
+  badge.className = 'graphic-readiness-badge';
+  action.classList.add('hide'); detail.classList.add('hide');
+  if (issue) {
+    badge.classList.add(issue.kind);
+    badge.textContent = issue.kind === 'transient' ? '暫時無法更新' : '需要調整';
+    copy.textContent = friendlyGraphicPreviewIssue(issue);
+    action.textContent = issue.kind === 'transient' ? '立即重試' : '嘗試自動修正';
+    action.classList.remove('hide'); detail.classList.remove('hide');
+    technical.textContent = issue.message;
+  } else if (pending || dirty) {
+    badge.classList.add('updating'); badge.textContent = '更新中';
+    copy.textContent = compiledGraphicPreviews[id]
+      ? '目前先顯示上一次有效預覽，完成後會自動換上。'
+      : '正在產生第一張精準預覽。';
+  } else if (compiledGraphicPreviews[id]) {
+    badge.textContent = '可輸出'; copy.textContent = '預覽已通過正式字卡 renderer。';
+  } else {
+    badge.classList.add('updating'); badge.textContent = '準備預覽';
+    copy.textContent = '選到字卡時間後會確認輸出結果。';
+  }
+}
+
 function inspectGraphic() {
   const one = graphics[graphicPicked], box = $('graphic-inspector');
   if (!one || !box) return;
@@ -2334,6 +2490,13 @@ function inspectGraphic() {
     .filter(t => (t.kinds || []).includes(one.kind))
     .map(t => [t.template_id, t.label]);
   box.innerHTML = `
+    <section class="graphic-readiness" id="graphic-readiness" aria-live="polite">
+      <span class="graphic-readiness-badge updating" id="graphic-readiness-badge">準備預覽</span>
+      <span class="graphic-readiness-copy" id="graphic-readiness-copy">正在確認這張字卡能否如畫面輸出。</span>
+      <button type="button" class="ghost hide" id="graphic-readiness-action">重試</button>
+      <details class="hide" id="graphic-readiness-detail"><summary>查看原因</summary>
+        <p id="graphic-readiness-technical"></p></details>
+    </section>
     <nav class="graphic-editor-nav" aria-label="字卡編輯分類">
       <button type="button" class="on" data-graphic-panel="content">內容</button>
       <button type="button" data-graphic-panel="style">樣式</button>
@@ -2341,34 +2504,72 @@ function inspectGraphic() {
       <button type="button" class="graphic-view-canvas" style="display:none">看畫面</button>
     </nav>
     <section class="ins-part graphic-editor-panel" data-panel="content"><h4>文字內容</h4>
-    <div class="why">第一行 · ${esc(graphicFactSourceLabel(one.primary_fact_id))}</div>
-    <textarea id="graphic-primary" class="cue-text" spellcheck="false">${esc(one.primary_text)}</textarea>
-    <div class="why">第二行 · ${esc(one.secondary_fact_id
-      ? graphicFactSourceLabel(one.secondary_fact_id) : '尚未輸入')}</div>
-    <textarea id="graphic-secondary" class="cue-text" spellcheck="false" placeholder="第二行，可留空">${esc(one.secondary_text || '')}</textarea>
+      <p class="graphic-quick-help">畫面上單擊選取、雙擊可直接修改主文字。</p>
+      <div class="why">第一行 · ${esc(graphicFactSourceLabel(one.primary_fact_id))}</div>
+      <textarea id="graphic-primary" class="cue-text" spellcheck="false">${esc(one.primary_text)}</textarea>
+      <div class="why">第二行 · ${esc(one.secondary_fact_id
+        ? graphicFactSourceLabel(one.secondary_fact_id) : '尚未輸入')}</div>
+      <textarea id="graphic-secondary" class="cue-text" spellcheck="false" placeholder="第二行，可留空">${esc(one.secondary_text || '')}</textarea>
     </section>
-    <section class="ins-part graphic-editor-panel" data-panel="content"><h4>內容與時間</h4><div class="pairs">
-      <span>類型</span><select id="graphic-kind" class="wide">${graphicOptions([
-        ['opening_title','開場主標'],['chapter','章節'],['product_name','產品名'],
-        ['feature','功能／規格'],['callout','重點標註'],['end_card','結尾卡']
-      ], one.kind)}</select>
+    <section class="ins-part graphic-editor-panel" data-panel="content"><h4>時間與輸出</h4><div class="pairs">
       <span>開始</span><input id="graphic-at" value="${stamp(one.at_seconds)}">
       <span>結束</span><input id="graphic-until" value="${stamp(one.at_seconds + one.duration_seconds)}">
       <span>狀態</span><select id="graphic-status" class="wide">${graphicOptions([
         ['draft','草稿，不輸出'],['approved','核准並輸出']
       ], one.status)}</select>
-      <span>Brief 備註</span><textarea id="graphic-note" class="wide" placeholder="排版或剪輯指示">${esc(one.editor_note || '')}</textarea>
     </div></section>
-    <section class="ins-part graphic-editor-panel hide-panel" data-panel="style"><h4>版面與樣式</h4><div class="pairs">
-      <span>模板</span><select id="graphic-template" class="wide">${graphicOptions(templates, one.template)}</select>
-      <span>設計起點</span><select id="graphic-style-preset" class="wide">${graphicOptions(
-        graphicStylePresetOptions, style.preset
-      )}</select>
-      <div class="graphic-family-grid">${graphicFamilyCards(style.preset)}</div>
-      <span></span><p class="why wide">${esc(
-        graphicStylePresets[style.preset]?.description
-        || '選家族後仍可逐項修改；修改不會把能力鎖死。'
-      )}</p>
+    <details class="graphic-advanced graphic-editor-panel" data-panel="content"><summary>進階內容與來源</summary>
+      <section class="ins-part"><div class="pairs">
+        <span>類型</span><select id="graphic-kind" class="wide">${graphicOptions([
+          ['opening_title','開場主標'],['chapter','章節'],['product_name','產品名'],
+          ['feature','功能／規格'],['callout','重點標註'],['end_card','結尾卡']
+        ], one.kind)}</select>
+        <span>Brief 備註</span><textarea id="graphic-note" class="wide" placeholder="排版或剪輯指示">${esc(one.editor_note || '')}</textarea>
+        <span></span><button type="button" id="graphic-undo" class="ghost wide">復原上一步</button>
+      </div></section>
+    </details>
+    <section class="ins-part graphic-editor-panel hide-panel" data-panel="style"><h4>推薦設計家族</h4>
+      <p class="graphic-quick-help">先選整體方向；下面仍可調整位置與大小。</p>
+      <div class="graphic-family-grid">${graphicFamilyCards(style.preset, 4)}</div>
+      <details class="graphic-advanced graphic-advanced-design"><summary>全部樣式與自訂</summary>
+        <section class="ins-part"><div class="pairs">
+          <span>設計起點</span><select id="graphic-style-preset" class="wide">${graphicOptions(
+            graphicStylePresetOptions, style.preset
+          )}</select>
+          <span></span><p class="why wide">${esc(
+            graphicStylePresets[style.preset]?.description
+            || '選家族後仍可逐項修改；修改不會把能力鎖死。'
+          )}</p>
+        </div></section>
+      </details>
+      <h4 style="margin-top:16px">位置與大小</h4><div class="pairs">
+        <div class="graphic-choice" aria-label="字卡位置模式">
+          <button type="button" data-graphic-placement="auto" class="${one.position === 'auto' ? 'on' : ''}" ${geometryLocked}>自動避讓</button>
+          <button type="button" data-graphic-placement="manual" class="${one.position === 'auto' ? '' : 'on'}" ${geometryLocked}>自由位置</button>
+        </div>
+        <span>整體大小</span><span><input id="graphic-transform-scale" type="range" min="0.25" max="4" step="0.01" value="${one.transform?.scale ?? 1}" ${geometryLocked}>
+          <i class="why mono" id="graphic-scale-value">${(one.transform?.scale ?? 1).toFixed(2)}×</i></span>
+        <span></span><button type="button" id="graphic-restore-auto" class="ghost wide">恢復完整自動排版</button>
+      </div>
+    </section>
+    <details class="graphic-advanced graphic-advanced-design graphic-editor-panel hide-panel" data-panel="style"><summary>進階設計</summary>
+    <section class="ins-part"><div class="pairs">
+      <span>版面結構</span><select id="graphic-template" class="wide">${graphicOptions(templates, one.template)}</select>
+      <span>精確位置</span><select id="graphic-position" class="wide" ${geometryLocked}>${graphicOptions([
+        ['auto','多幀自動'],['manual','自由位置'],['top','上方'],['upper_left','左上'],['upper_right','右上'],
+        ['lower_left','左下'],['lower_right','右下'],['center','中央']
+      ], one.position)}</select>
+      <span>水平位置</span><input id="graphic-transform-x" type="range" min="0" max="1" step="0.001" value="${one.transform?.x ?? .5}" ${geometryLocked}>
+      <span>垂直位置</span><input id="graphic-transform-y" type="range" min="0" max="1" step="0.001" value="${one.transform?.y ?? .5}" ${geometryLocked}>
+      <span>旋轉角度</span><input id="graphic-transform-rotation" type="number" min="-180" max="180" step="0.1" value="${one.transform?.rotation_degrees ?? 0}" ${geometryLocked}>
+      <span>位置鎖定</span><label class="wide"><input id="graphic-transform-locked" type="checkbox" ${one.transform?.locked ? 'checked' : ''}> 鎖定，避免誤拖</label>
+      <span>構圖</span><select id="graphic-composition" class="wide">${graphicOptions([
+        ['auto','自動判斷'],['negative_space','放在留白'],['avoid_subject','避開主體（需 SAM）'],
+        ['overlap_subject','刻意壓主體'],['foreground_plate','前景底板']
+      ], one.composition)}</select>
+      <span>可讀性補救</span><select id="graphic-contrast-mode" class="wide">${graphicOptions([
+        ['auto','不足時自動補救'],['strict','保留人工值，不足則停止輸出']
+      ], style.contrast_mode)}</select>
       <div class="graphic-project-style"><strong>專案字型組合</strong>
         <div class="font-row">
           <label for="graphic-display-font">標題／主字</label>
@@ -2378,23 +2579,6 @@ function inspectGraphic() {
         </div>
         <p class="why">整支影片共用，設計家族再決定大小、層級與外觀。</p>
       </div>
-      <span>可讀性補救</span><select id="graphic-contrast-mode" class="wide">${graphicOptions([
-        ['auto','不足時自動補救'],['strict','保留人工值，不足則停止輸出']
-      ], style.contrast_mode)}</select>
-      <span>位置</span><select id="graphic-position" class="wide" ${geometryLocked}>${graphicOptions([
-        ['auto','多幀自動'],['manual','自由位置'],['top','上方'],['upper_left','左上'],['upper_right','右上'],
-        ['lower_left','左下'],['lower_right','右下'],['center','中央']
-      ], one.position)}</select>
-      <span>水平位置</span><input id="graphic-transform-x" type="range" min="0" max="1" step="0.001" value="${one.transform?.x ?? .5}" ${geometryLocked}>
-      <span>垂直位置</span><input id="graphic-transform-y" type="range" min="0" max="1" step="0.001" value="${one.transform?.y ?? .5}" ${geometryLocked}>
-      <span>整體縮放</span><input id="graphic-transform-scale" type="range" min="0.25" max="4" step="0.01" value="${one.transform?.scale ?? 1}" ${geometryLocked}>
-      <span>旋轉角度</span><input id="graphic-transform-rotation" type="number" min="-180" max="180" step="0.1" value="${one.transform?.rotation_degrees ?? 0}" ${geometryLocked}>
-      <span>位置鎖定</span><label class="wide"><input id="graphic-transform-locked" type="checkbox" ${one.transform?.locked ? 'checked' : ''}> 鎖定，避免誤拖</label>
-      <span></span><button type="button" id="graphic-restore-auto" class="ghost wide">恢復自動排版</button>
-      <span>構圖</span><select id="graphic-composition" class="wide">${graphicOptions([
-        ['auto','自動判斷'],['negative_space','放在留白'],['avoid_subject','避開主體（需 SAM）'],
-        ['overlap_subject','刻意壓主體'],['foreground_plate','前景底板']
-      ], one.composition)}</select>
       <span>背景</span><select id="graphic-background" class="wide">${graphicOptions([
         ['auto','依模板'],['none','透明'],['plate','局部底板']
       ], one.background)}</select>
@@ -2421,8 +2605,7 @@ function inspectGraphic() {
       <span>水平內距</span><input id="graphic-padding-x" type="number" min="0" max="160" value="${style.padding_x}">
       <span>垂直內距</span><input id="graphic-padding-y" type="number" min="0" max="120" value="${style.padding_y}">
     </div></section>
-    <details class="graphic-advanced graphic-editor-panel hide-panel" data-panel="style"><summary>進階文字外觀</summary>
-    <section class="ins-part"><div class="pairs">
+    <section class="ins-part"><h4>文字外觀</h4><div class="pairs">
       <span>主文字</span><input id="graphic-fg" type="color" value="${esc(style.primary_color || graphicsPlan.brand.foreground || '#FFFFFF')}">
       <span>輔文字</span><input id="graphic-secondary-colour" type="color" value="${esc(style.secondary_color || graphicsPlan.brand.secondary || '#D9DCE3')}">
       <span>強調文字</span><input id="graphic-emphasis-text" value="${esc(style.emphasis_text)}" placeholder="例如 4.1mm">
@@ -2434,9 +2617,8 @@ function inspectGraphic() {
       <span>陰影模糊</span><input id="graphic-shadow-blur" type="range" min="0" max="40" value="${style.shadow_blur}">
       <span>陰影水平</span><input id="graphic-shadow-x" type="number" min="-40" max="40" value="${style.shadow_offset_x}">
       <span>陰影垂直</span><input id="graphic-shadow-y" type="number" min="-40" max="40" value="${style.shadow_offset_y}">
-    </div></section></details>
-    <details class="graphic-advanced graphic-editor-panel hide-panel" data-panel="style"><summary>進階底板與外框</summary>
-    <section class="ins-part"><div class="pairs">
+    </div></section>
+    <section class="ins-part"><h4>底板與外框</h4><div class="pairs">
       <span>底板色</span><input id="graphic-plate" type="color" value="${esc(style.plate_color || graphicsPlan.brand.plate || '#111318')}">
       <span>底板透明度</span><input id="graphic-plate-alpha" type="range" min="0" max="255" value="${style.plate_alpha ?? graphicsPlan.brand.plate_alpha ?? 205}">
       <span>圓角</span><input id="graphic-corner-radius" type="range" min="0" max="160" value="${style.corner_radius ?? Math.round((graphicsPlan.brand.corner_radius || .18) * 100)}">
@@ -2448,13 +2630,16 @@ function inspectGraphic() {
         ['none','直接出現'],['fade','淡入淡出'],['rise','向上進場'],
         ['slide_left','向左進場'],['slide_right','向右進場']
       ], one.motion)}</select>
+    </div>
+      <p class="graphic-quick-help">輸出整支字卡版請使用上方「匯出」。</p>
+    </section>
+    <details class="graphic-advanced graphic-editor-panel hide-panel" data-panel="motion"><summary>進階動畫設定</summary>
+      <section class="ins-part"><div class="pairs">
       <span>進場秒數</span><input id="graphic-enter" type="number" min="0.05" max="2" step="0.05" value="${style.entrance_seconds ?? .35}">
       <span>退場秒數</span><input id="graphic-exit" type="number" min="0.05" max="2" step="0.05" value="${style.exit_seconds ?? .25}">
       <span>移動距離</span><input id="graphic-motion-distance" type="range" min="0" max="240" value="${style.motion_distance ?? 28}">
-    </div></section>
-    <section class="ins-part"><button id="graphic-burn">輸出字卡版</button>
-      <button type="button" id="graphic-undo" class="ghost">還原字卡修改</button>
-      <p class="why">輸出為另一支影片，乾淨母版保留。草稿不會被燒入。</p></section>`;
+      </div></section>
+    </details>`;
   for (const id of ['graphic-primary','graphic-secondary','graphic-kind','graphic-at',
     'graphic-until','graphic-status','graphic-note','graphic-template','graphic-position',
     'graphic-transform-x','graphic-transform-y','graphic-transform-scale',
@@ -2479,7 +2664,6 @@ function inspectGraphic() {
     }
     control.onkeydown = (e) => e.stopPropagation();
   }
-  $('graphic-burn').onclick = burnGraphics;
   $('graphic-undo').onclick = undoGraphicEdit;
   const showGraphicEditorPanel = (wanted) => {
     activeGraphicPanel = wanted;
@@ -2507,12 +2691,31 @@ function inspectGraphic() {
       updateGraphicFromInspector({target: $('graphic-style-preset')});
     };
   }
+  for (const choice of box.querySelectorAll('[data-graphic-placement]')) {
+    choice.onclick = () => {
+      $('graphic-position').value = choice.dataset.graphicPlacement;
+      updateGraphicFromInspector({target: $('graphic-position')});
+    };
+  }
   showGraphicEditorPanel(activeGraphicPanel);
   $('graphic-restore-auto').onclick = () => {
-    $('graphic-position').value = 'auto';
-    $('graphic-transform-locked').checked = false;
+    resetGraphicPlacementControls();
     updateGraphicFromInspector({target: $('graphic-position')});
   };
+  $('graphic-readiness-action').onclick = () => {
+    const issue = graphicPreviewIssue(one.graphic_id);
+    if (issue?.kind === 'validation') {
+      resetGraphicPlacementControls();
+      $('graphic-contrast-mode').value = 'auto';
+      updateGraphicFromInspector({target: $('graphic-position')});
+      return;
+    }
+    delete graphicPreviewErrors[one.graphic_id];
+    graphicPreviewDirty.add(one.graphic_id);
+    requestGraphicPreview(one);
+    syncGraphicInspectorReadiness();
+  };
+  syncGraphicInspectorReadiness();
 }
 
 function editableGraphicFact(cue, which) {
@@ -2696,6 +2899,23 @@ async function updateGraphicFromInspector(event) {
       position: 'auto', composition: 'auto', background: 'auto', motion: 'rise',
       ...(preset.cue || {}),
     };
+    if (cue.transform?.locked) {
+      // A locked card keeps its authored placement when its visual family
+      // changes. Unlocking explicitly is what gives automation permission to
+      // move it again.
+      presetCue.position = cue.position;
+      presetCue.composition = cue.composition;
+    } else {
+      // Families have different intrinsic dimensions. Carrying a previous
+      // 3.8x scale or rotation into the new family makes a valid preset look
+      // broken, so an unlocked family switch starts from safe geometry.
+      $('graphic-transform-x').value = '.5';
+      $('graphic-transform-y').value = '.5';
+      $('graphic-transform-scale').value = '1';
+      $('graphic-transform-rotation').value = '0';
+      $('graphic-position').value = presetCue.position || 'auto';
+      $('graphic-composition').value = presetCue.composition || 'auto';
+    }
     background = presetCue.background || background;
     if (presetCue.template && graphicTemplates.some(
       item => item.template_id === presetCue.template
@@ -2742,6 +2962,8 @@ async function updateGraphicFromInspector(event) {
     editor_note: $('graphic-note').value.trim(),
     style,
   });
+  if ($('graphic-scale-value'))
+    $('graphic-scale-value').textContent = `${cue.transform.scale.toFixed(2)}×`;
   if (event?.target?.id === 'graphic-at'
       || event?.target?.id === 'graphic-until') reanchorGraphicCue(cue);
   const exactGeometryControls = new Set([
@@ -2883,16 +3105,36 @@ async function requestGraphicPreview(cue) {
   const requestNumber = (graphicPreviewRequests[id] || 0) + 1;
   graphicPreviewRequests[id] = requestNumber;
   graphicPreviewPending.set(id, requestNumber);
+  clearTimeout(graphicPreviewRetryTimers[id]);
+  delete graphicPreviewRetryTimers[id];
+  delete graphicPreviewErrors[id];
+  syncGraphicListReadiness(id);
+  showGraphicPreview();
   try {
     const got = await fetch(`/api/runs/${runId}/graphics-preview/${encodeURIComponent(id)}`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(graphicsPlan),
     });
     const answer = await got.json();
-    if (!got.ok) throw new Error(answer.detail || '無法編譯字卡預覽');
+    if (!got.ok) {
+      const structured = typeof answer.detail === 'object' ? answer.detail : answer;
+      const message = typeof answer.detail === 'string'
+        ? answer.detail : structured.message || '無法編譯字卡預覽';
+      const code = structured.code || answer.code || '';
+      const kind = got.status === 422 && !String(code).startsWith('transient_')
+        ? 'validation' : 'transient';
+      throw Object.assign(new Error(message), {
+        previewKind: kind, previewCode: code, httpStatus: got.status,
+      });
+    }
+    const joint = answer.joint_layout || {[id]: answer};
+    // A metadata response is not the same as pixels being ready. Decode every
+    // PNG while the cue is still off-screen so its first animation frame can
+    // be drawn immediately when the playhead reaches it.
+    await Promise.all(Object.values(joint).map(made =>
+      decodeGraphicPreviewPixels(made.url)));
     if (epoch !== graphicPreviewEpoch
         || graphicPreviewRequests[id] !== requestNumber) return;
-    const joint = answer.joint_layout || {[id]: answer};
     for (const [jointId, made] of Object.entries(joint)) {
       compiledGraphicPreviews[jointId] = {
         ...answer, ...made, graphic_id: jointId, joint_layout: joint,
@@ -2900,15 +3142,43 @@ async function requestGraphicPreview(cue) {
       graphicPreviewDirty.delete(jointId);
       delete graphicPreviewModes[jointId];
       delete graphicPreviewErrors[jointId];
+      delete graphicPreviewRetryAttempts[jointId];
+      syncGraphicListReadiness(jointId);
     }
     delete graphicPreviewErrors[id];
-    showGraphicPreview();
+    delete graphicPreviewRetryAttempts[id];
+    const note = $('strip-note');
+    if (note?.dataset.graphicPreviewId === id) {
+      note.textContent = '';
+      delete note.dataset.graphicPreviewId;
+    }
   } catch (error) {
     if (epoch === graphicPreviewEpoch
         && graphicPreviewRequests[id] === requestNumber) {
-      graphicPreviewErrors[id] = error.message;
-      $('strip-note').textContent = `字卡預覽失敗：${error.message}`;
-      showGraphicPreview();
+      const issue = {
+        kind: error.previewKind || 'transient',
+        code: error.previewCode || '', status: error.httpStatus || 0,
+        message: error.message || '無法編譯字卡預覽',
+      };
+      graphicPreviewErrors[id] = issue;
+      syncGraphicListReadiness(id);
+      const note = $('strip-note');
+      note.dataset.graphicPreviewId = id;
+      note.textContent = issue.kind === 'transient'
+        ? '字卡精準預覽暫時無法更新，會自動重試'
+        : `字卡設定需調整：${friendlyGraphicPreviewIssue(issue)}`;
+      if (issue.kind === 'transient') {
+        const attempt = (graphicPreviewRetryAttempts[id] || 0) + 1;
+        graphicPreviewRetryAttempts[id] = attempt;
+        if (attempt <= 2) {
+          graphicPreviewRetryTimers[id] = setTimeout(() => {
+            delete graphicPreviewRetryTimers[id];
+            if (epoch !== graphicPreviewEpoch) return;
+            const latest = graphicsPlan.cues.find(one => one.graphic_id === id);
+            if (latest) requestGraphicPreview(latest);
+          }, 350 * attempt);
+        }
+      }
     }
   } finally {
     if (graphicPreviewPending.get(id) === requestNumber)
@@ -2919,25 +3189,93 @@ async function requestGraphicPreview(cue) {
       graphicPreviewTimer = setTimeout(() => {
         graphicPreviewTimer = null;
         requestGraphicPreview(graphicsPlan.cues[graphicPicked]);
-      }, 180);
+      }, 20);
     }
+    showGraphicPreview();
+    syncGraphicInspectorReadiness();
   }
+}
+
+function decodeGraphicPreviewPixels(url) {
+  if (!url) return Promise.reject(new Error('字卡預覽沒有圖片資產'));
+  const absolute = new URL(url, location.href).href;
+  if (graphicPreviewPixelPromises.has(absolute))
+    return graphicPreviewPixelPromises.get(absolute);
+  const pending = new Promise((resolve, reject) => {
+    const image = new Image();
+    const loaded = new Promise((loadedResolve, loadedReject) => {
+      image.onload = loadedResolve;
+      image.onerror = () => loadedReject(new Error('無法載入字卡預覽圖片'));
+    });
+    image.src = absolute;
+    (async () => {
+      try {
+        if (image.decode) {
+          try { await image.decode(); }
+          catch (_) { await loaded; }
+        } else await loaded;
+        resolve(absolute);
+      } catch (error) { reject(error); }
+    })();
+  });
+  graphicPreviewPixelPromises.set(absolute, pending);
+  pending.catch(() => graphicPreviewPixelPromises.delete(absolute));
+  return pending;
+}
+
+function scheduleGraphicPreviewPrewarm(delay = 80) {
+  clearTimeout(graphicPrewarmTimer);
+  const epoch = graphicPreviewEpoch, targetRunId = runId;
+  graphicPrewarmTimer = setTimeout(async () => {
+    graphicPrewarmTimer = null;
+    const playAt = $('video')?.currentTime || 0;
+    // Warm the next visible cards first, then wrap around to the beginning.
+    // One request can also return every temporally-overlapping card, so the
+    // cache check keeps the two-worker queue inexpensive.
+    const approved = graphicsPlan.cues.filter(one => one.status === 'approved')
+      .sort((left, right) => {
+        const leftAhead = left.at_seconds >= playAt ? 0 : 1;
+        const rightAhead = right.at_seconds >= playAt ? 0 : 1;
+        return leftAhead - rightAhead || left.at_seconds - right.at_seconds;
+      });
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < approved.length) {
+        const cue = approved[cursor++];
+        if (epoch !== graphicPreviewEpoch || targetRunId !== runId) return;
+        if (!compiledGraphicPreviews[cue.graphic_id]
+            || graphicPreviewDirty.has(cue.graphic_id))
+          await requestGraphicPreview(cue);
+        // Yield between cards so loading a project never monopolises the UI.
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    };
+    await Promise.all([worker(), worker()]);
+  }, delay);
 }
 
 function invalidateGraphicPreviews() {
   clearTimeout(graphicPreviewTimer);
+  clearTimeout(graphicPrewarmTimer);
+  Object.values(graphicPreviewRetryTimers).forEach(clearTimeout);
   graphicPreviewTimer = null;
+  graphicPrewarmTimer = null;
   graphicPreviewEpoch += 1;
   compiledGraphicPreviews = {};
   graphicPreviewDirty.clear();
   graphicPreviewErrors = {};
   graphicPreviewModes = {};
   graphicPreviewPending.clear();
+  graphicPreviewPixelPromises.clear();
+  graphicPreviewRetryTimers = {}; graphicPreviewRetryAttempts = {};
 }
 
 function resetGraphicsEditorState() {
   clearTimeout(graphicPreviewTimer);
+  clearTimeout(graphicPrewarmTimer);
+  Object.values(graphicPreviewRetryTimers).forEach(clearTimeout);
   graphicPreviewTimer = null;
+  graphicPrewarmTimer = null;
   graphicPreviewEpoch += 1;
   compiledGraphicPreviews = {};
   graphicPreviewRequests = {};
@@ -2945,8 +3283,11 @@ function resetGraphicsEditorState() {
   graphicPreviewDirty.clear();
   graphicPreviewErrors = {};
   graphicPreviewModes = {};
+  graphicPreviewPixelPromises.clear();
+  graphicPreviewRetryTimers = {}; graphicPreviewRetryAttempts = {};
   graphicsUndoStack = []; graphicsUndoKey = ''; graphicsUndoAt = 0;
   graphicPicked = -1; graphicInteraction = null;
+  graphicLastCanvasClick = {id: '', at: 0};
 }
 
 function graphicPreviewComponent(seed) {
@@ -2974,16 +3315,29 @@ function scheduleGraphicPreview(mode = 'content', scope = 'component') {
   const affected = scope === 'all'
     ? new Set(graphicsPlan.cues.map(one => one.graphic_id))
     : graphicPreviewComponent(cue);
-  for (const id of affected) graphicPreviewDirty.add(id);
+  for (const id of affected) {
+    graphicPreviewDirty.add(id);
+    delete graphicPreviewErrors[id];
+    clearTimeout(graphicPreviewRetryTimers[id]);
+    delete graphicPreviewRetryTimers[id];
+    delete graphicPreviewRetryAttempts[id];
+    syncGraphicListReadiness(id);
+  }
+  const note = $('strip-note');
+  if (note?.dataset.graphicPreviewId
+      && affected.has(note.dataset.graphicPreviewId)) {
+    note.textContent = ''; delete note.dataset.graphicPreviewId;
+  }
   graphicPreviewModes[cue.graphic_id] = mode;
   showGraphicPreview();
   // Geometry is already previewed every pointer frame by transforming the
   // last production PNG.  Re-audit/rasterise quietly after the gesture has
   // settled instead of making a local drag feel like a server operation.
-  const delay = mode === 'transform' ? 700 : 220;
-  graphicPreviewTimer = setTimeout(() => {
+  const delay = mode === 'transform' ? 700 : mode === 'exact' ? 40 : 180;
+  graphicPreviewTimer = setTimeout(async () => {
     graphicPreviewTimer = null;
-    requestGraphicPreview(cue);
+    await requestGraphicPreview(cue);
+    scheduleGraphicPreviewPrewarm(0);
   }, delay);
 }
 
@@ -3050,6 +3404,41 @@ function editGraphicFromCanvas(id) {
     if (!editor) return;
     editor.focus({preventScroll: true});
     editor.select();
+  });
+}
+
+function beginGraphicInlineEdit(event, id) {
+  event.preventDefault(); event.stopPropagation();
+  const index = graphicsPlan.cues.findIndex(cue => cue.graphic_id === id);
+  if (index < 0) return;
+  selectGraphic(index);
+  requestAnimationFrame(() => {
+    const card = $('graphic-preview')?.querySelector(
+      `[data-graphic-id="${CSS.escape(id)}"]`);
+    const inspectorEditor = $('graphic-primary');
+    if (!card || !inspectorEditor) return;
+    const existing = card.querySelector('.graphic-inline-editor');
+    if (existing) { existing.focus(); return; }
+    const editor = document.createElement('textarea');
+    editor.className = 'graphic-inline-editor';
+    editor.value = inspectorEditor.value;
+    editor.setAttribute('aria-label', '直接編輯字卡主文字');
+    editor.onpointerdown = next => next.stopPropagation();
+    editor.ondblclick = next => next.stopPropagation();
+    editor.oninput = () => {
+      inspectorEditor.value = editor.value;
+      updateGraphicFromInspector({target: inspectorEditor});
+    };
+    editor.onkeydown = next => {
+      next.stopPropagation();
+      if (next.key === 'Escape'
+          || (next.key === 'Enter' && (next.metaKey || next.ctrlKey))) {
+        next.preventDefault(); editor.blur();
+      }
+    };
+    editor.onblur = () => editor.remove();
+    card.appendChild(editor);
+    editor.focus({preventScroll: true}); editor.select();
   });
 }
 
@@ -3144,7 +3533,15 @@ function beginGraphicCanvasGesture(event, id, mode = 'move') {
     card.classList.remove('interacting');
     graphicInteraction = null;
     if (!moved) {
-      editGraphicFromCanvas(id);
+      const now = performance.now();
+      if (graphicLastCanvasClick.id === id
+          && now - graphicLastCanvasClick.at < 420) {
+        graphicLastCanvasClick = {id: '', at: 0};
+        beginGraphicInlineEdit(next, id);
+      } else {
+        graphicLastCanvasClick = {id, at: now};
+        selectGraphic(index);
+      }
       return;
     }
     graphics = graphicsPlan.cues.map(one => ({...one,
@@ -3161,7 +3558,8 @@ function showGraphicPreview() {
   const layer = $('graphic-preview'), video = $('video');
   const previewStatus = $('graphic-preview-status');
   if (!layer || !video || (peeking && !beside) || !video.videoWidth) {
-    layer?.classList.add('hide'); previewStatus?.classList.add('hide'); return;
+    layer?.classList.add('hide'); previewStatus?.classList.add('hide');
+    syncGraphicInspectorReadiness(); return;
   }
   const at = video.currentTime || 0;
   const active = graphics.filter(one => one.status === 'approved'
@@ -3172,22 +3570,30 @@ function showGraphicPreview() {
       && at < selected.at_seconds + selected.duration_seconds) active.push(selected);
   if (!active.length) {
     layer.innerHTML = ''; layer.classList.add('hide');
-    previewStatus?.classList.add('hide'); return;
+    previewStatus?.classList.add('hide'); syncGraphicInspectorReadiness(); return;
   }
   if (!graphicPreviewTimer && !graphicInteraction) {
     const target = active.find(cue => cue.graphic_id === selected?.graphic_id)
       || active[0];
-    if (target) requestGraphicPreview(target);
+    // A known failure is retried by the bounded retry/action path. Calling
+    // the endpoint from every timeupdate would turn one invalid style into a
+    // request loop while the playhead is parked on it.
+    if (target && !graphicPreviewIssue(target.graphic_id))
+      requestGraphicPreview(target);
   }
   const shown = video.getBoundingClientRect(), holder = $('frame').getBoundingClientRect();
   const draftJoint = selected && selected.status !== 'approved'
     ? compiledGraphicPreviews[selected.graphic_id]?.joint_layout : null;
   const ready = active.map(one => {
     const made = compiledGraphicPreviews[one.graphic_id];
-    const synthetic = one.graphic_id === selected?.graphic_id && !made ? {
+    const synthetic = !made
+      && (one.status !== 'approved' || graphicPreviewErrors[one.graphic_id]) ? {
       synthetic: true, frame_width: video.videoWidth, frame_height: video.videoHeight,
-      card_width: video.videoWidth * .55, card_height: video.videoHeight * .14,
-      z_index: one.z_index || 0, plan_order: graphicPicked,
+      error_placeholder: one.status === 'approved',
+      card_width: video.videoWidth * .48,
+      card_height: video.videoHeight * (one.status === 'approved' ? .075 : .14),
+      z_index: one.z_index || 0,
+      plan_order: graphics.findIndex(item => item.graphic_id === one.graphic_id),
       authored_transform: {x:.5,y:.5,scale:1,rotation_degrees:0},
       animation: {start_seconds:one.at_seconds,
         end_seconds:one.at_seconds + one.duration_seconds,
@@ -3215,7 +3621,7 @@ function showGraphicPreview() {
       image.className = 'graphic-exact-image';
       card.appendChild(image);
       card.addEventListener('pointerdown', event => {
-        if (!event.target.closest('.graphic-handle'))
+        if (!event.target.closest('.graphic-handle,.graphic-inline-editor'))
           beginGraphicCanvasGesture(event, card.dataset.graphicId, 'move');
       });
       layer.appendChild(card);
@@ -3282,13 +3688,29 @@ function showGraphicPreview() {
     card.style.zIndex = `${3 + (made.z_index || 0)}`;
     const isSelected = one.graphic_id === selected?.graphic_id;
     const dirty = graphicPreviewDirty.has(one.graphic_id) || made.synthetic;
+    const issue = graphicPreviewIssue(one.graphic_id);
     card.classList.toggle('selected', isSelected);
     card.classList.toggle('locked', !!transform.locked);
-    card.classList.toggle('invalid', !!graphicPreviewErrors[one.graphic_id]);
-    card.title = graphicPreviewErrors[one.graphic_id]
-      || '點一下編輯文字；拖曳可移動字卡';
+    card.classList.toggle('invalid', issue?.kind === 'validation');
+    card.classList.toggle('transient', issue?.kind === 'transient');
+    card.title = issue?.message
+      || '單擊選取、雙擊編輯主文字；拖曳可移動字卡';
     let live = card.querySelector('.graphic-live-surface-wrap');
-    if (dirty && isSelected && dirtyMode === 'content') {
+    let renderError = card.querySelector('.graphic-preview-error');
+    if (made.error_placeholder) {
+      live?.remove();
+      if (!renderError) {
+        renderError = document.createElement('div');
+        renderError.className = 'graphic-preview-error';
+        card.appendChild(renderError);
+      }
+      renderError.textContent = issue?.kind === 'transient'
+        ? '精準預覽暫時無法載入，會自動重試'
+        : '字卡需要調整，無法產生精準預覽';
+      image.style.visibility = 'hidden';
+    } else if ((dirty && isSelected && dirtyMode === 'content')
+        || made.synthetic) {
+      renderError?.remove();
       if (!live) {
         live = document.createElement('div');
         live.className = 'graphic-live-surface-wrap';
@@ -3298,8 +3720,22 @@ function showGraphicPreview() {
       live.innerHTML = liveGraphicMarkup(one);
       image.style.visibility = 'hidden';
     } else {
-      live?.remove(); image.style.visibility = 'visible';
+      live?.remove(); renderError?.remove(); image.style.visibility = 'visible';
     }
+    let stale = card.querySelector('.graphic-preview-stale-badge');
+    const staleExact = isSelected && !!made.url && !made.synthetic
+      && (issue || (dirty && dirtyMode === 'exact'));
+    if (staleExact) {
+      if (!stale) {
+        stale = document.createElement('span');
+        stale.className = 'graphic-preview-stale-badge'; card.appendChild(stale);
+      }
+      stale.textContent = issue?.kind === 'validation'
+        ? '設定未通過 · 顯示上一次有效預覽'
+        : issue?.kind === 'transient'
+          ? '暫時無法更新 · 顯示上一次有效預覽'
+          : '正在更新 · 顯示上一次有效預覽';
+    } else stale?.remove();
     for (const handle of [...card.querySelectorAll('.graphic-handle')]) handle.remove();
     if (isSelected && !transform.locked) {
       for (const mode of ['scale','rotate']) {
@@ -3318,18 +3754,27 @@ function showGraphicPreview() {
       || graphicPreviewPending.has(selectedActive.graphic_id));
   const selectedMode = graphicPreviewModes[selectedActive?.graphic_id];
   if (previewStatus) {
-    previewStatus.textContent = graphicPreviewErrors[selectedActive?.graphic_id]
+    const selectedIssue = graphicPreviewIssue(selectedActive?.graphic_id);
+    previewStatus.classList.remove('validation', 'transient', 'stale');
+    previewStatus.textContent = selectedIssue?.kind === 'validation'
       ? '預覽需要調整'
+      : selectedIssue?.kind === 'transient'
+        ? '預覽暫時無法更新'
       : graphicPreviewPending.has(selectedActive?.graphic_id)
-        ? '正在產生精準預覽…' : '等待更新預覽…';
+        ? '正在產生精準預覽…' : '顯示上一次預覽，等待更新…';
+    if (selectedIssue) previewStatus.classList.add(selectedIssue.kind);
+    else if (compiledGraphicPreviews[selectedActive?.graphic_id]
+        && selectedUpdating) previewStatus.classList.add('stale');
     // Editor status stays fixed and never covers the picture during playback.
     previewStatus.classList.toggle(
       'hide', !selectedUpdating || !video.paused || selectedMode === 'transform');
   }
+  syncGraphicInspectorReadiness();
 }
 
 async function burnGraphics() {
-  const button = $('graphic-burn');
+  const button = $('export-graphics');
+  $('export-drop').classList.add('hide');
   button.disabled = true; button.textContent = '輸出中…';
   try {
     const saved = await saveGraphicsNow();
@@ -3341,7 +3786,7 @@ async function burnGraphics() {
     showGraphicPreview();
     $('strip-note').innerHTML = `字卡版完成：${answer.cues} 張　<a class="link" href="/api/runs/${runId}/graphics-burned" download>下載</a>`;
   } catch (error) { $('strip-note').textContent = `字卡版輸出失敗：${error.message}`; }
-  finally { button.disabled = false; button.textContent = '輸出字卡版'; }
+  finally { button.disabled = false; button.textContent = '產生成片＋字卡'; }
 }
 
 function addGraphicAtPlayhead(approvedFactId = '') {
@@ -4728,6 +5173,9 @@ $('export').addEventListener('click', (e) => {
   e.stopPropagation();
   $('export-drop').classList.toggle('hide');
 });
+$('export-graphics').addEventListener('click', (e) => {
+  e.stopPropagation(); burnGraphics();
+});
 addEventListener('click', () => $('export-drop').classList.add('hide'));
 $('export-drop').addEventListener('click', (e) => e.stopPropagation());
 
@@ -5208,8 +5656,9 @@ new ResizeObserver(() => {
 }).observe($('frame'));
 $('video').addEventListener('loadedmetadata', showBurnt);
 $('video').addEventListener('timeupdate', showBurnt);
-for (const eventName of ['timeupdate','seeked','loadedmetadata'])
+for (const eventName of ['timeupdate','seeked','loadedmetadata','pause'])
   $('video').addEventListener(eventName, showGraphicPreview);
+$('video').addEventListener('play', () => scheduleGraphicPreviewPrewarm(0));
 addEventListener('resize', showBurnt);
 </script>
 </body>

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
@@ -194,6 +195,7 @@ def safe_area(aspect: str) -> SafeArea:
 CHOSEN: str | None = None
 
 
+@lru_cache(maxsize=12)
 def _asked_of_the_system(lang: str) -> list[str]:
     """Candidate font files, ranked, from fontconfig if it is installed.
 

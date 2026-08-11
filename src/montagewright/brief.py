@@ -34,6 +34,32 @@ class BriefDocument:
     instructions: tuple["BriefInstruction", ...]
     sha256: str
 
+    def graphics_candidates(self) -> tuple["BriefCandidate", ...]:
+        """Server-issued copy choices Gemini may place on the timeline."""
+
+        projected: list[BriefCandidate] = list(self.candidates)
+        for fact in self.approved_copy:
+            kind = fact.allowed_kinds[0] if fact.allowed_kinds else "callout"
+            template = {
+                "opening_title": "hero_center",
+                "chapter": "center_stack",
+                "product_name": "product_plate",
+                "feature": "spec_stack" if len(fact.exact_text) > 12 else "stat_badge",
+                "callout": "editorial_rule",
+                "end_card": "end_roster",
+            }[kind]
+            projected.append(BriefCandidate(
+                candidate_id=f"approved.{fact.fact_id}",
+                primary_text=fact.exact_text,
+                secondary_text="",
+                kind=kind,
+                template=template,
+                instruction="使用者在 Brief 中明確核准的原文",
+                source_reference=fact.source_reference,
+                authority_fact_id=fact.fact_id,
+            ))
+        return tuple(projected)
+
     @classmethod
     def from_legacy(cls, raw: str) -> "BriefDocument":
         candidates, instructions = extract_brief_candidates(raw)
@@ -125,6 +151,8 @@ class BriefCandidate:
     instruction: str = ""
     source_reference: str = ""
     variants: tuple[CandidateVariant, ...] = ()
+    # Non-empty only for immutable copy from the fenced approved-copy block.
+    authority_fact_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -298,7 +326,9 @@ def initial_graphics_plan(
     authority remain deterministic local work.
     """
 
-    candidates = {one.candidate_id: one for one in document.candidates}
+    candidates = {
+        one.candidate_id: one for one in document.graphics_candidates()
+    }
     facts = [*document.approved_copy, *document.candidate_facts()]
     cues: list[GraphicCue] = []
     starts: list[float] = []
@@ -369,10 +399,21 @@ def initial_graphics_plan(
         # while making avoid/overlap/auto ineffective in rendered pixels.
         if requested_composition != "inherit":
             position = "auto"
+        authoritative = (
+            next(
+                (fact for fact in document.approved_copy
+                 if fact.fact_id == candidate.authority_fact_id),
+                None,
+            )
+            if candidate.authority_fact_id else None
+        )
         cues.append(GraphicCue(
             graphic_id=f"brief-{len(cues):02d}",
             kind=candidate.kind,
-            primary_fact_id=document.candidate_fact_id(candidate, "primary"),
+            primary_fact_id=(
+                authoritative.fact_id if authoritative is not None
+                else document.candidate_fact_id(candidate, "primary")
+            ),
             secondary_fact_id=(
                 document.candidate_fact_id(candidate, "secondary")
                 if candidate.secondary_text else ""
@@ -394,7 +435,7 @@ def initial_graphics_plan(
             ))),
             # Gemini chooses the editorial opportunity and timing. It cannot
             # promote ordinary Brief prose into approved on-screen copy.
-            status="draft",
+            status="approved" if authoritative is not None else "draft",
         ))
         used.add(candidate_id)
     return GraphicsPlan(facts=facts, cues=cues)

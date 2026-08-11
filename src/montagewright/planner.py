@@ -1766,6 +1766,7 @@ def select_shots(
     cache: UploadCache | None = None,
     client: Any | None = None,
     ledger: Any | None = None,
+    graphic_candidates: list[Any] | tuple[Any, ...] | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage two: which shots, in what order, and why each one."""
 
@@ -1790,7 +1791,11 @@ def select_shots(
     from montagewright.brief import parse_brief_markdown
     from montagewright.graphics import graphic_family_prompt
 
-    graphic_candidates = parse_brief_markdown(brief).candidates
+    graphic_candidates = (
+        tuple(graphic_candidates)
+        if graphic_candidates is not None
+        else parse_brief_markdown(brief).candidates
+    )
     graphic_candidate_ids = [one.candidate_id for one in graphic_candidates]
     graphic_copy = (
         "## 可引用的 Brief 字卡原文\n\n"

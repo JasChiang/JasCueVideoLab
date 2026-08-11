@@ -1020,6 +1020,11 @@ def test_web_graphics_track_round_trips_approved_copy(tmp_path: Path):
             facts=[fact(approved=False)], cues=[cue(status="draft")]
         ).model_dump(mode="json")
 
+        future = dict(payload)
+        future["revision"] = 9
+        assert client.put(
+            "/api/runs/r1/graphics-track", json=future
+        ).status_code == 409
         saved = client.put("/api/runs/r1/graphics-track", json=payload)
         approved = client.post(
             "/api/runs/r1/approve-graphic/g00", json={"revision": 1}
@@ -1091,7 +1096,9 @@ def test_generic_put_cannot_forge_human_review(tmp_path: Path):
         web.RUNS.pop("r1", None)
 
 
-def test_web_preview_uses_the_production_card_compiler(tmp_path: Path):
+def test_web_preview_uses_the_production_card_compiler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
     import json
     import subprocess
     import montagewright.webapp as web
@@ -1142,7 +1149,9 @@ def test_web_preview_uses_the_production_card_compiler(tmp_path: Path):
             second.json()["url"]
         ).content
         assert compiled.json()["card_width"] > 0
-        assert client.get(compiled.json()["url"]).headers["content-type"] == "image/png"
+        preview_file = client.get(compiled.json()["url"])
+        assert preview_file.headers["content-type"] == "image/png"
+        assert "immutable" in preview_file.headers["cache-control"]
 
         # Cached pixels are durable, but the run alias in the original URL
         # is not. Reopening the same output after a server restart must
@@ -1210,7 +1219,47 @@ def test_web_preview_uses_the_production_card_compiler(tmp_path: Path):
             json=strict.model_dump(mode="json"),
         )
         assert blocked.status_code == 422
-        assert "contrast" in blocked.json()["detail"]
+        problem = blocked.json()["detail"]
+        assert problem["error_code"] == "GRAPHIC_CONTRAST_FAILED"
+        assert problem["field"] == "cues.g00.style.contrast_mode"
+        assert problem["suggested_patch"] == {"contrast_mode": "auto"}
+
+        # A complete metadata + PNG pair is a direct cache hit. The production
+        # compiler is not invoked again for identical content.
+        def should_not_compile(*args, **kwargs):
+            raise AssertionError("a complete preview cache should be reused")
+
+        monkeypatch.setattr(
+            "montagewright.graphics.compile_graphic", should_not_compile
+        )
+        cache_hit = client.post(
+            "/api/runs/r1/graphics-preview/g00", json=payload
+        )
+        assert cache_hit.status_code == 200
+
+        # A direct immutable URL must never bless a truncated file as a PNG.
+        cached_png = (
+            here / "out" / "work" / "graphics-preview"
+            / Path(cache_hit.json()["url"]).name
+        )
+        cached_png.write_bytes(b"partial")
+        corrupt = client.get(cache_hit.json()["url"])
+        assert corrupt.status_code == 503
+        assert corrupt.json()["detail"]["error_code"] == (
+            "PREVIEW_CACHE_CORRUPT"
+        )
+
+        monkeypatch.setattr(
+            web, "_video_display_size",
+            lambda _picture: (_ for _ in ()).throw(OSError("busy disk")),
+        )
+        unavailable = client.post(
+            "/api/runs/r1/graphics-preview/g00", json=payload
+        )
+        assert unavailable.status_code == 503
+        assert unavailable.json()["detail"]["error_code"] == (
+            "PREVIEW_SOURCE_UNAVAILABLE"
+        )
     finally:
         web.RUNS_ROOT = was
         web.RUNS.pop("r1", None)
@@ -1445,16 +1494,80 @@ def test_layout_evidence_uses_the_same_smoothstep_as_rendered_crop():
     assert crop["x"] == pytest.approx(0.15625)
 
 
-def test_canvas_card_click_enters_text_edit_and_compare_reflows_overlay():
+def test_canvas_card_selects_then_double_click_enters_inline_text_edit():
     from montagewright.webapp import PAGE
 
     page = PAGE.read_text(encoding="utf-8")
-    assert "function editGraphicFromCanvas(id)" in page
-    assert "editor.focus({preventScroll: true})" in page
-    assert "editor.select()" in page
-    assert "if (!moved) {\n      editGraphicFromCanvas(id);" in page
+    assert "function beginGraphicInlineEdit(event, id)" in page
+    assert "editor.className = 'graphic-inline-editor'" in page
+    assert "inspectorEditor.value = editor.value;" in page
+    assert "now - graphicLastCanvasClick.at < 420" in page
+    assert "beginGraphicInlineEdit(next, id);" in page
     assert "requestAnimationFrame(() => {\n    forgetPlacement(); drawCrop(); showBurnt(); showGraphicPreview();" in page
     assert "new ResizeObserver(() =>" in page
+
+
+def test_web_prewarms_graphics_before_the_playhead_reaches_them():
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "scheduleGraphicPreviewPrewarm();" in page
+    assert "const approved = graphicsPlan.cues.filter(one => one.status === 'approved')" in page
+    assert "await requestGraphicPreview(cue);" in page
+    assert "await image.decode();" in page
+    assert "graphicPreviewPixelPromises" in page
+    assert "error_placeholder: one.status === 'approved'" in page
+    assert "字卡需要調整，無法產生精準預覽" in page
+
+
+def test_layout_evidence_frames_are_reused_across_style_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from io import BytesIO
+    from types import SimpleNamespace
+    from PIL import Image
+    from montagewright.graphics import _layout_frames
+
+    picture = tmp_path / "picture.mp4"
+    picture.write_bytes(b"stable picture fingerprint")
+    encoded = BytesIO()
+    Image.new("RGB", (32, 18), "#556677").save(encoded, "PNG")
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout=encoded.getvalue())
+
+    monkeypatch.setattr("montagewright.graphics.subprocess.run", fake_run)
+    cache = tmp_path / "frames"
+    first = _layout_frames(picture, cue(), cache_dir=cache)
+    second = _layout_frames(picture, cue(), cache_dir=cache)
+
+    assert len(first) == len(second) == 3
+    assert len(calls) == 3
+    assert len(list(cache.glob("*.png"))) == 3
+
+
+def test_system_font_catalog_is_not_queried_for_every_fitting_size(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from types import SimpleNamespace
+    from montagewright import subtitles
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout="/fonts/one.ttf\n", returncode=0)
+
+    subtitles._asked_of_the_system.cache_clear()
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    try:
+        assert subtitles._asked_of_the_system("zh-tw") == ["/fonts/one.ttf"]
+        assert subtitles._asked_of_the_system("zh-tw") == ["/fonts/one.ttf"]
+        assert len(calls) == 1
+    finally:
+        subtitles._asked_of_the_system.cache_clear()
 
 
 def test_graphics_track_click_seeks_to_the_point_that_was_clicked():
@@ -1550,3 +1663,185 @@ def test_saving_graphics_invalidates_every_previous_graphics_delivery(
 
     assert not layout.exists()
     assert all(not path.exists() for path in made)
+
+
+@pytest.mark.parametrize(
+    "family",
+    [
+        "clean", "outlined", "soft_shadow", "colour_label", "tech_frame",
+        "bold_pop", "editorial_minimal", "youtube_pop", "magazine_story",
+        "social_sticker", "broadcast_info", "cinematic_title",
+        "sports_energy", "soft_lifestyle",
+    ],
+)
+@pytest.mark.parametrize("width,height", [(360, 640), (640, 360)])
+def test_every_family_compiles_a_scaled_multiline_spec_card(
+    tmp_path: Path, family: str, width: int, height: int,
+):
+    """A legal family switch must not trip on resampled outline evidence."""
+
+    from PIL import Image
+
+    style_defaults, cue_defaults = graphic_preset_defaults(family)
+    style = GraphicStyle.model_validate({
+        **style_defaults,
+        "preset": family,
+        "contrast_mode": "auto",
+    })
+    made = cue(
+        kind="feature",
+        secondary_fact_id="details",
+        template="spec_stack",
+        position=str(cue_defaults.get("position") or "auto"),
+        composition=str(cue_defaults.get("composition") or "auto"),
+        background=str(cue_defaults.get("background") or "auto"),
+        motion=str(cue_defaults.get("motion") or "rise"),
+        transform={"scale": 0.9},
+        style=style,
+    )
+    plan = GraphicsPlan(
+        facts=[
+            fact("name", "Galaxy Watch Ultra2"),
+            fact("details", "EN13319 國際潛水標準認證\n40m"),
+        ],
+        cues=[made],
+    )
+    card, report = compile_graphic(
+        made, plan, width=width, height=height,
+        into=tmp_path / f"{family}-{width}x{height}.png",
+        frames=[Image.new("RGB", (width, height), "#78909C") for _ in range(3)],
+    )
+
+    assert report["contrast_ratio"] >= 4.5
+    assert card.foreground_path is not None and card.foreground_path.exists()
+
+
+@pytest.mark.parametrize("family", ["sports_energy", "broadcast_info"])
+def test_automatic_wide_family_uses_fade_when_slide_has_no_safe_travel(
+    tmp_path: Path, family: str,
+):
+    from PIL import Image
+
+    style_defaults, cue_defaults = graphic_preset_defaults(family)
+    style = GraphicStyle.model_validate({
+        **style_defaults,
+        "preset": family,
+        "contrast_mode": "auto",
+    })
+    made = cue(
+        kind="feature", secondary_fact_id="details",
+        template="center_stack", position="auto",
+        composition=str(cue_defaults.get("composition") or "auto"),
+        background=str(cue_defaults.get("background") or "auto"),
+        motion=str(cue_defaults["motion"]), style=style,
+    )
+    plan = GraphicsPlan(
+        facts=[fact("name", "全系列支援"), fact("details", "Galaxy AI")],
+        cues=[made],
+    )
+    _, report = compile_graphic(
+        made, plan, width=360, height=640,
+        into=tmp_path / f"{family}.png",
+        frames=[Image.new("RGB", (360, 640), "#4D5560") for _ in range(3)],
+    )
+
+    animation = report["animation"]
+    assert animation["requested_motion"] in {"slide_left", "slide_right"}
+    assert animation["resolved_motion"] == "fade"
+    assert animation["resolved_motion_distance"] == 0
+
+
+@pytest.mark.parametrize("guard", ["strict", "locked"])
+def test_authored_motion_guard_is_not_silently_repaired(
+    tmp_path: Path, guard: str,
+):
+    from PIL import Image
+
+    style_defaults, cue_defaults = graphic_preset_defaults("sports_energy")
+    style = GraphicStyle.model_validate({
+        **style_defaults,
+        "preset": "sports_energy",
+        "contrast_mode": "strict" if guard == "strict" else "auto",
+    })
+    made = cue(
+        kind="feature", secondary_fact_id="details",
+        template="center_stack", position="auto",
+        composition=str(cue_defaults.get("composition") or "auto"),
+        background=str(cue_defaults.get("background") or "auto"),
+        motion=str(cue_defaults["motion"]),
+        transform={"locked": guard == "locked"}, style=style,
+    )
+    plan = GraphicsPlan(
+        facts=[fact("name", "全系列支援"), fact("details", "Galaxy AI")],
+        cues=[made],
+    )
+
+    with pytest.raises(ValueError, match="entrance motion cannot fit"):
+        compile_graphic(
+            made, plan, width=360, height=640,
+            into=tmp_path / f"guard-{guard}.png",
+            frames=[Image.new("RGB", (360, 640), "#4D5560") for _ in range(3)],
+        )
+
+
+def test_atomic_png_publish_keeps_previous_file_after_encoder_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from PIL import Image
+    from montagewright.graphics import _save_png_atomic
+
+    destination = tmp_path / "card.png"
+    destination.write_bytes(b"previous complete png")
+
+    def fail_after_partial_write(self, target, *args, **kwargs):
+        Path(target).write_bytes(b"partial")
+        raise OSError("encoder stopped")
+
+    monkeypatch.setattr(Image.Image, "save", fail_after_partial_write)
+    with pytest.raises(OSError, match="encoder stopped"):
+        _save_png_atomic(Image.new("RGBA", (4, 4)), destination)
+
+    assert destination.read_bytes() == b"previous complete png"
+    assert not list(tmp_path.glob(".card-*.png"))
+
+
+def test_web_graphics_preview_distinguishes_transient_validation_and_stale_pixels():
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "const kind = got.status === 422" in page
+    assert "? 'validation' : 'transient'" in page
+    assert "graphicPreviewRetryAttempts" in page
+    assert "graphic-preview-stale-badge" in page
+    assert "顯示上一次有效預覽" in page
+    assert "預覽暫時無法更新" in page
+    assert "預覽需要調整" in page
+
+
+def test_web_graphics_inspector_progressively_discloses_advanced_controls():
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert 'id="graphic-readiness"' in page
+    assert "graphicFamilyCards(style.preset, 4)" in page
+    assert "<summary>進階內容與來源</summary>" in page
+    assert "<summary>進階設計</summary>" in page
+    assert "<summary>進階動畫設定</summary>" in page
+    assert 'data-graphic-placement="auto"' in page
+    assert 'data-graphic-placement="manual"' in page
+    assert 'id="export-graphics"' in page
+    assert "產生成片＋字卡" in page
+    assert "畫面上單擊選取、雙擊可直接修改主文字。" in page
+
+
+def test_web_graphics_family_and_auto_restore_reset_safe_geometry():
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "function resetGraphicPlacementControls()" in page
+    assert "$('graphic-transform-x').value = '.5';" in page
+    assert "$('graphic-transform-y').value = '.5';" in page
+    assert "$('graphic-transform-scale').value = '1';" in page
+    assert "$('graphic-transform-rotation').value = '0';" in page
+    assert "if (cue.transform?.locked)" in page
+    assert "Families have different intrinsic dimensions" in page
