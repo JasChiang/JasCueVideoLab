@@ -2,7 +2,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from montagewright.executor import RenderPlan, Segment, Source
+from montagewright.executor import AudioAssignment, RenderPlan, Segment, Source
 from montagewright.renderer import render
 
 
@@ -12,6 +12,261 @@ def _colour_clip(path: Path, *, fps: int, colour: str) -> None:
         "-f", "lavfi", "-i", f"color=c={colour}:s=320x180:d=0.6:r={fps}",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
     ], check=True)
+
+
+def _silent_colour_clip(path: Path, *, seconds: float, colour: str) -> None:
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i",
+        f"color=c={colour}:s=160x90:d={seconds}:r=30",
+        "-f", "lavfi", "-i", f"anullsrc=r=48000:cl=stereo:d={seconds}",
+        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", str(path),
+    ], check=True)
+
+
+def _pcm_peak(path: Path, start: float, seconds: float = .15) -> int:
+    from array import array
+
+    raw = subprocess.check_output([
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", str(start), "-t", str(seconds), "-i", str(path),
+        "-vn", "-f", "s16le", "-ac", "1", "-ar", "48000", "-",
+    ])
+    samples = array("h")
+    samples.frombytes(raw)
+    return max((abs(one) for one in samples), default=0)
+
+
+def test_one_audio_assignment_runs_continuously_across_three_picture_cuts(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A B-roll cut changes pictures, never the sentence underneath it."""
+
+    import montagewright.renderer as renderer
+
+    pictures = []
+    for index, colour in enumerate(("red", "green", "blue")):
+        path = tmp_path / f"picture-{index}.mp4"
+        _silent_colour_clip(path, seconds=1, colour=colour)
+        pictures.append(Source(f"p{index}", path, 1, 160, 90))
+    voice_path = tmp_path / "voice.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=black:s=160x90:d=2:r=30",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2:sample_rate=48000",
+        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", str(voice_path),
+    ], check=True)
+    voice = Source("voice", voice_path, 2, 160, 90)
+    assignment = AudioAssignment(
+        audio_id="a00", source=voice, in_seconds=0, out_seconds=2,
+        timeline_in_seconds=.5, timeline_start_frame=15, frame_count=60,
+        role="narrative", completion="complete_thought",
+    )
+    plan = RenderPlan(
+        project_id="jl-cut", output_size=(160, 90), output_fps=30,
+        segments=[
+            Segment(f"k{index:02d}", source, 0, 1)
+            for index, source in enumerate(pictures)
+        ],
+        audio_assignments=[assignment],
+        audio_track_explicit=True,
+    )
+    monkeypatch.setattr(renderer, "_encoder", lambda *_: "libx264")
+
+    made = render(plan, tmp_path / "out")
+
+    # Silence before/after, one uninterrupted tone through both picture cuts.
+    assert _pcm_peak(made.deliverable, .1) < 200
+    assert _pcm_peak(made.deliverable, .75) > 1000
+    assert _pcm_peak(made.deliverable, 1.25) > 1000
+    assert _pcm_peak(made.deliverable, 2.15) > 1000
+    assert _pcm_peak(made.deliverable, 2.75) < 200
+    assert (tmp_path / "out" / "voice-as-laid.m4a").exists()
+
+
+def test_subtitles_follow_the_audio_assignment_not_picture_boundaries() -> None:
+    from types import SimpleNamespace
+    from montagewright.transcript import against_audio_assignments
+
+    assignment = SimpleNamespace(
+        role="narrative", source=SimpleNamespace(source_id="voice"),
+        in_seconds=4.0, out_seconds=6.0, duration_seconds=2.0,
+        timeline_in_seconds=1.5,
+    )
+    cards = {"voice": {"lines": [{
+        "text": "這一句跨過三個畫面",
+        "starts_seconds": 4.0, "ends_seconds": 6.0,
+    }]}}
+
+    lines = against_audio_assignments([assignment], cards)
+
+    assert len(lines) == 1
+    assert lines[0].text == "這一句跨過三個畫面"
+    assert lines[0].starts_seconds == 1.5
+    assert lines[0].ends_seconds == 3.5
+
+
+def test_nle_exports_use_the_laid_voice_track_without_source_audio_leakage(
+    tmp_path: Path,
+) -> None:
+    from montagewright.timeline import to_fcpxml, to_xmeml
+
+    picture = tmp_path / "picture.mp4"
+    voice = tmp_path / "voice-as-laid.m4a"
+    picture.touch()
+    voice.touch()
+    source = Source("picture", picture, 2, 160, 90)
+    plan = RenderPlan(
+        project_id="nle-voice", output_size=(160, 90), output_fps=30,
+        segments=[Segment("k00", source, 0, 2)],
+        audio_track_explicit=True,
+    )
+
+    premiere = to_xmeml(
+        plan, {}, name="voice", width=160, height=90, voice=voice
+    )
+    finalcut = to_fcpxml(
+        plan, {}, name="voice", width=160, height=90, voice=voice
+    )
+
+    assert voice.resolve().as_uri() in premiere
+    assert voice.resolve().as_uri() in finalcut
+    assert 'id="voice-laid"' in premiere
+    assert 'audioRole="dialogue"' in finalcut
+    # With an authoritative laid dialogue stem, picture assets are video-only.
+    assert 'name="picture" start="0s" hasVideo="1" hasAudio="0"' in finalcut
+
+
+def test_audio_assignment_uses_the_same_master_frame_clock_as_picture() -> None:
+    from montagewright.executor import plan_render
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    source = Source("A", Path("A.mp4"), 20, 160, 90)
+    edl = EDL(
+        project_id="frame-clock",
+        clips=[
+            Clip(
+                clip_id="k00", source_id="A",
+                approx_in_seconds=0, approx_out_seconds=.515,
+                in_looks_like="first", energy_intent="medium",
+            ),
+            Clip(
+                clip_id="k01", source_id="A",
+                approx_in_seconds=1, approx_out_seconds=2,
+                in_looks_like="second", energy_intent="medium",
+            ),
+        ],
+        audio_clips=[AudioClip(
+            audio_id="a00", source_id="A", in_seconds=4, out_seconds=4.8,
+            starts_at_clip_id="k01", offset_seconds=.1,
+            role="narrative", completion="complete_thought",
+        )],
+    )
+
+    plan = plan_render(edl, {"A": source}, output_fps=30)
+
+    # .515s is cumulatively allocated to frame 15, then .1s adds 3 frames.
+    assert plan.audio_assignments[0].timeline_start_frame == 18
+    assert plan.audio_assignments[0].timeline_in_seconds == .6
+
+
+def test_web_current_timeline_v2_round_trips_independent_audio(
+    tmp_path: Path,
+) -> None:
+    import json
+    from montagewright.webapp import Run, _current_timeline
+
+    run = Run("audio-v2", tmp_path / "run")
+    (run.output / "work").mkdir(parents=True)
+    (run.output / "report.json").write_text(json.dumps({
+        "selection": {"shots": [{"source_id": "A"}, {"source_id": "B"}]},
+    }), encoding="utf-8")
+    assignment = {
+        "audio_id": "a00", "source_id": "voice",
+        "in_seconds": 4.0, "out_seconds": 5.0,
+        "timeline_start_frame": 12, "frame_count": 30,
+        "role": "narrative", "completion": "complete_thought",
+        "gain_db": 0.0, "why": "one thought across the cut",
+    }
+    (run.output / "work" / "current-timeline.json").write_text(json.dumps({
+        "version": "montagewright-current-timeline-v2", "revision": 2,
+        "output_fps": 30, "output_size": [160, 90],
+        "shots": [
+            {"selection_index": 0, "in_seconds": 0, "seconds": 1},
+            {"selection_index": 1, "in_seconds": 0, "seconds": 1},
+        ],
+        "audio_assignments": [assignment],
+    }), encoding="utf-8")
+
+    current = _current_timeline(run)
+
+    assert current["revision"] == 2
+    assert current["audio_assignments"] == [assignment]
+    assert [one["start_frame"] for one in current["shots"]] == [0, 30]
+
+
+def test_audio_assignment_cannot_run_past_the_picture() -> None:
+    import pytest
+    from montagewright.executor import plan_render
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    source = Source("A", Path("A.mp4"), 20, 160, 90)
+    edl = EDL(
+        project_id="too-long",
+        clips=[Clip(
+            clip_id="k00", source_id="A", approx_in_seconds=0,
+            approx_out_seconds=1, in_looks_like="picture",
+            energy_intent="medium",
+        )],
+        audio_clips=[AudioClip(
+            audio_id="a00", source_id="A", in_seconds=4, out_seconds=6,
+            starts_at_clip_id="k00", role="narrative",
+            completion="complete_thought",
+        )],
+    )
+
+    with pytest.raises(ValueError, match="outside"):
+        plan_render(edl, {"A": source}, output_fps=30)
+
+
+def test_detached_voice_does_not_drop_a_later_sync_sound() -> None:
+    from montagewright.executor import plan_render
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    sources = {
+        name: Source(name, Path(f"{name}.mp4"), 10, 160, 90)
+        for name in ("voice", "action")
+    }
+    edl = EDL(
+        project_id="mixed-audio",
+        clips=[
+            Clip(
+                clip_id="k00", source_id="voice", approx_in_seconds=0,
+                approx_out_seconds=1, in_looks_like="b-roll",
+                energy_intent="medium", audio_role="discard",
+            ),
+            Clip(
+                clip_id="k01", source_id="action", approx_in_seconds=2,
+                approx_out_seconds=3, in_looks_like="open the box",
+                energy_intent="medium", audio_role="sync_action",
+                audio_completion="complete_action_sound",
+            ),
+        ],
+        audio_clips=[AudioClip(
+            audio_id="a00", source_id="voice", in_seconds=4,
+            out_seconds=5, starts_at_clip_id="k00", role="narrative",
+            completion="complete_thought",
+        )],
+    )
+
+    plan = plan_render(edl, sources, output_fps=30)
+
+    assert plan.audio_track_explicit is True
+    assert [(one.role, one.source.source_id) for one in plan.audio_assignments] == [
+        ("narrative", "voice"), ("sync_action", "action")
+    ]
 
 
 def test_mixed_source_fps_becomes_one_cfr_timeline(

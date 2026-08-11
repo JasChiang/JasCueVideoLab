@@ -282,7 +282,10 @@ def _current_timeline(run: Run) -> dict:
         return {}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        if value.get("version") != "montagewright-current-timeline-v1":
+        if value.get("version") not in {
+            "montagewright-current-timeline-v1",
+            "montagewright-current-timeline-v2",
+        }:
             raise ValueError("unknown version")
         shots = value["shots"]
         if not isinstance(shots, list) or not shots:
@@ -313,6 +316,33 @@ def _current_timeline(run: Run) -> dict:
             }
             for shot, (start, end) in zip(shots, boundaries, strict=True)
         ]
+        audio_assignments = value.setdefault("audio_assignments", [])
+        if not isinstance(audio_assignments, list):
+            raise ValueError("audio_assignments must be a list")
+        picture_frames = boundaries[-1][1]
+        seen_audio_ids: set[str] = set()
+        narrative: list[tuple[int, int, str]] = []
+        for audio in audio_assignments:
+            audio_id = str(audio["audio_id"])
+            if audio_id in seen_audio_ids:
+                raise ValueError(f"duplicate audio assignment {audio_id}")
+            seen_audio_ids.add(audio_id)
+            start = int(audio["timeline_start_frame"])
+            count = int(audio["frame_count"])
+            if start < 0 or count <= 0 or start + count > picture_frames:
+                raise ValueError(
+                    f"audio assignment {audio_id} is outside the picture timeline"
+                )
+            if float(audio["out_seconds"]) <= float(audio["in_seconds"]):
+                raise ValueError(f"audio assignment {audio_id} has no source duration")
+            if str(audio.get("role", "narrative")) == "narrative":
+                narrative.append((start, start + count, audio_id))
+        narrative.sort()
+        for previous, here in zip(narrative, narrative[1:]):
+            if here[0] < previous[1]:
+                raise ValueError(
+                    f"narrative audio assignments {previous[2]} and {here[2]} overlap"
+                )
         return value
     except (OSError, ValueError, TypeError, KeyError) as error:
         # This file is the commit record for the public MP4. Falling back to
@@ -622,10 +652,50 @@ def _current_cut_decisions(run: Run) -> tuple[list[dict], dict[str, dict]]:
     return shots, rhythm
 
 
+def _current_audio_assignments(run: Run) -> list:
+    """A lightweight view of the committed independent audio track.
+
+    Subtitle derivation only needs source identity, source window, role and
+    the master-timeline start.  Keeping this projection on the committed
+    frame clock avoids rebuilding crops or invoking any model merely to read
+    captions.
+    """
+
+    from types import SimpleNamespace
+
+    current = _current_timeline(run)
+    fps = int(current.get("output_fps") or 30)
+    return [
+        SimpleNamespace(
+            audio_id=str(one["audio_id"]),
+            source=SimpleNamespace(source_id=str(one["source_id"])),
+            in_seconds=float(one["in_seconds"]),
+            out_seconds=float(one["out_seconds"]),
+            duration_seconds=(
+                int(one["frame_count"]) / fps
+            ),
+            timeline_start_frame=int(one["timeline_start_frame"]),
+            timeline_in_seconds=int(one["timeline_start_frame"]) / fps,
+            frame_count=int(one["frame_count"]),
+            role=str(one.get("role", "narrative")),
+            completion=str(one.get("completion", "none")),
+            gain_db=float(one.get("gain_db", 0.0) or 0.0),
+            why=str(one.get("why", "")),
+        )
+        for one in current.get("audio_assignments", [])
+    ]
+
+
 def _subtitle_words(run) -> "list":
     """The measured words, on the cut's own clock."""
 
-    from montagewright.transcript import words_against_cut
+    from montagewright.transcript import (
+        words_against_audio_assignments, words_against_cut,
+    )
+
+    audio = _current_audio_assignments(run)
+    if audio:
+        return words_against_audio_assignments(audio, _transcript_map(run))
 
     shots, rhythm = _current_cut_decisions(run)
     return words_against_cut(
@@ -643,7 +713,7 @@ def _subtitle_lines(run, *, edits: bool = True) -> "list":
     re-deriving a line somebody had already fixed.
     """
 
-    from montagewright.transcript import Line, against_cut
+    from montagewright.transcript import Line, against_audio_assignments, against_cut
 
     edited = run.output / "work" / "subtitles.json"
     if edits and edited.exists():
@@ -659,10 +729,20 @@ def _subtitle_lines(run, *, edits: bool = True) -> "list":
                     ends_seconds=float(one.get("until", 0.0)),
                     heard=str(one.get("heard", "")),
                     speaker=str(one.get("speaker", "")),
+                    timing_source=str(
+                        one.get("timing_source", "manual")
+                    ),
+                    timing_confidence=str(
+                        one.get("timing_confidence", "unverified")
+                    ),
+                    timing_locked=bool(one.get("timing_locked", False)),
                 )
                 for one in saved
             ]
 
+    audio = _current_audio_assignments(run)
+    if audio:
+        return against_audio_assignments(audio, _transcript_map(run))
     shots, rhythm = _current_cut_decisions(run)
     return against_cut(
         shots, rhythm,
@@ -690,7 +770,9 @@ def _retimed(run, kept: list[dict]) -> list[dict]:
     """
 
     from montagewright.backfill import across_lines
-    from montagewright.transcript import words_against_cut
+    from montagewright.transcript import (
+        words_against_audio_assignments, words_against_cut,
+    )
 
     # Narrowly caught on purpose. A card that is missing or unreadable is a
     # normal thing to meet and means "no measured words here". Anything
@@ -699,8 +781,14 @@ def _retimed(run, kept: list[dict]) -> list[dict]:
     # re-timing into edits that silently keep whatever times they arrived
     # with, which looks exactly like working.
     try:
-        shots, rhythm = _current_cut_decisions(run)
-        words = words_against_cut(shots, rhythm, _transcript_map(run))
+        audio = _current_audio_assignments(run)
+        if audio:
+            words = words_against_audio_assignments(
+                audio, _transcript_map(run)
+            )
+        else:
+            shots, rhythm = _current_cut_decisions(run)
+            words = words_against_cut(shots, rhythm, _transcript_map(run))
     except (OSError, ValueError, KeyError):
         return kept
     if not words or not kept:
@@ -709,8 +797,23 @@ def _retimed(run, kept: list[dict]) -> list[dict]:
     timings = across_lines([one["text"] for one in kept], words)
     out = []
     for one, (start, end, _) in zip(kept, timings):
-        if end > start:
-            one = dict(one, at=round(start, 3), until=round(end, 3))
+        if one.get("timing_locked"):
+            # Moving or trimming a cue is an explicit editorial timing
+            # decision. Text correction may still be saved, but no automatic
+            # alignment is allowed to overwrite the locked clock.
+            one = dict(
+                one,
+                timing_source="manual",
+                timing_confidence="human_locked",
+            )
+        elif end > start:
+            one = dict(
+                one,
+                at=round(start, 3),
+                until=round(end, 3),
+                timing_source="apple_audio_time_range",
+                timing_confidence="unverified",
+            )
         out.append(one)
     out.sort(key=lambda one: one["at"])
     return out
@@ -1441,6 +1544,18 @@ def create_app() -> FastAPI:
                     float(current_blocks[index].get("gain_db", 0.0))
                     if current_blocks else 0.0
                 ),
+                "audio_role": (
+                    str(current_blocks[index].get("audio_role", "auto"))
+                    if current_blocks else str(shot.get("audio_role", "auto"))
+                ),
+                "audio_completion": (
+                    str(current_blocks[index].get("audio_completion", "none"))
+                    if current_blocks else str(shot.get("audio_completion", "none"))
+                ),
+                "picture_role": (
+                    str(current_blocks[index].get("picture_role", "primary_action"))
+                    if current_blocks else str(shot.get("picture_role", "primary_action"))
+                ),
                 "in_seconds": (
                     float(current_blocks[index]["in_seconds"])
                     if current_blocks
@@ -1480,6 +1595,7 @@ def create_app() -> FastAPI:
         edl = report.get("edl") or {}
         return JSONResponse({
             "revision": int(current.get("revision", 0)),
+            "output_fps": int(current.get("output_fps") or 30),
             "music_from_seconds": float(
                 current.get("music_from_seconds",
                             edl.get("music_from_seconds")) or 0.0
@@ -1488,6 +1604,10 @@ def create_app() -> FastAPI:
                 current.get("music_spans")
                 if current else edl.get("music_spans") or []
             ),
+            # A separate, frame-clocked track. Picture edits must round-trip
+            # this unchanged unless an explicit audio editor changes it;
+            # otherwise a harmless B-roll reorder silently cuts the sentence.
+            "audio_assignments": current.get("audio_assignments") or [],
             "blocks": blocks,
             "seconds": round(cursor, 3),
             # Whether these boxes are what the render used or the best that
@@ -1501,7 +1621,11 @@ def create_app() -> FastAPI:
             "safe_area": _safe_area_of(report),
         })
 
-    def _rebuild(run: Run, wanted: list[dict] | None = None):
+    def _rebuild(
+        run: Run,
+        wanted: list[dict] | None = None,
+        wanted_audio: list[dict] | None = None,
+    ):
         """The render plan again, from what the report already records.
 
         Nothing here costs anything: the subject positions come out of the
@@ -1511,12 +1635,12 @@ def create_app() -> FastAPI:
         """
 
         from montagewright.clipcard import card_map
-        from montagewright.executor import plan_render
+        from montagewright.executor import allocate_timeline_frames, plan_render
         from montagewright.pipeline import (
             Report, follow_subjects, probe, read_crops,
         )
         from montagewright.reframe import CropPath, retime_crop_path
-        from montagewright.schema import EDL, Clip, reframe_of
+        from montagewright.schema import AudioClip, EDL, Clip, reframe_of
 
         report = run.report() or {}
         original = report.get("selection", {}).get("shots", [])
@@ -1527,6 +1651,8 @@ def create_app() -> FastAPI:
             for one in wanted:
                 if "index" not in one:
                     one["index"] = int(one["selection_index"])
+        if wanted_audio is None:
+            wanted_audio = list(current.get("audio_assignments") or [])
         aspect = ASPECTS.get(
             report.get("direction", {}).get("aspect", "9:16"), 9 / 16
         )
@@ -1535,22 +1661,26 @@ def create_app() -> FastAPI:
             default_library() / "cards",
         )
         clips, sources, gains = [], {}, {}
+        source_paths = (
+            list((run.output / "work" / "shots").glob("*"))
+            + list(Path(run.source).glob("*"))
+        )
+
+        def source_for(source_id: str):
+            if source_id in sources:
+                return sources[source_id]
+            match = next(
+                (path for path in source_paths if path.stem == source_id), None
+            )
+            if match is None:
+                raise HTTPException(404, f"{source_id} is gone")
+            sources[source_id] = probe(source_id, match)
+            return sources[source_id]
+
         for index, entry in enumerate(wanted):
             plan = original[int(entry["index"])]
             source_id = plan["source_id"]
-            if source_id not in sources:
-                match = next(
-                    (
-                        path for path in
-                        list((run.output / "work" / "shots").glob("*"))
-                        + list(Path(run.source).glob("*"))
-                        if path.stem == source_id
-                    ),
-                    None,
-                )
-                if match is None:
-                    raise HTTPException(404, f"{source_id} is gone")
-                sources[source_id] = probe(source_id, match)
+            source_for(source_id)
             start = float(entry["in_seconds"])
             gains[f"k{index:02d}"] = float(entry.get("gain_db", 0.0) or 0.0)
             clips.append(Clip(
@@ -1559,12 +1689,62 @@ def create_app() -> FastAPI:
                 approx_out_seconds=start + float(entry["seconds"]),
                 in_looks_like=subject_of(plan),
                 energy_intent=plan.get("energy", "medium"),
+                audio_role=entry.get("audio_role", plan.get("audio_role", "auto")),
+                audio_completion=entry.get(
+                    "audio_completion", plan.get("audio_completion", "none")
+                ),
+                picture_role=entry.get(
+                    "picture_role", plan.get("picture_role", "primary_action")
+                ),
                 reframe=reframe_of(plan),
+            ))
+        output_fps = int(current.get("output_fps") or 30)
+        picture_spans = allocate_timeline_frames(
+            [float(one["seconds"]) for one in wanted], output_fps
+        )
+        audio_clips = []
+        for one in wanted_audio:
+            # Narrative is deliberately independent and remains on the
+            # master clock while pictures move. Sync/ambient assignments are
+            # materialised from their picture shot below by plan_render, so
+            # they travel with that shot instead of being duplicated at the
+            # old absolute frame after a reorder.
+            if str(one.get("role", "narrative")) != "narrative":
+                continue
+            source_id = str(one["source_id"])
+            source_for(source_id)
+            starts = int(one["timeline_start_frame"])
+            containing = next(
+                (
+                    (index, start)
+                    for index, (start, end) in enumerate(picture_spans)
+                    if start <= starts < end
+                ),
+                None,
+            )
+            if containing is None:
+                raise HTTPException(
+                    422,
+                    f"audio {one.get('audio_id', '?')} starts outside the picture timeline",
+                )
+            clip_index, clip_start = containing
+            audio_clips.append(AudioClip(
+                audio_id=str(one["audio_id"]),
+                source_id=source_id,
+                in_seconds=float(one["in_seconds"]),
+                out_seconds=float(one["out_seconds"]),
+                starts_at_clip_id=f"k{clip_index:02d}",
+                offset_seconds=(starts - clip_start) / output_fps,
+                role=str(one.get("role", "narrative")),
+                completion=str(one.get("completion", "none")),
+                gain_db=float(one.get("gain_db", 0.0) or 0.0),
+                why=str(one.get("why", "")),
             ))
         recorded_edl = report.get("edl") or {}
         edl = EDL(
             project_id=run.run_id,
             clips=clips,
+            audio_clips=audio_clips,
             music_from_seconds=float(
                 recorded_edl.get("music_from_seconds") or 0.0
             ),
@@ -1621,14 +1801,17 @@ def create_app() -> FastAPI:
             for clip_id in stale:
                 if clip_id in rebuilt:
                     paths[clip_id] = rebuilt[clip_id]
-        plan = plan_render(
-            edl, sources, target_aspect=aspect, crop_paths=paths,
-            output_size=(
-                tuple(current["output_size"])
-                if current.get("output_size") else None
-            ),
-            output_fps=int(current.get("output_fps") or 30),
-        )
+        try:
+            plan = plan_render(
+                edl, sources, target_aspect=aspect, crop_paths=paths,
+                output_size=(
+                    tuple(current["output_size"])
+                    if current.get("output_size") else None
+                ),
+                output_fps=output_fps,
+            )
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
         # A shot somebody turned down stays turned down through a re-cut.
         for segment in plan.segments:
             segment.gain_db = gains.get(segment.clip_id, 0.0)
@@ -1674,11 +1857,24 @@ def create_app() -> FastAPI:
         if not wanted:
             raise HTTPException(400, "nothing left to cut")
         old_blocks = _timeline_blocks(run)
-        current_revision = int(_current_timeline(run).get("revision", 0))
-        if int(payload.get("base_revision", current_revision)) != current_revision:
+        current_state = _current_timeline(run)
+        current_revision = int(current_state.get("revision", 0))
+        if "base_revision" not in payload:
+            raise HTTPException(409, "the editor is stale; reload before recutting")
+        if int(payload["base_revision"]) != current_revision:
             raise HTTPException(
                 409, "the timeline changed in another editor; reload first"
             )
+        if (
+            current_state.get("version") == "montagewright-current-timeline-v2"
+            and "audio_assignments" not in payload
+        ):
+            raise HTTPException(
+                409, "the editor does not understand this audio timeline; reload first"
+            )
+        wanted_audio = payload.get(
+            "audio_assignments", current_state.get("audio_assignments") or []
+        )
         old_shape = [
             (
                 int(one["selection_index"]),
@@ -1695,7 +1891,9 @@ def create_app() -> FastAPI:
             for one in wanted
         ]
         structural_change = old_shape != new_shape
-        plan, report, _ = _rebuild(run, wanted)
+        old_audio = current_state.get("audio_assignments") or []
+        audio_changed = wanted_audio != old_audio
+        plan, report, _ = _rebuild(run, wanted, wanted_audio)
 
         # The bed and whether the voice survives were decided when the run
         # was set up; a recut is a different running order, not a different
@@ -1719,10 +1917,16 @@ def create_app() -> FastAPI:
                 # Speech is a property of this run, never of whatever
                 # unrelated transcripts happen to exist in the library.
                 keep_voice=(
-                    "--speech" not in run.command
-                    or run.command[run.command.index("--speech") + 1]
-                    != "never"
-                ) and bool(_transcript_map(run)),
+                    (
+                        "--speech" not in run.command
+                        or run.command[run.command.index("--speech") + 1]
+                        != "never"
+                    ) and bool(_transcript_map(run))
+                ) or any(
+                    segment.audio_role
+                    in {"narrative", "sync_action", "ambient_texture"}
+                    for segment in plan.segments
+                ),
                 under_speech=str(
                     report.get("direction", {}).get("music_under_speech")
                     or "duck"
@@ -1753,7 +1957,7 @@ def create_app() -> FastAPI:
                 plan.output_fps,
             )
             manifest = {
-                "version": "montagewright-current-timeline-v1",
+                "version": "montagewright-current-timeline-v2",
                 "revision": current_revision + 1,
                 "output_fps": plan.output_fps,
                 "output_size": list(plan.output_size),
@@ -1767,10 +1971,28 @@ def create_app() -> FastAPI:
                         "frame_count": end - start,
                         "seconds": (end - start) / plan.output_fps,
                         "gain_db": segment.gain_db,
+                        "audio_role": segment.audio_role,
+                        "audio_completion": segment.audio_completion,
+                        "picture_role": segment.picture_role,
                     }
                     for index, (segment, (start, end)) in enumerate(
                         zip(plan.segments, frame_spans, strict=True)
                     )
+                ],
+                "audio_assignments": [
+                    {
+                        "audio_id": audio.audio_id,
+                        "source_id": audio.source.source_id,
+                        "in_seconds": audio.in_seconds,
+                        "out_seconds": audio.out_seconds,
+                        "timeline_start_frame": audio.timeline_start_frame,
+                        "frame_count": audio.frame_count,
+                        "role": audio.role,
+                        "completion": audio.completion,
+                        "gain_db": audio.gain_db,
+                        "why": audio.why,
+                    }
+                    for audio in plan.audio_assignments
                 ],
             }
             write_json(
@@ -1782,6 +2004,11 @@ def create_app() -> FastAPI:
             laid = staging / "bed-as-laid.m4a"
             if laid.exists():
                 os.replace(laid, run.output / laid.name)
+            voice = staging / "voice-as-laid.m4a"
+            if voice.exists():
+                os.replace(voice, run.output / voice.name)
+            elif not plan.audio_assignments:
+                (run.output / "voice-as-laid.m4a").unlink(missing_ok=True)
             # Segments are not a public endpoint, so switch them after the
             # three playable artifacts are safely in place.
             old_segments = run.output / "segments"
@@ -1796,7 +2023,7 @@ def create_app() -> FastAPI:
             (run.output / "work").mkdir(parents=True, exist_ok=True)
             for name in ("crops.json", "current-timeline.json"):
                 os.replace(staging / "work" / name, run.output / "work" / name)
-            if structural_change:
+            if audio_changed:
                 subtitles = run.output / "work" / "subtitles.json"
                 if subtitles.exists():
                     # Edited subtitle cues have no source anchor in v1. Keep
@@ -1807,6 +2034,7 @@ def create_app() -> FastAPI:
                         run.output / "work" / "subtitles-before-recut.json",
                     )
                     subtitles.unlink()
+            if structural_change:
                 _retime_graphics_for_current_cut(
                     run, old_blocks, manifest["shots"]
                 )
@@ -1835,7 +2063,7 @@ def create_app() -> FastAPI:
             "seconds": round(result.duration_seconds, 3),
             "shots": len(plan.segments),
             "revision": current_revision + 1,
-            "subtitles_reset": structural_change,
+            "subtitles_reset": audio_changed,
         })
 
     @app.get("/api/runs/{run_id}/transcripts")
@@ -1992,9 +2220,11 @@ def create_app() -> FastAPI:
                 bed = maybe if maybe.exists() else None
             build = to_xmeml if flavour == "premiere" else to_fcpxml
             graphics = run.output / "graphics-overlay.mov"
+            voice = run.output / "voice-as-laid.m4a"
             path.write_text(
                 build(plan, report, name=run.output.name,
                       width=width, height=height, music=bed,
+                      voice=voice if voice.exists() else None,
                       graphics=graphics if graphics.exists() else None),
                 encoding="utf-8",
             )
@@ -2061,6 +2291,9 @@ def create_app() -> FastAPI:
                     "speaker": line.speaker,
                     "heard": line.heard,
                     "derived": derived.get(round(line.starts_seconds, 3), ""),
+                    "timing_source": line.timing_source,
+                    "timing_confidence": line.timing_confidence,
+                    "timing_locked": line.timing_locked,
                 }
                 for line in _subtitle_lines(run)
             ],
@@ -2991,6 +3224,13 @@ def create_app() -> FastAPI:
                 "text": str(one.get("text", "")),
                 "speaker": str(one.get("speaker", "")),
                 "heard": str(one.get("heard", "")),
+                "timing_source": str(
+                    one.get("timing_source", "apple_audio_time_range")
+                ),
+                "timing_confidence": str(
+                    one.get("timing_confidence", "unverified")
+                ),
+                "timing_locked": bool(one.get("timing_locked", False)),
             }
             for one in sent
             if str(one.get("text", "")).strip()
@@ -3017,7 +3257,13 @@ def create_app() -> FastAPI:
         return JSONResponse({
             "lines": len(kept),
             "timed": [
-                {"at": one["at"], "until": one["until"], "text": one["text"]}
+                {
+                    "at": one["at"], "until": one["until"],
+                    "text": one["text"],
+                    "timing_source": one.get("timing_source", ""),
+                    "timing_confidence": one.get("timing_confidence", ""),
+                    "timing_locked": bool(one.get("timing_locked", False)),
+                }
                 for one in kept
             ],
         })
@@ -3114,7 +3360,9 @@ def create_app() -> FastAPI:
             else ((1920, 1080) if aspect == "16:9" else (1080, 1920))
         )
         try:
-            timed = as_cues(timed, aspect, width, height)
+            timed = as_cues(
+                timed, aspect, width, height, words=_subtitle_words(run),
+            )
         except NoFontHere:
             # Without a font there is nothing to measure against, and a long
             # cue in a file is better than no file.

@@ -29,6 +29,16 @@ Normalised = Annotated[float, Field(ge=0.0, le=1.0)]
 CameraEnergy = Literal["calm", "active", "dynamic"]
 CoverageType = Literal["literal", "implied", "tonal"]
 EnergyIntent = Literal["low", "medium", "high"]
+AudioRole = Literal[
+    "auto", "discard", "narrative", "sync_action", "ambient_texture"
+]
+PictureRole = Literal[
+    "speaker", "primary_action", "illustrative_broll", "reaction",
+    "establishing", "transition",
+]
+AudioCompletion = Literal[
+    "none", "complete_thought", "complete_action_sound", "intentional_cut"
+]
 
 
 class ModelFacing(BaseModel):
@@ -413,6 +423,28 @@ class Clip(ModelFacing):
             "can be checked for actually holding motion."
         ),
     )
+    audio_role: AudioRole = Field(
+        default="auto",
+        description=(
+            "What this shot contributes to the soundtrack. 'discard' removes "
+            "its source audio; 'narrative' carries spoken meaning; "
+            "'sync_action' preserves a sound tied to a visible event; "
+            "'ambient_texture' preserves deliberate atmosphere. 'auto' is "
+            "legacy-only and follows the render's global voice setting."
+        ),
+    )
+    audio_completion: AudioCompletion = Field(
+        default="none",
+        description=(
+            "The audible obligation this edit must finish. It is independent "
+            "of what picture is shown, which is what later permits B-roll "
+            "over a complete answer."
+        ),
+    )
+    picture_role: PictureRole = Field(
+        default="primary_action",
+        description="Why this source is visible during this editorial beat.",
+    )
     reframe: Reframe | None = Field(
         default=None,
         description="Required when the output aspect differs from the source.",
@@ -512,6 +544,31 @@ class BriefCoverage(ModelFacing):
     goals: list[Goal] = Field(default_factory=list)
 
 
+class AudioClip(ModelFacing):
+    """One continuous source-audio assignment on the edit timeline."""
+
+    audio_id: str
+    source_id: str
+    in_seconds: float = Field(ge=0.0)
+    out_seconds: float = Field(gt=0.0)
+    starts_at_clip_id: str
+    offset_seconds: float = 0.0
+    role: Literal["narrative", "sync_action", "ambient_texture"]
+    completion: AudioCompletion = "none"
+    gain_db: float = 0.0
+    why: str = ""
+
+    @model_validator(mode="after")
+    def source_window_is_forward(self) -> "AudioClip":
+        if self.out_seconds <= self.in_seconds:
+            raise ValueError("audio assignment out must follow in")
+        if self.role == "narrative" and self.completion not in {
+            "complete_thought", "intentional_cut"
+        }:
+            raise ValueError("narrative audio must complete a thought or cut intentionally")
+        return self
+
+
 class EDL(ModelFacing):
     """The edit decision list: the whole plan, from any source.
 
@@ -538,6 +595,7 @@ class EDL(ModelFacing):
         ),
     )
     clips: list[Clip] = Field(min_length=1)
+    audio_clips: list[AudioClip] = Field(default_factory=list)
     brief_coverage: BriefCoverage = Field(default_factory=BriefCoverage)
     named_facts: list[NamedFact] = Field(default_factory=list)
 
@@ -547,6 +605,13 @@ class EDL(ModelFacing):
         duplicates = {value for value in ids if ids.count(value) > 1}
         if duplicates:
             raise ValueError(f"duplicate clip_ids: {sorted(duplicates)}")
+        known = set(ids)
+        missing = {
+            audio.starts_at_clip_id for audio in self.audio_clips
+            if audio.starts_at_clip_id not in known
+        }
+        if missing:
+            raise ValueError(f"audio assignments name unknown clip_ids: {sorted(missing)}")
         return self
 
     @model_validator(mode="after")
@@ -597,7 +662,7 @@ class Issue(ModelFacing):
 
     issue_type: Literal[
         "pacing", "framing", "music_sync", "coverage", "named_fact",
-        "continuity", "other",
+        "continuity", "audio_content", "other",
     ]
     issue_type_other: str | None = None
     severity: Literal["minor", "major", "blocking"]

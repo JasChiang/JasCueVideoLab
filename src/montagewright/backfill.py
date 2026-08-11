@@ -13,13 +13,9 @@ new characters are spread across the span the old ones occupied. Nothing is
 invented and nothing drifts: the first and last moment of a line are moments
 the recogniser actually measured.
 
-This follows the approach worked out in caption-lab, which cross-checks
-Apple's `SpeechTranscriber` against a second, independent transcription and
-writes the agreed text back onto the recogniser's own per-word clock. The
-mechanism there re-times genuinely new syllables against energy peaks in the
-audio; this spreads them evenly instead, which is cruder and needs no signal
-analysis. Where a whole run is unchanged -- which is most of any line --
-both approaches give the same answer, because both give the recogniser's.
+This module is deliberately self-contained: it uses Python's sequence matcher
+and the Apple word spans already present in a Montagewright transcript card.
+It neither imports nor depends on another captioning project.
 """
 
 from __future__ import annotations
@@ -195,10 +191,9 @@ def what_was_heard(
 def drift(timed: list[Timed], words: list[Word]) -> float:
     """How far the finished caption has slid from what was measured.
 
-    caption-lab checks this and requires zero. It is the one number that
-    says whether the join held: text may change freely, but the first and
-    last moment of a line have to be moments somebody actually said
-    something.
+    This is the one number that says whether the join held: text may change
+    freely, but the first and last moment of a line have to be moments
+    somebody actually said something.
     """
 
     if not timed or not words:

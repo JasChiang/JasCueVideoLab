@@ -144,6 +144,13 @@ class Segment:
     # Levelling makes every speaker the same loudness, which is not the same
     # as every speaker being right: one of them stood next to a road.
     gain_db: float = 0.0
+    # Sound and picture are separate editorial assignments.  The first
+    # executable slice still uses one source window for both, but this role
+    # already prevents irrelevant on-location speech from leaking into a
+    # project merely because another shot contains an interview.
+    audio_role: str = "auto"
+    audio_completion: str = "none"
+    picture_role: str = "primary_action"
     # The stretch of the source this segment may not leave, when the card
     # named one. The renderer writes handles either side of every cut so an
     # editor opening the timeline can pull a shot longer; those were bounded
@@ -157,6 +164,28 @@ class Segment:
     @property
     def duration_seconds(self) -> float:
         return self.out_seconds - self.in_seconds
+
+
+@dataclass(frozen=True)
+class AudioAssignment:
+    """Source audio laid independently of picture cuts."""
+
+    audio_id: str
+    source: Source
+    in_seconds: float
+    out_seconds: float
+    timeline_in_seconds: float
+    timeline_start_frame: int
+    frame_count: int
+    role: str
+    timeline_fps: int = 30
+    completion: str = "none"
+    gain_db: float = 0.0
+    why: str = ""
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.frame_count / self.timeline_fps
 
 
 # What a delivery actually measures, per shape. Every segment is scaled to
@@ -196,6 +225,10 @@ class RenderPlan:
     # does not have to know about planning to lay music that is not the intro.
     music_from_seconds: float = 0.0
     music_spans: list[tuple[float, float]] = field(default_factory=list)
+    audio_assignments: list[AudioAssignment] = field(default_factory=list)
+    # True when sound has been intentionally separated from picture. An
+    # empty assignment list then means deliberate silence, not legacy auto.
+    audio_track_explicit: bool = False
     degradations: list[DegradationStep] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -307,12 +340,119 @@ def plan_render(
                 out_seconds=out_seconds,
                 crop=crop,
                 crop_path=path,
+                audio_role=clip.audio_role,
+                audio_completion=clip.audio_completion,
+                picture_role=clip.picture_role,
                 usable_from_seconds=clip.usable_from_seconds,
                 usable_to_seconds=clip.usable_to_seconds,
             )
         )
 
     assert len(segments) == len(edl.clips), "the executor never drops a clip"
+    frame_spans = allocate_timeline_frames(
+        [segment.duration_seconds for segment in segments], output_fps
+    )
+    timeline_starts = {
+        segment.clip_id: start
+        for segment, (start, _) in zip(segments, frame_spans, strict=True)
+    }
+    audio_assignments: list[AudioAssignment] = []
+    for audio in edl.audio_clips:
+        source = sources.get(audio.source_id)
+        if source is None:
+            raise MissingSource(
+                f"audio {audio.audio_id} names source {audio.source_id!r}, "
+                "which was not supplied"
+            )
+        timeline_start_frame = (
+            timeline_starts[audio.starts_at_clip_id]
+            + seconds_to_frames(audio.offset_seconds, output_fps)
+        )
+        out_seconds = min(audio.out_seconds, source.duration_seconds)
+        if out_seconds <= audio.in_seconds:
+            raise MissingSource(
+                f"audio {audio.audio_id} window {audio.in_seconds:.3f}-"
+                f"{audio.out_seconds:.3f}s is outside {audio.source_id}"
+            )
+        audio_assignments.append(AudioAssignment(
+            audio_id=audio.audio_id,
+            source=source,
+            in_seconds=audio.in_seconds,
+            out_seconds=out_seconds,
+            timeline_in_seconds=timeline_start_frame / output_fps,
+            timeline_start_frame=timeline_start_frame,
+            frame_count=seconds_to_frames(
+                out_seconds - audio.in_seconds, output_fps
+            ),
+            role=audio.role,
+            timeline_fps=output_fps,
+            completion=audio.completion,
+            gain_db=audio.gain_db,
+            why=audio.why,
+        ))
+    # Once a project uses the explicit sound contract, every retained piece
+    # of sync/ambient/narrative source audio joins that track. Otherwise the
+    # renderer would mute it with the picture while laying only the detached
+    # interview assignment.
+    explicit_audio_ids = {one.audio_id for one in audio_assignments}
+    has_detached_narrative = any(
+        one.role == "narrative" for one in audio_assignments
+    )
+    for clip, segment, (start_frame, end_frame) in zip(
+        edl.clips, segments, frame_spans, strict=True
+    ):
+        if clip.audio_role not in {
+            "narrative", "sync_action", "ambient_texture"
+        }:
+            continue
+        if has_detached_narrative and clip.audio_role == "narrative":
+            raise ValueError(
+                f"{clip.clip_id} duplicates narrative audio already assigned "
+                "on the independent track"
+            )
+        audio_id = f"shot-{clip.clip_id}"
+        if audio_id in explicit_audio_ids:
+            # A committed v2 manifest already materialises retained shot
+            # sound as an assignment. Rebuilding it must be idempotent.
+            continue
+        frame_count = end_frame - start_frame
+        audio_assignments.append(AudioAssignment(
+            audio_id=audio_id,
+            source=segment.source,
+            in_seconds=segment.in_seconds,
+            out_seconds=segment.out_seconds,
+            timeline_in_seconds=start_frame / output_fps,
+            timeline_start_frame=start_frame,
+            frame_count=frame_count,
+            role=clip.audio_role,
+            timeline_fps=output_fps,
+            completion=clip.audio_completion,
+            gain_db=segment.gain_db,
+            why=f"picture shot {clip.clip_id} retained its explicit source audio",
+        ))
+    total_frames = frame_spans[-1][1] if frame_spans else 0
+    narrative: list[tuple[int, int, str]] = []
+    for audio in audio_assignments:
+        end_frame = audio.timeline_start_frame + audio.frame_count
+        if (
+            audio.timeline_start_frame < 0
+            or audio.frame_count <= 0
+            or end_frame > total_frames
+        ):
+            raise ValueError(
+                f"audio {audio.audio_id} falls outside the {total_frames}-frame "
+                "picture timeline"
+            )
+        if audio.role == "narrative":
+            narrative.append((
+                audio.timeline_start_frame, end_frame, audio.audio_id
+            ))
+    narrative.sort()
+    for previous, here in zip(narrative, narrative[1:]):
+        if here[0] < previous[1]:
+            raise ValueError(
+                f"narrative audio {previous[2]} overlaps {here[2]}"
+            )
     return RenderPlan(
         project_id=edl.project_id,
         segments=segments,
@@ -322,6 +462,11 @@ def plan_render(
         output_fps=output_fps,
         music_from_seconds=getattr(edl, "music_from_seconds", 0.0),
         music_spans=list(getattr(edl, "music_spans", []) or []),
+        audio_assignments=audio_assignments,
+        audio_track_explicit=(
+            bool(edl.audio_clips)
+            or any(clip.audio_role != "auto" for clip in edl.clips)
+        ),
     )
 
 

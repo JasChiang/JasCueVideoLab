@@ -160,6 +160,7 @@ def to_xmeml(
     height: int,
     fps: int | None = None,
     music: Path | None = None,
+    voice: Path | None = None,
     graphics: Path | None = None,
 ) -> str:
     """FCP7 XML: what Premiere and Resolve open without complaint.
@@ -275,21 +276,28 @@ def to_xmeml(
             '</samplecharacteristics></video></media></file>'
             '</clipitem></track>'
         )
-    audio_track = "<audio/>"
-    if music is not None and Path(music).exists():
-        music_path = Path(music)
-        audio_track = (
-            "<audio><track><clipitem id=\"music-bed\">"
-            f"<name>{escape(music_path.stem)}</name>"
+    audio_tracks = []
+    for track_id, media in (("voice-laid", voice), ("music-bed", music)):
+        if media is None or not Path(media).exists():
+            continue
+        media_path = Path(media)
+        audio_tracks.append(
+            f'<track><clipitem id="{track_id}">'
+            f"<name>{escape(media_path.stem)}</name>"
+            f"<duration>{total_frames}</duration>"
+            f"<rate><timebase>{fps}</timebase><ntsc>FALSE</ntsc></rate>"
             f"<start>0</start><end>{total_frames}</end>"
             f"<in>0</in><out>{total_frames}</out>"
-            '<file id="music-bed-file">'
-            f"<name>{escape(music_path.name)}</name>"
-            f"<pathurl>{escape(music_path.resolve().as_uri())}</pathurl>"
+            f'<file id="{track_id}-file">'
+            f"<name>{escape(media_path.name)}</name>"
+            f"<pathurl>{escape(media_path.resolve().as_uri())}</pathurl>"
             f"<rate><timebase>{fps}</timebase><ntsc>FALSE</ntsc></rate>"
             f"<duration>{total_frames}</duration>"
-            "<media><audio/></media></file></clipitem></track></audio>"
+            "<media><audio/></media></file></clipitem></track>"
         )
+    audio_track = (
+        f"<audio>{''.join(audio_tracks)}</audio>" if audio_tracks else "<audio/>"
+    )
 
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -314,6 +322,7 @@ def to_fcpxml(
     height: int,
     fps: int | None = None,
     music: Path | None = None,
+    voice: Path | None = None,
     graphics: Path | None = None,
 ) -> str:
     """FCPXML: what Final Cut reads properly."""
@@ -374,10 +383,15 @@ def to_fcpxml(
             )
             if shape not in shapes:
                 shapes[shape] = f"f{len(shapes) + 1}"
+            carries_source_audio = not plan.audio_track_explicit
+            audio_attributes = (
+                'hasAudio="1" audioSources="1" audioChannels="2"'
+                if carries_source_audio else 'hasAudio="0"'
+            )
             assets[asset_id] = (
                 f'<asset id="{asset_id}" name="{html.escape(source.path.stem)}" '
-                f'start="0s" hasVideo="1" hasAudio="1" '
-                f'format="{shapes[shape]}" audioSources="1" audioChannels="2" '
+                f'start="0s" hasVideo="1" {audio_attributes} '
+                f'format="{shapes[shape]}" '
                 f'duration="{source_rational(source.duration_seconds, source)}">'
                 f'<media-rep kind="original-media" '
                 f'src="{html.escape(source.path.resolve().as_uri())}"/>'
@@ -470,6 +484,25 @@ def to_fcpxml(
             f'ref="{bed_id}" lane="-1" offset="0s" start="0s" '
             f'duration="{rational_frames(total_frames)}" audioRole="music"/>'
         )
+    voice_layer = ""
+    if voice is not None and Path(voice).exists():
+        voice_id = f"r{len(assets) + 2}"
+        voice_path = Path(voice)
+        assets[voice_id] = (
+            f'<asset id="{voice_id}" name="{html.escape(voice_path.stem)}" '
+            f'start="0s" hasAudio="1" audioSources="1" audioChannels="2" '
+            f'duration="{rational_frames(total_frames)}">'
+            f'<media-rep kind="original-media" '
+            f'src="{html.escape(voice_path.resolve().as_uri())}"/>'
+            "</asset>"
+        )
+        voice_layer = (
+            f'<asset-clip name="{html.escape(voice_path.stem)}" '
+            f'ref="{voice_id}" lane="-1" offset="0s" start="0s" '
+            f'duration="{rational_frames(total_frames)}" audioRole="dialogue"/>'
+        )
+        if bed:
+            bed = bed.replace('lane="-1"', 'lane="-2"')
 
     graphic_layer = ""
     if graphics is not None and Path(graphics).exists():
@@ -512,7 +545,8 @@ def to_fcpxml(
         f'<library><event name="{html.escape(name)}">'
         f'<project name="{html.escape(name)}"><sequence format="r1" '
         f'duration="{rational_frames(total_frames)}" tcStart="0s">'
-        f"<spine>{''.join(clips)}{graphic_layer}{bed}</spine></sequence></project>"
+        f"<spine>{''.join(clips)}{graphic_layer}{voice_layer}{bed}</spine>"
+        "</sequence></project>"
         "</event></library></fcpxml>\n"
     )
 
@@ -532,17 +566,19 @@ def write_timelines(
     finalcut = output_dir / f"{name}.fcpxml"
     graphics = output_dir / "graphics-overlay.mov"
     graphics = graphics if graphics.exists() else None
+    voice = output_dir / "voice-as-laid.m4a"
+    voice = voice if voice.exists() else None
     premiere.write_text(
         to_xmeml(
             plan, report, name=name, width=width, height=height,
-            graphics=graphics,
+            graphics=graphics, voice=voice,
         ),
         encoding="utf-8",
     )
     finalcut.write_text(
         to_fcpxml(
             plan, report, name=name, width=width, height=height,
-            graphics=graphics,
+            graphics=graphics, voice=voice,
         ),
         encoding="utf-8",
     )

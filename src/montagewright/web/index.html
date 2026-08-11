@@ -843,6 +843,15 @@
     padding: 1px 6px;
   }
   .lane img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .5; }
+  .audio-block {
+    position: absolute; z-index: 3; top: 5px; height: 20px;
+    box-sizing: border-box; overflow: hidden; white-space: nowrap;
+    text-overflow: ellipsis; border-radius: 3px; padding: 2px 6px;
+    font-size: 10px; color: var(--ink);
+    background: color-mix(in srgb, var(--ok) 22%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--ok) 60%, var(--line));
+    pointer-events: none;
+  }
   /* An empty track in an editing application is empty. This centred a
      sentence across the whole lane, which reads as content. */
   .lane.silent { background: var(--sunk); }
@@ -1802,6 +1811,8 @@ async function openRun(id, where) {
 
 let blocks = [], blocksWere = [], picked = -1, lastReport = null;
 let timelineRevision = 0;
+let audioAssignments = [];
+let timelineFps = 30;
 // Both at once. peeking stays true so the take keeps loading and the box
 // keeps being drawn; this only says the cut is on screen as well.
 let beside = false;
@@ -1890,6 +1901,8 @@ function inspect(i) {
             : esc(plan.subject || '—')
         }</span>
         ${said.speaker ? `<span>說話</span><span>${esc(said.speaker)}</span>` : ''}
+        <span>原音任務</span><span>${esc(AUDIO_ROLES[b.audio_role] || b.audio_role || '—')}</span>
+        <span>畫面任務</span><span>${esc(PICTURE_ROLES[b.picture_role] || b.picture_role || '—')}</span>
       </div>
       <p class="why">${esc(plan.why || '—')}</p>
       ${rhythm.why ? `<p class="why"><i>為什麼這個長度：</i>${esc(rhythm.why)}</p>` : ''}
@@ -1921,6 +1934,8 @@ async function showStrip() {
   // shot's reasoning and the recut asked to re-cut the wrong take.
   blocks = data.blocks;
   timelineRevision = data.revision || 0;
+  audioAssignments = data.audio_assignments || [];
+  timelineFps = data.output_fps || 30;
   cropsAre = data.crops_are || 'recorded';
   safeArea = data.safe_area || null;
   $('crop-warn').classList.toggle('hide', cropsAre !== 'rebuilt');
@@ -3974,6 +3989,9 @@ function wireCues() {
       // A cue that ends before it starts is not an edit, it is a typo.
       if (edge === 'at') subs[i].at = Math.min(want, subs[i].until - 0.1);
       else subs[i].until = Math.max(want, subs[i].at + 0.1);
+      subs[i].timing_locked = true;
+      subs[i].timing_source = 'manual';
+      subs[i].timing_confidence = 'human_locked';
       saveSubs(); paintSubs(); paintCues(); showBurnt();
     };
   }
@@ -4058,6 +4076,9 @@ function wireSubs() {
         const up = () => {
           document.removeEventListener('mousemove', move);
           document.removeEventListener('mouseup', up);
+          subs[i].timing_locked = true;
+          subs[i].timing_source = 'manual';
+          subs[i].timing_confidence = 'human_locked';
           saveSubs();
         };
         document.addEventListener('mousemove', move);
@@ -4092,6 +4113,9 @@ function saveSubs() {
           if (subs[i].at !== one.at || subs[i].until !== one.until) moved = true;
           subs[i].at = one.at;
           subs[i].until = one.until;
+          subs[i].timing_source = one.timing_source || subs[i].timing_source;
+          subs[i].timing_confidence = one.timing_confidence || subs[i].timing_confidence;
+          subs[i].timing_locked = !!one.timing_locked;
         });
         if (moved) { paintSubs(); paintCues(); }
       }
@@ -4123,6 +4147,7 @@ function paintWaves(total) {
       lane.innerHTML =
         `<span class="name">${which === 'voice' ? '人聲' : musicName()}</span>`;
       lane.appendChild(img);
+      if (which === 'voice') paintAudioAssignments();
     };
     img.onerror = () => {
       lane.classList.add('silent');
@@ -4130,6 +4155,23 @@ function paintWaves(total) {
         `<span class="name">${which === 'voice' ? '人聲' : '音樂'}</span>`;
     };
     img.src = `/api/runs/${runId}/waveform/${which}?width=${width}`;
+  }
+}
+
+function paintAudioAssignments() {
+  const lane = $('lane-voice');
+  lane.querySelectorAll('.audio-block').forEach(one => one.remove());
+  for (const audio of audioAssignments) {
+    if (audio.role !== 'narrative') continue;
+    const block = document.createElement('div');
+    block.className = 'audio-block';
+    block.style.left = `${audio.timeline_start_frame / timelineFps * scale}px`;
+    block.style.width = `${Math.max(
+      2, audio.frame_count / timelineFps * scale
+    )}px`;
+    block.textContent = audio.why || audio.source_id || '人聲';
+    block.title = `${audio.source_id} ${Number(audio.in_seconds).toFixed(2)}–${Number(audio.out_seconds).toFixed(2)}s`;
+    lane.appendChild(block);
   }
 }
 
@@ -4160,6 +4202,7 @@ function paintStrip() {
   wireStrip();
   paintGraphics();
   paintSubs();
+  paintAudioAssignments();
   const changed = JSON.stringify(blocks) !== JSON.stringify(blocksWere);
   $('recut').classList.toggle('hide', !changed);
   // Only worth saying when there is something to say. A permanent line of
@@ -4258,9 +4301,15 @@ $('recut').addEventListener('click', async () => {
   $('strip-note').textContent = '重新輸出中…';
   const res = await fetch(`/api/runs/${runId}/recut`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ base_revision: timelineRevision, shots: blocks.map(b => ({
-      index: b.index, in_seconds: b.in_seconds, seconds: b.seconds,
-      gain_db: b.gain_db || 0 })) }),
+    body: JSON.stringify({
+      base_revision: timelineRevision,
+      audio_assignments: audioAssignments,
+      shots: blocks.map(b => ({
+        index: b.index, in_seconds: b.in_seconds, seconds: b.seconds,
+        gain_db: b.gain_db || 0, audio_role: b.audio_role || 'auto',
+        audio_completion: b.audio_completion || 'none',
+        picture_role: b.picture_role || 'primary_action' }))
+    }),
   });
   $('recut').disabled = false;
   if (!res.ok) { $('strip-note').textContent = '失敗：' + (await res.text()).slice(0, 120); return; }
@@ -5286,7 +5335,13 @@ function inspectCue() {
       ${line.speaker ? `<span>說話</span><span>${esc(line.speaker)}</span>` : ''}
       ${line.heard && line.heard !== line.text
         ? `<span>聽到</span><span class="why">${esc(line.heard)}</span>` : ''}
+      <span>時間來源</span><span>${line.timing_locked ? '人工鎖定' : 'Apple Speech'}
+        <i class="why">${esc(line.timing_confidence || '未獨立驗證')}</i></span>
     </div>
+
+    <label class="check"><input id="cue-timing-lock" type="checkbox"
+      ${line.timing_locked ? 'checked' : ''}> 鎖定目前出現時間</label>
+    <p class="why">拖曳字幕邊界或手動輸入時間會自動鎖定，重新分析不會覆蓋。</p>
 
     <section class="ins-part">
       <h4>整支片的字幕怎麼呈現</h4>
@@ -5311,6 +5366,13 @@ function inspectCue() {
     saveSubs(); paintSubs(); showBurnt();
   };
   $('cue-text').onkeydown = (e) => e.stopPropagation();
+  $('cue-timing-lock').onchange = () => {
+    const locked = $('cue-timing-lock').checked;
+    subs[cue].timing_locked = locked;
+    subs[cue].timing_source = locked ? 'manual' : 'apple_audio_time_range';
+    subs[cue].timing_confidence = locked ? 'human_locked' : 'unverified';
+    saveSubs(); paintCues(); inspectCue();
+  };
   wireBurn();
   loadFonts(runId);
 }
@@ -5334,7 +5396,11 @@ $('cue-add').addEventListener('click', () => {
   const next = subs.find(line => line.at > at);
   const until = Math.min(at + 2, next ? next.at : at + 2, reelSeconds());
   if (until - at < 0.2) return;
-  subs.push({ at, until, text: '新的一句', speaker: '', heard: '', derived: '' });
+  subs.push({
+    at, until, text: '新的一句', speaker: '', heard: '', derived: '',
+    timing_locked: true, timing_source: 'manual',
+    timing_confidence: 'human_locked',
+  });
   subs.sort((a, b) => a.at - b.at);
   afterCues(subs.findIndex(line => line.at === at));
 });
@@ -5370,9 +5436,14 @@ $('cue-split').addEventListener('click', () => {
 
   const tail = {
     at, until: line.until, text: line.text.slice(cut).trim(),
-    speaker: line.speaker, heard: '', derived: '',
+    speaker: line.speaker, heard: '', derived: '', timing_locked: true,
+    timing_source: 'manual', timing_confidence: 'human_locked',
   };
-  subs[i] = { ...line, until: at, text: line.text.slice(0, cut).trim() };
+  subs[i] = {
+    ...line, until: at, text: line.text.slice(0, cut).trim(),
+    timing_locked: true, timing_source: 'manual',
+    timing_confidence: 'human_locked',
+  };
   subs.splice(i + 1, 0, tail);
   afterCues(i + 1);
 });
@@ -5386,6 +5457,9 @@ $('cue-join').addEventListener('click', () => {
     until: next.until,
     text: `${subs[i].text}${next.text}`,
     heard: `${subs[i].heard || ''}${next.heard || ''}`,
+    timing_locked: true,
+    timing_source: 'manual',
+    timing_confidence: 'human_locked',
   };
   subs.splice(i + 1, 1);
   afterCues(i);
@@ -5520,6 +5594,15 @@ const SOURCE_MOTIONS = {
 const COMPOSITES = {
   source_only: '只用原生運鏡', digital_only: '只用數位運鏡',
   stacked: '原生＋數位疊加', still: '兩層都固定',
+};
+const AUDIO_ROLES = {
+  auto: '沿用舊設定', discard: '不使用原音', narrative: '敘事／訪談',
+  sync_action: '同步動作聲', ambient_texture: '刻意環境聲'
+};
+const PICTURE_ROLES = {
+  speaker: '說話者', primary_action: '主要動作',
+  illustrative_broll: '說明性 B-roll', reaction: '反應鏡頭',
+  establishing: '建立場面', transition: '轉場'
 };
 function motionLabel(value, layer) {
   if (!value) return '—';

@@ -20,6 +20,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from dataclasses import replace
 
 from montagewright.executor import RenderPlan, Segment, allocate_timeline_frames
 from montagewright.reframe import ffmpeg_crop_filters
@@ -239,10 +240,13 @@ def _render_segment(
     # as their own file, so a transition or a nudge has material without the
     # timeline paying for it -- the concat stays frame-exact because every
     # segment is already the length it is meant to be.
-    audio = (
-        ["-af", f"volume={segment.gain_db:.2f}dB"]
-        if abs(segment.gain_db) > 0.01 else []
-    )
+    audio = []
+    if segment.audio_role == "discard":
+        # Keep a silent audio stream rather than dropping it. Every rendered
+        # segment must have the same stream layout for frame-exact concat.
+        audio = ["-af", "volume=0"]
+    elif abs(segment.gain_db) > 0.01:
+        audio = ["-af", f"volume={segment.gain_db:.2f}dB"]
 
     # Handles reach back to the start of the file and forward to its end,
     # which is the wrong boundary: half a second before a take is usually the
@@ -523,6 +527,72 @@ def _preview(source: Path, destination: Path, *, video_encoder: str) -> Path:
     return destination
 
 
+def _lay_audio_assignments(
+    picture: Path, assignments, destination: Path, *, output_fps: int,
+) -> Path:
+    """Lay continuous source audio independently of picture segment cuts."""
+
+    duration = probe_duration(picture)
+    ordered = sorted(assignments, key=lambda one: one.timeline_in_seconds)
+    previous_end = 0.0
+    for assignment in ordered:
+        begins = assignment.timeline_in_seconds
+        ends = begins + assignment.duration_seconds
+        if begins < -1e-6 or ends > duration + 0.05:
+            raise RenderError(
+                f"audio {assignment.audio_id} falls outside the picture "
+                f"timeline ({begins:.3f}–{ends:.3f}s of {duration:.3f}s)"
+            )
+        if assignment.role == "narrative" and begins < previous_end - 1e-6:
+            raise RenderError(
+                f"narrative audio {assignment.audio_id} overlaps another "
+                "narrative assignment"
+            )
+        if assignment.role == "narrative":
+            previous_end = ends
+
+    inputs = ["-i", str(picture)]
+    filters = [
+        f"anullsrc=r=48000:cl=stereo,atrim=duration={duration:.6f}[silence]"
+    ]
+    labels = ["[silence]"]
+    for index, assignment in enumerate(ordered, start=1):
+        inputs += ["-i", str(assignment.source.path)]
+        delay_samples = max(
+            0, round(assignment.timeline_start_frame * 48000 / output_fps)
+        )
+        label = f"a{index}"
+        filters.append(
+            f"[{index}:a]atrim={assignment.in_seconds:.6f}:"
+            f"{assignment.out_seconds:.6f},asetpts=PTS-STARTPTS,"
+            f"atrim=duration={assignment.duration_seconds:.6f},"
+            "aresample=48000,aformat=channel_layouts=stereo,"
+            f"volume={assignment.gain_db:.2f}dB,"
+            f"adelay={delay_samples}S:all=1[{label}]"
+        )
+        labels.append(f"[{label}]")
+    filters.append(
+        "".join(labels)
+        + f"amix=inputs={len(labels)}:duration=first:normalize=0:"
+        "dropout_transition=0,"
+        f"atrim=duration={duration:.6f},"
+        f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled[out]"
+    )
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs, "-filter_complex", ";".join(filters),
+        "-map", "0:v:0", "-map", "[out]", "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k", "-t", f"{duration:.6f}",
+        str(destination),
+    ])
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(destination), "-vn", "-c:a", "aac", "-b:a", "192k",
+        str(destination.parent / "voice-as-laid.m4a"),
+    ])
+    return destination
+
+
 def render(
     plan: RenderPlan,
     output_dir: Path,
@@ -562,8 +632,12 @@ def render(
                 "timeline frame"
             )
         destination = segment_dir / f"{index:03d}-{segment.clip_id}.mp4"
+        picture_segment = (
+            replace(segment, audio_role="discard")
+            if plan.audio_track_explicit else segment
+        )
         rendered, handles = _render_segment(
-            segment, destination, video_encoder=video_encoder,
+            picture_segment, destination, video_encoder=video_encoder,
             output_size=plan.output_size,
             output_fps=plan.output_fps,
             output_frames=segment_frames,
@@ -571,19 +645,28 @@ def render(
         segment_paths.append((rendered, handles, segment.duration_seconds))
 
     picture = _concat(segment_paths, output_dir / "picture.mp4", output_dir)
+    mix_picture = picture
+    if plan.audio_assignments:
+        mix_picture = _lay_audio_assignments(
+            picture, plan.audio_assignments, output_dir / "picture-with-audio.mp4",
+            output_fps=plan.output_fps,
+        )
     kept_paths = [path for path, _, _ in segment_paths]
 
     deliverable = output_dir / "deliverable.mp4"
     if music is not None:
         _mux_music(
-            picture, music, deliverable,
-            video_encoder=video_encoder, keep_voice=keep_voice,
+            mix_picture, music, deliverable,
+            video_encoder=video_encoder,
+            # An explicit laid track is authoritative. A caller's legacy
+            # keep_voice switch must never discard audio the EDL assigned.
+            keep_voice=keep_voice or bool(plan.audio_assignments),
             under_speech=under_speech,
             music_from_seconds=plan.music_from_seconds,
             music_spans=plan.music_spans or None,
         )
     else:
-        shutil.copyfile(picture, deliverable)
+        shutil.copyfile(mix_picture, deliverable)
 
     preview = _preview(
         deliverable, output_dir / "preview.mp4", video_encoder=video_encoder

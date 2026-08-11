@@ -305,6 +305,9 @@ def _describe_clips(edl: EDL, context: dict[str, dict] | None = None) -> str:
     """
 
     context = context or {}
+    audio_at: dict[str, list] = {}
+    for audio in edl.audio_clips:
+        audio_at.setdefault(audio.starts_at_clip_id, []).append(audio)
     seen: set[str] = set()
     lines = []
     for index, clip in enumerate(edl.clips, start=1):
@@ -327,6 +330,12 @@ def _describe_clips(edl: EDL, context: dict[str, dict] | None = None) -> str:
             f"選片說這顆需要≈{approx:.1f}s",
             f"能量={clip.energy_intent}",
         ]
+        for audio in audio_at.get(clip.clip_id, []):
+            facts.append(
+                f"從這顆+{audio.offset_seconds:.1f}s開始有獨立"
+                f"{audio.role}聲音 {audio.out_seconds - audio.in_seconds:.1f}s；"
+                "可跨後續畫面，但這些畫面的連續總長必須完整容納它"
+            )
         if clip.usable_window is not None:
             available = max(
                 0.0, clip.usable_window[1] - clip.approx_in_seconds
@@ -1437,6 +1446,7 @@ def _selection_schema(
     span_ids: list[str], *, min_shots: int | None = None,
     max_shots: int | None = None, replace_clip_ids: list[str] | None = None,
     graphic_candidate_ids: list[str] | None = None,
+    audio_span_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Flat shots plus flat coverage. Nothing nests more than one level.
 
@@ -1449,10 +1459,11 @@ def _selection_schema(
     from montagewright.graphics import curated_graphic_family_ids
 
     graphic_families = ["auto", *curated_graphic_family_ids()]
-    return {
+    required = ["shots", "covered", "uncovered"]
+    result = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["shots", "covered", "uncovered"],
+        "required": required,
         "properties": {
             "shots": {
                 "type": "array",
@@ -1483,6 +1494,10 @@ def _selection_schema(
                         "looks",
                         "energy",
                         "seconds_needed",
+                        "audio_role",
+                        "audio_completion",
+                        "picture_role",
+                        "audio_reason",
                         "why",
                     ],
                     "properties": {
@@ -1523,6 +1538,59 @@ def _selection_schema(
                                 "a count with too many shots in it。\n"
                                 "寫成 MM:SS（`0:03`）。"
                             ),
+                        },
+                        "audio_role": {
+                            "type": "string",
+                            "enum": (
+                                ["discard", "sync_action", "ambient_texture"]
+                                if audio_span_ids
+                                else [
+                                    "discard", "narrative", "sync_action",
+                                    "ambient_texture",
+                                ]
+                            ),
+                            "description": (
+                                "這顆原音在成片裡的任務。現場閒聊、記者會"
+                                "背景人聲、純產品 B-roll 通常 discard；訪談"
+                                "答案在有逐字稿時必須用頂層 audio_assignments，"
+                                "不可綁死在 picture shot；必須和畫面動作同步的聲音"
+                                "是 sync_action；刻意保留的空間感才是"
+                                " ambient_texture。不要因為偵測到有人聲就保留。"
+                            ),
+                        },
+                        "audio_completion": {
+                            "type": "string",
+                            "enum": [
+                                "none", "complete_thought",
+                                "complete_action_sound", "intentional_cut",
+                            ],
+                            "description": (
+                                "聲音必須完成什麼。narrative 通常是"
+                                " complete_thought；sync_action 通常是"
+                                " complete_action_sound；discard 填 none。"
+                                "intentional_cut 只有刻意截斷語意時才用。"
+                            ),
+                        },
+                        "picture_role": {
+                            "type": "string",
+                            "enum": [
+                                "speaker", "primary_action",
+                                "illustrative_broll", "reaction",
+                                "establishing", "transition",
+                            ],
+                            "description": (
+                                "為什麼此刻要看這個畫面，獨立於原音是否保留。"
+                                "speaker 表示必須與此刻播放的 narrative "
+                                "assignment 使用同一來源時鐘、嘴型同步；可在 "
+                                "B-roll 後回到講者，由本機依聲音進度對齊。"
+                                "只拿人物畫面覆蓋別段聲音要用 reaction 或 "
+                                "illustrative_broll；描述那句"
+                                "內容的產品畫面可填 illustrative_broll。"
+                            ),
+                        },
+                        "audio_reason": {
+                            "type": "string",
+                            "description": "為何保留或丟棄這顆原音；用素材中的可聽事實回答。",
                         },
                         "camera_intent": {
                             "type": "string",
@@ -1742,6 +1810,51 @@ def _selection_schema(
             },
         },
     }
+    # The selection prompt always explains the independent audio track, so
+    # the initial response always carries it (an empty list when no speech is
+    # available). One-for-one picture replans preserve the existing track and
+    # deliberately do not ask the model to restate it.
+    if replace_clip_ids is None:
+        required.append("audio_assignments")
+        result["properties"]["audio_assignments"] = {
+            "type": "array",
+            "description": (
+                "Continuous narrative audio placed independently of picture "
+                "cuts. One assignment may continue across several shots."
+            ),
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "audio_span_id", "starts_at_shot_index",
+                    "offset_seconds", "completion", "gain_db", "why",
+                ],
+                "properties": {
+                    "audio_span_id": {
+                        "type": "string",
+                        "enum": audio_span_ids or ["none"],
+                    },
+                    "starts_at_shot_index": {
+                        "type": "integer", "minimum": 0,
+                        "description": "The picture shot under which this audio begins.",
+                    },
+                    "offset_seconds": {
+                        "type": "string",
+                        "description": (
+                            "Offset from that shot's start, MM:SS. Usually 0:00; "
+                            "a positive value delays the voice for a J-cut setup."
+                        ),
+                    },
+                    "completion": {
+                        "type": "string",
+                        "enum": ["complete_thought", "intentional_cut"],
+                    },
+                    "gain_db": {"type": "number", "minimum": -18, "maximum": 12},
+                    "why": {"type": "string"},
+                },
+            },
+        }
+    return result
 
 
 def _beaten_and_broken(
@@ -1808,6 +1921,12 @@ def select_shots(
         else parse_brief_markdown(brief).candidates
     )
     graphic_candidate_ids = [one.candidate_id for one in graphic_candidates]
+    audio_span_sources = {
+        line.split("`", 2)[1]: item.source_id
+        for item in usable for line in item.speech
+        if line.startswith("`") and "`" in line[1:]
+    }
+    audio_span_ids = list(audio_span_sources)
     graphic_copy = (
         "## 可引用的 Brief 字卡原文\n\n"
         + "\n".join(
@@ -1853,50 +1972,124 @@ def select_shots(
     ]
     selection_input += _attach_material(usable, cache, client, beaten)
 
-    interaction = ask(
-        client,
-        model=MODEL_ID,
-        store=False,
-        input=selection_input,
-        generation_config={
-            "thinking_level": THINKING_HIGH,
-            "max_output_tokens": MAX_OUTPUT_TOKENS,
-        },
-        response_format=structured_json(
-            _selection_schema(
-                [one.span_id for one in offered],
-                min_shots=min_shots,
-                max_shots=max_shots,
-                graphic_candidate_ids=graphic_candidate_ids,
-            )
-        ),
-        ledger=ledger,
-        budget_stage="selection",
-    )
-    chosen = _parse(interaction, what="selection pass")
-    shot_count = len(chosen.get("shots") or [])
-    if (
-        (min_shots is not None and shot_count < min_shots)
-        or (max_shots is not None and shot_count > max_shots)
-    ):
-        raise PlannerError(
-            f"selection returned {shot_count} shots; direction requires "
-            f"{min_shots}–{max_shots}"
+    schema = structured_json(
+        _selection_schema(
+            [one.span_id for one in offered],
+            min_shots=min_shots,
+            max_shots=max_shots,
+            graphic_candidate_ids=graphic_candidate_ids,
+            audio_span_ids=audio_span_ids,
         )
-    expand_spans(
-        chosen, offered,
-        source_motion={item.source_id: item.camera_motion for item in usable},
     )
-    sequence_faults = sequence_disagreements(chosen.get("shots") or [])
-    if sequence_faults:
+    usage_total = Usage(0, 0, 0)
+    chosen: dict[str, Any] = {}
+    faults: list[str] = []
+    attempt_input = selection_input
+    for attempt in range(2):
+        interaction = ask(
+            client,
+            model=MODEL_ID,
+            store=False,
+            input=attempt_input,
+            generation_config={
+                "thinking_level": THINKING_HIGH,
+                "max_output_tokens": MAX_OUTPUT_TOKENS,
+            },
+            response_format=schema,
+            ledger=ledger,
+            budget_stage="selection",
+        )
+        used = Usage.from_interaction(interaction)
+        usage_total = Usage(
+            usage_total.input_tokens + used.input_tokens,
+            usage_total.output_tokens + used.output_tokens,
+            usage_total.thought_tokens + used.thought_tokens,
+        )
+        chosen = _parse(interaction, what="selection pass")
+        shot_count = len(chosen.get("shots") or [])
+        faults = []
+        if (
+            (min_shots is not None and shot_count < min_shots)
+            or (max_shots is not None and shot_count > max_shots)
+        ):
+            faults.append(
+                f"shot count {shot_count} is outside {min_shots}–{max_shots}"
+            )
+        expand_spans(
+            chosen, offered,
+            source_motion={item.source_id: item.camera_motion for item in usable},
+        )
+        expand_audio_assignments(chosen, audio_span_ids)
+        faults.extend(audio_assignment_disagreements(
+            chosen.get("shots") or [], usable
+        ))
+        if (
+            audio_span_ids
+            and not (chosen.get("audio_assignments") or [])
+            and any(
+                str(shot.get("picture_role") or "") == "speaker"
+                for shot in chosen.get("shots") or []
+            )
+        ):
+            faults.append(
+                "speaker-led pictures use transcribed content but "
+                "audio_assignments is empty; choose canonical transcript "
+                "span IDs and set picture source audio to discard"
+            )
+        assignments_at: dict[int, list[dict[str, Any]]] = {}
+        for assignment in chosen.get("audio_assignments") or []:
+            assignments_at.setdefault(
+                int(assignment.get("starts_at_shot_index", -1)), []
+            ).append(assignment)
+        for shot_index, shot in enumerate(chosen.get("shots") or []):
+            if str(shot.get("picture_role") or "") != "speaker":
+                continue
+            starts = assignments_at.get(shot_index) or []
+            if len(starts) > 1:
+                faults.append(
+                    f"k{shot_index:02d}: speaker picture has multiple "
+                    "narrative assignments starting on this shot"
+                )
+                continue
+            # A later speaker shot may return during one continuing answer
+            # after illustrative B-roll.  Its exact source clock is known
+            # only after rhythm fixes the picture durations, so the local
+            # pipeline validates and aligns that case before tracking.
+            if not starts:
+                continue
+            span_id = str(starts[0].get("audio_span_id") or "")
+            voice_source = audio_span_sources.get(span_id)
+            if voice_source != str(shot.get("source_id") or ""):
+                faults.append(
+                    f"k{shot_index:02d}: speaker picture source "
+                    f"{shot.get('source_id')} cannot lip-sync narrative "
+                    f"{span_id} from {voice_source}; use the same source or "
+                    "change picture_role to reaction/illustrative_broll"
+                )
+        faults.extend(sequence_disagreements(chosen.get("shots") or []))
+        if not faults:
+            break
+        if attempt == 0:
+            attempt_input = selection_input + [{
+                "type": "text",
+                "text": (
+                    "## 上一版不能執行，請完整重選一次\n\n"
+                    "下面是本機依 schema 與來源時窗算出的錯誤；不要只改理由，"
+                    "請改 shots/audio_assignments，並回傳完整新答案。\n\n- "
+                    + "\n- ".join(faults)
+                    + "\n\n上一版答案：\n"
+                    + json.dumps(chosen, ensure_ascii=False)
+                ),
+            }]
+    if faults:
         raise PlannerError(
-            "selection repeated overlapping adjacent source windows; it was "
-            "not cached or rendered: " + "; ".join(sequence_faults)
+            "selection remained structurally unrenderable after one repair: "
+            + "; ".join(faults)
         )
     chosen["frame_disagreements"] = frame_disagreements(
         chosen.get("shots") or [], material
     )
-    return chosen, Usage.from_interaction(interaction)
+    return chosen, usage_total
 
 
 def _shot_count_bounds(
@@ -1911,6 +2104,79 @@ def _shot_count_bounds(
     lower = max(1, min(available_spans, target - slack))
     upper = max(lower, min(available_spans, target + slack))
     return lower, upper
+
+
+def audio_assignment_disagreements(
+    shots: list[dict[str, Any]], material: "list[MaterialItem]"
+) -> list[str]:
+    """Reject sound duties that contradict their own completion contract."""
+
+    speech = {item.source_id: bool(item.speech) for item in material}
+    faults: list[str] = []
+    for index, shot in enumerate(shots):
+        clip_id = f"k{index:02d}"
+        role = str(shot.get("audio_role") or "")
+        completion = str(shot.get("audio_completion") or "")
+        source_id = str(shot.get("source_id") or "")
+        if role == "discard" and completion != "none":
+            faults.append(f"{clip_id}: discarded audio cannot require {completion}")
+        elif role == "narrative":
+            if not speech.get(source_id, False):
+                faults.append(
+                    f"{clip_id}: narrative audio names {source_id}, which has "
+                    "no transcribed content speech"
+                )
+            if completion not in {"complete_thought", "intentional_cut"}:
+                faults.append(
+                    f"{clip_id}: narrative audio requires complete_thought or "
+                    "an explicit intentional_cut"
+                )
+        elif role == "sync_action" and completion not in {
+            "complete_action_sound", "intentional_cut"
+        }:
+            faults.append(
+                f"{clip_id}: sync_action requires complete_action_sound or "
+                "intentional_cut"
+            )
+        elif role == "ambient_texture" and completion != "none":
+            faults.append(f"{clip_id}: ambient texture has no completion duty")
+    return faults
+
+
+def expand_audio_assignments(
+    chosen: dict[str, Any], offered_ids: list[str]
+) -> None:
+    """Normalise model-facing audio placement and reject invented spans."""
+
+    from montagewright.spans import seconds_of
+
+    offered = set(offered_ids)
+    shots = chosen.get("shots") or []
+    assignments = chosen.get("audio_assignments") or []
+    seen: set[str] = set()
+    for index, assignment in enumerate(assignments):
+        span_id = str(assignment.get("audio_span_id") or "")
+        if span_id not in offered:
+            raise PlannerError(f"audio assignment names unknown span {span_id!r}")
+        if span_id in seen:
+            raise PlannerError(f"audio span {span_id} was assigned more than once")
+        seen.add(span_id)
+        shot_index = int(assignment.get("starts_at_shot_index", -1))
+        if not 0 <= shot_index < len(shots):
+            raise PlannerError(
+                f"audio assignment {span_id} starts at missing shot {shot_index}"
+            )
+        assignment["offset_seconds"] = seconds_of(
+            assignment.get("offset_seconds")
+        ) or 0.0
+        assignment["audio_id"] = f"a{index:02d}"
+    if assignments and any(
+        str(shot.get("audio_role")) == "narrative" for shot in shots
+    ):
+        raise PlannerError(
+            "narrative audio is duplicated: use top-level audio_assignments "
+            "and set picture-shot source audio to discard"
+        )
 
 
 def expand_spans(

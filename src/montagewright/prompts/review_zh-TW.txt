@@ -16,6 +16,8 @@
 - `overall`：整體怎麼樣，兩三句。
 - `issues`：要改的地方。每一項都要有 `clip_id` 或 `at_seconds`（大概就好，本機會對到精確位置）、`severity`、以及 `fix`——具體要怎麼動。
 
+如果問題是選錯台詞、答案答非所問、句意不完整或敘事聲音本身不對，請用 `issue_type=audio_content`。這會重新挑聲音與覆蓋畫面；不要誤標成 framing 後只替換畫面。
+
 嚴重度只有 `major` 和 `blocking` 會啟動下一輪。`minor` 記錄下來但不重剪。
 
 ## 幾件事

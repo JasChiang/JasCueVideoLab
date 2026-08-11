@@ -959,6 +959,224 @@ def test_the_planner_sees_the_sentences_it_is_choosing_between() -> None:
     assert "說了什麼" in described and "流汗完又下雨" in described
 
 
+def test_adjacent_asr_lines_become_one_canonical_continuous_soundbite() -> None:
+    from montagewright.cli import _audio_spans, _speech_lines
+    from montagewright.transcript import CARD_VERSION
+
+    card = {
+        "version": CARD_VERSION,
+        "lines": [
+            {
+                "text": "就流很多汗很麻煩，尤其是吹頭髮就很熱，",
+                "speaker": "短髮受訪女子",
+                "starts_seconds": 2.46, "ends_seconds": 8.52,
+            },
+            {
+                "text": "然後還要吹那熱風會流汗。",
+                "speaker": "短髮受訪女子",
+                "starts_seconds": 8.70, "ends_seconds": 10.86,
+            },
+            {
+                "text": "那還有其他的嗎？",
+                "speaker": "主持人",
+                "starts_seconds": 10.86, "ends_seconds": 12.30,
+            },
+        ],
+    }
+
+    spans = _audio_spans({"S01": card})
+    grouped = spans["S01:t00-t01"]
+    assert grouped["in_seconds"] == 2.46
+    assert grouped["out_seconds"] == 10.86
+    assert grouped["line_ids"] == ["S01:t00", "S01:t01"]
+    assert grouped["kind"] == "continuous_turn"
+    assert "S01:t00-t02" not in spans  # a speaker change cannot be spliced in
+    described = _speech_lines("S01", card)
+    assert any("`S01:t00-t01`" in one and "連續多行" in one for one in described)
+
+
+def test_continuous_soundbites_split_at_long_pauses_and_duration_cap() -> None:
+    from montagewright.cli import _audio_spans_for_source
+    from montagewright.transcript import CARD_VERSION
+
+    def line(text: str, start: float, end: float) -> dict:
+        return {
+            "text": text, "speaker": "受訪者",
+            "starts_seconds": start, "ends_seconds": end,
+        }
+
+    card = {
+        "version": CARD_VERSION,
+        "lines": [
+            line("一", 0.0, 4.0), line("二", 4.1, 8.0),
+            line("三", 8.1, 15.0),  # exceeds the 14-second group cap
+            line("四", 17.0, 19.0),  # a 2-second pause starts another run
+            line("五", 19.1, 21.0),
+        ],
+    }
+    spans = _audio_spans_for_source("S02", card)
+    assert "S02:t00-t01" in spans
+    assert "S02:t00-t02" not in spans
+    assert "S02:t03-t04" in spans
+
+
+def test_grouped_soundbite_resolves_to_one_source_window_in_the_edl(tmp_path) -> None:
+    from montagewright.cli import _edl_from_selection
+    from montagewright.transcript import CARD_VERSION
+
+    transcript = {
+        "version": CARD_VERSION,
+        "lines": [
+            {
+                "text": "前半句，", "speaker": "受訪者",
+                "starts_seconds": 4.0, "ends_seconds": 5.5,
+            },
+            {
+                "text": "後半句。", "speaker": "受訪者",
+                "starts_seconds": 5.6, "ends_seconds": 7.0,
+            },
+        ],
+    }
+    selection = {
+        "shots": [{
+            "span_id": "P:s00", "source_id": "P", "start_seconds": 0,
+            "seconds_needed": 4, "frame": "settles", "energy": "medium",
+            "why": "B-roll", "audio_role": "discard",
+            "looks": [{"at": "centre", "seconds": 4, "framing": "thirds"}],
+        }],
+        "audio_assignments": [{
+            "audio_span_id": "V:t00-t01", "starts_at_shot_index": 0,
+            "offset_seconds": 0, "completion": "complete_thought",
+            "gain_db": 0, "why": "完整回答",
+        }],
+    }
+
+    edl, _ = _edl_from_selection(
+        selection, tmp_path, cards={}, transcripts={"V": transcript}
+    )
+    audio = edl.audio_clips[0]
+    assert (audio.source_id, audio.in_seconds, audio.out_seconds) == ("V", 4.0, 7.0)
+    assert len(edl.audio_clips) == 1
+
+
+def test_speaker_picture_is_locked_to_the_narrative_source_clock(tmp_path) -> None:
+    from montagewright.cli import _edl_from_selection
+    from montagewright.transcript import CARD_VERSION
+
+    transcript = {
+        "version": CARD_VERSION,
+        "lines": [{
+            "text": "嘴型必須對上這一句。", "speaker": "受訪者",
+            "starts_seconds": 4.25, "ends_seconds": 7.25,
+        }],
+    }
+    selection = {
+        "shots": [{
+            "span_id": "V:s00", "source_id": "V", "start_seconds": 20,
+            "seconds_needed": 3, "frame": "settles", "energy": "medium",
+            "why": "講者", "audio_role": "discard",
+            "audio_completion": "none", "picture_role": "speaker",
+            "looks": [{"at": "centre", "seconds": 3, "framing": "thirds"}],
+        }],
+        "audio_assignments": [{
+            "audio_span_id": "V:t00", "starts_at_shot_index": 0,
+            "offset_seconds": 0, "completion": "complete_thought",
+            "gain_db": 0, "why": "完整回答",
+        }],
+    }
+
+    edl, notes = _edl_from_selection(
+        selection, tmp_path, cards={}, transcripts={"V": transcript}
+    )
+
+    assert edl.clips[0].approx_in_seconds == 4.25
+    assert edl.clips[0].approx_out_seconds == 7.25
+    assert "source clock aligned" in notes["k00"]
+
+
+def test_speaker_picture_cannot_pretend_another_sources_voice_is_synced(tmp_path) -> None:
+    import pytest
+    from montagewright.cli import _edl_from_selection
+    from montagewright.transcript import CARD_VERSION
+
+    transcript = {
+        "version": CARD_VERSION,
+        "lines": [{
+            "text": "另一個人說的話。", "speaker": "受訪者",
+            "starts_seconds": 1, "ends_seconds": 3,
+        }],
+    }
+    selection = {
+        "shots": [{
+            "span_id": "PICTURE:s00", "source_id": "PICTURE",
+            "start_seconds": 0, "seconds_needed": 2,
+            "frame": "settles", "energy": "medium", "why": "錯的人",
+            "audio_role": "discard", "audio_completion": "none",
+            "picture_role": "speaker",
+            "looks": [{"at": "centre", "seconds": 2, "framing": "thirds"}],
+        }],
+        "audio_assignments": [{
+            "audio_span_id": "VOICE:t00", "starts_at_shot_index": 0,
+            "offset_seconds": 0, "completion": "complete_thought",
+            "gain_db": 0, "why": "不相符",
+        }],
+    }
+    with pytest.raises(ValueError, match="speaker picture.*narrative audio"):
+        _edl_from_selection(
+            selection, tmp_path, cards={}, transcripts={"VOICE": transcript}
+        )
+
+
+def test_speaker_can_return_after_broll_on_the_continuing_audio_clock() -> None:
+    """A/B-roll/A does not restart or detach the speaker's lip sync."""
+
+    from montagewright.pipeline import align_speaker_pictures_to_audio
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    edl = EDL(
+        project_id="answer-over-broll",
+        clips=[
+            Clip(
+                clip_id="k00", source_id="VOICE", approx_in_seconds=2,
+                approx_out_seconds=4, picture_role="speaker",
+            ),
+            Clip(
+                clip_id="k01", source_id="BROLL", approx_in_seconds=20,
+                approx_out_seconds=22, picture_role="illustrative_broll",
+            ),
+            Clip(
+                clip_id="k02", source_id="VOICE", approx_in_seconds=40,
+                approx_out_seconds=42, picture_role="speaker",
+            ),
+        ],
+        audio_clips=[AudioClip(
+            audio_id="a00", source_id="VOICE", in_seconds=10,
+            out_seconds=16, starts_at_clip_id="k00", role="narrative",
+            completion="complete_thought",
+        )],
+    )
+
+    aligned, notes = align_speaker_pictures_to_audio(edl)
+
+    assert aligned.clips[0].approx_in_seconds == pytest.approx(10)
+    assert aligned.clips[1].approx_in_seconds == pytest.approx(20)
+    assert aligned.clips[2].approx_in_seconds == pytest.approx(14)
+    assert any("k02" in note and "14.000" in note for note in notes)
+
+
+def test_transcribed_selection_requires_narrative_on_the_independent_track() -> None:
+    from montagewright.planner import _selection_schema
+
+    schema = _selection_schema(
+        ["S:s00"], min_shots=1, max_shots=2,
+        audio_span_ids=["S:t00-t01"],
+    )
+    shot = schema["properties"]["shots"]["items"]["properties"]
+    assert "narrative" not in shot["audio_role"]["enum"]
+    assignment = schema["properties"]["audio_assignments"]["items"]
+    assert assignment["properties"]["audio_span_id"]["enum"] == ["S:t00-t01"]
+
+
 def test_a_cut_that_never_asked_for_a_beat_is_not_a_missed_one() -> None:
     """A speech-led cut read as 0/13 aligned.
 
@@ -1273,7 +1491,9 @@ def test_a_replan_renders_the_same_way_the_first_pass_did() -> None:
     assert source.count("resolved = run(") == 0, (
         "both renders go through one definition"
     )
-    assert source.count("= cut(") == 2
+    # Initial render, picture-only replacement, and a joint audio+picture
+    # reselection after an audio_content review all share the same helper.
+    assert source.count("= cut(") == 3
 
 
 def test_dropping_the_question_depends_on_something_carrying_the_premise() -> None:
@@ -2418,6 +2638,87 @@ def test_a_long_sentence_becomes_several_cues_not_more_rows() -> None:
         assert abs(before.ends_seconds - after.starts_seconds) < 1e-6
 
 
+def test_a_split_cue_uses_measured_words_instead_of_character_pace() -> None:
+    """A pause before the next phrase must not put that phrase on screen early."""
+
+    from montagewright.subtitles import _face, _width, split_cues
+    from montagewright.transcript import Line, Word
+
+    face = _face(40)
+    text = "前半句說得很快，後半句停一下才開始"
+    room = _width("前半句說得很快，", face) + 2
+    words = []
+    at = 0.0
+    for character in "前半句說得很快":
+        words.append(Word(character, at, at + 0.1))
+        at += 0.1
+    # A real pause. Character-proportional timing would start the next cue
+    # around the middle of the 4s line rather than at this measured boundary.
+    at = 2.4
+    for character in "後半句停一下才開始":
+        words.append(Word(character, at, at + 0.2))
+        at += 0.2
+
+    cues = split_cues(
+        [Line(text=text, starts_seconds=0.0, ends_seconds=4.0)],
+        face, room, words=words,
+    )
+
+    assert len(cues) >= 2
+    assert cues[1].starts_seconds == pytest.approx(2.4)
+    assert cues[0].ends_seconds == cues[1].starts_seconds
+
+
+def test_a_split_cue_prefers_the_corrected_character_clock() -> None:
+    """Gemini spelling and Apple timing remain joined through cue layout."""
+
+    from montagewright.subtitles import _face, _width, split_cues
+    from montagewright.transcript import CharacterTiming, Line, Word
+
+    text = "前半句說得很快，後半句停一下才開始"
+    clock, at = [], 0.0
+    for character in text:
+        if character == "，":
+            clock.append(CharacterTiming(character, at, at, False))
+            at = 2.4
+            continue
+        clock.append(CharacterTiming(character, at, at + 0.1, True))
+        at += 0.1
+    line = Line(
+        text=text, starts_seconds=0.0, ends_seconds=3.3,
+        timed_text=tuple(clock),
+    )
+    # Deliberately misleading legacy word evidence. It must not override the
+    # corrected character clock carried by the line.
+    words = [Word(character, index * .05, index * .05 + .05)
+             for index, character in enumerate(text) if character != "，"]
+    cues = split_cues(
+        [line], _face(40), _width("前半句說得很快，", _face(40)) + 2,
+        words=words,
+    )
+
+    assert len(cues) >= 2
+    assert cues[1].starts_seconds == pytest.approx(2.4)
+    assert cues[1].timed_text
+
+
+def test_cue_layout_does_not_leave_one_character_of_a_phrase_orphaned() -> None:
+    """Visual width may split a quote, but not as a lone final character."""
+
+    from montagewright.subtitles import _by_sense, _face, _width
+
+    face = _face(40)
+    text = "「喔，你身上有梅雨的味道。」這樣子。"
+    room = round(_width("「喔，你身上有梅雨的味", face) + 1)
+    pieces = _by_sense(text, face, room)
+
+    assert "".join(pieces) == text
+    meaningful = [one.strip("，。、！？：；,.!?;:「」") for one in pieces]
+    assert all(len(one) >= 2 for one in meaningful), pieces
+    assert not any(one.startswith("道") for one in pieces[1:])
+    assert any("梅雨的味道" in one for one in pieces), pieces
+
+
 def test_a_brief_cue_is_joined_only_while_it_still_fits_one_row() -> None:
     """Two rules pull against each other, and one of them wins.
 
@@ -2497,6 +2798,206 @@ def test_clipping_a_line_never_inverts_the_slice() -> None:
         got = _within(line, from_seconds=float(at), to_seconds=at + 2.0)
         assert got == "" or len(got) >= 3, (at, got)
         assert got in line.text or got.strip("…，。") in line.text, (at, got)
+
+
+def test_clipping_without_a_nearby_joint_does_not_restore_the_whole_line() -> None:
+    """A missing punctuation joint is -1, not an instruction to use index 0."""
+
+    from montagewright.transcript import Line, _within
+
+    line = Line(
+        text="夏天最讓我崩潰哦",
+        starts_seconds=1.44,
+        ends_seconds=4.80,
+    )
+    clipped = _within(line, from_seconds=4.0, to_seconds=9.0)
+    assert clipped != line.text
+    assert clipped in line.text
+
+
+def test_corrected_character_clock_keeps_only_the_audible_tail() -> None:
+    """Corrected text follows Apple's character clock, not string proportion."""
+
+    from montagewright.transcript import (
+        CharacterTiming, CutWindow, Line, _portion_within, against_windows,
+    )
+
+    line = Line(
+        text="夏天最讓我崩潰哦？",
+        starts_seconds=1.44,
+        ends_seconds=4.80,
+        timed_text=tuple(
+            CharacterTiming(letter, start, end, measured)
+            for letter, start, end, measured in [
+                ("夏", 1.44, 1.80, True), ("天", 1.80, 2.16, True),
+                ("最", 2.16, 2.52, True), ("讓", 2.52, 2.88, True),
+                ("我", 2.88, 3.24, True), ("崩", 3.24, 4.02, True),
+                ("潰", 4.02, 4.80, False), ("哦", 4.80, 4.80, False),
+                ("？", 4.80, 4.80, False),
+            ]
+        ),
+    )
+    said, starts, ends = _portion_within(
+        line, from_seconds=4.0, to_seconds=9.0
+    )
+    assert said == "崩潰哦？"
+    assert starts == pytest.approx(4.0)
+    assert ends == pytest.approx(4.8)
+
+    card = {
+        "lines": [{
+            "text": line.text,
+            "starts_seconds": line.starts_seconds,
+            "ends_seconds": line.ends_seconds,
+            "timed_text": [one.__dict__ for one in line.timed_text],
+        }]
+    }
+    moved = against_windows([CutWindow("A", 4.0, 5.0)], {"A": card})
+    assert [one.text for one in moved] == ["崩潰哦？"]
+    assert moved[0].starts_seconds == pytest.approx(0.0)
+    assert moved[0].ends_seconds == pytest.approx(0.8)
+
+
+def test_final_dialogue_audit_snaps_to_a_measured_pause() -> None:
+    """Action/music grounding may move a safe proposal back into speech."""
+
+    from montagewright.schema import Clip, EDL
+    from montagewright.transcript import snap_edl_to_dialogue
+
+    edl = EDL(project_id="p", clips=[Clip(
+        clip_id="k00", source_id="A",
+        approx_in_seconds=1.0, approx_out_seconds=4.05,
+    )])
+    card = {
+        "lines": [{
+            "text": "前半句，後半句。",
+            "starts_seconds": 1.0,
+            "ends_seconds": 5.0,
+            "timed_text": [
+                {"text": "前", "starts_seconds": 1.0, "ends_seconds": 1.5},
+                {"text": "半", "starts_seconds": 1.5, "ends_seconds": 2.0},
+                {"text": "句", "starts_seconds": 2.0, "ends_seconds": 2.5},
+                {"text": "，", "starts_seconds": 2.5, "ends_seconds": 2.5},
+                {"text": "後", "starts_seconds": 2.8, "ends_seconds": 3.3},
+                {"text": "半", "starts_seconds": 3.3, "ends_seconds": 3.8},
+                {"text": "句", "starts_seconds": 3.8, "ends_seconds": 4.3},
+                {"text": "。", "starts_seconds": 4.3, "ends_seconds": 4.3},
+            ],
+        }],
+        "words": [
+            {"text": "前半句", "starts_seconds": 1.0, "ends_seconds": 2.5},
+            {"text": "後半句", "starts_seconds": 2.8, "ends_seconds": 4.3},
+        ],
+    }
+    snapped, notes, faults = snap_edl_to_dialogue(edl, {"A": card})
+    assert faults == []
+    assert notes
+    assert snapped.clips[0].approx_out_seconds == pytest.approx(4.3)
+
+
+def test_final_dialogue_audit_refuses_an_unfixable_mid_sentence_cut() -> None:
+    from montagewright.schema import Clip, EDL
+    from montagewright.transcript import snap_edl_to_dialogue
+
+    edl = EDL(project_id="p", clips=[Clip(
+        clip_id="k00", source_id="A",
+        approx_in_seconds=1.0, approx_out_seconds=5.0,
+    )])
+    card = {"lines": [{
+        "text": "這是一整段沒有停頓而且還沒有講完的話",
+        "starts_seconds": 1.0,
+        "ends_seconds": 9.0,
+    }]}
+    _, _, faults = snap_edl_to_dialogue(
+        edl, {"A": card}, max_snap_seconds=0.3
+    )
+    assert faults and "cuts active dialogue" in faults[0]
+
+
+def test_discarded_source_audio_does_not_constrain_a_visual_cut() -> None:
+    """A product B-roll shot may come from a file containing irrelevant talk."""
+
+    from montagewright.schema import Clip, EDL
+    from montagewright.transcript import snap_edl_to_dialogue
+
+    edl = EDL(project_id="p", clips=[Clip(
+        clip_id="k00", source_id="A",
+        approx_in_seconds=3.0, approx_out_seconds=5.0,
+        audio_role="discard", audio_completion="none",
+        picture_role="primary_action",
+    )])
+    card = {"lines": [{
+        "text": "現場有人一直講話但這顆只使用產品畫面",
+        "starts_seconds": 0.0, "ends_seconds": 10.0,
+    }]}
+    resolved, notes, faults = snap_edl_to_dialogue(edl, {"A": card})
+    assert faults == []
+    assert notes == []
+    assert resolved.clips[0].approx_in_seconds == 3.0
+
+
+def test_audio_and_picture_roles_survive_into_the_render_segment(tmp_path) -> None:
+    from montagewright.executor import Source, plan_render
+    from montagewright.schema import Clip, EDL
+
+    source = Source("A", tmp_path / "a.mp4", 10.0, 1920, 1080)
+    edl = EDL(project_id="p", clips=[Clip(
+        clip_id="k00", source_id="A",
+        approx_in_seconds=1.0, approx_out_seconds=3.0,
+        audio_role="discard", audio_completion="none",
+        picture_role="illustrative_broll",
+    )])
+    segment = plan_render(edl, {"A": source}).segments[0]
+    assert segment.audio_role == "discard"
+    assert segment.audio_completion == "none"
+    assert segment.picture_role == "illustrative_broll"
+
+
+def test_audio_assignment_contract_rejects_narration_without_speech() -> None:
+    from montagewright.planner import MaterialItem, audio_assignment_disagreements
+
+    material = [MaterialItem(source_id="A", duration_seconds=10.0, summary="")]
+    faults = audio_assignment_disagreements([{
+        "source_id": "A",
+        "audio_role": "narrative",
+        "audio_completion": "complete_thought",
+    }], material)
+    assert faults and "no transcribed content speech" in faults[0]
+
+
+def test_discarded_audio_is_silenced_before_segment_concat() -> None:
+    import inspect
+    from montagewright import renderer
+
+    source = inspect.getsource(renderer._render_segment)
+    assert 'segment.audio_role == "discard"' in source
+    assert '["-af", "volume=0"]' in source
+
+
+def test_discarded_audio_renders_as_silence_with_the_same_stream_layout(
+    tmp_path,
+) -> None:
+    import subprocess
+
+    from montagewright.executor import Segment, Source
+    from montagewright.renderer import _level, _render_segment
+
+    source_path = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=blue:s=64x64:r=30:d=1",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+        "-shortest", "-c:v", "libx264", "-c:a", "aac", str(source_path),
+    ], check=True)
+    segment = Segment(
+        "k00", Source("A", source_path, 1.0, 64, 64), 0.0, 1.0,
+        audio_role="discard",
+    )
+    rendered, _ = _render_segment(
+        segment, tmp_path / "muted.mp4", video_encoder="libx264",
+        output_size=(64, 64), output_fps=30, output_frames=30,
+    )
+    assert _level(rendered) < -80.0
 
 
 def test_a_refused_run_leaves_nothing_behind(tmp_path) -> None:
@@ -2700,6 +3201,130 @@ def test_the_words_move_onto_the_cut_with_the_lines() -> None:
     assert [word.text for word in moved] == ["在", "夏"]
     assert moved[0].starts_seconds == 0.0
     assert abs(moved[1].starts_seconds - 0.3) < 1e-6
+
+
+def test_subtitles_follow_resolved_windows_after_action_snapping() -> None:
+    """The rendered in-point wins over the earlier selection proposal."""
+
+    from types import SimpleNamespace
+
+    from montagewright.transcript import (
+        against_windows, windows_against_segments, words_against_windows,
+    )
+
+    cards = {"A": {
+        "lines": [
+            {"text": "提早保留", "starts_seconds": 0.2, "ends_seconds": 1.2},
+            {"text": "原本入點", "starts_seconds": 2.2, "ends_seconds": 3.2},
+        ],
+        "words": [
+            {"text": "提", "starts_seconds": 0.2, "ends_seconds": 0.4},
+            {"text": "原", "starts_seconds": 2.2, "ends_seconds": 2.4},
+        ],
+    }}
+    segment = SimpleNamespace(
+        source=SimpleNamespace(source_id="A"),
+        in_seconds=0.0,
+        duration_seconds=3.5,
+    )
+    windows = windows_against_segments([segment])
+
+    lines = against_windows(windows, cards)
+    words = words_against_windows(windows, cards)
+
+    assert [line.text for line in lines] == ["提早保留", "原本入點"]
+    assert lines[0].starts_seconds == pytest.approx(0.2)
+    assert [word.text for word in words] == ["提", "原"]
+    assert words[0].starts_seconds == pytest.approx(0.2)
+
+
+def test_resolved_subtitle_windows_follow_late_snap_and_final_durations() -> None:
+    """A later snap drops old speech and advances the next shot by real frames."""
+
+    from types import SimpleNamespace
+
+    from montagewright.transcript import against_windows, windows_against_segments
+
+    cards = {
+        "A": {"lines": [
+            {"text": "已剪掉", "starts_seconds": 4.2, "ends_seconds": 5.2},
+            {"text": "真正留下", "starts_seconds": 6.2, "ends_seconds": 7.2},
+        ]},
+        "B": {"lines": [
+            {"text": "下一顆", "starts_seconds": 1.5, "ends_seconds": 2.5},
+        ]},
+    }
+    segments = [
+        SimpleNamespace(
+            source=SimpleNamespace(source_id="A"),
+            in_seconds=6.0,
+            duration_seconds=2.0,
+        ),
+        SimpleNamespace(
+            source=SimpleNamespace(source_id="B"),
+            in_seconds=1.0,
+            duration_seconds=3.0,
+        ),
+    ]
+
+    lines = against_windows(windows_against_segments(segments), cards)
+
+    assert [line.text for line in lines] == ["真正留下", "下一顆"]
+    assert lines[0].starts_seconds == pytest.approx(0.2)
+    assert lines[1].starts_seconds == pytest.approx(2.5)
+
+
+def test_speech_detector_intervals_remain_separate_measured_evidence() -> None:
+    """VAD evidence is preserved, but never fabricated from token lengths."""
+
+    from montagewright.transcript import detector_silences
+
+    assert detector_silences({"silences": []}) == []
+    assert detector_silences({
+        "silences": [
+            {"starts_seconds": 1.2344, "ends_seconds": 2.3456},
+            # SpeechDetector can finish with an open interval represented as
+            # a zero-length marker.  It is not a measured silence interval.
+            {"starts_seconds": 8.0, "ends_seconds": 8.0},
+            {"starts_seconds": "bad", "ends_seconds": 9.0},
+        ],
+    }) == [{"starts_seconds": 1.234, "ends_seconds": 2.346}]
+
+
+def test_transcript_cache_identity_includes_the_apple_speech_helper(
+    tmp_path, monkeypatch,
+) -> None:
+    """Changing the local timestamp contract cannot reuse an old card."""
+
+    import montagewright.transcript as transcript
+
+    executable = tmp_path / "Transcribe"
+    source = executable.with_suffix(".swift")
+    source.write_text("let detector = SpeechDetector(.high)\n", encoding="utf-8")
+    monkeypatch.setattr(transcript, "TOOL", executable)
+    before = transcript._transcript_version()
+
+    source.write_text("let detector = SpeechDetector(.medium)\n", encoding="utf-8")
+    after = transcript._transcript_version()
+
+    assert before != after
+
+
+def test_an_anomalous_apple_word_range_is_not_rewritten_without_evidence() -> None:
+    """A suspicious duration alone is not permission to alter Apple's clock."""
+
+    from montagewright.transcript import CutWindow, words_against_windows
+
+    card = {"words": [
+        {"text": "要", "starts_seconds": 2.46, "ends_seconds": 4.38},
+        {"text": "流", "starts_seconds": 4.38, "ends_seconds": 4.56},
+    ]}
+    moved = words_against_windows(
+        [CutWindow("A", 0.0, 6.0)], {"A": card},
+    )
+
+    assert moved[0].starts_seconds == pytest.approx(2.46)
+    assert moved[0].ends_seconds == pytest.approx(4.38)
 
 
 def test_a_cue_fills_at_the_speed_it_was_actually_said() -> None:

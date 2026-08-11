@@ -183,7 +183,37 @@ def test_an_edit_saved_from_the_browser_comes_back_on_the_measured_clock(
         assert [(one["at"], one["until"]) for one in back] == [
             (0.0, 0.6), (0.6, 1.3)
         ]
+        assert [one["timing_source"] for one in back] == [
+            "apple_audio_time_range", "apple_audio_time_range",
+        ]
+        assert all(one["timing_confidence"] == "unverified" for one in back)
+        assert all(not one["timing_locked"] for one in back)
         assert all(not path.exists() for path in stale)
+
+        # A timing edit is a different authority from a text correction.
+        # Once a person locks the clock, a later save must not silently move
+        # it back to Apple's measured word ranges.
+        locked = client.put("/api/runs/r1/subtitle-track", json={"lines": [{
+            "at": 0.125,
+            "until": 0.875,
+            "text": "在夏天吹頭髮",
+            "timing_source": "manual",
+            "timing_confidence": "human_locked",
+            "timing_locked": True,
+        }]})
+        assert locked.status_code == 200
+        assert locked.json()["timed"] == [{
+            "at": 0.125,
+            "until": 0.875,
+            "text": "在夏天吹頭髮",
+            "timing_source": "manual",
+            "timing_confidence": "human_locked",
+            "timing_locked": True,
+        }]
+        loaded = client.get("/api/runs/r1/subtitle-track")
+        assert loaded.status_code == 200
+        assert loaded.json()["lines"][0]["timing_locked"] is True
+        assert loaded.json()["lines"][0]["timing_source"] == "manual"
     finally:
         web.RUNS_ROOT = was
         web._transcript_map = held
@@ -2208,3 +2238,33 @@ def test_the_recogniser_is_asked_for_its_other_readings():
     # And that a candidate is evidence, not an answer.
     assert "候選是從聲音來的" in prompt
     assert "不是正確答案的保證" in prompt
+def test_old_transcript_with_apple_word_clock_migrates_without_retranscribing(
+    tmp_path,
+) -> None:
+    import json
+
+    from montagewright.transcript import ALIGNMENT_VERSION, CARD_VERSION, load
+
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({
+        "version": "montagewright-transcript-older",
+        "lines": [{
+            "text": "吹頭髮很熱，還會流汗。",
+            "speaker": "受訪者",
+            "starts_seconds": 99,
+            "ends_seconds": 100,
+        }],
+        "words": [
+            {"text": "吹頭髮很熱", "starts_seconds": 2.0, "ends_seconds": 3.0},
+            {"text": "還會流汗", "starts_seconds": 3.1, "ends_seconds": 4.0},
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    migrated = load(path)
+
+    assert migrated is not None
+    assert migrated["version"] == CARD_VERSION
+    assert migrated["timing"]["aligner"] == ALIGNMENT_VERSION
+    assert migrated["lines"][0]["starts_seconds"] == 2.0
+    assert migrated["lines"][0]["ends_seconds"] == 4.0
+    assert migrated["lines"][0]["timed_text"]

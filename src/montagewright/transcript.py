@@ -42,6 +42,7 @@ TOOL = Path(__file__).resolve().parents[2] / "tools" / "transcribe" / "transcrib
 # Below this a "word" is usually the recogniser splitting one syllable, and a
 # subtitle cannot sit on it.
 MIN_WORD_SECONDS = 0.04
+ALIGNMENT_VERSION = "corrected-character-clock-v1"
 
 
 class TranscriberMissing(RuntimeError):
@@ -54,6 +55,16 @@ class Word:
     starts_seconds: float
     ends_seconds: float
     confidence: float | None = None
+
+
+@dataclass(frozen=True)
+class CharacterTiming:
+    """One corrected character placed on Apple's measured audio clock."""
+
+    text: str
+    starts_seconds: float
+    ends_seconds: float
+    measured: bool = True
 
 
 @dataclass(frozen=True)
@@ -70,6 +81,16 @@ class Line:
     # a talking shot framed on whoever is not talking is the fault this is
     # here to make fixable.
     speaker: str = ""
+    # Timing is a separate authority from text. Apple supplies the measured
+    # audio clock; a person may explicitly lock a correction. Keeping this on
+    # the line lets Web, CLI and render make the same choice.
+    timing_source: str = "apple_audio_time_range"
+    timing_confidence: str = "unverified"
+    timing_locked: bool = False
+    # Gemini owns the corrected text; Apple owns the clock.  Keeping their
+    # character-level join is what lets a later edit retain only the words a
+    # source window actually contains instead of estimating by string length.
+    timed_text: tuple[CharacterTiming, ...] = ()
 
     @property
     def duration(self) -> float:
@@ -147,6 +168,34 @@ def words_of(payload: dict[str, Any]) -> list[Word]:
                 )
             )
     return sorted(words, key=lambda word: word.starts_seconds)
+
+
+def detector_silences(payload: dict[str, Any]) -> list[dict[str, float]]:
+    """Preserve the macOS 26 SpeechDetector evidence without inventing it.
+
+    SpeechDetector gates the transcriber and may report no boundaries at all,
+    particularly under continuous environmental noise.  An empty list means
+    "no detector evidence", not "there was no silence".  Keep the measured
+    intervals separate from punctuation pauses so a future alignment stage
+    can use them without changing Apple's word ``audioTimeRange`` values.
+    """
+
+    found: list[dict[str, float]] = []
+    for entry in payload.get("silences", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            start = float(entry["starts_seconds"])
+            end = float(entry["ends_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start < 0 or end <= start:
+            continue
+        found.append({
+            "starts_seconds": round(start, 3),
+            "ends_seconds": round(end, 3),
+        })
+    return sorted(found, key=lambda item: item["starts_seconds"])
 
 
 def hesitations(payload: dict[str, Any]) -> list[tuple[float, float, str, list[str]]]:
@@ -284,7 +333,53 @@ def load(path: Path) -> dict[str, Any] | None:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return payload if payload.get("version") == CARD_VERSION else None
+    if payload.get("version") == CARD_VERSION:
+        return payload
+
+    # The character clock added in this version is derived entirely from
+    # evidence older cards already persisted: Apple's word audioTimeRanges
+    # and Gemini's corrected lines. Re-align those locally instead of
+    # throwing away a paid transcript and hearing the same file twice again.
+    # Cards without that evidence still fail closed and regenerate normally.
+    words = words_in(payload)
+    raw_lines = payload.get("lines") or []
+    said = [str(line.get("text", "")).strip() for line in raw_lines]
+    if not words or not said or any(not text for text in said):
+        return None
+    from montagewright.backfill import across_lines
+
+    timings = across_lines(said, words)
+    if len(timings) != len(raw_lines) or any(
+        end <= start for start, end, _ in timings
+    ):
+        return None
+    migrated_lines = []
+    for line, (start, end, clock) in zip(raw_lines, timings):
+        migrated_lines.append({
+            **line,
+            "starts_seconds": round(start, 3),
+            "ends_seconds": round(end, 3),
+            "timing_source": "apple_audio_time_range",
+            "timing_confidence": str(line.get("timing_confidence", "unverified")),
+            "timing_locked": bool(line.get("timing_locked", False)),
+            "timed_text": [
+                {
+                    "text": piece.text,
+                    "starts_seconds": round(piece.starts_seconds, 4),
+                    "ends_seconds": round(piece.ends_seconds, 4),
+                    "measured": piece.measured,
+                }
+                for piece in clock
+            ],
+        })
+    timing = dict(payload.get("timing") or {})
+    timing["aligner"] = ALIGNMENT_VERSION
+    return {
+        **payload,
+        "version": CARD_VERSION,
+        "lines": migrated_lines,
+        "timing": timing,
+    }
 
 
 def save(card: dict[str, Any], path: Path) -> Path:
@@ -344,6 +439,7 @@ def words_for(
                 "starts_seconds": round(word.starts_seconds, 3),
                 "ends_seconds": round(word.ends_seconds, 3),
                 "confidence": word.confidence,
+                "timing_source": "apple_audio_time_range",
             }
             for word in found
         ]
@@ -359,6 +455,21 @@ def lines_of(card: dict[str, Any]) -> list[Line]:
             ends_seconds=float(entry.get("ends_seconds", 0.0)),
             heard=str(entry.get("heard", "")),
             speaker=str(entry.get("speaker", "")),
+            timing_source=str(
+                entry.get("timing_source", "apple_audio_time_range")
+            ),
+            timing_confidence=str(entry.get("timing_confidence", "unverified")),
+            timing_locked=bool(entry.get("timing_locked", False)),
+            timed_text=tuple(
+                CharacterTiming(
+                    text=str(piece.get("text", "")),
+                    starts_seconds=float(piece.get("starts_seconds", 0.0)),
+                    ends_seconds=float(piece.get("ends_seconds", 0.0)),
+                    measured=bool(piece.get("measured", False)),
+                )
+                for piece in entry.get("timed_text", []) or []
+                if piece.get("text")
+            ),
         )
         for entry in card.get("lines", []) or []
         if entry.get("text")
@@ -413,7 +524,7 @@ def _within(line: Line, *, from_seconds: float, to_seconds: float) -> str:
     # clause, so a sentence that started on time started two words late.
     if before > 0.02:
         moved = joint_near(head)
-        if 0 <= moved + 1 < tail:
+        if moved >= 0 and moved + 1 < tail:
             head = moved + 1
     if after > 0.02:
         moved = joint_near(tail)
@@ -426,9 +537,241 @@ def _within(line: Line, *, from_seconds: float, to_seconds: float) -> str:
     return said if len(said) >= 3 else ""
 
 
-def against_cut(
-    shots: list[dict],
-    rhythm: dict[str, dict],
+def _portion_within(
+    line: Line, *, from_seconds: float, to_seconds: float
+) -> tuple[str, float, float]:
+    """Return the corrected characters actually audible in a source window.
+
+    Positive-duration characters are speech evidence. Zero-duration pieces
+    are punctuation or insertions and travel with the measured characters
+    around them; they never create an audible span of their own.
+    """
+
+    clock = line.timed_text
+    if not clock:
+        said = _within(line, from_seconds=from_seconds, to_seconds=to_seconds)
+        if not said:
+            return "", 0.0, 0.0
+        # Legacy cards have no character clock. Keep their old conservative
+        # timing until cache invalidation regenerates them with timed_text.
+        return (
+            said,
+            max(line.starts_seconds, from_seconds),
+            min(line.ends_seconds, to_seconds),
+        )
+
+    audible = [
+        index
+        for index, piece in enumerate(clock)
+        if piece.ends_seconds > piece.starts_seconds
+        and piece.ends_seconds > from_seconds
+        and piece.starts_seconds < to_seconds
+    ]
+    if not audible:
+        return "", 0.0, 0.0
+
+    head, tail = audible[0], audible[-1] + 1
+    # Punctuation immediately following the last audible character belongs
+    # to it. Stop before the next spoken character, which belongs outside the
+    # cut even when its punctuation shares the same timestamp.
+    while tail < len(clock):
+        piece = clock[tail]
+        if piece.ends_seconds > piece.starts_seconds:
+            break
+        if piece.starts_seconds > to_seconds:
+            break
+        tail += 1
+
+    said = "".join(piece.text for piece in clock[head:tail]).strip()
+    if len(said) < 2:
+        return "", 0.0, 0.0
+    chosen = [clock[index] for index in audible]
+    return (
+        said,
+        max(from_seconds, chosen[0].starts_seconds),
+        min(to_seconds, chosen[-1].ends_seconds),
+    )
+
+
+@dataclass(frozen=True)
+class CutWindow:
+    """One source window on the delivery timeline.
+
+    Selection is an editorial proposal.  Action snapping, beat grounding and
+    source-bound clamping can all change its in-point or duration before a
+    frame is rendered.  Subtitles must therefore consume these resolved
+    windows, not reconstruct the picture clock from the proposal.
+    """
+
+    source_id: str
+    in_seconds: float
+    duration_seconds: float
+
+
+class DialogueBoundaryError(RuntimeError):
+    """A final cut still crosses speech and has no nearby safe boundary."""
+
+
+def _dialogue_boundaries(card: dict[str, Any]) -> tuple[list[float], list[Line]]:
+    """Measured source-clock positions where an editor may safely cut."""
+
+    lines = lines_of(card)
+    boundaries: set[float] = {
+        edge
+        for line in lines
+        for edge in (line.starts_seconds, line.ends_seconds)
+    }
+    for line in lines:
+        for piece in line.timed_text:
+            if piece.text in _JOINTS:
+                boundaries.add(piece.starts_seconds)
+
+    words = words_in(card)
+    for before, after in zip(words, words[1:]):
+        # A short acoustic gap is a real breath/word boundary.  Both edges
+        # are useful: an out-point belongs at the earlier edge, while an
+        # in-point generally belongs at the later one.
+        if after.starts_seconds - before.ends_seconds >= 0.12:
+            boundaries.add(before.ends_seconds)
+            boundaries.add(after.starts_seconds)
+    return sorted(boundaries), lines
+
+
+def snap_edl_to_dialogue(
+    edl,
+    cards: Mapping[str, dict | None],
+    *,
+    max_snap_seconds: float = 0.6,
+):
+    """Snap final source boundaries away from unfinished dialogue.
+
+    This deliberately runs after rhythm/action grounding.  Earlier advice can
+    be invalidated by either stage; this is the release gate over the actual
+    windows the renderer is about to consume.  It returns a new EDL, notes,
+    and unresolved faults.  Callers must not render when faults is non-empty.
+    """
+
+    changed = []
+    notes: list[str] = []
+    faults: list[str] = []
+    for clip in edl.clips:
+        # A visual shot may come from a file that also contains speech. If
+        # its source audio is discarded, that speech must not constrain the
+        # picture cut. Conversely an explicit intentional_cut is an authored
+        # exception, not a fault for the release gate to undo.
+        if getattr(clip, "audio_role", "auto") not in {"auto", "narrative"}:
+            changed.append(clip)
+            continue
+        if getattr(clip, "audio_completion", "none") == "intentional_cut":
+            changed.append(clip)
+            continue
+        card = cards.get(clip.source_id)
+        if not card:
+            changed.append(clip)
+            continue
+        boundaries, lines = _dialogue_boundaries(card)
+        start = float(clip.approx_in_seconds)
+        end = float(clip.approx_out_seconds)
+
+        def inside_dialogue(at: float) -> bool:
+            return any(
+                line.starts_seconds + 0.04 < at < line.ends_seconds - 0.04
+                for line in lines
+            )
+
+        def nearest(at: float, *, opening: bool) -> float | None:
+            candidates = [
+                edge for edge in boundaries
+                if abs(edge - at) <= max_snap_seconds
+            ]
+            if not candidates:
+                return None
+            # Equal-distance in-points prefer the later word; out-points keep
+            # the earlier word. This avoids adding speech the selection did
+            # not ask for merely because two silence edges were equidistant.
+            return min(
+                candidates,
+                key=lambda edge: (abs(edge - at), -edge if opening else edge),
+            )
+
+        new_start, new_end = start, end
+        if inside_dialogue(start):
+            moved = nearest(start, opening=True)
+            if moved is None:
+                faults.append(
+                    f"{clip.clip_id}: in {start:.3f}s cuts active dialogue in "
+                    f"{clip.source_id}; no measured pause within "
+                    f"{max_snap_seconds:.2f}s"
+                )
+            else:
+                new_start = moved
+        if inside_dialogue(end):
+            moved = nearest(end, opening=False)
+            if moved is None:
+                faults.append(
+                    f"{clip.clip_id}: out {end:.3f}s cuts active dialogue in "
+                    f"{clip.source_id}; no measured pause within "
+                    f"{max_snap_seconds:.2f}s"
+                )
+            else:
+                new_end = moved
+
+        usable = clip.usable_window
+        if usable is not None:
+            new_start = max(new_start, usable[0])
+            new_end = min(new_end, usable[1])
+        if new_end - new_start < 0.35:
+            faults.append(
+                f"{clip.clip_id}: dialogue-safe snap would leave only "
+                f"{new_end - new_start:.3f}s"
+            )
+            changed.append(clip)
+            continue
+        if abs(new_start - start) > 1e-6 or abs(new_end - end) > 1e-6:
+            notes.append(
+                f"{clip.clip_id}: dialogue boundary snapped "
+                f"{start:.3f}–{end:.3f}s to {new_start:.3f}–{new_end:.3f}s"
+            )
+            clip = clip.model_copy(update={
+                "approx_in_seconds": new_start,
+                "approx_out_seconds": new_end,
+            })
+        changed.append(clip)
+    return edl.model_copy(update={"clips": changed}), notes, faults
+
+
+def windows_against_cut(
+    shots: list[dict], rhythm: dict[str, dict],
+) -> list[CutWindow]:
+    """Legacy/editorial windows for callers without a resolved render plan."""
+
+    return [
+        CutWindow(
+            source_id=str(shot.get("source_id", "")),
+            in_seconds=float(shot.get("start_seconds", 0.0)),
+            duration_seconds=float(
+                rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)
+            ),
+        )
+        for index, shot in enumerate(shots)
+    ]
+
+
+def windows_against_segments(segments) -> list[CutWindow]:
+    """The authoritative windows that the renderer actually consumed."""
+
+    return [
+        CutWindow(
+            source_id=str(segment.source.source_id),
+            in_seconds=float(segment.in_seconds),
+            duration_seconds=float(segment.duration_seconds),
+        )
+        for segment in segments
+    ]
+
+
+def against_windows(
+    windows: list[CutWindow],
     # Read-only, and a Mapping rather than a dict so a caller holding plain
     # cards can pass them: dict is invariant in its value type, so
     # dict[str, dict] is not a dict[str, dict | None].
@@ -437,7 +780,7 @@ def against_cut(
     # for one it cannot read. Both mean the same thing here: no lines.
     cards: Mapping[str, dict | None],
 ) -> list[Line]:
-    """Every transcribed line, moved onto the timeline the shots landed on.
+    """Every transcribed line, moved onto resolved delivery windows.
 
     A line is timed against the take it was spoken in, and the cut kept two
     seconds of that take starting somewhere in the middle. A subtitle file
@@ -451,21 +794,42 @@ def against_cut(
 
     timed: list[Line] = []
     cursor = 0.0
-    for index, shot in enumerate(shots):
-        seconds = float(rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0))
-        card = cards.get(str(shot.get("source_id", "")))
-        start = float(shot.get("start_seconds", 0.0))
+    for window in windows:
+        seconds = window.duration_seconds
+        card = cards.get(window.source_id)
+        start = window.in_seconds
+        measured_words = words_in(card or {})
         for line in lines_of(card or {}):
-            if line.ends_seconds <= start:
+            inside = [
+                word for word in measured_words
+                if word.ends_seconds > line.starts_seconds
+                and word.starts_seconds < line.ends_seconds
+            ]
+            audible_start = max(
+                line.starts_seconds,
+                inside[0].starts_seconds if inside else line.starts_seconds,
+            )
+            audible = Line(
+                text=line.text,
+                starts_seconds=audible_start,
+                ends_seconds=line.ends_seconds,
+                heard=line.heard,
+                speaker=line.speaker,
+                timing_source=line.timing_source,
+                timing_confidence=line.timing_confidence,
+                timing_locked=line.timing_locked,
+                timed_text=line.timed_text,
+            )
+            if audible.ends_seconds <= start:
                 continue
-            if line.starts_seconds >= start + seconds:
+            if audible.starts_seconds >= start + seconds:
                 continue
             # A shot can hold part of a sentence. Clipping the window and
             # not the words put five seconds of talking on screen for one,
             # so the whole sentence flashed past under a shot that only
             # caught its tail.
-            said = _within(
-                line, from_seconds=start, to_seconds=start + seconds
+            said, said_start, said_end = _portion_within(
+                audible, from_seconds=start, to_seconds=start + seconds
             )
             if not said:
                 continue
@@ -473,20 +837,120 @@ def against_cut(
                 Line(
                     text=said,
                     starts_seconds=cursor
-                    + max(0.0, line.starts_seconds - start),
+                    + max(0.0, said_start - start),
                     ends_seconds=cursor
-                    + min(seconds, line.ends_seconds - start),
-                    heard=line.heard,
-                    speaker=line.speaker,
+                    + min(seconds, said_end - start),
+                    heard=audible.heard,
+                    speaker=audible.speaker,
+                    timing_source=audible.timing_source,
+                    timing_confidence=audible.timing_confidence,
+                    timing_locked=audible.timing_locked,
+                    timed_text=tuple(
+                        CharacterTiming(
+                            text=piece.text,
+                            starts_seconds=cursor
+                            + max(0.0, piece.starts_seconds - start),
+                            ends_seconds=cursor
+                            + min(seconds, piece.ends_seconds - start),
+                            measured=piece.measured,
+                        )
+                        for piece in audible.timed_text
+                        if piece.ends_seconds > start
+                        and piece.starts_seconds < start + seconds
+                    ),
                 )
             )
         cursor += seconds
     return timed
 
 
-def words_against_cut(
+def against_audio_assignments(
+    assignments, cards: Mapping[str, dict | None]
+) -> list[Line]:
+    """Subtitles follow narrative audio, never the pictures covering it."""
+
+    laid: list[Line] = []
+    for assignment in assignments:
+        if assignment.role != "narrative":
+            continue
+        local = against_windows([
+            CutWindow(
+                source_id=assignment.source.source_id,
+                in_seconds=assignment.in_seconds,
+                duration_seconds=assignment.duration_seconds,
+            )
+        ], cards)
+        laid.extend(
+            Line(
+                text=line.text,
+                starts_seconds=assignment.timeline_in_seconds + line.starts_seconds,
+                ends_seconds=assignment.timeline_in_seconds + line.ends_seconds,
+                heard=line.heard,
+                speaker=line.speaker,
+                timing_source=line.timing_source,
+                timing_confidence=line.timing_confidence,
+                timing_locked=line.timing_locked,
+                timed_text=tuple(
+                    CharacterTiming(
+                        text=piece.text,
+                        starts_seconds=(
+                            assignment.timeline_in_seconds
+                            + piece.starts_seconds
+                        ),
+                        ends_seconds=(
+                            assignment.timeline_in_seconds
+                            + piece.ends_seconds
+                        ),
+                        measured=piece.measured,
+                    )
+                    for piece in line.timed_text
+                ),
+            )
+            for line in local
+        )
+    return sorted(laid, key=lambda line: line.starts_seconds)
+
+
+def words_against_audio_assignments(
+    assignments, cards: Mapping[str, dict | None]
+) -> list[Word]:
+    """Karaoke/word evidence on the same independent narrative clock."""
+
+    laid: list[Word] = []
+    for assignment in assignments:
+        if assignment.role != "narrative":
+            continue
+        local = words_against_windows([
+            CutWindow(
+                source_id=assignment.source.source_id,
+                in_seconds=assignment.in_seconds,
+                duration_seconds=assignment.duration_seconds,
+            )
+        ], cards)
+        laid.extend(
+            Word(
+                text=word.text,
+                starts_seconds=assignment.timeline_in_seconds + word.starts_seconds,
+                ends_seconds=assignment.timeline_in_seconds + word.ends_seconds,
+                confidence=word.confidence,
+            )
+            for word in local
+        )
+    return sorted(laid, key=lambda word: word.starts_seconds)
+
+
+def against_cut(
     shots: list[dict],
     rhythm: dict[str, dict],
+    cards: Mapping[str, dict | None],
+) -> list[Line]:
+    """Compatibility adapter for an edit without a resolved render plan."""
+
+    return against_windows(windows_against_cut(shots, rhythm), cards)
+
+
+def words_against_windows(
+    windows: list[CutWindow],
     cards: Mapping[str, dict | None],
 ) -> list[Word]:
     """Every measured word, moved onto the timeline the shots landed on.
@@ -498,10 +962,10 @@ def words_against_cut(
 
     moved: list[Word] = []
     cursor = 0.0
-    for index, shot in enumerate(shots):
-        seconds = float(rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0))
-        card = cards.get(str(shot.get("source_id", "")))
-        start = float(shot.get("start_seconds", 0.0))
+    for window in windows:
+        seconds = window.duration_seconds
+        card = cards.get(window.source_id)
+        start = window.in_seconds
         for word in words_in(card or {}):
             if word.ends_seconds <= start:
                 continue
@@ -515,6 +979,16 @@ def words_against_cut(
             ))
         cursor += seconds
     return moved
+
+
+def words_against_cut(
+    shots: list[dict],
+    rhythm: dict[str, dict],
+    cards: Mapping[str, dict | None],
+) -> list[Word]:
+    """Compatibility adapter for an edit without a resolved render plan."""
+
+    return words_against_windows(windows_against_cut(shots, rhythm), cards)
 
 
 def _hearing_schema() -> dict[str, Any]:
@@ -662,18 +1136,30 @@ def _schema() -> dict[str, Any]:
 
 
 def _transcript_version() -> str:
-    """Invalidate cached words when either listening contract changes."""
+    """Invalidate cached words when either listening contract changes.
+
+    The Swift helper is part of the data contract, not merely an executable
+    detail: changing its SpeechTranscriber attributes, detector configuration
+    or clock conversion changes every timestamp in the resulting card.  It
+    therefore belongs in the same content identity as the response schemas
+    and prompts.
+    """
 
     import hashlib
 
     prompts = Path(__file__).resolve().parent / "prompts"
     payload = json.dumps(
-        {"hearing": _hearing_schema(), "correction": _schema()},
+        {
+            "hearing": _hearing_schema(),
+            "correction": _schema(),
+            "alignment": ALIGNMENT_VERSION,
+        },
         ensure_ascii=False,
         sort_keys=True,
     )
     payload += (prompts / "hearing_zh-TW.txt").read_text(encoding="utf-8")
     payload += (prompts / "transcript_zh-TW.txt").read_text(encoding="utf-8")
+    payload += TOOL.with_suffix(".swift").read_text(encoding="utf-8")
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
     return f"montagewright-transcript-{digest}"
 
@@ -721,6 +1207,7 @@ def describe(
     heard = hear(audio or source, locale=locale)
     words = words_of(heard)
     silences = gaps(words)
+    vad_silences = detector_silences(heard)
     # What the recogniser wrote, without a single timestamp on it. Its
     # confidence stays, because that is a statement about itself rather than
     # about the clock, and it is a good one -- the two characters misheard in
@@ -877,7 +1364,7 @@ def describe(
     timings = across_lines(said, words)
 
     lines = []
-    for entry, text, (start, end, _) in zip(
+    for entry, text, (start, end, timed_text) in zip(
         payload.get("lines", []) or [], said, timings
     ):
         if end <= start:
@@ -893,6 +1380,20 @@ def describe(
             "speaker": str(entry.get("speaker", "")).strip(),
             "starts_seconds": round(start, 3),
             "ends_seconds": round(end, 3),
+            "timing_source": "apple_audio_time_range",
+            # Apple exposes no boundary-confidence score. Lexical confidence
+            # is intentionally not relabelled as timing confidence.
+            "timing_confidence": "unverified",
+            "timing_locked": False,
+            "timed_text": [
+                {
+                    "text": piece.text,
+                    "starts_seconds": round(piece.starts_seconds, 4),
+                    "ends_seconds": round(piece.ends_seconds, 4),
+                    "measured": piece.measured,
+                }
+                for piece in timed_text
+            ],
         })
 
     card = {
@@ -906,6 +1407,19 @@ def describe(
         # talking shot lands mid-syllable, and every consumer of this card
         # needs them, not just the one that wrote them.
         "silences": silences,
+        # Raw intervals reported by macOS 26 SpeechDetector.  They are
+        # evidence, not a promise: Apple may return no intervals at all, so
+        # consumers must not infer that an empty list means continuous speech
+        # or manufacture a boundary from token duration.
+        "vad_silences": vad_silences,
+        "timing": {
+            "raw_source": "apple_speech_transcriber.audioTimeRange",
+            "resolved_source": "apple_speech_transcriber.audioTimeRange",
+            "verification": "unverified",
+            "detector": "apple_speech_detector.high",
+            "detector_intervals": len(vad_silences),
+            "aligner": None,
+        },
         # When each word was said. Measured locally and used here to write
         # the prompt and find the silences, then thrown away -- which put
         # word-level subtitles out of reach of a card that already knew the
@@ -917,6 +1431,7 @@ def describe(
                 "starts_seconds": round(word.starts_seconds, 3),
                 "ends_seconds": round(word.ends_seconds, 3),
                 "confidence": word.confidence,
+                "timing_source": "apple_audio_time_range",
             }
             for word in words
         ],

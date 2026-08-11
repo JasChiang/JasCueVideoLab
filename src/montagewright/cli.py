@@ -622,7 +622,7 @@ def command_render(args: argparse.Namespace) -> int:
                 ),
                 motion=tuple(motion_of(source_id) or ()),
                 crop_width=min(1.0, ASPECTS[args.aspect] / _aspect(proxy)),
-                speech=_speech_lines(transcripts.get(source_id)),
+                speech=_speech_lines(source_id, transcripts.get(source_id)),
             )
         )
 
@@ -756,6 +756,7 @@ def command_render(args: argparse.Namespace) -> int:
                 one.candidate_id
                 for one in brief_document.graphics_candidates()
             ],
+            audio_span_ids=list(_audio_spans(transcripts)),
         ),
     )
     chose = _asked(
@@ -795,15 +796,23 @@ def command_render(args: argparse.Namespace) -> int:
     for note in disagreed:
         print(f"  {note}", flush=True)
 
-    edl, snaps = _edl_from_selection(selection, rushes, cards)
+    edl, snaps = _edl_from_selection(
+        selection, rushes, cards, transcripts=transcripts
+    )
     if snaps:
         print(f"cut on action: {len(snaps)} in-points moved", flush=True)
     found = {path.stem: path for path in sources_paths}
+    audio_source_ids = {audio.source_id for audio in edl.audio_clips}
     sources = {
         shot["source_id"]: probe(shot["source_id"], found[shot["source_id"]])
         for shot in selection["shots"]
         if shot["source_id"] in found
     }
+    sources.update({
+        source_id: probe(source_id, found[source_id])
+        for source_id in audio_source_ids
+        if source_id in found and source_id not in sources
+    })
     if args.music_map:
         grid = load_beat_grid(args.music_map)
     elif args.music:
@@ -859,6 +868,7 @@ def command_render(args: argparse.Namespace) -> int:
             keep_voice=bool(transcripts),
             under_speech=str(direction.get("music_under_speech") or "duck"),
             client=client,
+            transcripts=transcripts,
         )
 
     result, plan, report, resolved = cut(edl, sources, rhythm_context)
@@ -974,6 +984,64 @@ def command_render(args: argparse.Namespace) -> int:
                   f"({len(verdict.issues)} issues) — {verdict.overall[:70]}",
                   flush=True,
               )
+              audio_issues = [
+                  issue for issue in verdict.issues
+                  if issue.severity in {"major", "blocking"}
+                  and issue.issue_type == "audio_content"
+              ]
+              if audio_issues:
+                  # A wrong sentence is not repaired by replacing the image
+                  # at its timecode. Re-run the joint selection pass so the
+                  # canonical transcript span and the B-roll covering it can
+                  # change together, then render before the next review.
+                  feedback = "\n".join(
+                      f"- {issue.description}；請改成：{issue.fix}"
+                      for issue in audio_issues
+                  )
+                  try:
+                      ledger.check()
+                      selection, _ = select_shots(
+                          material,
+                          direction,
+                          brief=(
+                              brief
+                              + "\n\n## 上一版聲音審核未通過\n"
+                              + feedback
+                          ),
+                          cache=cache,
+                          client=client,
+                          ledger=ledger,
+                          graphic_candidates=brief_document.graphics_candidates(),
+                      )
+                      _decide(work, "selection", chose, selection)
+                      edl, snaps = _edl_from_selection(
+                          selection, rushes, cards, transcripts=transcripts
+                      )
+                      sources = {
+                          shot["source_id"]: probe(
+                              shot["source_id"], found[shot["source_id"]]
+                          )
+                          for shot in selection["shots"]
+                          if shot["source_id"] in found
+                      }
+                      sources.update({
+                          audio.source_id: probe(
+                              audio.source_id, found[audio.source_id]
+                          )
+                          for audio in edl.audio_clips
+                          if audio.source_id in found
+                          and audio.source_id not in sources
+                      })
+                      rhythm_context = _rhythm_context(selection, cards)
+                      result, plan, report, resolved = cut(
+                          edl, sources, rhythm_context
+                      )
+                  except BudgetSpent as error:
+                      stopped = str(error)
+                      break
+                  report.target_seconds = float(direction["target_seconds"])
+                  undelivered = len(audio_issues)
+                  continue
               # Worked out before the gate, not after it. The shot reviewer's
               # findings used to be computed on the far side of an early
               # return, so an approving film reviewer threw them away
@@ -1150,7 +1218,9 @@ def command_render(args: argparse.Namespace) -> int:
               # Everything downstream is rebuilt from the amended selection, so
               # the next round renders a different film rather than re-reading
               # the same one.
-              edl, snaps = _edl_from_selection(selection, rushes, cards)
+              edl, snaps = _edl_from_selection(
+                  selection, rushes, cards, transcripts=transcripts
+              )
               sources = {
                   shot["source_id"]: probe(
                       shot["source_id"], found[shot["source_id"]]
@@ -1158,6 +1228,14 @@ def command_render(args: argparse.Namespace) -> int:
                   for shot in selection["shots"]
                   if shot["source_id"] in found
               }
+              sources.update({
+                  audio.source_id: probe(
+                      audio.source_id, found[audio.source_id]
+                  )
+                  for audio in edl.audio_clips
+                  if audio.source_id in found
+                  and audio.source_id not in sources
+              })
               rhythm_context = _rhythm_context(selection, cards)
               try:
                   ledger.check()
@@ -1240,19 +1318,30 @@ def command_render(args: argparse.Namespace) -> int:
     # is what gets burned.
     if transcripts and args.subtitles != "none":
         from montagewright.transcript import (
-            against_cut, to_srt, words_against_cut,
+            against_audio_assignments, against_windows, to_srt,
+            windows_against_segments, words_against_audio_assignments,
+            words_against_windows,
         )
 
-        said = against_cut(
-            selection["shots"],
-            {k: v for k, v in report.rhythm_decisions.items()},
-            transcripts,
-        )
+        # The render plan is the picture's clock. Selection can differ after
+        # action snapping, beat grounding or source clamping; rebuilding the
+        # subtitle clock from it made captions drift exactly on those cuts.
+        subtitle_windows = windows_against_segments(plan.segments)
+        if plan.audio_assignments:
+            said = against_audio_assignments(plan.audio_assignments, transcripts)
+            subtitle_words = words_against_audio_assignments(
+                plan.audio_assignments, transcripts
+            )
+        else:
+            said = against_windows(subtitle_windows, transcripts)
+            subtitle_words = words_against_windows(subtitle_windows, transcripts)
         try:
             from montagewright.subtitles import as_cues
 
             wide, tall = plan.output_size
-            said = as_cues(said, args.aspect, wide, tall)
+            said = as_cues(
+                said, args.aspect, wide, tall, words=subtitle_words,
+            )
         except Exception:
             pass
         if said:
@@ -1273,11 +1362,7 @@ def command_render(args: argparse.Namespace) -> int:
                         output / "deliverable-subtitled.mp4",
                         aspect=args.aspect, work=work / "subs",
                         style=typeset.look(args.subtitle_look),
-                        words=words_against_cut(
-                            selection["shots"],
-                            report.rhythm_decisions,
-                            transcripts,
-                        ),
+                        words=subtitle_words,
                     )
                     print(f"burned in   {burned}", flush=True)
                 except NoFontHere as error:
@@ -1305,10 +1390,12 @@ def command_render(args: argparse.Namespace) -> int:
             if args.timeline in {flavour, "both"}:
                 path = output / f"timeline.{suffix}"
                 laid_bed = output / "bed-as-laid.m4a"
+                laid_voice = output / "voice-as-laid.m4a"
                 path.write_text(
                     build(plan, payload, name=output.name,
                           width=width, height=height,
                           music=laid_bed if laid_bed.exists() else args.music,
+                          voice=laid_voice if laid_voice.exists() else None,
                           graphics=(
                               output / "graphics-overlay.mov"
                               if (output / "graphics-overlay.mov").exists()
@@ -1332,7 +1419,9 @@ def _suffix(rushes: Path, stem: str) -> str:
     return ".mp4"
 
 
-def _speech_lines(card: dict | None, limit: int = 40) -> tuple[str, ...]:
+def _speech_lines(
+    source_id: str | dict, card: dict | None = None, limit: int = 40
+) -> tuple[str, ...]:
     """The soundbites, as the planner needs to read them.
 
     A window out of an interview is chosen because of a sentence, so the
@@ -1341,15 +1430,93 @@ def _speech_lines(card: dict | None, limit: int = 40) -> tuple[str, ...]:
     wrong, and with its seconds, because they are what the shot's length is.
     """
 
+    # Keep the small helper source-compatible for callers that only need the
+    # prose list; production supplies the source ID so Gemini can return a
+    # stable canonical span reference.
+    if isinstance(source_id, dict):
+        card, source_id = source_id, "source"
     if not card:
         return ()
+    return tuple(
+        f"`{span_id}` "
+        f"{span['in_seconds']:.1f}-{span['out_seconds']:.1f}s"
+        f"（{span['speaker'] or '未標'}）{span['text']}"
+        + ("〔連續多行〕" if len(span["line_ids"]) > 1 else "")
+        for span_id, span in _audio_spans_for_source(
+            str(source_id), card, limit=limit
+        ).items()
+    )
+
+
+def _audio_spans_for_source(
+    source_id: str, card: dict, *, limit: int = 40,
+    max_gap_seconds: float = 1.2, max_span_seconds: float = 14.0,
+) -> dict[str, dict]:
+    """Canonical source-contiguous soundbites available to the planner.
+
+    Apple ASR may split one thought across several lines.  Exposing only the
+    lines makes the planner either cut the sentence short or lay several
+    independently timed clips.  Alongside every original line, expose one
+    deterministic run for adjacent lines by the same speaker.  The run is a
+    single source window: Gemini may choose it, but cannot reorder, rewrite,
+    or splice non-adjacent words.
+    """
+
     from montagewright.transcript import lines_of
 
-    return tuple(
-        f"{line.starts_seconds:.1f}-{line.ends_seconds:.1f}s"
-        f"（{line.speaker or '未標'}）{line.text}"
-        for line in lines_of(card)[:limit]
-    )
+    lines = lines_of(card)[:limit]
+    made: dict[str, dict] = {}
+
+    def add(first: int, last: int) -> None:
+        chosen = lines[first:last + 1]
+        span_id = (
+            f"{source_id}:t{first:02d}"
+            if first == last else f"{source_id}:t{first:02d}-t{last:02d}"
+        )
+        made[span_id] = {
+            "source_id": source_id,
+            "in_seconds": chosen[0].starts_seconds,
+            "out_seconds": chosen[-1].ends_seconds,
+            "speaker": chosen[0].speaker,
+            "text": " ".join(one.text.strip() for one in chosen if one.text.strip()),
+            "line_ids": [f"{source_id}:t{index:02d}" for index in range(first, last + 1)],
+            "kind": "line" if first == last else "continuous_turn",
+        }
+
+    for index in range(len(lines)):
+        add(index, index)
+
+    run_start = 0
+    while run_start < len(lines):
+        run_end = run_start
+        while run_end + 1 < len(lines):
+            current, following = lines[run_end], lines[run_end + 1]
+            same_speaker = (current.speaker or "") == (following.speaker or "")
+            small_gap = (
+                following.starts_seconds - current.ends_seconds
+                <= max_gap_seconds
+            )
+            within_cap = (
+                following.ends_seconds - lines[run_start].starts_seconds
+                <= max_span_seconds
+            )
+            if not (same_speaker and small_gap and within_cap):
+                break
+            run_end += 1
+        if run_end > run_start:
+            add(run_start, run_end)
+        run_start = run_end + 1
+
+    return made
+
+
+def _audio_spans(cards: dict[str, dict]) -> dict[str, dict]:
+    """Canonical transcript spans Gemini may place on the edit timeline."""
+
+    made: dict[str, dict] = {}
+    for source_id, card in cards.items():
+        made.update(_audio_spans_for_source(source_id, card))
+    return made
 
 
 def _subject_line(box, source_aspect: float, target_aspect: float) -> str:
@@ -1584,7 +1751,8 @@ def _look_boxes(card: dict, reframe) -> list[tuple[float, float, float]]:
 
 
 def _edl_from_selection(
-    selection: dict, rushes: Path, cards: dict[str, Path]
+    selection: dict, rushes: Path, cards: dict[str, Path], *,
+    transcripts: dict[str, dict] | None = None,
 ) -> tuple[EDL, dict[str, str]]:
     clips = []
     snaps: dict[str, str] = {}
@@ -1634,6 +1802,9 @@ def _edl_from_selection(
                 approx_out_seconds=start + wanted,
                 in_looks_like=subject_of(shot),
                 energy_intent=shot.get("energy", "medium"),
+                audio_role=shot.get("audio_role", "auto"),
+                audio_completion=shot.get("audio_completion", "none"),
+                picture_role=shot.get("picture_role", "primary_action"),
                 reframe=reframe,
                 # Carried on the clip so the layers after this one can see
                 # it. Rhythm stretches shots to land on beats and the
@@ -1650,7 +1821,59 @@ def _edl_from_selection(
                 usable_to_seconds=(window[1] if window else 0.0),
             )
         )
-    return EDL(project_id=rushes.name, clips=clips), snaps
+    from montagewright.schema import AudioClip
+
+    available_audio = _audio_spans(transcripts or {})
+    audio_clips = []
+    speaker_sync: dict[int, tuple[float, str]] = {}
+    for assignment in selection.get("audio_assignments") or []:
+        span_id = str(assignment.get("audio_span_id") or "")
+        span = available_audio.get(span_id)
+        shot_index = int(assignment.get("starts_at_shot_index", -1))
+        if span is None or not 0 <= shot_index < len(clips):
+            raise ValueError(f"cannot resolve audio assignment {span_id!r}")
+        picture = clips[shot_index]
+        if picture.picture_role == "speaker":
+            if picture.source_id != str(span["source_id"]):
+                raise ValueError(
+                    f"speaker picture {picture.clip_id} uses {picture.source_id} "
+                    f"but its narrative audio uses {span['source_id']}"
+                )
+            offset = float(assignment.get("offset_seconds") or 0.0)
+            source_in = float(span["in_seconds"]) - offset
+            if source_in < 0:
+                raise ValueError(
+                    f"speaker picture {picture.clip_id} cannot begin "
+                    f"{abs(source_in):.3f}s before its source"
+                )
+            speaker_sync[shot_index] = (source_in, span_id)
+        audio_clips.append(AudioClip(
+            audio_id=str(assignment.get("audio_id") or f"a{len(audio_clips):02d}"),
+            source_id=str(span["source_id"]),
+            in_seconds=float(span["in_seconds"]),
+            out_seconds=float(span["out_seconds"]),
+            starts_at_clip_id=clips[shot_index].clip_id,
+            offset_seconds=float(assignment.get("offset_seconds") or 0.0),
+            role="narrative",
+            completion=str(assignment.get("completion") or "complete_thought"),
+            gain_db=float(assignment.get("gain_db") or 0.0),
+            why=str(assignment.get("why") or ""),
+        ))
+
+    for index, (source_in, span_id) in speaker_sync.items():
+        clip = clips[index]
+        duration = clip.approx_out_seconds - clip.approx_in_seconds
+        clips[index] = clip.model_copy(update={
+            "approx_in_seconds": source_in,
+            "approx_out_seconds": source_in + duration,
+        })
+        snaps[clip.clip_id] = (
+            f"speaker picture source clock aligned to {span_id} at "
+            f"{source_in:.3f}s"
+        )
+    return EDL(
+        project_id=rushes.name, clips=clips, audio_clips=audio_clips
+    ), snaps
 
 
 def _usable_window(shot: dict) -> tuple[float, float] | None:
@@ -1841,6 +2064,11 @@ def command_transcribe(args: argparse.Namespace) -> int:
         if card is None:
             card, usage = describe(
                 proxy, client=client, locale=args.locale, cache=cache,
+                # Match the render path: Gemini watches the reusable proxy,
+                # while local Apple Speech listens to the source master.
+                # A standalone subtitle command must not silently measure a
+                # second, lossy audio encode for the same file.
+                audio=source,
                 ledger=ledger,
             )
             save(card, destination)
@@ -1877,8 +2105,36 @@ def command_timeline(args: argparse.Namespace) -> int:
 
     output = args.output.expanduser().resolve()
     report = json.loads((output / "report.json").read_text(encoding="utf-8"))
-    shots = report.get("selection", {}).get("shots", [])
+    original_shots = report.get("selection", {}).get("shots", [])
+    shots = original_shots
     rhythm = report.get("rhythm", {})
+    current = {}
+    current_path = output / "work" / "current-timeline.json"
+    if current_path.exists():
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        if current.get("version") not in {
+            "montagewright-current-timeline-v1",
+            "montagewright-current-timeline-v2",
+        }:
+            raise SystemExit("current-timeline.json has an unknown version")
+        blocks = current.get("shots") or []
+        shots = [
+            {
+                **original_shots[int(one["selection_index"])],
+                "start_seconds": float(one["in_seconds"]),
+            }
+            for one in blocks
+        ]
+        rhythm = {
+            f"k{index:02d}": {"seconds": float(one["seconds"])}
+            for index, one in enumerate(blocks)
+        }
+        projected = dict(report)
+        projected_selection = dict(report.get("selection") or {})
+        projected_selection["shots"] = shots
+        projected["selection"] = projected_selection
+        projected["rhythm"] = rhythm
+        report = projected
     aspect = ASPECTS.get(report.get("direction", {}).get("aspect", "9:16"), 9 / 16)
     library = (args.library or default_library()).expanduser()
     cards = card_map(output / "work" / "proxies", library / "cards")
@@ -1938,7 +2194,14 @@ def command_timeline(args: argparse.Namespace) -> int:
             edl, sources, target_aspect=aspect, report=Report(),
             cards=cards, checkpoint=None, client=None,
         )
-    plan = plan_render(edl, sources, target_aspect=aspect, crop_paths=paths)
+    plan = plan_render(
+        edl, sources, target_aspect=aspect, crop_paths=paths,
+        output_size=(
+            tuple(current["output_size"])
+            if current.get("output_size") else None
+        ),
+        output_fps=int(current.get("output_fps") or 30),
+    )
     width, height = plan.output_size
     for flavour, suffix, build in (
         ("premiere", "xml", to_xmeml), ("finalcut", "fcpxml", to_fcpxml)
@@ -1951,6 +2214,10 @@ def command_timeline(args: argparse.Namespace) -> int:
                       music=(
                           output / "bed-as-laid.m4a"
                           if (output / "bed-as-laid.m4a").exists() else None
+                      ),
+                      voice=(
+                          output / "voice-as-laid.m4a"
+                          if (output / "voice-as-laid.m4a").exists() else None
                       ),
                       graphics=(
                           output / "graphics-overlay.mov"

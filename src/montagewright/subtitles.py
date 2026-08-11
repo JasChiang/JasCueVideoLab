@@ -399,15 +399,30 @@ def _in_two(text: str, face, room: int) -> list[str] | None:
         head, tail = text[:cut].rstrip(), text[cut:].lstrip()
         if not head or not tail:
             continue
-        if tail[0] in NEVER_STARTS:
+        # Chinese permits a visual break between most ideographs, but a
+        # structural particle at the start makes the previous noun phrase
+        # look broken (「梅雨 / 的味道」).  Prefer a slightly less geometric
+        # balance over that grammatical stumble.
+        if tail[0] in NEVER_STARTS + "的地得":
             continue
         wide_head = _width(head, face)
         wide_tail = _width(tail, face)
         if wide_head > room or wide_tail > room:
             continue
-        # A break after punctuation is a break the sentence already had.
-        bonus = 0 if text[cut - 1] in "，。、！？：；,.!?;:" else 1
-        score = (abs(wide_head - wide_tail), bonus)
+        # A breath wins first, then a light grammatical joint, then raw
+        # geometry.  Purely balancing glyph widths split compounds such as
+        # 「梅雨」even though the nearby「有 / 梅雨的味道」joint is still
+        # comfortably balanced.
+        if text[cut - 1] in "，。、！？：；,.!?;:":
+            joint = 0
+        elif text[cut - 1] in "是有在就也又都很更最會要想說讓把被給與和或但而":
+            joint = 1
+        else:
+            joint = 2
+        # Do not buy a grammatical joint by leaving one side visibly tiny.
+        if min(wide_head, wide_tail) < max(wide_head, wide_tail) * 0.6:
+            joint += 3
+        score = (joint, abs(wide_head - wide_tail))
         if best is None or score < best[0]:
             best = (score, [head, tail])
     return best[1] if best else None
@@ -420,7 +435,9 @@ BREAKS: tuple[str, ...] = ("。", "！", "？", "…", "，", "、", "；", "：
 LEAST_SECONDS = 0.7
 
 
-def split_cues(lines, face, room: int, *, least: float = LEAST_SECONDS):
+def split_cues(
+    lines, face, room: int, *, least: float = LEAST_SECONDS, words=None,
+):
     """Break long lines into separate cues, rather than into more rows.
 
     The transcript's idea of a line is a sentence: the median is thirteen
@@ -429,10 +446,11 @@ def split_cues(lines, face, room: int, *, least: float = LEAST_SECONDS):
     not a subtitle, it is a paragraph -- and shrinking the type to make it
     fit only made it a smaller paragraph.
 
-    There are no word timings to split on, so a piece is given the share of
-    the window its characters take up. That is approximate in a way nobody
-    can see at this length, and it is what the reader wants: one thought at
-    a time, on one row.
+    Measured word timings place each break when they are available.  A long
+    corrected sentence used to be divided by character count even though the
+    recogniser had measured every word; pauses and uneven delivery could make
+    the next cue appear several tenths early.  Old transcripts without words
+    retain the proportional fallback.
     """
 
     from montagewright.transcript import Line
@@ -446,15 +464,49 @@ def split_cues(lines, face, room: int, *, least: float = LEAST_SECONDS):
         pieces = _by_sense(line.text, face, room)
         span = max(line.ends_seconds - line.starts_seconds, 0.001)
         total = sum(len(one) for one in pieces) or 1
+        # The corrected character clock is the strongest timing evidence we
+        # have: Gemini owns the spelling, Apple owns these timestamps.  Do
+        # not throw it away and rematch the pre-correction ASR words merely
+        # because the sentence became too wide for one cue.
+        marks = _character_marks(line)
+        if not marks and words:
+            marks = _word_marks(
+                line.text, words, line.starts_seconds, line.ends_seconds
+            )
         at = line.starts_seconds
         made = []
-        for one in pieces:
-            share = span * len(one) / total
+        consumed = 0
+        for index, one in enumerate(pieces):
+            begins_at = consumed
+            consumed += len(one)
+            proportional_end = line.starts_seconds + span * consumed / total
+            # The next cue begins when its first measured word begins, not
+            # when the previous word ends.  Keeping a real pause between the
+            # two is the point of using the recogniser clock here.
+            following = [
+                starts for begins, _, starts, _ in marks
+                if begins >= consumed and begins - consumed <= 2
+            ]
+            preceding = [
+                ends for _, reached, _, ends in marks
+                if reached <= consumed and ends > at
+            ]
+            measured = following[:1] or preceding[-1:]
+            until = (
+                line.ends_seconds
+                if index == len(pieces) - 1
+                else measured[-1] if measured else proportional_end
+            )
+            until = min(line.ends_seconds, max(at, until))
             made.append(Line(
-                text=one, starts_seconds=at, ends_seconds=at + share,
+                text=one, starts_seconds=at, ends_seconds=until,
                 heard=line.heard, speaker=line.speaker,
+                timing_source=line.timing_source,
+                timing_confidence=line.timing_confidence,
+                timing_locked=line.timing_locked,
+                timed_text=_clock_slice(line, begins_at, consumed),
             ))
-            at += share
+            at = until
 
         # A piece too brief to read is joined to the one before it, which is
         # why this is not simply "split and move on".
@@ -486,6 +538,15 @@ def _by_sense(text: str, face, room: int) -> list[str]:
 
     pieces, rest = [], text
     while _width(rest, face) > room:
+        # When all that remains fits in two rows, balance them as two cues.
+        # Filling the first to the pixel edge is how a perfectly ordinary
+        # phrase such as「梅雨的味道」became「梅雨的味 / 道」.  This is a
+        # general orphan rule, not a vocabulary exception.
+        balanced = _in_two(rest, face, room)
+        if balanced:
+            pieces.extend(balanced)
+            rest = ""
+            break
         cut = len(rest)
         while cut > 1 and face.getbbox(rest[:cut])[2] > room:
             cut -= 1
@@ -504,6 +565,39 @@ def _by_sense(text: str, face, room: int) -> list[str]:
     if rest:
         pieces.append(rest.strip())
     return [one for one in pieces if one]
+
+
+def _character_marks(line) -> list[tuple[int, int, float, float]]:
+    """Character spans and Apple's clock, if it still matches the copy."""
+
+    clock = tuple(getattr(line, "timed_text", ()) or ())
+    if not clock or "".join(one.text for one in clock) != line.text:
+        return []
+    marks = []
+    where = 0
+    for piece in clock:
+        reached = where + len(piece.text)
+        if piece.ends_seconds > piece.starts_seconds:
+            marks.append((
+                where, reached, piece.starts_seconds, piece.ends_seconds,
+            ))
+        where = reached
+    return marks
+
+
+def _clock_slice(line, begins: int, reaches: int):
+    """Keep timing provenance on a visual fragment of one transcript line."""
+
+    clock = tuple(getattr(line, "timed_text", ()) or ())
+    if not clock or "".join(one.text for one in clock) != line.text:
+        return ()
+    kept, where = [], 0
+    for piece in clock:
+        after = where + len(piece.text)
+        if after > begins and where < reaches:
+            kept.append(piece)
+        where = after
+    return tuple(kept)
 
 
 def draw_line(
@@ -612,6 +706,27 @@ def layout_boxes(
     ).boxes
 
 
+def _word_marks(text: str, words, at: float, until: float):
+    """Matched character span plus the recogniser's start/end clock."""
+
+    inside = [w for w in words if w.ends_seconds > at and w.starts_seconds < until]
+    marks: list[tuple[int, int, float, float]] = []
+    where = 0
+    for word in inside:
+        said = word.text.strip()
+        if not said:
+            continue
+        found = text.find(said, where)
+        if found < 0:
+            continue
+        where = found + len(said)
+        # Punctuation after a word is revealed with it.
+        while where < len(text) and text[where] in NEVER_STARTS:
+            where += 1
+        marks.append((found, where, word.starts_seconds, word.ends_seconds))
+    return marks
+
+
 def spans_in(text: str, words, at: float, until: float):
     """Match a cue's characters to the words that were measured.
 
@@ -626,21 +741,10 @@ def spans_in(text: str, words, at: float, until: float):
     draw the cue as one piece rather than to guess.
     """
 
-    inside = [w for w in words if w.ends_seconds > at and w.starts_seconds < until]
-    marks: list[tuple[int, float]] = []
-    where = 0
-    for word in inside:
-        said = word.text.strip()
-        if not said:
-            continue
-        found = text.find(said, where)
-        if found < 0:
-            continue
-        where = found + len(said)
-        # Punctuation after a word is revealed with it.
-        while where < len(text) and text[where] in NEVER_STARTS:
-            where += 1
-        marks.append((where, word.ends_seconds))
+    marks = [
+        (reached, ends)
+        for _, reached, _, ends in _word_marks(text, words, at, until)
+    ]
     return marks if len(marks) >= 2 else []
 
 
@@ -659,7 +763,7 @@ def prepare_overlays(
     area = safe_area(aspect)
     face = _face(max(12, round(height * area.text_height)))
     room = round(width * (1 - area.side_margin * 2))
-    lines = split_cues(lines, face, room)
+    lines = split_cues(lines, face, room, words=words)
     style = style or Style()
     palette = palette_for(lines, style)
     unknown = cannot_spell("".join(line.text for line in lines))
@@ -768,7 +872,7 @@ def burn(
     return destination
 
 
-def as_cues(lines, aspect: str, width: int, height: int):
+def as_cues(lines, aspect: str, width: int, height: int, *, words=None):
     """The lines a viewer should see, whatever is going to show them.
 
     The file and the picture had better agree, and a fifty-six character
@@ -777,7 +881,9 @@ def as_cues(lines, aspect: str, width: int, height: int):
 
     area = safe_area(aspect)
     face = _face(max(12, round(height * area.text_height)))
-    return split_cues(lines, face, round(width * (1 - area.side_margin * 2)))
+    return split_cues(
+        lines, face, round(width * (1 - area.side_margin * 2)), words=words,
+    )
 
 
 # The looks worth offering by name. Anything finer is a Style, which is

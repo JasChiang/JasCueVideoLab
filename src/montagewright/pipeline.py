@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from montagewright.clipcard import find_subject, load_card
@@ -63,6 +64,75 @@ TRACK_FPS = 4.0
 # shortfall is recorded, because a track that survived one frame in nine is
 # not a measurement, it is a single guess wearing a measurement's name.
 TRACK_QUORUM = 0.5
+
+
+def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
+    """Put every lip-synced picture on the independent audio source clock.
+
+    One answer may continue while picture cuts to illustrative B-roll and
+    later returns to the speaker.  The returning shot must resume at the
+    source frame being heard then; aligning only the shot where the audio
+    assignment starts makes that return visibly out of sync.
+
+    B-roll and reactions are deliberately untouched.  A speaker shot is
+    aligned only when its own source is the source of the unique narrative
+    assignment active at that point (or when it is the assignment's anchor
+    shot before a positive offset).  Ambiguous or ungrounded speaker pictures
+    fail closed instead of pretending to be lip-synced.
+    """
+
+    starts: dict[str, float] = {}
+    cursor = 0.0
+    for clip in edl.clips:
+        starts[clip.clip_id] = cursor
+        cursor += clip.approx_out_seconds - clip.approx_in_seconds
+
+    narrative = []
+    for audio in edl.audio_clips:
+        if audio.role != "narrative":
+            continue
+        anchored = starts[audio.starts_at_clip_id]
+        at = anchored + audio.offset_seconds
+        narrative.append((audio, at, at + audio.out_seconds - audio.in_seconds))
+
+    aligned, notes = [], []
+    for clip in edl.clips:
+        if clip.picture_role != "speaker":
+            aligned.append(clip)
+            continue
+        shot_at = starts[clip.clip_id]
+        candidates = [
+            (audio, audio_at)
+            for audio, audio_at, audio_end in narrative
+            if audio.source_id == clip.source_id
+            and (
+                audio.starts_at_clip_id == clip.clip_id
+                or audio_at <= shot_at < audio_end
+            )
+        ]
+        if len(candidates) != 1:
+            raise ValueError(
+                f"speaker picture {clip.clip_id} must match exactly one active "
+                f"narrative assignment from {clip.source_id}; found "
+                f"{len(candidates)}"
+            )
+        audio, audio_at = candidates[0]
+        source_in = audio.in_seconds + shot_at - audio_at
+        if source_in < 0:
+            raise ValueError(
+                f"speaker picture {clip.clip_id} cannot begin "
+                f"{abs(source_in):.3f}s before its source"
+            )
+        duration = clip.approx_out_seconds - clip.approx_in_seconds
+        aligned.append(clip.model_copy(update={
+            "approx_in_seconds": source_in,
+            "approx_out_seconds": source_in + duration,
+        }))
+        notes.append(
+            f"{clip.clip_id}: speaker picture aligned to {audio.audio_id} "
+            f"at source {source_in:.3f}s"
+        )
+    return edl.model_copy(update={"clips": aligned}), notes
 
 
 @dataclass
@@ -1459,6 +1529,7 @@ def run(
     keep_voice: bool = False,
     under_speech: str = "duck",
     client: Any | None = None,
+    transcripts: Mapping[str, dict | None] | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
     """Take an EDL to a finished file.
 
@@ -1493,10 +1564,46 @@ def run(
         )
         _charge(report, "rhythm", usage)
 
-    # Grounding enforces each usable source window before advancing the next
-    # cut, so this is already the same timeline the renderer will receive.
+    # Music grounding and dialogue boundaries both move cuts.  Neither may
+    # silently invalidate the other, so converge them before rendering and
+    # report only the final timeline. Speech has the final say inside each
+    # round; a following grounding round proves the musical request still
+    # lands. A cycle is a real planning conflict, not something to hide.
+    dialogue_history: list[str] = []
+    seen_windows: set[tuple[tuple[float, float], ...]] = set()
     timeline = ground_timeline(edl, grid)
-    edl = apply_to_edl(edl, timeline)
+    for attempt in range(4):
+        edl = apply_to_edl(edl, timeline)
+        if not transcripts:
+            break
+        from montagewright.transcript import (
+            DialogueBoundaryError, snap_edl_to_dialogue,
+        )
+
+        snapped, dialogue_notes, dialogue_faults = snap_edl_to_dialogue(
+            edl, transcripts
+        )
+        dialogue_history.extend(dialogue_notes)
+        if dialogue_faults:
+            raise DialogueBoundaryError(
+                "final cut crosses unfinished dialogue; reselect or replan: "
+                + "; ".join(dialogue_faults)
+            )
+        if not dialogue_notes:
+            break
+        signature = tuple(
+            (round(clip.approx_in_seconds, 4), round(clip.approx_out_seconds, 4))
+            for clip in snapped.clips
+        )
+        if signature in seen_windows or attempt == 3:
+            raise DialogueBoundaryError(
+                "music grounding and dialogue-safe boundaries do not "
+                "converge; replan the named speech shots"
+            )
+        seen_windows.add(signature)
+        edl = snapped
+        timeline = ground_timeline(edl, grid)
+    report.plan_disagreements.extend(dict.fromkeys(dialogue_history))
     report.aligned_cuts = timeline.aligned_count
     report.total_cuts = len(timeline.clips)
     report.delivered_seconds = round(timeline.duration_seconds, 2)
@@ -1525,6 +1632,11 @@ def run(
     edl, pacing_notes = _audit_static_holds(edl, max_static_seconds)
     report.plan_disagreements.extend(pacing_notes)
     report.plan_disagreements.extend(_resolved_sequence_disagreements(edl))
+    # Rhythm now fixes the picture timeline, so this is the first point where
+    # a return to the speaker after B-roll can be mapped to the exact progress
+    # of the continuing audio assignment.  It must precede SAM/reframing.
+    edl, speaker_notes = align_speaker_pictures_to_audio(edl)
+    report.plan_disagreements.extend(speaker_notes)
     for clip in edl.clips:
         if clip.clip_id in report.rhythm_decisions:
             report.rhythm_decisions[clip.clip_id]["seconds"] = round(
@@ -1571,7 +1683,15 @@ def run(
     # opening a single shot. The segments are what that question is asked of.
     result = render(
         plan, output_dir, music=music, keep_segments=True,
-        keep_voice=keep_voice, under_speech=under_speech,
+        keep_voice=(
+            keep_voice
+            or any(
+                segment.audio_role
+                in {"narrative", "sync_action", "ambient_texture"}
+                for segment in plan.segments
+            )
+        ),
+        under_speech=under_speech,
     )
     # The resolved plan is the only truthful source for a later Web/CLI
     # edit. Selection in-points precede action snapping and beat grounding;
@@ -1586,7 +1706,7 @@ def run(
     )
 
     write_json(output_dir / "work" / "current-timeline.json", {
-        "version": "montagewright-current-timeline-v1",
+        "version": "montagewright-current-timeline-v2",
         "revision": 0,
         "output_fps": plan.output_fps,
         "output_size": list(plan.output_size),
@@ -1600,10 +1720,28 @@ def run(
                 "frame_count": end - start,
                 "seconds": (end - start) / plan.output_fps,
                 "gain_db": segment.gain_db,
+                "audio_role": segment.audio_role,
+                "audio_completion": segment.audio_completion,
+                "picture_role": segment.picture_role,
             }
             for index, (segment, (start, end)) in enumerate(
                 zip(plan.segments, frame_spans, strict=True)
             )
+        ],
+        "audio_assignments": [
+            {
+                "audio_id": audio.audio_id,
+                "source_id": audio.source.source_id,
+                "in_seconds": audio.in_seconds,
+                "out_seconds": audio.out_seconds,
+                "timeline_start_frame": audio.timeline_start_frame,
+                "frame_count": audio.frame_count,
+                "role": audio.role,
+                "completion": audio.completion,
+                "gain_db": audio.gain_db,
+                "why": audio.why,
+            }
+            for audio in plan.audio_assignments
         ],
     })
     report.delivered_seconds = round(result.duration_seconds, 2)

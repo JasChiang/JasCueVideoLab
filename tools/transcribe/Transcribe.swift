@@ -44,12 +44,10 @@ struct Payload: Codable {
     let locale: String
     let duration_seconds: Double
     let utterances: [Utterance]
-    // Where nobody is speaking, from the system's own detector. Not derivable
-    // from the word timings: the transcriber segments a stream continuously,
-    // so each word's end is the next word's start and the gaps between them
-    // are all zero. And not derivable from level either -- this material is a
-    // street, where traffic never falls below the threshold a quiet room
-    // would put every breath under.
+    // Intervals the system detector chose to report. This sequence may be
+    // empty even when the recording contains pauses, so an empty array means
+    // "no VAD evidence", not "continuous speech". Keep it separate from the
+    // transcriber's audioTimeRange attributes and punctuation pauses.
     let silences: [Silence]
 }
 

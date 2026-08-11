@@ -74,7 +74,7 @@ def _verdict_schema() -> dict[str, Any]:
                             "type": "string",
                             "enum": [
                                 "pacing", "framing", "music_sync", "coverage",
-                                "named_fact", "continuity", "other",
+                                "named_fact", "continuity", "audio_content", "other",
                             ],
                         },
                         "severity": {
