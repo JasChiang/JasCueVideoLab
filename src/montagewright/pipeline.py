@@ -949,55 +949,67 @@ def _reference_subject_samples(
         )
     if not _may_ask(client):
         return [], [], ()
-    discovery = discoveries.get(source.source_id)
-    if discovery is None:
-        stored = (
-            output / f"{source.source_id}-candidates.json"
-            if output is not None else None
-        )
-        if stored is not None and stored.exists():
-            try:
-                discovery = CandidateDiscoveryResult.model_validate_json(
-                    stored.read_text(encoding="utf-8")
-                )
-                if (
-                    discovery.grounding_spec_sha256 != spec.definition_sha256()
-                    or discovery.video_sha256
-                    != inspect_video_lineage(source.path).content_sha256
-                ):
-                    discovery = None
-            except (OSError, ValueError):
-                discovery = None
-        if discovery is None:
-            _afford(report)
-            discovered = discover_reference_candidates(
-                source.path,
-                spec,
-                client=client,
-                cache=upload_cache,
-                ledger=report.ledger,
-            )
-            if discovered is None:
-                return [], [], ()
-            discovery, usage = discovered
-            _charge(report, "reference_candidate", usage)
-            if stored is not None:
-                _write_grounding_record(
-                    stored, discovery.model_dump(mode="json")
-                )
-        discoveries[source.source_id] = discovery
-
+    # The window this shot uses IS the question, so ask it directly.
+    #
+    # This used to pay for a second discovery, on the master, over a source
+    # the material screen had already judged on its proxy -- the same
+    # question, the same model, two different encodings of the same seconds,
+    # and no reconciliation between the answers. Measured on this material
+    # the two disagreed on three of eight shots: the screen said the Fold8
+    # was there, the master pass said absent, no exact frame was ever
+    # decoded, and the shot died reporting that its identity "could not be
+    # confirmed on two exact source frames" -- a sentence about a judgement
+    # nobody had made.
+    #
+    # The contract forbids pairing a proxy discovery with master frames, and
+    # rightly: candidate milliseconds belong to the video they were measured
+    # on. So the interval is built locally from the cut instead. It claims
+    # nothing about identity -- `uncertain` is exactly what is known before
+    # the frames are judged -- and the judgement comes where it always came
+    # from, the exact frames themselves.
     clip_start_ms = round(float(clip.approx_in_seconds) * 1000)
     clip_end_ms = round(float(clip.approx_out_seconds) * 1000)
-    eligible = [
-        candidate for candidate in discovery.candidates
-        if candidate.target_id == target_id
-        and candidate.identity_status != "hard_negative"
-        and candidate.start_ms < clip_end_ms
-        and candidate.end_ms > clip_start_ms
-    ]
-    if not eligible:
+    video = inspect_video_lineage(source.path)
+    window_end = min(clip_end_ms, int(video.duration_ms))
+    if window_end <= clip_start_ms:
+        report.subject_notes[clip.clip_id] = (
+            "the cut starts at or after the end of the take; nothing was judged"
+        )
         return [], [], ()
+    discovery = CandidateDiscoveryResult.model_validate({
+        "contract_version": "reference-candidate-discovery-v1",
+        "query_id": spec.identity_lock.query_id,
+        "query_lock_sha256": spec.identity_lock.definition_sha256(),
+        "grounding_spec_sha256": spec.definition_sha256(),
+        "video_asset_id": video.asset_id,
+        "video_sha256": video.content_sha256,
+        "duration_ms": int(video.duration_ms),
+        "candidates": [{
+            "candidate_id": f"cut_{clip.clip_id}",
+            "target_id": target_id,
+            "start_ms": clip_start_ms,
+            "end_ms": window_end,
+            "recommended_seed_ms": clip_start_ms + (window_end - clip_start_ms) // 2,
+            "identity_status": "uncertain",
+            "confidence": 0.5,
+            "visible_state": "unjudged; this interval is the cut, not a sighting",
+            "visibility_state": "unknown",
+            "occlusion_state": "unknown",
+            "identity_evidence": [],
+            "exclusion_evidence": [],
+        }],
+        "target_summaries": [{
+            "target_id": target_id,
+            "verdict": "uncertain",
+            "reason": (
+                "the material screen placed this identity in this source; "
+                "these frames decide whether it is in this cut"
+            ),
+        }],
+        "warnings": [],
+    })
+    discoveries[source.source_id] = discovery
+    eligible = list(discovery.candidates)
 
     # Spread exact checkpoints over every overlapping candidate interval.
     # Reusing one decoded frame twice would satisfy a count while proving
@@ -1040,6 +1052,14 @@ def _reference_subject_samples(
         if len(prepared) >= 4:
             break
     if len(prepared) < 2:
+        # Not the same thing as a refused identity, and it read as one for a
+        # whole evening: the caller's message says the identity "could not be
+        # confirmed on two exact source frames", which describes a judgement
+        # that in this case was never asked for. Say which it was.
+        report.subject_notes[clip.clip_id] = (
+            f"only {len(prepared)} distinct frame(s) could be decoded inside "
+            f"{clip_start_ms}-{window_end}ms; nothing was judged"
+        )
         return [], [], ()
 
     # What this call answers is a fact about specific decoded frames under
@@ -1087,6 +1107,9 @@ def _reference_subject_samples(
             )
             return [], [], ()
         if decided is None:
+            report.subject_notes[clip.clip_id] = (
+                "no client was available to judge the exact frames"
+            )
             return [], [], ()
         batch, usage = decided
         _charge(report, "reference_exact", usage)
@@ -1357,9 +1380,14 @@ def follow_subjects(
                             raise ReferenceIdentityUnconfirmed(
                                 clip.clip_id, entity_id,
                                 f"{clip.clip_id}: locked reference identity "
-                                f"{entity_id} was selected but could not be "
-                                "confirmed on two exact source frames; reselect "
-                                "the shot instead of substituting a lookalike",
+                                f"{entity_id} could not be delivered from "
+                                "this cut ("
+                                + (
+                                    report.subject_notes.get(clip.clip_id)
+                                    or "the exact frames did not confirm it"
+                                )
+                                + "); reselect the shot instead of "
+                                "substituting a lookalike",
                             )
                 card = (
                     load_card(cards[clip.source_id])

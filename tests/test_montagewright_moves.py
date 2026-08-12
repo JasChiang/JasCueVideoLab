@@ -6464,31 +6464,19 @@ def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatc
     from montagewright.planner import Usage
     from montagewright.reframe import Observation
 
-    candidate = SimpleNamespace(
-        candidate_id="candidate.001",
-        target_id="target.fold",
-        identity_status="matched_target",
-        start_ms=1_000,
-        end_ms=4_000,
-        recommended_seed_ms=2_000,
-    )
-    discovery = SimpleNamespace(
-        candidates=(candidate,),
-        grounding_spec_sha256="spec",
-        video_sha256="video",
-        candidate=lambda candidate_id: candidate,
-        model_dump=lambda mode: {},
-    )
+    # The cut's own window is the candidate now: no second discovery is
+    # bought on the master to re-answer what the material screen answered on
+    # the proxy, and the interval is built locally from the in and out
+    # points. So the lineage has to be real enough to build one.
+    digest = "c" * 64
     lineage = SimpleNamespace(
+        asset_id=f"sha256:{digest}",
         source_start_pts=0,
         source_time_base=SimpleNamespace(numerator=1, denominator=1000),
-        content_sha256="video",
+        content_sha256=digest,
+        duration_ms=8_000,
     )
 
-    monkeypatch.setattr(
-        "montagewright.reference_grounding.discover_reference_candidates",
-        lambda *args, **kwargs: (discovery, Usage(10, 2, 1)),
-    )
     monkeypatch.setattr(
         "montagewright.reference_grounding.inspect_video_lineage",
         lambda path: lineage,
@@ -6498,7 +6486,7 @@ def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatc
         return SimpleNamespace(lineage=SimpleNamespace(
             frame_pts=requested_time_ms,
             frame_time_ms=requested_time_ms,
-            video_asset_id="sha256:video",
+            video_asset_id=f"sha256:{digest}",
             frame_sha256=(f"{requested_time_ms:064x}"[-64:]),
             width=1440,
             height=810,
@@ -6513,7 +6501,7 @@ def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatc
             lineage=SimpleNamespace(
                 frame_pts=at,
                 frame_time_ms=at,
-                video_asset_id="sha256:video",
+                video_asset_id=f"sha256:{digest}",
                 frame_sha256=f"{at:064x}"[-64:],
                 width=1440,
                 height=810,
@@ -6540,7 +6528,11 @@ def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatc
     )
 
     spec = SimpleNamespace(
-        definition_sha256=lambda: "spec",
+        definition_sha256=lambda: "5" * 64,
+        identity_lock=SimpleNamespace(
+            query_id="grounding:target.fold",
+            definition_sha256=lambda: "1" * 64,
+        ),
     )
     handed_to_sam = {}
 
@@ -6580,7 +6572,10 @@ def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatc
     assert (exact.width, exact.height) == (1440, 810)
     assert handed_to_sam["require_identity_validation"] is True
     assert report.reference_grounding["k00"]["status"] == "sam_geometry_validated"
-    assert [usage.input_tokens for usage in report.usages] == [10, 12]
+    assert [usage.input_tokens for usage in report.usages] == [12], (
+        "one paid call, the exact frames -- the second discovery this used to "
+        "buy on the master asked what the material screen had already answered"
+    )
 
 
 def test_reference_critical_grounding_without_sam_fails_before_gemini(
@@ -7064,3 +7059,27 @@ def test_an_exact_frame_verdict_is_remembered_by_the_frames_it_judged():
 
     # And the path reaches it from the run, not from the output directory.
     assert "grounding_memory" in inspect.getsource(pipeline.follow_subjects)
+
+
+def test_no_silent_exit_from_the_reference_stage():
+    """Every way out of this stage ends as the same sentence to the caller.
+
+    "could not be confirmed on two exact source frames" describes a
+    judgement -- and three of the ways to reach it never made one: the cut
+    fell outside the take, no client was there to ask, or fewer than two
+    distinct frames could be decoded. An evening was spent believing a model
+    was refusing shots it had never been shown.
+    """
+
+    import inspect
+
+    from montagewright import pipeline
+
+    source = inspect.getsource(pipeline._reference_subject_samples)
+    exits = source.count("return [], [], ()")
+    explained = source.count("report.subject_notes[clip.clip_id]")
+    assert exits >= 4, "this test is about the early exits; find them"
+    assert explained >= exits - 1, (
+        f"{exits} ways out, {explained} of them say why -- a silent one "
+        "becomes a sentence about a judgement nobody made"
+    )
