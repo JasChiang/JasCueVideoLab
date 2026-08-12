@@ -55,6 +55,11 @@ TargetVerdict = Literal["present", "absent", "uncertain"]
 ExactFrameVerdict = Literal[
     "matched_target", "hard_negative", "uncertain", "not_visible"
 ]
+VisibilityState = Literal[
+    "full", "partial", "occluded", "entering", "exiting", "unknown"
+]
+OcclusionState = Literal["none", "minor", "major", "unknown"]
+FrameEdge = Literal["top", "right", "bottom", "left"]
 
 VIDEO_MIME_BY_SUFFIX = {
     ".3gp": "video/3gpp",
@@ -436,6 +441,10 @@ class CandidateInterval(FrozenStrictModel):
     identity_status: CandidateIdentityStatus
     confidence: float = Field(ge=0.0, le=1.0)
     visible_state: str = Field(min_length=1)
+    visibility_state: VisibilityState = "unknown"
+    occlusion_state: OcclusionState = "unknown"
+    frame_entry_ms: int | None = Field(default=None, ge=0)
+    frame_exit_ms: int | None = Field(default=None, ge=0)
     identity_evidence: tuple[str, ...] = ()
     exclusion_evidence: tuple[str, ...] = ()
 
@@ -445,6 +454,18 @@ class CandidateInterval(FrozenStrictModel):
             raise ValueError("candidate interval must be non-empty")
         if not self.start_ms <= self.recommended_seed_ms < self.end_ms:
             raise ValueError("recommended seed must lie inside its candidate interval")
+        for name, value in (
+            ("frame_entry_ms", self.frame_entry_ms),
+            ("frame_exit_ms", self.frame_exit_ms),
+        ):
+            if value is not None and not self.start_ms <= value < self.end_ms:
+                raise ValueError(f"{name} must lie inside its candidate interval")
+        if (
+            self.frame_entry_ms is not None
+            and self.frame_exit_ms is not None
+            and self.frame_exit_ms < self.frame_entry_ms
+        ):
+            raise ValueError("frame_exit_ms must not precede frame_entry_ms")
         _unique_non_empty(self.identity_evidence, "identity_evidence")
         _unique_non_empty(self.exclusion_evidence, "exclusion_evidence")
         if self.identity_status == "matched_target" and not self.identity_evidence:
@@ -672,6 +693,9 @@ class ExactFrameBBoxDecision(FrozenStrictModel):
     verdict: ExactFrameVerdict
     confidence: float = Field(ge=0.0, le=1.0)
     native_box_yxyx_1000: tuple[int, int, int, int] | None = None
+    visibility_state: VisibilityState = "unknown"
+    occlusion_state: OcclusionState = "unknown"
+    touches_frame_edges: tuple[FrameEdge, ...] = ()
     identity_evidence: tuple[str, ...] = ()
     exclusion_evidence: tuple[str, ...] = ()
     reason: str = Field(min_length=1)
@@ -682,6 +706,8 @@ class ExactFrameBBoxDecision(FrozenStrictModel):
             raise ValueError("exact decision asset id and sha256 disagree")
         _unique_non_empty(self.identity_evidence, "identity_evidence")
         _unique_non_empty(self.exclusion_evidence, "exclusion_evidence")
+        if len(self.touches_frame_edges) != len(set(self.touches_frame_edges)):
+            raise ValueError("touches_frame_edges values must be unique")
         if self.native_box_yxyx_1000 is not None:
             native_yxyx_to_canonical_xyxy(self.native_box_yxyx_1000)
         if self.verdict == "matched_target":
@@ -689,6 +715,14 @@ class ExactFrameBBoxDecision(FrozenStrictModel):
                 raise ValueError("matched target requires an exact-frame box")
             if not self.identity_evidence:
                 raise ValueError("matched target requires identity evidence")
+            if self.visibility_state == "unknown":
+                raise ValueError(
+                    "matched target requires a categorical visibility_state"
+                )
+            if self.occlusion_state == "unknown":
+                raise ValueError(
+                    "matched target requires a categorical occlusion_state"
+                )
         elif self.native_box_yxyx_1000 is not None:
             raise ValueError("only a matched target may contain a box")
         if self.verdict == "hard_negative" and not self.exclusion_evidence:
@@ -852,6 +886,10 @@ def _candidate_schema(target_ids: Sequence[str]) -> dict[str, Any]:
                         "identity_status",
                         "confidence",
                         "visible_state",
+                        "visibility_state",
+                        "occlusion_state",
+                        "frame_entry_ms",
+                        "frame_exit_ms",
                         "identity_evidence",
                         "exclusion_evidence",
                     ],
@@ -871,6 +909,23 @@ def _candidate_schema(target_ids: Sequence[str]) -> dict[str, Any]:
                         },
                         "confidence": {"type": "number"},
                         "visible_state": {"type": "string"},
+                        "visibility_state": {
+                            "type": "string",
+                            "enum": [
+                                "full", "partial", "occluded", "entering",
+                                "exiting", "unknown",
+                            ],
+                        },
+                        "occlusion_state": {
+                            "type": "string",
+                            "enum": ["none", "minor", "major", "unknown"],
+                        },
+                        "frame_entry_ms": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}]
+                        },
+                        "frame_exit_ms": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}]
+                        },
                         "identity_evidence": string_array,
                         "exclusion_evidence": string_array,
                     },
@@ -921,6 +976,9 @@ def _exact_frame_schema_for_candidates(
             "verdict",
             "confidence",
             "native_box_yxyx_1000",
+            "visibility_state",
+            "occlusion_state",
+            "touches_frame_edges",
             "identity_evidence",
             "exclusion_evidence",
             "reason",
@@ -962,6 +1020,25 @@ def _exact_frame_schema_for_candidates(
                     },
                     {"type": "null"},
                 ]
+            },
+            "visibility_state": {
+                "type": "string",
+                "enum": [
+                    "full", "partial", "occluded", "entering", "exiting",
+                    "unknown",
+                ],
+            },
+            "occlusion_state": {
+                "type": "string",
+                "enum": ["none", "minor", "major", "unknown"],
+            },
+            "touches_frame_edges": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {
+                    "type": "string",
+                    "enum": ["top", "right", "bottom", "left"],
+                },
             },
             "identity_evidence": string_array,
             "exclusion_evidence": string_array,

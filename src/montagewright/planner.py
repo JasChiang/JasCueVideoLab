@@ -1705,7 +1705,7 @@ def _selection_schema(
                                 # bar it had to clear from whole to 85%.
                                 "required": [
                                     "entity_id", "at", "seconds", "framing",
-                                    "must_be_whole"
+                                    "must_be_whole", "presentation_intent"
                                 ],
                                 "properties": {
                                     "entity_id": {
@@ -1767,6 +1767,26 @@ def _selection_schema(
                                             "為它把畫面縮小塞進去。要它成真得"
                                             "靠規劃——兩個落點帶過去、換一顆更"
                                             "窄的素材、或填 false 接受局部。"
+                                        ),
+                                    },
+                                    "presentation_intent": {
+                                        "type": "string",
+                                        "enum": [
+                                            "complete_hold",
+                                            "centered_hold",
+                                            "reveal_endpoint",
+                                            "partial_reveal",
+                                            "transition_pass",
+                                        ],
+                                        "description": (
+                                            "宣告這個落點對觀眾承諾什麼。"
+                                            "complete_hold 要完整看見；"
+                                            "centered_hold 要有穩定可辨識落點；"
+                                            "reveal_endpoint 是運鏡最後真的要到達的主體；"
+                                            "partial_reveal 明確允許主體只進出一部分；"
+                                            "transition_pass 是經過而非落點。"
+                                            "不要因為 partial 就棄用素材，也不要把半個入鏡"
+                                            "宣稱成完整落點。"
                                         ),
                                     },
                                 },
@@ -2123,6 +2143,14 @@ def select_shots(
             chosen, offered,
             source_motion={item.source_id: item.camera_motion for item in usable},
         )
+        # Material cards already retain the source moment at which a named
+        # subject was actually seen.  Treat a look that the chosen source
+        # window cannot reach as a structural selection fault, not a warning
+        # discovered after render.  This does not ban partial reveals: a
+        # planner may describe the partial subject that is genuinely inside
+        # the window and mark it partial_reveal/transition_pass.  It only
+        # rejects promising a different moment of the take.
+        faults.extend(frame_disagreements(chosen.get("shots") or [], material))
         if grounding_target_ids:
             known_grounding_targets = set(grounding_target_ids)
             for shot_index, shot in enumerate(chosen.get("shots") or []):

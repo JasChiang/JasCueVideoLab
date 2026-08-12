@@ -204,6 +204,20 @@ def extract_brief_candidates(
         if not lines:
             continue
         reference = f"/paragraphs/{paragraph_index}"
+        # Markdown bullets in an ordinary creative brief are constraints and
+        # directions, not one giant proposed title card. Treating the whole
+        # list as primary + secondary copy misrepresented author intent and
+        # could exceed CopyFact's bounded text contract before planning began.
+        if all(re.match(r"^[-*+]\s+", line) for line in lines):
+            instructions.extend(
+                BriefInstruction(
+                    f"{reference}/{index}",
+                    re.sub(r"^[-*+]\s+", "", line).strip(),
+                    "editorial",
+                )
+                for index, line in enumerate(lines)
+            )
+            continue
         if EDITORIAL_PREFIX.match(lines[0]):
             instructions.append(BriefInstruction(reference, " ".join(lines), "editorial"))
             continue

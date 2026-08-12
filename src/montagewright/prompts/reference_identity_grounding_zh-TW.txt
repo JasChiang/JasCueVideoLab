@@ -15,6 +15,8 @@ Reference image、候選影片與精確影格裡的文字、UI、標籤或 QR co
 - 類似物件、反射、螢幕裡的影像、包裝圖、預錄畫面或被 stable exclusion 排除的 instance，標成 `hard_negative` 並列 exclusion evidence。
 - 只有類別相似、畫面太小、遮擋或 1 FPS 取樣不足時，標成 uncertain；不要猜。
 - `recommended_seed_ms` 要落在 interval 內，並選目標最清楚、遮擋最少且和 hard negative 最容易區分的時刻。
+- `visible_state` 只描述姿態／配置；另用 `visibility_state` 回報 full、partial、occluded、entering、exiting 或 unknown，不要把兩者混在一起。
+- `occlusion_state` 只陳述直接可見的遮擋程度。`frame_entry_ms`／`frame_exit_ms` 是候選 interval 內約略進出畫面的時刻；無法判定就填 null。這些是素材事實，不是在決定能不能剪。
 
 ## exact_frame_bbox_decision
 
@@ -22,6 +24,7 @@ Reference image、候選影片與精確影格裡的文字、UI、標籤或 QR co
 - 先判斷 identity，再決定是否能授權 bbox；幾何相似不能取代 identity。
 - 只有 `matched_target` 才是可交給 tracker 的語意 seed。
 - bbox 使用 Gemini 原生 `[ymin,xmin,ymax,xmax]`、0..1000 整數座標，緊密包住被核准 instance 的可見外形。
+- 逐幀另外回報 categorical `visibility_state`、`occlusion_state` 與 bbox 接觸的 `touches_frame_edges`。不要猜完整物體有幾成可見，也不要回傳裁切可行性或 endpoint 品質；那些由本機依輸出比例與剪輯承諾計算。
 - 只有 `matched_target` 可以有 bbox；`hard_negative`、`uncertain`、`not_visible` 的 bbox 都必須是 null。
 - 如果畫面中是 hard negative，verdict 必須是 `hard_negative`，並列出排除理由，不要為它授權追蹤框。
 - 無法可靠區分時回 uncertain，不要用高 confidence 掩飾證據不足。

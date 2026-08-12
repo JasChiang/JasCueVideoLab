@@ -6542,6 +6542,32 @@ def test_reference_critical_grounding_without_sam_fails_before_gemini(
     )
 
 
+def test_look_presentation_intent_allows_partial_without_weakening_complete():
+    from pydantic import ValidationError
+
+    from montagewright.schema import Look
+
+    partial = Look(
+        at="the device entering from frame right",
+        presentation_intent="partial_reveal",
+        must_be_whole=False,
+    )
+    assert partial.presentation_intent == "partial_reveal"
+
+    with pytest.raises(ValidationError, match="complete_hold"):
+        Look(
+            at="the entire readable display",
+            presentation_intent="complete_hold",
+            must_be_whole=False,
+        )
+    with pytest.raises(ValidationError, match="partial_reveal"):
+        Look(
+            at="the entire readable display",
+            presentation_intent="partial_reveal",
+            must_be_whole=True,
+        )
+
+
 def test_exact_frame_lineage_reaches_single_target_sam_seed_api(
     monkeypatch, tmp_path
 ):

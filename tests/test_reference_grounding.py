@@ -175,6 +175,10 @@ def _candidate_payload(spec, video, *, lock_hash=None, end_ms=7_000):
                 "identity_status": "matched_target",
                 "confidence": 0.91,
                 "visible_state": "changed configuration",
+                "visibility_state": "full",
+                "occlusion_state": "none",
+                "frame_entry_ms": None,
+                "frame_exit_ms": None,
                 "identity_evidence": ["same long-edge hinge"],
                 "exclusion_evidence": [],
             }
@@ -188,6 +192,70 @@ def _candidate_payload(spec, video, *, lock_hash=None, end_ms=7_000):
         ],
         "warnings": ["coarse video sampling"],
     }
+
+
+def test_candidate_visibility_facts_are_categorical_and_bounded(tmp_path):
+    spec = _write_spec(tmp_path)
+    video = _video_lineage("a" * 64)
+    payload = _candidate_payload(spec, video)
+    candidate = payload["candidates"][0]
+    candidate.update({
+        "visibility_state": "entering",
+        "occlusion_state": "minor",
+        "frame_entry_ms": 1_500,
+        "frame_exit_ms": 6_500,
+    })
+    result = validate_candidate_payload(
+        payload,
+        spec=spec,
+        video=video,
+        target_ids=("target.primary",),
+    )
+    assert result.candidates[0].visibility_state == "entering"
+    assert result.candidates[0].frame_exit_ms == 6_500
+
+    candidate["frame_exit_ms"] = 9_000
+    with pytest.raises(ReferenceGroundingError, match="frame_exit_ms"):
+        validate_candidate_payload(
+            payload,
+            spec=spec,
+            video=video,
+            target_ids=("target.primary",),
+        )
+
+
+def test_exact_visibility_is_evidence_not_a_blank_matched_box(tmp_path):
+    spec = _write_spec(tmp_path)
+    video = _video_lineage("b" * 64)
+    discovery = CandidateDiscoveryResult.model_validate(
+        _candidate_payload(spec, video)
+    )
+    frame = _exact_frame(tmp_path, video, 4_000)
+    payload = _exact_decision_payload(spec, video, frame)
+    payload.update({
+        "visibility_state": "partial",
+        "occlusion_state": "minor",
+        "touches_frame_edges": ["right"],
+    })
+    decision = validate_exact_frame_payload(
+        payload,
+        spec=spec,
+        discovery=discovery,
+        candidate=discovery.candidate("candidate.001"),
+        frame=frame.lineage,
+    )
+    assert decision.visibility_state == "partial"
+    assert decision.touches_frame_edges == ("right",)
+
+    payload["visibility_state"] = "unknown"
+    with pytest.raises(ReferenceGroundingError, match="visibility_state"):
+        validate_exact_frame_payload(
+            payload,
+            spec=spec,
+            discovery=discovery,
+            candidate=discovery.candidate("candidate.001"),
+            frame=frame.lineage,
+        )
 
 
 def _exact_frame(tmp_path, video, time_ms: int) -> ExactFrameMaterial:
@@ -237,6 +305,9 @@ def _exact_decision_payload(
         "verdict": verdict,
         "confidence": 0.95 if matched else 0.4,
         "native_box_yxyx_1000": [100, 200, 700, 800] if matched else None,
+        "visibility_state": "full" if matched else "unknown",
+        "occlusion_state": "none" if matched else "unknown",
+        "touches_frame_edges": [],
         "identity_evidence": ["same hinge and corner mark"] if matched else [],
         "exclusion_evidence": ["stable exclusion is visible"]
         if hard_negative
@@ -461,6 +532,9 @@ def test_exact_bbox_decision_preserves_lineage_and_converts_native_order(tmp_pat
         "verdict": "matched_target",
         "confidence": 0.95,
         "native_box_yxyx_1000": [100, 200, 700, 800],
+        "visibility_state": "full",
+        "occlusion_state": "none",
+        "touches_frame_edges": [],
         "identity_evidence": ["same hinge and corner mark"],
         "exclusion_evidence": [],
         "reason": "The approved stable cues are both directly visible.",

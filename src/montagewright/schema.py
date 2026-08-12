@@ -257,6 +257,33 @@ class Look(ModelFacing):
             "is a contradiction local code will report rather than resolve."
         ),
     )
+    presentation_intent: Literal[
+        "complete_hold",
+        "centered_hold",
+        "reveal_endpoint",
+        "partial_reveal",
+        "transition_pass",
+    ] = Field(
+        default="centered_hold",
+        description=(
+            "What this look promises to the viewer. complete_hold requires "
+            "the whole subject; centered_hold requires a stable recognizable "
+            "landing; reveal_endpoint is the destination of a move; "
+            "partial_reveal and transition_pass explicitly allow an object "
+            "to enter, leave, or remain partly outside the frame. This is an "
+            "editorial promise, not a detector result."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def presentation_matches_whole_promise(self) -> "Look":
+        if self.presentation_intent == "complete_hold" and not self.must_be_whole:
+            raise ValueError("complete_hold requires must_be_whole=true")
+        if self.presentation_intent in {"partial_reveal", "transition_pass"} and self.must_be_whole:
+            raise ValueError(
+                f"{self.presentation_intent} cannot also promise must_be_whole"
+            )
+        return self
 
 
 class Reframe(ModelFacing):
@@ -751,6 +778,10 @@ def looks_of(shot: dict) -> "list[Look]":
             seconds=float(one.get("seconds", 0.0) or 0.0),
             framing=str(one.get("framing", "thirds") or "thirds"),
             must_be_whole=bool(one.get("must_be_whole", False)),
+            presentation_intent=str(
+                one.get("presentation_intent", "centered_hold")
+                or "centered_hold"
+            ),
         )
         for one in (shot.get("looks") or [])
         if str(one.get("at", "")).strip()

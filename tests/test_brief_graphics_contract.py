@@ -64,3 +64,17 @@ def test_plain_brief_candidate_remains_a_draft():
 
     assert plan.cues[0].status == "draft"
     assert plan.fact(plan.cues[0].primary_fact_id).approved is False
+
+
+def test_markdown_bullet_constraints_are_instructions_not_one_copy_card():
+    document = parse_brief_markdown(
+        "# Direction\n\n"
+        "- Keep the approved subject recognizable throughout the edit.\n"
+        "- A partial entrance may be used as a transition, not a full endpoint.\n"
+        "- Do not substitute a similar object.\n"
+    )
+
+    assert document.candidates == ()
+    assert len(document.instructions) == 3
+    assert all(note.kind == "editorial" for note in document.instructions)
+    assert document.candidate_facts() == ()
