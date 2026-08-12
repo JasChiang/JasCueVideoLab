@@ -156,3 +156,29 @@ def test_planning_contract_changes_with_its_schema():
         {"type": "object", "properties": {"new": {"type": "string"}}},
     )
     assert first != second
+
+
+def test_a_project_spend_cap_is_money_even_though_it_is_a_403():
+    """403 PERMISSION_DENIED, not 429: Google is not throttling the request,
+    it is refusing to bill it. The translation was gated behind 429, so a
+    spend cap came out as a raw ClientError traceback halfway through the
+    fifth shot -- with every completed stage sitting in the cache and no
+    sentence anywhere saying what to do about it.
+    """
+
+    from montagewright.planner import _is_spend_cap, _provider_budget_message
+
+    class Refused(Exception):
+        code = 403
+
+    error = Refused(
+        "403 PERMISSION_DENIED. {'error': {'code': 403, 'message': 'Spend cap "
+        "breached for project: projects/723974504654 for service: "
+        "generativelanguage.googleapis.com.', 'status': 'PERMISSION_DENIED'}}"
+    )
+
+    assert _is_spend_cap(error), "money, not permissions"
+    said = _provider_budget_message(error)
+    assert said is not None
+    assert "ai.studio/spend" in said, "say where the cap lives"
+    assert "resume" in said and "cached" in said, "say that nothing is lost"

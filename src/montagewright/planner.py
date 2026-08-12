@@ -414,9 +414,21 @@ def _provider_budget_message(error: Exception) -> str | None:
     """
 
     raw = " ".join(str(error).split())
+    said = raw.lower()
+    # A project spend cap arrives as 403 PERMISSION_DENIED, not 429: Google
+    # is not throttling the request, it is refusing to bill it. Same money
+    # condition, same remedy, same resumable path -- and gated behind 429 it
+    # came out as a raw ClientError traceback halfway through the fifth shot
+    # of a run whose completed work was all sitting in the cache.
+    if "spend cap breached" in said or "spending cap" in said:
+        return (
+            "Gemini project spend cap has been reached. Raise the project cap "
+            "at https://ai.studio/spend or wait for the next billing cycle, "
+            "then resume; completed work is cached. Provider detail: "
+            + raw[:600]
+        )
     if getattr(error, "code", None) != 429 and "429" not in raw:
         return None
-    said = raw.lower()
     if "prepayment credits are depleted" in said or "prepay" in said and (
         "depleted" in said or "no credits" in said
     ):
