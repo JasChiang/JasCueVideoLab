@@ -635,6 +635,10 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         # the move short, keep the planned length and lose the beat. Rhythm
         # is the thing that gives way here, not the content.
         ceiling = content_ceiling(clip)
+        keeps_source_move = (
+            clip.reframe is not None
+            and clip.reframe.editorial_intent == "use_source_motion"
+        )
         if ceiling is not None and end - cursor > ceiling + 1e-6:
             room = cursor + ceiling
             earlier = None
@@ -642,8 +646,16 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 # The beat before, not any beat before. Halving a shot to
                 # reach a distant cue is not "cutting a little early", it is
                 # a different edit -- and one the rhythm pass never saw.
+                # A shot that exists to let the source's own move play has
+                # a length that is a statement about that move, not a budget
+                # to spend: cutting back to the earlier beat here left an
+                # authored three-second pan 2.564s to finish in, which the
+                # release check refused -- rightly, and after this function
+                # had already been told the shot could show three seconds.
                 soonest = max(
-                    cursor + max(floor, 1e-3), room - grid.seconds_per_beat
+                    cursor + max(floor, 1e-3),
+                    cursor + wanted if keeps_source_move else 0.0,
+                    room - grid.seconds_per_beat,
                 )
                 earlier = max(
                     (
@@ -663,7 +675,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                     f"the earlier cue {earlier.cue_id} instead"
                 )
             else:
-                end = room
+                end = max(room, cursor + wanted) if keeps_source_move else room
                 landed = None
                 landed_kind = None
                 cut_short = (

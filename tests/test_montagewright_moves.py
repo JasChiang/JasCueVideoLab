@@ -6840,3 +6840,43 @@ def test_a_panning_take_offers_a_subject_only_while_it_is_on_screen():
     opens, closes = (float(one) for one in window.split("–"))
     assert opens < 6.0 < closes
     assert closes - opens < 10.0, "a travelling frame does not hold it all"
+
+
+def test_the_beat_never_cuts_an_authored_move_short():
+    """A shot that lets the source's own move play is not a budget.
+
+    Its length is a statement about that move. Pulling it back to the
+    earlier beat -- the right answer when a shot is simply held too long --
+    left an authored three-second pan 2.564s to finish in, and the release
+    check refused the timeline, after this same function had been told the
+    shot could show its full three seconds.
+    """
+
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.schema import EDL, Clip, MusicSync, Reframe
+
+    grid = BeatGrid(bpm=120.0, meter=4, duration_seconds=60.0, cues=(
+        Cue(cue_id="b0", time_seconds=0.0, kind="beat"),
+        Cue(cue_id="b1", time_seconds=2.56, kind="beat"),
+        Cue(cue_id="b2", time_seconds=3.34, kind="beat"),
+    ))
+
+    def one(intent):
+        return ground_timeline(EDL(project_id="p", clips=[Clip(
+            clip_id="k00", source_id="C1",
+            approx_in_seconds=0.0, approx_out_seconds=3.0,
+            audio_role="discard", coverage_claim_seconds=3.0,
+            reframe=Reframe(editorial_intent=intent, intent="let it play"),
+            music_sync=MusicSync(cut_on_beat=True),
+        )]), grid).clips[0]
+
+    held = one("hold")
+    assert abs(held.duration_seconds - 2.56) < 1e-6, (
+        "an ordinary held shot takes the beat before"
+    )
+
+    authored = one("use_source_motion")
+    assert authored.duration_seconds >= 3.0 - 1e-6, (
+        "the source move runs to the end it was measured to need"
+    )
+    assert authored.landed_on is None, "and this cut is simply not on a beat"
