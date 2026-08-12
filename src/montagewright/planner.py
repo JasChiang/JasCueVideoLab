@@ -2318,6 +2318,7 @@ def select_shots(
             chosen, offered,
             source_motion={item.source_id: item.camera_motion for item in usable},
         )
+        faults.extend(look_contract_disagreements(chosen.get("shots") or []))
         # Material cards already retain the source moment at which a named
         # subject was actually seen.  Treat a look that the chosen source
         # window cannot reach as a structural selection fault, not a warning
@@ -2440,6 +2441,24 @@ def select_shots(
         chosen.get("shots") or [], material
     )
     return chosen, usage_total
+
+
+def look_contract_disagreements(shots: list[dict[str, Any]]) -> list[str]:
+    """Run the executable Look contract while Selection can still repair it.
+
+    JSON Schema can require every field but cannot express relationships such
+    as ``complete_hold`` requiring ``must_be_whole``. Delaying the canonical
+    Pydantic validation until EDL construction turns a repairable provider
+    answer into a local crash after the paid selection call.
+    """
+
+    faults: list[str] = []
+    for index, shot in enumerate(shots):
+        try:
+            looks_of(shot)
+        except (TypeError, ValueError) as error:
+            faults.append(f"k{index:02d} has an invalid look contract: {error}")
+    return faults
 
 
 def _shot_count_bounds(

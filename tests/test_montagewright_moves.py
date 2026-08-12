@@ -4238,6 +4238,22 @@ def test_silence_about_cropping_does_not_read_as_permission():
     assert set(look["required"]) == set(look["properties"])
 
 
+def test_selection_audits_cross_field_look_contract_before_edl():
+    from montagewright.planner import look_contract_disagreements
+
+    faults = look_contract_disagreements([{
+        "looks": [{
+            "at": "the complete product", "seconds": 2.0,
+            "framing": "centre", "composition": "object_priority",
+            "energy": "low", "must_be_whole": False,
+            "entity_id": "device.fold",
+            "presentation_intent": "complete_hold",
+        }],
+    }])
+    assert len(faults) == 1
+    assert "complete_hold requires must_be_whole=true" in faults[0]
+
+
 def test_movement_that_reveals_nothing_is_not_the_source_doing_the_work():
     """Texture was described to the planner as a camera move.
 
