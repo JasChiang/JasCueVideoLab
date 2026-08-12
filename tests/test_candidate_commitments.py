@@ -14,6 +14,9 @@ from montagewright.candidate_commitments import (
 )
 from montagewright.spans import Span
 from montagewright.planner import MaterialItem, correct_candidate_options
+from montagewright.coverage import (
+    CoverageAudit, CoverageEntry, repair_preferred_unsupported_time,
+)
 
 
 @dataclass
@@ -145,6 +148,37 @@ def test_candidate_correction_is_text_only_and_cannot_change_direction():
         key: value for key, value in base.items()
         if key != "candidate_options"
     }
+
+
+def test_preferred_delivery_removes_only_proven_unsupported_tail():
+    commitments = _resolved(_direction(min_supported_seconds="0:02"))
+    chosen = {"shots": [{
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.0, "picture_role": "primary_action",
+    }]}
+    audit = CoverageAudit(
+        3.0, 2.0, 3.0,
+        (CoverageEntry("k00", "primary_action", 3.0, 0.0, 3.0, 2.0),),
+        ("one unsupported second",),
+    )
+    repairs = repair_preferred_unsupported_time(chosen, audit, commitments)
+    assert chosen["shots"][0]["seconds_needed"] == 2.0
+    assert repairs
+
+
+def test_preferred_delivery_never_trims_below_commitment_minimum():
+    commitments = _resolved(_direction(min_supported_seconds="0:03"))
+    chosen = {"shots": [{
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.0, "picture_role": "primary_action",
+    }]}
+    audit = CoverageAudit(
+        3.0, 2.0, 3.0,
+        (CoverageEntry("k00", "primary_action", 3.0, 0.0, 3.0, 2.0),),
+        ("one unsupported second",),
+    )
+    assert not repair_preferred_unsupported_time(chosen, audit, commitments)
+    assert chosen["shots"][0]["seconds_needed"] == 3.0
 
 
 def test_each_commitment_requires_exactly_one_primary():

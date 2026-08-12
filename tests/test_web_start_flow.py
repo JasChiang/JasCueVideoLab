@@ -96,6 +96,65 @@ def test_web_duration_contract_is_explicit_and_reaches_the_cli(
     assert "偏好長度，可自然縮短" in page
 
 
+def test_new_round_inherits_parent_brief_on_the_server(
+    tmp_path, monkeypatch
+):
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    roots = tmp_path / "runs"
+    monkeypatch.setattr(web, "RUNS_ROOT", roots)
+    monkeypatch.setattr(web.subprocess, "Popen", _FinishedProcess)
+    web.RUNS.clear()
+    parent_root = roots / "parent"
+    parent_brief = parent_root / "brief.md"
+    parent_brief.parent.mkdir(parents=True)
+    parent_brief.write_text("Only the approved foldable; exclude watches.")
+    web.RUNS["parent"] = web.Run(
+        "parent", parent_root, source=str(rushes),
+        command=["render", str(rushes), "--brief", str(parent_brief)],
+    )
+
+    response = TestClient(web.create_app()).post(
+        "/api/runs", data={
+            "source_path": str(rushes), "base_run_id": "parent",
+            "inherit_brief": "true", "brief": "", "review": "false",
+        },
+    )
+
+    assert response.status_code == 200
+    child = web.RUNS[response.json()["run_id"]]
+    at = child.command.index("--brief")
+    child_brief = Path(child.command[at + 1])
+    assert child_brief.parent == child.root
+    assert child_brief.read_text() == parent_brief.read_text()
+
+
+def test_web_can_start_from_a_brief_file_path(tmp_path, monkeypatch):
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    brief = tmp_path / "fold8.md"
+    brief.write_text("Z Fold8 only")
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(web.subprocess, "Popen", _FinishedProcess)
+    web.RUNS.clear()
+
+    response = TestClient(web.create_app()).post(
+        "/api/runs", data={
+            "source_path": str(rushes), "brief_path": str(brief),
+            "brief": "experience event context", "review": "false",
+        },
+    )
+
+    assert response.status_code == 200
+    run = web.RUNS[response.json()["run_id"]]
+    at = run.command.index("--brief")
+    saved = Path(run.command[at + 1]).read_text()
+    assert "Z Fold8 only" in saved
+    assert "experience event context" in saved
+
+
 def test_writable_run_root_can_also_discover_read_only_legacy_runs(
     tmp_path, monkeypatch
 ):

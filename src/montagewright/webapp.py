@@ -41,6 +41,7 @@ from montagewright.uploads import default_library
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".aiff", ".MP3", ".M4A", ".WAV"}
+BRIEF_SUFFIXES = {".md", ".markdown", ".txt", ".MD", ".TXT"}
 # The names a request may ask for, and what each one is as a ratio. These
 # were two different shapes with one name -- a tuple to validate against and
 # a dict to look up -- and the lookup silently returned nothing.
@@ -1219,6 +1220,9 @@ def create_app() -> FastAPI:
         grounding_identity_cues: str = Form(""),
         grounding_exclusions: str = Form(""),
         brief: str = Form(""),
+        brief_path: str = Form(""),
+        base_run_id: str = Form(""),
+        inherit_brief: bool = Form(False),
         aspect: str = Form("9:16"),
         seconds: float = Form(0.0),
         duration_mode: str = Form("preferred"),
@@ -1473,10 +1477,33 @@ def create_app() -> FastAPI:
             command += ["--speech", speech]
         if locale.strip():
             command += ["--locale", locale.strip()]
+        if inherit_brief and not brief.strip() and not brief_path.strip():
+            if not base_run_id.strip():
+                raise HTTPException(400, "inheriting a brief requires base_run_id")
+            parent = _run(base_run_id.strip())
+            brief = _brief_of(parent)
+            if not brief.strip():
+                raise HTTPException(400, "the base run has no readable brief")
+        typed_brief = _typed_path(brief_path)
+        if typed_brief is not None:
+            if not typed_brief.is_file():
+                if made_root:
+                    shutil.rmtree(root, ignore_errors=True)
+                raise HTTPException(400, f"{typed_brief} is not a brief file")
+            try:
+                file_brief = typed_brief.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                if made_root:
+                    shutil.rmtree(root, ignore_errors=True)
+                raise HTTPException(400, f"brief is unreadable: {error}")
+            brief = file_brief + (
+                "\n\n## Web 補充需求\n\n" + brief.strip()
+                if brief.strip() else ""
+            )
         if brief.strip():
-            brief_path = keep() / "brief.md"
-            brief_path.write_text(brief, encoding="utf-8")
-            command += ["--brief", str(brief_path)]
+            stored_brief = keep() / "brief.md"
+            stored_brief.write_text(brief, encoding="utf-8")
+            command += ["--brief", str(stored_brief)]
         if review:
             command += ["--review"]
         if timeline in {"premiere", "finalcut", "both"}:
@@ -1561,7 +1588,11 @@ def create_app() -> FastAPI:
         if not here.is_dir():
             here = here.parent
 
-        looking = AUDIO_SUFFIXES if kind == "audio" else VIDEO_SUFFIXES
+        looking = (
+            AUDIO_SUFFIXES if kind == "audio"
+            else BRIEF_SUFFIXES if kind == "file"
+            else VIDEO_SUFFIXES
+        )
         folders = []
         for entry in sorted(here.iterdir()):
             if not entry.is_dir() or entry.name.startswith("."):

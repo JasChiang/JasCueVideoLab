@@ -1592,8 +1592,13 @@
           <input type="number" id="budget" value="6" min="0.5" step="0.5"></div>
         </div></details>
         <div class="field wide brief-field"><label>創作 Brief（可留空）</label>
+          <div class="row" style="gap:8px;flex-wrap:nowrap">
+            <input type="text" id="brief-path" placeholder="Brief 檔案路徑（.md／.txt，可留空）">
+            <button type="button" class="ghost" id="browse-brief" style="white-space:nowrap">瀏覽…</button>
+          </div>
           <textarea id="brief" placeholder="這支片要給誰看？希望觀眾記得什麼？哪些內容非講不可？也可以直接貼現有文件。"></textarea>
-          <div class="why">Gemini 會用它決定敘事、挑片與哪些文字值得做成字卡；一般文字只會先成為可檢查的字卡草稿，不會自行變成已核准文案。</div></div>
+          <label class="check"><input type="checkbox" id="inherit-brief"> 從目前開啟的 run 繼承 Brief（重新整理後也有效）</label>
+          <div class="why">可直接指定本機 Brief 檔；下方文字會作為補充需求一起保存。Gemini 會用它決定敘事、挑片與哪些文字值得做成字卡；一般文字只會先成為可檢查的字卡草稿，不會自行變成已核准文案。</div></div>
       </div>
       <div class="actions">
         <button id="go">開始剪</button>
@@ -1630,6 +1635,8 @@
 const $ = (id) => document.getElementById(id);
 let runId = null, seen = 0, timer = null, ticker = null, allLines = [], lastSource = '';
 let openedFrom = { source: '', music: '', brief: '' };
+let baseRunId = '';
+let inheritOpenedBrief = false;
 
 let picking = '', pickTarget = 'path', pickKind = 'video';
 
@@ -1649,15 +1656,15 @@ async function browseTo(path) {
       (f.clips ? `<span class="count">${f.clips} 支</span>` : '') + `</div>`);
   }
   for (const v of d.videos) {
-    rows.push(pickKind === 'audio'
-      ? `<div class="pick" data-file="${esc(v.path)}"><span class="ico">♪</span>${esc(v.name)}</div>`
+    rows.push(pickKind === 'audio' || pickKind === 'file'
+      ? `<div class="pick" data-file="${esc(v.path)}"><span class="ico">${pickKind === 'audio' ? '♪' : '§'}</span>${esc(v.name)}</div>`
       : `<div class="pick file"><span class="ico">·</span>${esc(v.name)}</div>`);
   }
   $('listing').innerHTML = rows.join('') ||
     '<div class="pick file"><span class="ico">·</span>這裡沒有東西</div>';
   $('picker-note').textContent = d.videos.length
-    ? (pickKind === 'audio' ? `點一個檔案選它` : `這層有 ${d.videos.length} 支影片`)
-    : (pickKind === 'audio' ? '這層沒有音檔，往下點' : '這層沒有影片，往下點');
+    ? (pickKind === 'audio' || pickKind === 'file' ? `點一個檔案選它` : `這層有 ${d.videos.length} 支影片`)
+    : (pickKind === 'audio' ? '這層沒有音檔，往下點' : pickKind === 'file' ? '這層沒有 Brief 檔，往下點' : '這層沒有影片，往下點');
   for (const el of $('listing').querySelectorAll('.pick[data-path]')) {
     el.onclick = () => browseTo(el.dataset.path);
   }
@@ -1671,12 +1678,13 @@ async function browseTo(path) {
 
 function openPicker(target, kind) {
   pickTarget = target; pickKind = kind;
-  $('use-here').style.display = kind === 'audio' ? 'none' : '';
+  $('use-here').style.display = kind === 'audio' || kind === 'file' ? 'none' : '';
   $('picker').classList.remove('hide');
   browseTo($(target).value.trim());
 }
 $('browse').addEventListener('click', () => openPicker('path', 'video'));
 $('browse-music').addEventListener('click', () => openPicker('music-path', 'audio'));
+$('browse-brief').addEventListener('click', () => openPicker('brief-path', 'file'));
 $('close-picker').addEventListener('click', () => $('picker').classList.add('hide'));
 $('use-here').addEventListener('click', () => {
   $(pickTarget).value = picking;
@@ -1807,6 +1815,7 @@ async function openRun(id, where) {
     music: data.music_path || '',
     brief: data.brief_text || '',
   };
+  baseRunId = id;
   // Opening a run shows the workspace, whether or not it finished. This
   // only happened inside render(), which only runs when there is a report
   // -- so a run that crashed could not be opened at all: the progress log,
@@ -4485,6 +4494,9 @@ $('go').addEventListener('click', async () => {
   body.append('speech', $('speech').value);
   body.append('locale', $('locale').value.trim());
   body.append('brief', $('brief').value);
+  body.append('brief_path', $('brief-path').value.trim());
+  body.append('base_run_id', baseRunId);
+  body.append('inherit_brief', $('inherit-brief').checked ? 'true' : 'false');
   body.append('aspect', $('aspect').value);
   body.append('seconds', $('seconds').value || '0');
   body.append('duration_mode', $('duration-mode').value);
@@ -5063,6 +5075,8 @@ $('new-run').addEventListener('click', () => {
   if (openedFrom.brief && !$('brief').value.trim()) {
     $('brief').value = openedFrom.brief;
   }
+  inheritOpenedBrief = Boolean(baseRunId && openedFrom.brief);
+  $('inherit-brief').checked = inheritOpenedBrief;
   $('veil').classList.remove('hide');
   $('setup').classList.remove('hide');
 });

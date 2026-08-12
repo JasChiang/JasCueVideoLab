@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -653,7 +654,7 @@ def decide_rhythm(
     attempt_input = request_input
     coverage_faults: tuple[str, ...] = ()
     release_faults: tuple[str, ...] = ()
-    for attempt in range(3):
+    for attempt in range(2):
         request["input"] = attempt_input
         interaction = ask(
             client, ledger=ledger, budget_stage="rhythm", **request
@@ -2284,7 +2285,7 @@ def select_shots(
     chosen: dict[str, Any] = {}
     faults: list[str] = []
     attempt_input = selection_input
-    for attempt in range(2):
+    for attempt in range(3):
         interaction = ask(
             client,
             model=MODEL_ID,
@@ -2406,6 +2407,7 @@ def select_shots(
         # particular genre or source folder.
         from montagewright.coverage import (
             repair_bounded_visual_holds,
+            repair_preferred_unsupported_time,
             selection_coverage_audit,
         )
 
@@ -2416,6 +2418,17 @@ def select_shots(
             chosen, usable, float(direction.get("target_seconds") or 0.0),
             hard_target=duration_mode == "exact",
         )
+        if duration_mode == "preferred":
+            preferred_repairs = repair_preferred_unsupported_time(
+                chosen, coverage, commitments
+            )
+            if preferred_repairs:
+                chosen["duration_repairs"].extend(preferred_repairs)
+                coverage = selection_coverage_audit(
+                    chosen, usable,
+                    float(direction.get("target_seconds") or 0.0),
+                    hard_target=False,
+                )
         faults.extend(coverage.faults)
         faults.extend(sequence_disagreements(chosen.get("shots") or []))
         if not faults:
@@ -2441,6 +2454,33 @@ def select_shots(
             # executable faults, immutable commitment catalog and factual
             # card text. It cannot pass by persuasion: this loop reruns every
             # geometry, grounding, audio, coverage and sequence gate below.
+            failing_indices = {
+                int(found.group(1))
+                for fault in faults
+                for found in [re.search(r"(?:^k|^shot )(\d+)", fault)]
+                if found is not None
+            }
+            allowed_span_ids: set[str] = set()
+            if commitments is not None:
+                failing_commitments = {
+                    str(chosen["shots"][index].get("commitment_id") or "")
+                    for index in failing_indices
+                    if 0 <= index < len(chosen.get("shots") or [])
+                }
+                allowed_span_ids = {
+                    option.span_id for option in commitments.options
+                    if option.commitment_id in failing_commitments
+                }
+            from dataclasses import replace
+
+            scoped_material = [
+                replace(item, spans=tuple(
+                    span for span in item.spans
+                    if span.span_id in allowed_span_ids
+                ))
+                for item in usable
+                if any(span.span_id in allowed_span_ids for span in item.spans)
+            ]
             attempt_input = [{
                 "type": "text",
                 "text": (
@@ -2460,8 +2500,9 @@ def select_shots(
                     + json.dumps(chosen, ensure_ascii=False, sort_keys=True)
                     + "\n\n## 素材文字目錄\n"
                     + _describe_material(usable)
+                    + "\n\n只有上述錯誤鏡頭可改；其他 shots 必須原樣保留。"
                 ),
-            }]
+            }] + _attach_material(scoped_material, cache, client, beaten)
     if faults:
         raise PlannerError(
             "selection remained structurally unrenderable after two repairs: "

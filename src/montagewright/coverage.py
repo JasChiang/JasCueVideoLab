@@ -153,6 +153,46 @@ def repair_bounded_visual_holds(
     return tuple(repairs)
 
 
+def repair_preferred_unsupported_time(
+    chosen: dict[str, Any], audit: CoverageAudit,
+    commitments: Any | None = None,
+) -> tuple[str, ...]:
+    """Remove unsupported visual tails when delivery length is a preference.
+
+    This is deliberately monotonic: it only shortens a shot to time the same
+    audit already proved, never below its selected commitment minimum. Speech
+    and readable titles remain structural decisions and are not trimmed here.
+    """
+
+    repairable = {
+        "illustrative_broll", "reaction", "transition", "establishing",
+        "punchline_hold", "end_hold", "music_montage", "primary_action",
+    }
+    repairs: list[str] = []
+    shots = chosen.get("shots") or []
+    for index, (shot, entry) in enumerate(zip(shots, audit.entries, strict=True)):
+        if entry.picture_role not in repairable:
+            continue
+        requested = float(shot.get("seconds_needed") or 0.0)
+        if entry.supported_seconds >= requested - 0.05:
+            continue
+        from montagewright.candidate_commitments import (
+            minimum_supported_seconds_for_shot,
+        )
+
+        minimum = minimum_supported_seconds_for_shot(shot, commitments)
+        repaired = max(float(entry.supported_seconds), minimum)
+        if repaired >= requested - 0.05 or repaired > entry.supported_seconds + 0.05:
+            continue
+        shot["seconds_needed"] = round(repaired, 3)
+        shot.pop("coverage_claim_seconds", None)
+        repairs.append(
+            f"k{index:02d}: shortened unsupported {entry.picture_role} tail "
+            f"from {requested:.2f}s to {repaired:.2f}s for preferred delivery"
+        )
+    return tuple(repairs)
+
+
 def _overlap(
     start: float, end: float, intervals: Iterable[tuple[float, float, str]],
     *, source_id: str | None = None,
