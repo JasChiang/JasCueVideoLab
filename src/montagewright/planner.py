@@ -574,6 +574,8 @@ def decide_rhythm(
     brief: str = "",
     context: dict[str, dict] | None = None,
     music: Path | None = None,
+    shots: "list[MaterialItem] | None" = None,
+    cache: UploadCache | None = None,
     target_seconds: float = 0.0,
     duration_mode: str = "exact",
     client: Any | None = None,
@@ -665,6 +667,16 @@ def decide_rhythm(
                 "uri": uploaded.uri,
             }
         )
+    # The shots themselves, not only a line each. This pass hears the track
+    # and decides how long every shot runs, and it had never seen one: given
+    # eight descriptions and an average it returned eight lengths inside one
+    # and a half of each other, twice, before and after the average was
+    # taken away. Density is a judgement about what is on screen -- a busy
+    # shot and an empty one do not want the same seconds -- and it was being
+    # made from prose. The proxies are already uploaded for the passes that
+    # chose them, so this costs tokens and no upload.
+    if shots is not None:
+        request_input += _attach_material(shots, cache, client)
 
     request = {
         "model": MODEL_ID,

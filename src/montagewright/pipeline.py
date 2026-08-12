@@ -2220,6 +2220,7 @@ def run(
     transcripts: Mapping[str, dict | None] | None = None,
     grounding_spec: Any | None = None,
     grounding_memory: Path | None = None,
+    rhythm_shots: "list[Any] | None" = None,
     upload_cache: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
     """Take an EDL to a finished file.
@@ -2249,6 +2250,8 @@ def run(
             brief=brief,
             context=rhythm_context or {},
             music=music,
+            shots=rhythm_shots,
+            cache=upload_cache,
             target_seconds=target_seconds,
             duration_mode=duration_mode,
             client=client,

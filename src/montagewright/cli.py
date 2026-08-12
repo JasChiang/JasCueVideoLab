@@ -1511,6 +1511,14 @@ def command_render(args: argparse.Namespace) -> int:
             transcripts=transcripts,
             grounding_spec=args.reference_grounding_spec,
             grounding_memory=library / "reference-grounding",
+            # The pass that decides how long each shot runs should be able
+            # to see the shots. They are the material items selection chose,
+            # in the order it chose them.
+            rhythm_shots=[
+                item for shot in selection["shots"]
+                for item in material
+                if item.source_id == shot.get("source_id")
+            ],
             upload_cache=cache,
         )
 
