@@ -134,6 +134,44 @@ class Run:
 RUNS: dict[str, Run] = {}
 
 
+def _lines_on_disk(out: Path) -> list[str]:
+    """What a run nobody here started has said so far.
+
+    Not a tail. The page asks for everything after the line it last saw, so
+    the positions have to keep meaning the same thing -- a sliding window of
+    the last five hundred lines never grows, which read as a run that had
+    stopped talking, and left the log frozen at whatever it said when the
+    page happened to open.
+    """
+
+    try:
+        return [
+            line for line in
+            (out / "run.log").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ][-20_000:]
+    except OSError:
+        return []
+
+
+def _catch_up(run: "Run") -> "Run":
+    """Re-read a run this server did not start.
+
+    Its state and its log both live on disk and both move while it works,
+    and they were read once when the folder was first seen. So a cut from
+    the command line reported "running" over a log frozen at the moment the
+    page happened to open, and stayed that way until it finished.
+    """
+
+    if run.process is not None:
+        return run
+    run.state = _state_of_a_foreign_run(run.output)
+    lines = _lines_on_disk(run.output)
+    if len(lines) > len(run.lines):
+        run.lines = lines
+    return run
+
+
 def _state_of_a_foreign_run(out: Path) -> str:
     """What a run nobody here started is doing, if it says so.
 
@@ -187,16 +225,8 @@ def recall() -> None:
         if not note.exists():
             # A run from the command line keeps its own log beside the
             # output; without it the page shows a state and nothing else.
-            spare_log = folder / "out" / "run.log"
-            if spare_log.exists() and not saved.get("log"):
-                try:
-                    saved["log"] = [
-                        line for line in
-                        spare_log.read_text(encoding="utf-8").splitlines()
-                        if line.strip()
-                    ][-500:]
-                except OSError:
-                    pass
+            if not saved.get("log"):
+                saved["log"] = _lines_on_disk(folder / "out")
             # A run started from the command line leaves only the note beside
             # its output, and that note is written before the work begins --
             # so "it exists" says the run started, not that it finished. A
@@ -2575,7 +2605,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/runs/{run_id}")
     def status(run_id: str, since: int = 0) -> JSONResponse:
-        run = _run(run_id)
+        run = _catch_up(_run(run_id))
         return JSONResponse({
             "state": run.state,
             "returncode": run.returncode,
