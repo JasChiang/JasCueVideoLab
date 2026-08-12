@@ -6906,3 +6906,49 @@ def test_a_tracker_that_holds_nothing_is_one_shot_not_the_run():
         )
         assert fault.clip_id == "k03" and fault.entity_id == "device.fold"
         assert "0/12" in str(fault)
+
+
+def test_an_unverified_track_says_so_instead_of_counting_frames():
+    """"0/12 frames passed" reads as a tracker that lost its subject twelve
+    times. What happened is one verdict over the whole track: fewer than two
+    exact-frame anchors agreed with the mask, so every sample was discarded
+    at once. The two have nothing in common to fix, so they cannot share a
+    sentence -- and the numbers that decided it were never written down.
+    """
+
+    from types import SimpleNamespace
+
+    from montagewright.reframe import observations_from_sam
+
+    def sample(at_ms, box):
+        return SimpleNamespace(
+            analysis_sample_time_ms=at_ms,
+            derived_tracking_box=box,
+            tracking_state="tracked",
+            semantic_identity_status="",
+        )
+
+    track = SimpleNamespace(
+        analysis_fps=4.0,
+        samples=[
+            sample(0, (100, 100, 200, 200)),
+            sample(250, (100, 100, 200, 200)),
+        ],
+    )
+    # Anchors sit where the tracker is, but on a different extent: a mask
+    # tight on the screen against a box drawn around the whole handset.
+    observations, states = observations_from_sam(
+        track,
+        clip_start_seconds=0.0,
+        semantic_anchors=((0.0, (0.10, 0.10, 0.40, 0.40)),
+                          (0.25, (0.10, 0.10, 0.40, 0.40))),
+        require_identity_validation=True,
+    )
+
+    assert observations == []
+    assert states["identity_unverified"] == 2
+    assert states["_anchors_offered"] == 2
+    assert states["_anchors_agreed"] == 0
+    assert 0 < states["_best_agreement_pct"] < 35, (
+        "record how close it came, or nobody can tell 34% from 3%"
+    )

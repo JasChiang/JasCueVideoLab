@@ -1671,6 +1671,7 @@ def observations_from_sam(
         # agrees with its geometry. This prevents a confident mask that has
         # switched to a lookalike from becoming an equally confident crop.
         matched_times: list[float] = []
+        best = 0.0
         for anchor_time, anchor_box in semantic_anchors:
             candidates = [
                 sample for sample in samples
@@ -1693,10 +1694,19 @@ def observations_from_sam(
                 float(raw_box[2]) / 1000.0,
                 float(raw_box[3]) / 1000.0,
             )
-            if overlap(sam_box, anchor_box) >= 0.35:
+            agreement = overlap(sam_box, anchor_box)
+            best = max(best, agreement)
+            if agreement >= 0.35:
                 matched_times.append(anchor_time)
         if len(matched_times) < 2:
             states["identity_unverified"] = len(samples)
+            # Underscored, so the caller counting frames does not count these.
+            # "0/12 frames passed" reads as a tracker that lost its subject
+            # twelve times; what actually happened is one verdict over the
+            # whole track, and the two have nothing in common to fix.
+            states["_anchors_offered"] = len(semantic_anchors)
+            states["_anchors_agreed"] = len(matched_times)
+            states["_best_agreement_pct"] = int(round(best * 100))
             return [], states
         validated_interval = (min(matched_times), max(matched_times))
     for sample in samples:

@@ -1117,7 +1117,9 @@ def _reference_subject_samples(
             f"{clip.clip_id}: SAM/local geometry failed for locked reference "
             f"identity {target_id}; refusing Gemini-box crop",
         ) from error
-    total = sum(states.values()) or 1
+    total = sum(
+        count for name, count in states.items() if not name.startswith("_")
+    ) or 1
     # Only locally materialized observations can become crop geometry. A
     # sample labelled tracked but lacking a valid mask-derived box is not a
     # successful handoff for a reference-critical target.
@@ -1128,7 +1130,21 @@ def _reference_subject_samples(
             "status": "local_geometry_unverified",
             "tracked_frames": kept,
             "analysed_frames": total,
+            "anchors_agreed": states.get("_anchors_agreed"),
+            "anchors_offered": states.get("_anchors_offered"),
+            "best_agreement_pct": states.get("_best_agreement_pct"),
         }
+        if states.get("identity_unverified"):
+            raise ReferenceGeometryUnavailable(
+                clip.clip_id, target_id,
+                f"{clip.clip_id}: the track for {target_id} was never tied to "
+                f"the exact frames that proved it -- "
+                f"{states.get('_anchors_agreed', 0)} of "
+                f"{states.get('_anchors_offered', 0)} anchors agreed with the "
+                f"mask (best overlap "
+                f"{states.get('_best_agreement_pct', 0)}%, needs 35% on two); "
+                "refusing Gemini-box fallback",
+            )
         raise ReferenceGeometryUnavailable(
             clip.clip_id, target_id,
             f"{clip.clip_id}: SAM/local geometry for locked reference identity "
