@@ -1945,6 +1945,18 @@ async function openRun(id, where, how) {
     for (const t of document.querySelectorAll('.tab')) t.classList.remove('hide');
     render(data.report); showExtras(); showTab('pane-shots');
   } else {
+    // The progress panel lives inside the setup sheet, because that is where
+    // it appears when this tab is the one that pressed start -- and the
+    // sheet is closed when a cut is opened from its own URL, so the steps,
+    // the fault and the raw log were all unhidden inside something nobody
+    // could see. Bring it to where the cut is being watched.
+    const shots = $('pane-shots');
+    if (shots && !shots.contains($('progress'))) {
+      shots.insertBefore($('progress'), shots.firstChild);
+      $('progress').style.marginTop = '0';
+    }
+    for (const t of document.querySelectorAll('.tab')) t.classList.remove('hide');
+    showTab('pane-shots');
     // A cut still being made has no report, and the header only ever learned
     // its name from one. Opening a running cut therefore said "nothing is
     // open" over a workspace that plainly had something in it.
