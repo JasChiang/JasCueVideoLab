@@ -134,6 +134,30 @@ class Run:
 RUNS: dict[str, Run] = {}
 
 
+def _state_of_a_foreign_run(out: Path) -> str:
+    """What a run nobody here started is doing, if it says so.
+
+    The claim is only believed while the process that made it is alive: a
+    "running" left behind by a killed job is exactly the stale state this
+    loader was already refusing to trust.
+    """
+
+    try:
+        said = json.loads((out / "run-state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        said = {}
+    state = str(said.get("state") or "")
+    if state == "running":
+        try:
+            os.kill(int(said.get("pid") or 0), 0)
+        except (OSError, TypeError, ValueError):
+            return "interrupted"
+        return "running"
+    if state in {"done", "failed"}:
+        return state
+    return "done" if (out / "report.json").exists() else "interrupted"
+
+
 def recall() -> None:
     """Pick up runs left by an earlier server."""
 
@@ -183,11 +207,12 @@ def recall() -> None:
             # difference. `interrupted` already means this and already offers
             # to pick the run up again, which is the useful thing to do with
             # one.
-            saved.setdefault(
-                "state",
-                "done" if (folder / "out" / "report.json").exists()
-                else "interrupted",
-            )
+            # A cut made from the command line leaves a pid behind while it
+            # works. Without that, a folder with no report in it is
+            # indistinguishable from one whose run died with the last
+            # server -- so a cut that was busy cutting read as "interrupted"
+            # and the page never refreshed it.
+            saved.setdefault("state", _state_of_a_foreign_run(folder / "out"))
             saved.setdefault(
                 "started_at", (folder / "out").stat().st_mtime
             )

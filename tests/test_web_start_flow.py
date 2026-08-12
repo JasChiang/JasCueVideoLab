@@ -219,3 +219,42 @@ def test_opening_a_running_cut_names_it_and_starts_the_clock():
     assert opening.count("clearInterval(timer)") >= 1, (
         "without leaving the previous cut's timer running"
     )
+
+
+def test_a_cut_made_from_the_command_line_reads_as_running(tmp_path, monkeypatch):
+    """A folder with no report in it meant "died with the last server".
+
+    Which is right for a run that did, and wrong for one that is busy
+    cutting -- so a command-line cut showed as interrupted, under a page
+    that never refreshed it, for as long as it took to finish. A pid is
+    enough to tell them apart, and is only believed while it is alive.
+    """
+
+    import json
+    import os
+
+    from montagewright.webapp import _state_of_a_foreign_run
+
+    out = tmp_path / "out"
+    out.mkdir()
+    assert _state_of_a_foreign_run(out) == "interrupted", "no report, no claim"
+
+    (out / "run-state.json").write_text(
+        json.dumps({"state": "running", "pid": os.getpid()}), encoding="utf-8"
+    )
+    assert _state_of_a_foreign_run(out) == "running", "this process is alive"
+
+    # A pid nobody is using: the claim outlived its process.
+    (out / "run-state.json").write_text(
+        json.dumps({"state": "running", "pid": 2 ** 22}), encoding="utf-8"
+    )
+    assert _state_of_a_foreign_run(out) == "interrupted"
+
+    (out / "run-state.json").write_text(
+        json.dumps({"state": "failed", "pid": 2 ** 22}), encoding="utf-8"
+    )
+    assert _state_of_a_foreign_run(out) == "failed", "a finished claim stands"
+
+    (out / "run-state.json").unlink()
+    (out / "report.json").write_text("{}", encoding="utf-8")
+    assert _state_of_a_foreign_run(out) == "done", "older runs still read right"

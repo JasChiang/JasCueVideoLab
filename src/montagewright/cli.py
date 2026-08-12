@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -3060,6 +3061,27 @@ def command_graphics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_run_state(path: Path, state: str) -> None:
+    """Say who is doing this and whether they are still here.
+
+    The pid is the whole point: "running" written by a process that has
+    since died is exactly the stale claim the interface was already
+    guarding against by ignoring the field.
+    """
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "state": state, "pid": os.getpid(), "at": time.time(),
+            }),
+            encoding="utf-8",
+        )
+    except OSError:
+        # Not being watchable is not a reason to refuse to cut.
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     from montagewright.environment import load_project_env
 
@@ -3224,7 +3246,23 @@ def main(argv: list[str] | None = None) -> int:
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(effective_argv)
     args._argv = effective_argv
-    return args.handler(args)
+    # A run started here is invisible to the interface: it reads a folder,
+    # and a folder with no report in it is a run that died with the last
+    # server. So a cut that was busy cutting showed as "interrupted", under
+    # a workspace that never refreshed, for as long as it took to finish.
+    # Leaving a pid behind is enough for the reader to tell the two apart.
+    where = getattr(args, "output", None)
+    if where is None:
+        return args.handler(args)
+    state = Path(where).expanduser() / "run-state.json"
+    _write_run_state(state, "running")
+    try:
+        outcome = args.handler(args)
+    except BaseException:
+        _write_run_state(state, "failed")
+        raise
+    _write_run_state(state, "done" if not outcome else "failed")
+    return outcome
 
 
 if __name__ == "__main__":
