@@ -269,8 +269,7 @@ def _describe_music(grid: BeatGrid) -> str:
         # interchangeable beats and no sense of where a bar or a phrase
         # turns over.
         f"One bar is {grid.seconds_per_beat * grid.meter:.2f}s; a four-bar "
-        f"phrase is {grid.phrase_seconds():.2f}s. Shots do not have to be "
-        "equal -- a phrase can hold one long shot or four short ones.",
+        f"phrase is {grid.phrase_seconds():.2f}s.",
     ]
     if sections:
         lines.append("Section boundaries the analyser found:")
@@ -642,9 +641,7 @@ def decide_rhythm(
                     # failure mode.
                     f"## 長度\n\n定調偏好全片 {target_seconds:.0f} 秒，"
                     f"你手上有 {len(edl.clips)} 顆。"
-                    "長度是總量，不是每顆的配額：把它花在該長的地方。"
-                    "疏密對比才是節奏——幾顆短切之後留一顆長的，或反過來；"
-                    "每顆都差不多長的版本聽起來像節拍器，是這一關最常見的失敗。"
+                    "這是總量，不是每顆的配額。"
                     + (
                         "這是精確交付規格，必須在內容證據允許下達成。"
                         if duration_mode == "exact" else

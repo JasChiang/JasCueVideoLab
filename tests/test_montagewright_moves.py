@@ -7143,7 +7143,13 @@ def test_rhythm_is_given_a_whole_and_a_structure_not_an_average():
 
     source = inspect.getsource(decide_rhythm)
     assert "平均每顆" not in source, "no per-shot average to anchor on"
-    assert "長度是總量，不是每顆的配額" in source
+    assert "這是總量，不是每顆的配額" in source
+    # And no shape is prescribed here. The prompt file already asks for one
+    # -- "每顆都差不多長，就是還沒有做這件事" -- in the right terms: a
+    # result to reach, not a pattern to copy. Naming a pattern would make
+    # every film the same pattern.
+    for prescription in ("短切", "先短後長", "一顆長的"):
+        assert prescription not in source
 
 
 def test_the_floor_of_a_shot_has_one_name():
