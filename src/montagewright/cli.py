@@ -405,13 +405,37 @@ def _screen_material_identity(
         if not seen:
             kept.append(item)
             continue
-        surviving = tuple(
-            span for span in item.spans
-            if any(
-                span.starts_seconds < ends and span.ends_seconds > starts
+        # Any overlap at all was enough to keep a span, and selection is
+        # free to cut anywhere inside one -- so a span that clipped a
+        # sighting by a fifth of a second was offered whole, the cut landed
+        # in the part where the target is not, and the shot died four
+        # stages later with the frames judged and no target in them. Keep
+        # the part of the span the identity was actually seen in.
+        surviving = []
+        for span in item.spans:
+            inside = [
+                (max(span.starts_seconds, starts), min(span.ends_seconds, ends))
                 for starts, ends in seen
-            )
-        )
+                if span.starts_seconds < ends and span.ends_seconds > starts
+            ]
+            if not inside:
+                continue
+            opens = min(one[0] for one in inside)
+            closes = max(one[1] for one in inside)
+            if closes - opens < 0.5:
+                # Too little of it to cut anything from; leaving it out is
+                # honest, and leaving it in offers a window nothing can use.
+                continue
+            if (
+                opens <= span.starts_seconds + 1e-3
+                and closes >= span.ends_seconds - 1e-3
+            ):
+                surviving.append(span)
+                continue
+            surviving.append(replace(
+                span, starts_seconds=round(opens, 3), ends_seconds=round(closes, 3)
+            ))
+        surviving = tuple(surviving)
         if not surviving:
             aside[item.source_id] = (
                 "the locked identity was seen in this source but never "

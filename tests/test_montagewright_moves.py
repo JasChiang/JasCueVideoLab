@@ -7172,3 +7172,86 @@ def test_the_floor_of_a_shot_has_one_name():
     assert after.count("floor_seconds") >= 4, (
         "the snap, the ceiling and the feasibility clamp all consult it"
     )
+
+
+def test_a_span_is_offered_only_where_the_identity_was_seen():
+    """Any overlap kept the whole span, and a cut may land anywhere in it.
+
+    So a span that clipped a sighting by a fraction was offered entire,
+    the cut landed in the part where the target is not, and the shot died
+    four stages later with its frames judged and nothing in them. Keeping
+    the sighted part is the same fix as everything else here: do not offer
+    what cannot be delivered.
+    """
+
+    from dataclasses import dataclass
+
+    from montagewright.cli import _screen_material_identity
+    from montagewright.spans import Span
+
+    @dataclass(frozen=True)
+    class Item:
+        source_id: str
+        proxy: object
+        spans: tuple
+
+    class Seen:
+        def __init__(self, spans):
+            self.candidates = [
+                type("C", (), {
+                    "target_id": "device.fold",
+                    "identity_status": "matched_target",
+                    "start_ms": int(a * 1000), "end_ms": int(b * 1000),
+                })()
+                for a, b in spans
+            ]
+            self.target_summaries = []
+
+    item = Item("C1", None, (
+        Span("C1:s00", "C1", 0.0, 6.0),   # sighted 2.0-6.0 only
+        Span("C1:s01", "C1", 6.0, 9.0),   # sighted 6.0-6.2: too little
+        Span("C1:s02", "C1", 9.0, 12.0),  # never sighted
+    ))
+    # The screen only reads `proxy`; a source without one is passed through,
+    # so drive the narrowing logic directly against a stub discovery.
+    from montagewright import cli
+
+    def remembered(*_args, **_kwargs):
+        return Seen([(2.0, 6.2)]), None
+
+    original = cli.__dict__.get("remembered_discovery")
+    import montagewright.reference_grounding as grounding
+    was = grounding.remembered_discovery
+    grounding.remembered_discovery = remembered
+    try:
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as work:
+            proxy = Path(work) / "C1.mp4"
+            proxy.write_bytes(b"proxy")
+            spec = type("S", (), {
+                "identity_lock": type("L", (), {
+                    "framing": type("F", (), {"required_target_ids": ["device.fold"]})(),
+                    "identity": type("I", (), {"targets": []})(),
+                })(),
+            })()
+            kept, aside = _screen_material_identity(
+                [Item("C1", proxy, item.spans)], spec,
+                client=object(), cache=None,
+                ledger=type("L", (), {"check": lambda self: None,
+                                      "spent_usd": 0.0})(),
+                library=Path(work),
+            )
+    finally:
+        grounding.remembered_discovery = was
+        del original
+
+    assert aside == {}
+    spans = kept[0].spans
+    assert [one.span_id for one in spans] == ["C1:s00"], (
+        "the unsighted span and the sliver both go"
+    )
+    assert spans[0].starts_seconds == 2.0 and spans[0].ends_seconds == 6.0, (
+        "and what is left is the part the identity was actually seen in"
+    )
