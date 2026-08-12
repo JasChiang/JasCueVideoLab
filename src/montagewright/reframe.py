@@ -1619,6 +1619,40 @@ def ffmpeg_crop_filters(
     ]
 
 
+def _track_holds_together(samples: list) -> bool:
+    """Whether this track ever let go of what it was following.
+
+    A tracker that switches to a neighbouring object leaves a trace: the
+    box jumps, or its area changes by a factor no real subject does between
+    two samples a quarter of a second apart. A track that does neither is
+    still on the thing it was seeded with, which a verified frame has
+    already named.
+    """
+
+    from math import hypot
+
+    last: tuple[float, float, float, float] | None = None
+    for sample in samples:
+        box = getattr(sample, "derived_tracking_box", None)
+        at = getattr(sample, "analysis_sample_time_ms", 0) / 1000.0
+        if not box or len(box) != 4:
+            # A gap is not a jump; it is simply nothing to compare across.
+            last = None
+            continue
+        x0, y0, x1, y1 = (value / 1000.0 for value in box)
+        centre = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        area = max(1e-6, abs(x1 - x0) * abs(y1 - y0))
+        if last is not None:
+            was_x, was_y, was_area, was_at = last
+            gap = max(1e-3, at - was_at)
+            if hypot(centre[0] - was_x, centre[1] - was_y) / gap > 0.6:
+                return False
+            if not 0.4 <= area / was_area <= 2.5:
+                return False
+        last = (centre[0], centre[1], area, at)
+    return True
+
+
 def observations_from_sam(
     track,
     *,
@@ -1698,7 +1732,30 @@ def observations_from_sam(
             best = max(best, agreement)
             if agreement >= 0.35:
                 matched_times.append(anchor_time)
-        if len(matched_times) < 2:
+        # One agreement plus a track that never jumps is the same evidence
+        # as two agreements. Gemini says which instance this is; SAM's job
+        # is to keep hold of it, and it does -- what the second anchor
+        # actually guards against is the tracker letting go and picking up
+        # something else, which leaves a trace in the geometry. Demanding
+        # two agreements instead threw away six good shots in one cut,
+        # every one of them with its identity confirmed on three frames,
+        # because the second anchor's moment happened to be one the tracker
+        # had no mask for. Sixty seconds came out twenty-seven.
+        if len(matched_times) == 1 and _track_holds_together(samples):
+            tracked = [
+                sample.analysis_sample_time_ms / 1000.0
+                for sample in samples
+                if sample.derived_tracking_box
+            ]
+            # Three samples at least: a track too short to have moved is not
+            # evidence that it never let go, it is evidence of nothing.
+            if len(tracked) >= 3:
+                states["_identity_by_continuity"] = 1
+                states["_anchors_agreed"] = 1
+                states["_best_agreement_pct"] = int(round(best * 100))
+                validated_interval = (min(tracked), max(tracked))
+                matched_times = list(tracked)
+        if len(matched_times) < 2 and validated_interval is None:
             states["identity_unverified"] = len(samples)
             # Underscored, so the caller counting frames does not count these.
             # "0/12 frames passed" reads as a tracker that lost its subject
@@ -1708,7 +1765,8 @@ def observations_from_sam(
             states["_anchors_agreed"] = len(matched_times)
             states["_best_agreement_pct"] = int(round(best * 100))
             return [], states
-        validated_interval = (min(matched_times), max(matched_times))
+        if validated_interval is None:
+            validated_interval = (min(matched_times), max(matched_times))
     for sample in samples:
         state = getattr(sample.tracking_state, "value", str(sample.tracking_state))
         if state not in accept_states:

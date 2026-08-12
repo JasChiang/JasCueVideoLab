@@ -274,6 +274,19 @@ def _client():
     return genai.Client(api_key=key, http_options=_http_options(types))
 
 
+def _why(fault: Exception) -> str:
+    """The reason a shot could not be delivered, in one line.
+
+    Batching the repairs dropped it: the messages named the shot and the
+    identity and said nothing about whether the frames had refused it or
+    the tracker had never held it -- which are the two things anyone
+    reading the log needs to tell apart.
+    """
+
+    said = str(fault)
+    return (said.split(": ", 1)[-1] if ": " in said else said)[:150]
+
+
 def _swap_for_alternate(
     shot: dict[str, Any],
     direction: dict[str, Any],
@@ -1565,8 +1578,8 @@ def command_render(args: argparse.Namespace) -> int:
                     selection["shots"][index] = swapped
                     identity_swaps.append(
                         f"{fault.clip_id}: {shot.get('span_id')} could not "
-                        f"deliver {fault.entity_id}; took the alternate "
-                        f"{swapped.get('span_id')}"
+                        f"deliver {fault.entity_id} ({_why(fault)}); took "
+                        f"the alternate {swapped.get('span_id')}"
                     )
                 elif (
                     args.duration_mode != "exact"
@@ -1575,9 +1588,9 @@ def command_render(args: argparse.Namespace) -> int:
                     selection["shots"].pop(index)
                     identity_swaps.append(
                         f"{fault.clip_id}: {shot.get('span_id')} could not "
-                        f"deliver {fault.entity_id} and its commitment has "
-                        "no alternate left; dropped the shot and delivered "
-                        "shorter"
+                        f"deliver {fault.entity_id} ({_why(fault)}) and its "
+                        "commitment has no alternate left; dropped the shot "
+                        "and delivered shorter"
                     )
                 else:
                     continue

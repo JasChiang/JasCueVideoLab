@@ -1441,6 +1441,16 @@ def _describe_material(material: list[MaterialItem]) -> str:
                     if span.span_id in inside
                     else "，此段沒有測到可命名的主體"
                 )
+                # The other half of the rule. Saying only what may not be
+                # named taught the pass to name one thing and hold: eleven
+                # shots, eleven single looks, not one move in the film --
+                # from a listing that had two nameable subjects sitting in
+                # the same segment and never said they could be joined.
+                + (
+                    "，兩者都在此段內，可以在它們之間運鏡"
+                    if len(inside.get(span.span_id, ())) >= 2
+                    else ""
+                )
                 + "）"
                 for span in item.spans
             )

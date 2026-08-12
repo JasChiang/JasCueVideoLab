@@ -6382,6 +6382,61 @@ def test_reference_identity_track_requires_two_agreeing_semantic_anchors():
     assert states["tracked"] == 3
 
 
+def test_one_anchor_and_an_unbroken_track_is_enough():
+    """Gemini says which instance; SAM's job is to keep hold of it.
+
+    What a second agreement actually guards against is the tracker letting
+    go and picking up something else, and that leaves a trace in the
+    geometry -- a jump, or an area that changes by a factor no real subject
+    does in a quarter of a second. Demanding a second agreement instead
+    threw away six shots in one cut, every one of them with its identity
+    confirmed on three frames, because the second anchor's moment happened
+    to be one the tracker had no mask for. Sixty seconds came out
+    twenty-seven.
+    """
+
+    from types import SimpleNamespace
+
+    from montagewright.reframe import observations_from_sam
+
+    def track(boxes):
+        return SimpleNamespace(
+            analysis_fps=4.0,
+            samples=[
+                SimpleNamespace(
+                    analysis_sample_time_ms=index * 250,
+                    tracking_state="tracked",
+                    semantic_identity_status="seed_grounded",
+                    derived_tracking_box=box,
+                )
+                for index, box in enumerate(boxes)
+            ],
+        )
+
+    steady = [[100, 200, 400, 700], [110, 200, 410, 700],
+              [120, 200, 420, 700], [130, 200, 430, 700]]
+    observations, states = observations_from_sam(
+        track(steady),
+        clip_start_seconds=0.0,
+        semantic_anchors=((0.0, (0.1, 0.2, 0.4, 0.7)),),
+        require_identity_validation=True,
+    )
+    assert observations, "one agreement over an unbroken track is enough"
+    assert states.get("_identity_by_continuity") == 1, "and it says why"
+
+    # The tracker lets go and picks up something across the frame.
+    jumped = [[100, 200, 400, 700], [110, 200, 410, 700],
+              [600, 200, 900, 700], [610, 200, 910, 700]]
+    observations, states = observations_from_sam(
+        track(jumped),
+        clip_start_seconds=0.0,
+        semantic_anchors=((0.0, (0.1, 0.2, 0.4, 0.7)),),
+        require_identity_validation=True,
+    )
+    assert observations == [], "a jump is still refused on one agreement"
+    assert states["identity_unverified"] == 4
+
+
 def test_reference_identity_track_fails_closed_with_one_anchor():
     from types import SimpleNamespace
 
@@ -6402,6 +6457,8 @@ def test_reference_identity_track_fails_closed_with_one_anchor():
         semantic_anchors=((0.0, (0.1, 0.2, 0.4, 0.7)),),
         require_identity_validation=True,
     )
+    # One sample is a track too short to have moved: it is not evidence
+    # that nothing let go, so a single agreement does not carry it.
     assert observations == []
     assert states["identity_unverified"] == 1
 
@@ -7333,3 +7390,35 @@ def test_a_second_review_knows_the_cut_was_changed_for_the_first():
     assert "already=rounds" in inspect.getsource(
         __import__("montagewright.cli", fromlist=["cli"]).command_render
     ), "and the run actually hands the history over"
+
+
+def test_a_segment_that_can_carry_a_move_says_so():
+    """Saying only what may not be named taught the pass to hold.
+
+    Eleven shots, eleven single looks, not one move in the film -- from a
+    listing that had two nameable subjects sitting in the same segment and
+    never said they could be joined. A look that cannot be reached is
+    refused later; a move that was never asked for is simply absent, and
+    nothing reports it.
+    """
+
+    from montagewright.planner import MaterialItem, _describe_material
+    from montagewright.spans import Span
+
+    described = _describe_material([MaterialItem(
+        source_id="C1",
+        duration_seconds=10.0,
+        summary="two handsets on a table",
+        proxy=None,
+        crop_width=0.32,
+        spans=(
+            Span("C1:s00", "C1", 0.0, 6.0, "locked", "both in shot"),
+            Span("C1:s01", "C1", 6.0, 10.0, "locked", "only one left"),
+        ),
+        sightings=(("左邊的白色", 1.0), ("右邊的紫色", 3.0), ("右邊的紫色", 7.0)),
+        subjects=("左邊的白色", "右邊的紫色"),
+    )])
+
+    first, second = described.split("；C1:s01")
+    assert "可以在它們之間運鏡" in first, "two subjects, one segment: a move is on"
+    assert "可以在它們之間運鏡" not in second, "one subject is a hold"
