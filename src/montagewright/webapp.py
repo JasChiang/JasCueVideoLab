@@ -1208,6 +1208,20 @@ def create_app() -> FastAPI:
     def index() -> str:
         return PAGE.read_text(encoding="utf-8")
 
+    @app.get("/run/{run_id}", response_class=HTMLResponse)
+    def index_for_run(run_id: str) -> str:
+        """The same page. Which cut is open belongs in the address bar.
+
+        Everything here was one URL: opening a past cut left the location at
+        the root, so reloading threw the cut away, no link to one could be
+        sent or kept, and the back button left the application entirely. The
+        page decides what to show from the path; this route exists so that
+        path survives a reload rather than 404ing.
+        """
+
+        del run_id
+        return PAGE.read_text(encoding="utf-8")
+
     @app.post("/api/runs")
     async def start(
         rushes: list[UploadFile] | None = None,

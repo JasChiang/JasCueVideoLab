@@ -1876,14 +1876,43 @@ function wirePast(within) {
   }
 }
 
-async function openRun(id, where) {
+// Which cut is open is address-bar state: a reload, a bookmark, a link
+// pasted to somebody else and the back button all mean the same thing, and
+// all of them used to land on the chooser. 'keep' is for arrivals that the
+// history already describes -- the first load and popstate -- so they read
+// the URL instead of writing it.
+function markRunInUrl(id, how) {
+  const at = id ? `/run/${id}` : '/';
+  if (how === 'keep') return;
+  if (how === 'replace') history.replaceState({ runId: id || null }, '', at);
+  else history.pushState({ runId: id || null }, '', at);
+}
+
+function runIdInUrl() {
+  const match = location.pathname.match(/^\/run\/([A-Za-z0-9._-]+)\/?$/);
+  return match ? match[1] : null;
+}
+
+async function openRun(id, where, how) {
   // A debounced save belongs to the run and plan that scheduled it. Flush it
   // before switching global workspace state, then invalidate every preview
   // and undo artifact whose cue ids may also exist in the next run.
   if (graphicsSaving) saveGraphicsNow(runId, graphicsPlan);
   resetGraphicsEditorState();
   runId = id; seen = 0; lastSource = where || '';
-  const data = await (await fetch(`/api/runs/${id}`)).json();
+  const res = await fetch(`/api/runs/${id}`);
+  if (!res.ok) {
+    // A stale link or a run from a different runs root. Say so and stand on
+    // the chooser rather than throwing inside the render below.
+    runId = null;
+    markRunInUrl(null, how === 'keep' ? 'replace' : 'push');
+    showWorkspace(false);
+    loadPast();
+    alert(`找不到這一輪：${id}`);
+    return;
+  }
+  const data = await res.json();
+  markRunInUrl(id, how);
   $('log').textContent = data.lines.join('\n');
   allLines = data.lines;
   openedFrom = {
@@ -4539,6 +4568,23 @@ loadFonts('');
 showWorkspace(false);
 loadPast();
 
+// Arriving straight at a cut: a reload, a bookmark, or a link somebody was
+// sent. The chooser is what the page shows before this resolves.
+const arrivedAt = runIdInUrl();
+if (arrivedAt) openRun(arrivedAt, '', 'keep');
+else history.replaceState({ runId: null }, '', '/');
+
+window.addEventListener('popstate', () => {
+  const wanted = runIdInUrl();
+  if (wanted && wanted !== runId) { openRun(wanted, '', 'keep'); return; }
+  if (!wanted && runId) {
+    runId = null;
+    $('video').removeAttribute('src');
+    showWorkspace(false);
+    loadPast();
+  }
+});
+
 $('rushes').addEventListener('change', () => {
   const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
   $('picked').textContent = files.length ? `${files.length} 支影片` : '沒有找到影片檔';
@@ -4632,6 +4678,9 @@ $('go').addEventListener('click', async () => {
     return;
   }
   runId = (await res.json()).run_id;
+  // A run that is still cutting is the one worth being able to reload back
+  // into, more than a finished one.
+  markRunInUrl(runId, 'push');
   $('state').textContent = '執行中';
   seen = 0; allLines = []; stepWas = -1; $('log').textContent = '';
   // Whatever is on screen belongs to the last run. Leaving it there while a
@@ -5650,6 +5699,7 @@ syncPanelButtons();
 $('open-past').addEventListener('click', () => {
   runId = null;
   $('video').removeAttribute('src');
+  markRunInUrl(null, 'push');
   showWorkspace(false);
   loadPast();
 });

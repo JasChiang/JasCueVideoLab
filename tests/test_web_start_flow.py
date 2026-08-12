@@ -174,3 +174,26 @@ def test_writable_run_root_can_also_discover_read_only_legacy_runs(
 
     assert web.RUNS["old-cut"].root == old
     assert web.RUNS["old-cut"].source == "/old/rushes"
+
+
+def test_opening_a_cut_is_addressable_and_survives_a_reload():
+    """Every cut lived at the same URL, so none of them could be returned to.
+
+    Opening a past run left the address bar at the root: reloading threw the
+    cut away, the back button left the application, and a link to one cut
+    could not be sent or bookmarked. The page decides what to show from the
+    path, so the path has to survive a reload rather than 404.
+    """
+
+    client = TestClient(web.create_app())
+    page = (
+        Path(__file__).parents[1] / "src" / "montagewright" / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    served = client.get("/run/231d62b566e7")
+    assert served.status_code == 200
+    assert served.text == client.get("/").text, (
+        "one page; which cut it opens is read from the path"
+    )
+    assert "history.pushState" in page and "popstate" in page
+    assert "function runIdInUrl" in page
