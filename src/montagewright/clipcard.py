@@ -167,6 +167,7 @@ class SubjectBox:
     width: float
     height: float
     moves: bool
+    entity_id: str | None = None
     # When this position was true. A box is a moment, and a moment is the
     # whole answer only for a locked-off frame.
     at_seconds: float = 0.0
@@ -463,6 +464,14 @@ def card_schema() -> dict[str, Any]:
                         "seen_at",
                     ],
                     "properties": {
+                        "entity_id": {
+                            "type": "string",
+                            "description": (
+                                "Stable id supplied by an approved grounding "
+                                "spec. Leave absent for an ordinary descriptive "
+                                "subject; never invent one."
+                            ),
+                        },
                         "label": {
                             "type": "string",
                             "description": (
@@ -525,6 +534,10 @@ def subjects_from_card(card: dict[str, Any]) -> list[SubjectBox]:
             boxes.append(
                 SubjectBox(
                     label=str(entry["label"]),
+                    entity_id=(
+                        str(entry["entity_id"])
+                        if entry.get("entity_id") else None
+                    ),
                     centre_x=float(entry["centre_x"]),
                     centre_y=float(entry["centre_y"]),
                     width=float(entry["width"]),
@@ -538,7 +551,9 @@ def subjects_from_card(card: dict[str, Any]) -> list[SubjectBox]:
     return boxes
 
 
-def find_subject(card: dict[str, Any], description: str) -> SubjectBox | None:
+def find_subject(
+    card: dict[str, Any], description: str, *, entity_id: str | None = None
+) -> SubjectBox | None:
     """Match a planner's subject description to a box the card already holds.
 
     Exact wording will not match, so this looks for the card's label inside
@@ -548,17 +563,29 @@ def find_subject(card: dict[str, Any], description: str) -> SubjectBox | None:
     """
 
     boxes = subjects_from_card(card)
+    if entity_id is not None:
+        matched = [box for box in boxes if box.entity_id == entity_id]
+        return matched[0] if len(matched) == 1 else None
     lowered = description.lower()
+    exactish = []
     for box in boxes:
         label = box.label.lower()
         if label and (label in lowered or lowered in label):
-            return box
-    # Fall back to any shared distinguishing word of reasonable length.
+            exactish.append(box)
+    if len(exactish) == 1:
+        return exactish[0]
+    if exactish:
+        return None
+    # Fall back only when one candidate shares a distinguishing word. A
+    # common token matching two boxes is ambiguity, not permission to pick
+    # whichever the card happened to list first.
+    candidates = []
     for box in boxes:
         for word in box.label.split():
-            if len(word) >= 2 and word in description:
-                return box
-    return None
+            if len(word) >= 3 and word.casefold() in lowered:
+                candidates.append(box)
+                break
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def clip_seconds(path: Path) -> float:

@@ -41,6 +41,17 @@ VISUAL_ONLY_LIMITS: dict[str, float | None] = {
     "music_montage": 4.00,
 }
 
+# These roles describe bounded pauses rather than content whose minimum
+# duration has to be inferred from speech, readable copy or measured action.
+# A model overshooting one of these ceilings can therefore be repaired
+# monotonically: removing the unsupported tail cannot cut a sentence or an
+# action.  If the shorter sequence no longer reaches the delivery target, the
+# ordinary coverage audit asks selection for more real content instead of
+# silently stretching another shot.
+REPAIRABLE_VISUAL_HOLD_ROLES = frozenset({
+    "reaction", "transition", "punchline_hold", "end_hold",
+})
+
 _SPEECH = re.compile(
     r"^`(?P<id>[^`]+)`\s+"
     r"(?P<start>\d+(?:\.\d+)?)-(?P<end>\d+(?:\.\d+)?)s"
@@ -75,6 +86,47 @@ class CoverageAudit:
 
 class TimelineCoverageError(ValueError):
     """The edit has timeline seconds for which no content evidence exists."""
+
+
+def repair_bounded_visual_holds(chosen: dict[str, Any]) -> tuple[str, ...]:
+    """Clamp unsupported pure-visual tails before asking Gemini to replan.
+
+    The function deliberately excludes speaker, title/read, B-roll and action
+    roles.  Those need source evidence and may require a structural choice;
+    only semantically bounded holds are safe to shorten deterministically.
+    """
+
+    repairs: list[str] = []
+    shots = chosen.get("shots") or []
+    # Without canonical span lengths this small selection-stage helper cannot
+    # prove that a top-level narrative assignment has ended before a visual
+    # hold.  Be conservative: any independent audio keeps duration decisions
+    # in the structural planner, where the full clock is available.
+    has_independent_audio = bool(chosen.get("audio_assignments"))
+    for index, shot in enumerate(shots):
+        role = str(shot.get("picture_role") or "")
+        if role not in REPAIRABLE_VISUAL_HOLD_ROLES:
+            continue
+        if (
+            has_independent_audio
+            or str(shot.get("audio_role") or "discard") != "discard"
+            or bool(shot.get("audio_completion"))
+        ):
+            continue
+        limit = VISUAL_ONLY_LIMITS[role]
+        requested = max(0.0, float(shot.get("seconds_needed") or 0.0))
+        if limit is None or requested <= limit + 1e-9:
+            continue
+        shot["seconds_needed"] = round(float(limit), 3)
+        # This field is derived by the coverage audit, but clearing a cached
+        # value keeps the mutation honest until the audit recomputes it.
+        shot.pop("coverage_claim_seconds", None)
+        repairs.append(
+            f"k{index:02d}: shortened {role} from {requested:.2f}s to "
+            f"{float(limit):.2f}s; the removed tail had no additional "
+            "content evidence"
+        )
+    return tuple(repairs)
 
 
 def _overlap(
@@ -172,7 +224,7 @@ def _entry(
 
 
 def _target_faults(
-    duration: float, supported: float, target: float,
+    duration: float, supported: float, target: float, *, hard: bool = False,
 ) -> list[str]:
     if target <= 0:
         return []
@@ -180,7 +232,7 @@ def _target_faults(
         TARGET_TOLERANCE_SECONDS, target * TARGET_TOLERANCE_FRACTION
     )
     faults = []
-    if duration < target - tolerance:
+    if hard and duration < target - tolerance:
         faults.append(
             f"timeline is only {duration:.2f}s against the {target:.2f}s "
             f"target; structural selection is short by {target - duration:.2f}s"
@@ -191,7 +243,17 @@ def _target_faults(
             f"it is over by {duration - target:.2f}s and must remove or "
             "shorten content rather than ignore the delivery length"
         )
-    if supported < target - tolerance:
+    # Soft targets may be shorter, but a timeline that already reaches its
+    # requested duration by adding unsupported seconds is still invalid.
+    # Compare evidence with the actual edit here, not with the optional goal.
+    if supported < duration - tolerance:
+        faults.append(
+            f"evidence covers {supported:.2f}s of the {duration:.2f}s edit; "
+            f"{duration - supported:.2f}s needs additional narrative, visible "
+            "action/reaction, readable graphics, montage or an explicit "
+            "shorter delivery—not longer holds"
+        )
+    elif hard and supported < target - tolerance:
         faults.append(
             f"evidence covers {supported:.2f}s of the {target:.2f}s target; "
             f"{target - supported:.2f}s needs additional narrative, visible "
@@ -238,6 +300,7 @@ def _visual_claim(item: Any, shot: dict[str, Any], role: str) -> float:
 
 def selection_coverage_audit(
     chosen: dict[str, Any], material: list[Any], target_seconds: float,
+    *, hard_target: bool = False,
 ) -> CoverageAudit:
     """Audit the model's nominal selection using canonical audio durations."""
 
@@ -301,14 +364,18 @@ def selection_coverage_audit(
         entries.append(made)
         faults.extend(found)
     supported = sum(one.supported_seconds for one in entries)
-    faults.extend(_target_faults(cursor, supported, float(target_seconds or 0)))
+    faults.extend(_target_faults(
+        cursor, supported, float(target_seconds or 0), hard=hard_target
+    ))
     return CoverageAudit(
         cursor, supported, float(target_seconds or 0), tuple(entries),
         tuple(dict.fromkeys(faults)),
     )
 
 
-def edl_coverage_audit(edl: EDL, target_seconds: float) -> CoverageAudit:
+def edl_coverage_audit(
+    edl: EDL, target_seconds: float, *, hard_target: bool = False,
+) -> CoverageAudit:
     """Audit the resolved picture/audio clock shared by CLI, Web and render."""
 
     starts, cursor = {}, 0.0
@@ -346,7 +413,9 @@ def edl_coverage_audit(edl: EDL, target_seconds: float) -> CoverageAudit:
         entries.append(made)
         faults.extend(found)
     supported = sum(one.supported_seconds for one in entries)
-    faults.extend(_target_faults(cursor, supported, float(target_seconds or 0)))
+    faults.extend(_target_faults(
+        cursor, supported, float(target_seconds or 0), hard=hard_target
+    ))
     return CoverageAudit(
         cursor, supported, float(target_seconds or 0), tuple(entries),
         tuple(dict.fromkeys(faults)),

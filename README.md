@@ -146,6 +146,25 @@ montagewright render RUSHES/ \
 
 SAM 是預設路徑。找不到 checkpoint 時 CLI 會顯示詳細警告並退回 Gemini 的稀疏定位；只有在你確定不需要逐幀追蹤時才使用 `--no-sam-tracking`。
 
+### 用參考圖片鎖定人、物或地點
+
+只有文字 Brief 時，展開的摺疊機可能被模型看成一般平板。需要鎖定「這一個」實例時，可提供一張或多張正例圖片，以及跨角度仍穩定的辨識線索：
+
+```bash
+montagewright render RUSHES/ \
+  --grounding-target-id foldable.hero \
+  --grounding-target-description 'Brief 指定的銀色摺疊手機；展開後仍是同一台' \
+  --grounding-reference ~/Pictures/folded-front.jpg \
+  --grounding-reference ~/Pictures/unfolded-screen.jpg \
+  --grounding-identity-cue '相機模組與鉸鏈配置' \
+  --grounding-exclusion '不要用外觀相似的平板或另一款摺疊機' \
+  --output CUT/
+```
+
+Gemini 先以參考圖和正／反向條件找出候選區間，再對候選的精確影片格確認身份與框；至少兩個不同時間點確認成功後，SAM 才能接手逐幀追蹤。SAM 負責延續遮罩與位置，不會自行判斷兩個相似物件是不是同一個。任何階段無法確認都會停止該身份追蹤，而不是換成外觀相似的替代品。
+
+Web 的「開始新一輪」提供相同的簡易欄位。需要多個目標、hard negative 或已核准的完整查詢契約時，可改用 CLI `--grounding-spec PATH` 或 Web 的進階 grounding JSON；兩條入口最後都會寫成同一份 `work/grounding-spec.json`，供續跑、報表與稽核使用。
+
 ### 本機逐字稿（macOS 26）
 
 Apple SpeechTranscriber 提供逐字時間碼；Gemini 負責校正文意，但不提供字幕時鐘。

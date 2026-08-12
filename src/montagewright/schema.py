@@ -167,6 +167,15 @@ class Subject(ModelFacing):
             "is the single most common reason a shot cannot be reframed."
         )
     )
+    entity_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$",
+        description=(
+            "Stable identity from an approved grounding spec. Null means the "
+            "subject is descriptive only and must never be treated as a "
+            "reference-verified instance."
+        ),
+    )
     min_visible: Normalised = Field(
         default=0.85,
         description=(
@@ -210,6 +219,15 @@ class Look(ModelFacing):
             "handset'. Use the same wording twice to look at one thing "
             "again at a different framing -- that is what a push in is."
         )
+    )
+    entity_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$",
+        description=(
+            "Stable grounding identity when this look refers to a supplied "
+            "reference entity; otherwise null. The label in `at` is display "
+            "copy, not identity authority."
+        ),
     )
     seconds: float = Field(
         default=0.0,
@@ -725,6 +743,11 @@ def looks_of(shot: dict) -> "list[Look]":
     looks = [
         Look(
             at=str(one.get("at", "")),
+            entity_id=(
+                str(one["entity_id"])
+                if one.get("entity_id") not in {None, "", "none"}
+                else None
+            ),
             seconds=float(one.get("seconds", 0.0) or 0.0),
             framing=str(one.get("framing", "thirds") or "thirds"),
             must_be_whole=bool(one.get("must_be_whole", False)),
@@ -902,13 +925,15 @@ def reframe_of(shot: dict) -> Reframe:
         subject=(
             Subject(
                 description=first.at,
+                entity_id=first.entity_id,
                 min_visible=1.0 if first.must_be_whole else 0.85,
             )
             if first is not None
             else None
         ),
         then_subject=(
-            Subject(description=looks[1].at) if len(looks) > 1 else None
+            Subject(description=looks[1].at, entity_id=looks[1].entity_id)
+            if len(looks) > 1 else None
         ),
         intent=shot.get("why", "")[:120],
         # Read off the looks rather than taken from the plan. A plan written

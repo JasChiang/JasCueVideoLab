@@ -715,9 +715,20 @@ def _apply(
     from montagewright.spans import seconds_of
 
     rewritten: list[Clip] = []
+    has_independent_audio = bool(edl.audio_clips)
     for clip in edl.clips:
         decision = decisions[clip.clip_id]
         hold = seconds_of(decision.get("hold_seconds")) or 0.0
+        # Selection has already proved this source window's visual coverage.
+        # Rhythm may make a supported shot shorter, but it cannot manufacture
+        # another second of content by stretching it. Independent audio is
+        # excluded here because its completion clock needs structural review.
+        if (
+            not has_independent_audio
+            and clip.audio_role == "discard"
+            and clip.coverage_claim_seconds is not None
+        ):
+            hold = min(hold, float(clip.coverage_claim_seconds))
         rewritten.append(
             clip.model_copy(
                 update={
@@ -1388,6 +1399,7 @@ def decide_direction(
     cache: UploadCache | None = None,
     client: Any | None = None,
     ledger: Any | None = None,
+    grounding_spec: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage one: what should this material become.
 
@@ -1427,6 +1439,19 @@ def decide_direction(
             ),
         }
     ]
+    if grounding_spec is not None:
+        from montagewright.reference_grounding import reference_prompt_parts
+
+        # Direction establishes tone and structure; it does not bind an
+        # identity to a selected shot. Give it the approved text catalog but
+        # reserve the high-resolution reference uploads for selection, where
+        # their pixels can actually affect an executable entity_id decision.
+        request_input += reference_prompt_parts(
+            grounding_spec,
+            client=None,
+            cache=None,
+            resolution="high",
+        )
     request_input += _attach_material(material, cache, client)
     if music is not None:
         request_input.append(_attach_music(music, cache, client))
@@ -1485,6 +1510,7 @@ def _selection_schema(
     max_shots: int | None = None, replace_clip_ids: list[str] | None = None,
     graphic_candidate_ids: list[str] | None = None,
     audio_span_ids: list[str] | None = None,
+    grounding_target_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Flat shots plus flat coverage. Nothing nests more than one level.
 
@@ -1678,9 +1704,22 @@ def _selection_schema(
                                 # was a wordmark, and its silence lowered the
                                 # bar it had to clear from whole to 85%.
                                 "required": [
-                                    "at", "seconds", "framing", "must_be_whole"
+                                    "entity_id", "at", "seconds", "framing",
+                                    "must_be_whole"
                                 ],
                                 "properties": {
+                                    "entity_id": {
+                                        "type": "string",
+                                        "enum": [
+                                            "none", *(grounding_target_ids or [])
+                                        ],
+                                        "description": (
+                                            "Only when the request supplies a "
+                                            "stable reference identity: copy "
+                                            "its entity_id exactly. Otherwise "
+                                            "write none; never invent an id."
+                                        ),
+                                    },
                                     "at": {
                                         "type": "string",
                                         "description": (
@@ -1936,6 +1975,7 @@ def select_shots(
     client: Any | None = None,
     ledger: Any | None = None,
     graphic_candidates: list[Any] | tuple[Any, ...] | None = None,
+    grounding_spec: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage two: which shots, in what order, and why each one."""
 
@@ -1966,6 +2006,14 @@ def select_shots(
         else parse_brief_markdown(brief).candidates
     )
     graphic_candidate_ids = [one.candidate_id for one in graphic_candidates]
+    grounding_target_ids = (
+        [target.target_id for target in grounding_spec.identity_lock.identity.targets]
+        if grounding_spec is not None else []
+    )
+    grounding_required_target_ids = (
+        list(grounding_spec.identity_lock.framing.required_target_ids)
+        if grounding_spec is not None else []
+    )
     audio_span_sources = {
         line.split("`", 2)[1]: item.source_id
         for item in usable for line in item.speech
@@ -2015,6 +2063,16 @@ def select_shots(
             ),
         }
     ]
+    if grounding_spec is not None:
+        from montagewright.reference_grounding import reference_prompt_parts
+
+        selection_input += reference_prompt_parts(
+            grounding_spec,
+            client=client,
+            cache=cache,
+            target_ids=grounding_target_ids,
+            resolution="high",
+        )
     selection_input += _attach_material(usable, cache, client, beaten)
 
     schema = structured_json(
@@ -2024,6 +2082,7 @@ def select_shots(
             max_shots=max_shots,
             graphic_candidate_ids=graphic_candidate_ids,
             audio_span_ids=audio_span_ids,
+            grounding_target_ids=grounding_target_ids,
         )
     )
     usage_total = Usage(0, 0, 0)
@@ -2064,6 +2123,22 @@ def select_shots(
             chosen, offered,
             source_motion={item.source_id: item.camera_motion for item in usable},
         )
+        if grounding_target_ids:
+            known_grounding_targets = set(grounding_target_ids)
+            for shot_index, shot in enumerate(chosen.get("shots") or []):
+                for look_index, look in enumerate(shot.get("looks") or []):
+                    entity_id = look.get("entity_id")
+                    if (
+                        entity_id not in {None, "", "none"}
+                        and entity_id not in known_grounding_targets
+                    ):
+                        faults.append(
+                            f"k{shot_index:02d} look {look_index + 1} names "
+                            f"unknown grounding entity_id {entity_id!r}"
+                        )
+            faults.extend(grounding_target_disagreements(
+                chosen.get("shots") or [], grounding_required_target_ids
+            ))
         expand_audio_assignments(chosen, audio_span_ids)
         faults.extend(audio_assignment_disagreements(
             chosen.get("shots") or [], usable
@@ -2117,8 +2192,14 @@ def select_shots(
         # catches the common failure where a short selection is inflated by
         # leaving dead air after every speaker shot, without privileging any
         # particular genre or source folder.
-        from montagewright.coverage import selection_coverage_audit
+        from montagewright.coverage import (
+            repair_bounded_visual_holds,
+            selection_coverage_audit,
+        )
 
+        chosen["duration_repairs"] = list(
+            repair_bounded_visual_holds(chosen)
+        )
         coverage = selection_coverage_audit(
             chosen, usable, float(direction.get("target_seconds") or 0.0)
         )
@@ -2161,6 +2242,33 @@ def _shot_count_bounds(
     lower = max(1, min(available_spans, target - slack))
     upper = max(lower, min(available_spans, target + slack))
     return lower, upper
+
+
+def grounding_target_disagreements(
+    shots: list[dict[str, Any]], required_target_ids: list[str]
+) -> list[str]:
+    """Require every lock-mandated identity to survive into selection.
+
+    ``none`` is valid for ordinary people and objects in a grounded run, but
+    it must not let the planner silently omit an identity that the approved
+    framing contract marks required. Geometry cannot restore an identity that
+    selection discarded, so this belongs in the retryable planning gate.
+    """
+
+    required = tuple(dict.fromkeys(
+        target_id.strip() for target_id in required_target_ids
+        if target_id.strip()
+    ))
+    selected = {
+        str(look.get("entity_id") or "").strip()
+        for shot in shots
+        for look in shot.get("looks") or []
+    }
+    return [
+        f"selection omits required grounding entity_id {target_id!r}"
+        for target_id in required
+        if target_id not in selected
+    ]
 
 
 def audio_assignment_disagreements(
@@ -2471,6 +2579,7 @@ def replan_shots(
     cache: UploadCache | None = None,
     client: Any | None = None,
     ledger: Any | None = None,
+    grounding_spec: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Plan the shots that did not deliver, again, from what was seen.
 
@@ -2528,6 +2637,20 @@ def replan_shots(
             ),
         }
     ]
+    grounding_target_ids = (
+        [target.target_id for target in grounding_spec.identity_lock.identity.targets]
+        if grounding_spec is not None else []
+    )
+    if grounding_spec is not None:
+        from montagewright.reference_grounding import reference_prompt_parts
+
+        replan_input += reference_prompt_parts(
+            grounding_spec,
+            client=client,
+            cache=cache,
+            target_ids=grounding_target_ids,
+            resolution="high",
+        )
     replan_input += _attach_material(usable, cache, client, beaten)
 
     interaction = ask(
@@ -2543,6 +2666,7 @@ def replan_shots(
             _selection_schema(
                 [one.span_id for one in offered],
                 replace_clip_ids=[f"k{index:02d}" for index, _, _ in failing],
+                grounding_target_ids=grounding_target_ids,
             )
         ),
         ledger=ledger,

@@ -1,40 +1,32 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from pydantic import ValidationError
 
 from montagewright.measure.models import (
-    AspectConstraint,
     EvidenceAnchor,
     EvidenceApprovalSource,
-    EvidenceAspectConstraintV2,
+    EvidenceAspectConstraint,
     EvidenceClaimSource,
-    EvidenceFramingObligationsV2,
-    EvidenceIdentityContractV2,
-    EvidencePredicateContractV2,
-    EvidencePredicatePhasesV2,
+    EvidenceFramingObligations,
+    EvidenceIdentityContract,
+    EvidencePredicateContract,
+    EvidencePredicatePhases,
     EvidenceQueryApprovalProvenance,
     EvidenceQueryLock,
-    EvidenceQueryLockV2,
-    EvidenceQueryProposalV2,
+    EvidenceQueryProposal,
     EvidenceQueryProvenance,
-    EvidenceQueryProvenanceV2,
-    EvidenceQueryTargetRef,
-    EvidenceTargetIdentityV2,
+    EvidenceTargetIdentity,
     PredicateRequiredAt,
     TargetIdentityScope,
-    approve_evidence_query_proposal_v2,
-    migrate_evidence_query_lock_v1_to_proposal_v2,
-    migrate_evidence_query_lock_v1_to_v2,
+    approve_evidence_query_proposal,
 )
 
 
-def _identity() -> EvidenceIdentityContractV2:
-    return EvidenceIdentityContractV2(
+def _identity() -> EvidenceIdentityContract:
+    return EvidenceIdentityContract(
         targets=(
-            EvidenceTargetIdentityV2(
+            EvidenceTargetIdentity(
                 target_id="subject.primary",
                 target_description="the reviewer-selected foreground subject",
                 identity_cues=("distinctive outline", "persistent surface pattern"),
@@ -47,7 +39,7 @@ def _identity() -> EvidenceIdentityContractV2:
                     EvidenceAnchor(frame_id="RF000120", crop_sha256="b" * 64),
                 ),
             ),
-            EvidenceTargetIdentityV2(
+            EvidenceTargetIdentity(
                 target_id="subject.primary.detail",
                 target_description="a visible detail belonging to the selected subject",
                 scope=TargetIdentityScope.VISIBLE_REGION,
@@ -58,13 +50,13 @@ def _identity() -> EvidenceIdentityContractV2:
     )
 
 
-def _predicate() -> EvidencePredicateContractV2:
-    return EvidencePredicateContractV2(
+def _predicate() -> EvidencePredicateContract:
+    return EvidencePredicateContract(
         predicate_id="predicate.transition",
         statement="the selected subject changes into the requested observable state",
         participant_target_ids=("subject.primary", "subject.primary.detail"),
         required_at=PredicateRequiredAt.TRANSITION,
-        phases=EvidencePredicatePhasesV2(
+        phases=EvidencePredicatePhases(
             precondition="the requested state is not yet visible",
             apex="the observable change is in progress",
             postcondition="the requested state is directly visible",
@@ -74,15 +66,15 @@ def _predicate() -> EvidencePredicateContractV2:
     )
 
 
-def _framing() -> EvidenceFramingObligationsV2:
-    return EvidenceFramingObligationsV2(
+def _framing() -> EvidenceFramingObligations:
+    return EvidenceFramingObligations(
         required_target_ids=("subject.primary",),
         preferred_target_ids=("subject.primary.detail",),
         overlay_keepout_target_ids=("subject.primary.detail",),
         framing_intent="Keep the selected instance complete and preserve its visible detail.",
         editing_uses=("demonstration", "portrait_reframe"),
         aspect_constraints=(
-            EvidenceAspectConstraintV2(
+            EvidenceAspectConstraint(
                 aspect_ratio="9:16",
                 required_target_ids=("subject.primary",),
                 constraint="the selected instance must remain recognizable",
@@ -91,8 +83,8 @@ def _framing() -> EvidenceFramingObligationsV2:
     )
 
 
-def _proposal() -> EvidenceQueryProposalV2:
-    return EvidenceQueryProposalV2(
+def _proposal() -> EvidenceQueryProposal:
+    return EvidenceQueryProposal(
         proposal_id="proposal:001",
         revision=1,
         editorial_goal="Show the selected observable transition without changing identity.",
@@ -100,7 +92,7 @@ def _proposal() -> EvidenceQueryProposalV2:
         predicate=_predicate(),
         framing=_framing(),
         claim_source=EvidenceClaimSource.MODEL_PROPOSAL,
-        provenance=EvidenceQueryProvenanceV2(
+        provenance=EvidenceQueryProvenance(
             created_at="2026-07-22T00:00:00Z",
             created_by="planner-run:001",
             source_reference="clip-card-library:001",
@@ -117,7 +109,7 @@ def _human_approval() -> EvidenceQueryApprovalProvenance:
     )
 
 
-def test_v2_keeps_identity_predicate_and_framing_as_separate_contracts() -> None:
+def test_keeps_identity_predicate_and_framing_as_separate_contracts() -> None:
     proposal = _proposal()
     assert proposal.identity.targets[0].context_cues
     assert proposal.predicate is not None
@@ -127,9 +119,9 @@ def test_v2_keeps_identity_predicate_and_framing_as_separate_contracts() -> None
     )
 
 
-def test_v2_hashes_are_stable_and_component_scoped() -> None:
+def test_hashes_are_stable_and_component_scoped() -> None:
     proposal = _proposal()
-    reparsed = EvidenceQueryProposalV2.model_validate_json(proposal.model_dump_json())
+    reparsed = EvidenceQueryProposal.model_validate_json(proposal.model_dump_json())
     assert reparsed.component_hashes() == proposal.component_hashes()
     assert reparsed.composite_sha256() == proposal.composite_sha256()
 
@@ -157,7 +149,7 @@ def test_v2_hashes_are_stable_and_component_scoped() -> None:
 
 def test_approval_creates_frozen_lock_without_relabeling_claim_source() -> None:
     proposal = _proposal()
-    lock = approve_evidence_query_proposal_v2(
+    lock = approve_evidence_query_proposal(
         proposal,
         query_id="query:001",
         approval=_human_approval(),
@@ -192,7 +184,7 @@ def test_auto_policy_approval_requires_named_policy() -> None:
 
 def test_subparts_require_a_known_parent_and_parent_graph_is_acyclic() -> None:
     with pytest.raises(ValidationError, match="require parent_target_id"):
-        EvidenceTargetIdentityV2(
+        EvidenceTargetIdentity(
             target_id="detail",
             target_description="selected detail",
             scope=TargetIdentityScope.SUBPART,
@@ -201,13 +193,13 @@ def test_subparts_require_a_known_parent_and_parent_graph_is_acyclic() -> None:
     payload = _proposal().model_dump(mode="json")
     payload["identity"]["targets"][1]["parent_target_id"] = "unknown"
     with pytest.raises(ValidationError, match="unknown targets"):
-        EvidenceQueryProposalV2.model_validate(payload)
+        EvidenceQueryProposal.model_validate(payload)
 
 
 def test_positive_and_negative_anchors_cannot_be_the_same_crop() -> None:
     anchor = {"frame_id": "RF000001", "crop_sha256": "c" * 64}
     with pytest.raises(ValidationError, match="must not overlap"):
-        EvidenceTargetIdentityV2(
+        EvidenceTargetIdentity(
             target_id="subject",
             target_description="selected subject",
             positive_anchors=[anchor],
@@ -215,7 +207,7 @@ def test_positive_and_negative_anchors_cannot_be_the_same_crop() -> None:
         )
 
     with pytest.raises(ValidationError, match="same crop bytes"):
-        EvidenceTargetIdentityV2(
+        EvidenceTargetIdentity(
             target_id="subject",
             target_description="selected subject",
             positive_anchors=[anchor],
@@ -227,7 +219,7 @@ def test_positive_and_negative_anchors_cannot_be_the_same_crop() -> None:
 
 def test_transition_predicate_requires_all_three_observable_phases() -> None:
     with pytest.raises(ValidationError, match="require pre/apex/post phases"):
-        EvidencePredicateContractV2(
+        EvidencePredicateContract(
             predicate_id="predicate",
             statement="an observable change occurs",
             participant_target_ids=("subject",),
@@ -235,125 +227,51 @@ def test_transition_predicate_requires_all_three_observable_phases() -> None:
         )
 
 
-def test_v2_rejects_unknown_predicate_and_framing_targets() -> None:
+def test_rejects_unknown_predicate_and_framing_targets() -> None:
     payload = _proposal().model_dump(mode="json")
     payload["predicate"]["participant_target_ids"] = ["unknown"]
     with pytest.raises(ValidationError, match="unknown participant targets"):
-        EvidenceQueryProposalV2.model_validate(payload)
+        EvidenceQueryProposal.model_validate(payload)
 
     payload = _proposal().model_dump(mode="json")
     payload["framing"]["required_target_ids"] = ["unknown"]
     with pytest.raises(ValidationError, match="references unknown targets"):
-        EvidenceQueryProposalV2.model_validate(payload)
+        EvidenceQueryProposal.model_validate(payload)
 
 
 def test_primary_framing_roles_are_mutually_exclusive() -> None:
     with pytest.raises(ValidationError, match="must be disjoint"):
-        EvidenceFramingObligationsV2(
+        EvidenceFramingObligations(
             required_target_ids=("subject",),
             sacrificable_target_ids=("subject",),
             framing_intent="Preserve the evidence hierarchy.",
         )
 
 
-def _legacy_lock() -> EvidenceQueryLock:
-    return EvidenceQueryLock(
-        query_id="legacy:001",
-        revision=3,
-        editorial_goal="Show the selected subject reaching the observable result.",
-        targets=[
-            EvidenceQueryTargetRef(
-                target_id="subject.primary",
-                target_description="the selected foreground subject",
-                positive_attributes=["distinctive outline"],
-                negative_attributes=["background depiction"],
-                reference_frame_ids=["RF000120"],
-                reference_crop_hashes=["d" * 64],
-            )
-        ],
-        observable_predicate="the requested result state becomes visible",
-        required_evidence=["the selected instance remains visible"],
-        negative_constraints=["do not substitute a similar instance"],
-        editing_uses=["demonstration"],
-        aspect_constraints=[
-            AspectConstraint(
-                aspect_ratio="9:16",
-                required_target_ids=["subject.primary"],
-                constraint="keep the selected subject visible",
-            )
-        ],
-        claim_source=EvidenceClaimSource.HUMAN_REVIEW,
-        provenance=EvidenceQueryProvenance(
-            created_at="2026-07-21T00:00:00Z",
-            created_by="reviewer:legacy",
-        ),
-    )
-
-
-def test_v1_migrates_through_proposal_without_claiming_model_approval() -> None:
-    legacy = _legacy_lock()
-    proposal = migrate_evidence_query_lock_v1_to_proposal_v2(legacy)
-    assert proposal.claim_source is EvidenceClaimSource.HUMAN_REVIEW
-    assert proposal.identity.targets[0].positive_anchors[0].frame_id == "RF000120"
-    assert proposal.predicate is not None
-    assert proposal.predicate.statement == legacy.observable_predicate
-    assert proposal.framing.required_target_ids == ("subject.primary",)
-
-    lock = migrate_evidence_query_lock_v1_to_v2(
-        legacy,
-        approval=_human_approval(),
-    )
-    assert isinstance(lock, EvidenceQueryLockV2)
-    assert lock.query_id == legacy.query_id
-    assert lock.approval.approval_source is EvidenceApprovalSource.HUMAN_REVIEW
-
-
-def test_v1_migration_rejects_unpaired_reference_material() -> None:
-    payload = _legacy_lock().model_dump(mode="json")
-    payload["targets"][0]["reference_crop_hashes"] = []
-    valid_v1 = EvidenceQueryLock.model_validate(payload)
-    with pytest.raises(ValueError, match="equal lengths"):
-        migrate_evidence_query_lock_v1_to_proposal_v2(valid_v1)
-
-
-def test_v1_migration_never_invents_a_predicate_from_generic_constraints() -> None:
-    payload = _legacy_lock().model_dump(mode="json")
-    payload["observable_predicate"] = None
-    payload["predicate_phases"] = None
-    with pytest.raises(ValueError, match="cannot be losslessly migrated"):
-        migrate_evidence_query_lock_v1_to_proposal_v2(
-            EvidenceQueryLock.model_validate(payload)
-        )
-
-
-def test_v1_migration_uses_description_as_identity_fallback() -> None:
-    payload = _legacy_lock().model_dump(mode="json")
-    payload["targets"][0]["positive_attributes"] = []
-    payload["targets"][0]["reference_frame_ids"] = []
-    payload["targets"][0]["reference_crop_hashes"] = []
-    migrated = migrate_evidence_query_lock_v1_to_proposal_v2(
-        EvidenceQueryLock.model_validate(payload)
-    )
-    assert migrated.identity.targets[0].identity_cues == (
-        "the selected foreground subject",
-    )
-
-
-def test_v2_models_forbid_unversioned_extra_fields() -> None:
+def test_models_forbid_unversioned_extra_fields() -> None:
     payload = _proposal().model_dump(mode="json")
     payload["approved_by_model"] = True
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        EvidenceQueryProposalV2.model_validate(payload)
+        EvidenceQueryProposal.model_validate(payload)
 
 
-def test_checked_in_v2_query_lock_example_matches_contract() -> None:
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "examples"
-        / "evidence-query-lock-v2.json"
+def test_only_grounding_query_v1_wire_formats_are_accepted() -> None:
+    proposal = _proposal()
+    assert proposal.contract_version == "grounding-query-proposal-v1"
+
+    lock = approve_evidence_query_proposal(
+        proposal,
+        query_id="query:001",
+        approval=_human_approval(),
     )
-    lock = EvidenceQueryLockV2.model_validate_json(path.read_text(encoding="utf-8"))
-    assert lock.predicate is not None
-    assert lock.predicate.required_at is PredicateRequiredAt.TRANSITION
-    assert lock.approval.approval_source is EvidenceApprovalSource.HUMAN_REVIEW
-    assert len(lock.definition_sha256()) == 64
+    assert lock.contract_version == "grounding-query-lock-v1"
+
+    proposal_payload = proposal.model_dump(mode="json")
+    proposal_payload["contract_version"] = "evidence-query-proposal-v2"
+    with pytest.raises(ValidationError, match="grounding-query-proposal-v1"):
+        EvidenceQueryProposal.model_validate(proposal_payload)
+
+    lock_payload = lock.model_dump(mode="json")
+    lock_payload["contract_version"] = "evidence-query-lock-v2"
+    with pytest.raises(ValidationError, match="grounding-query-lock-v1"):
+        EvidenceQueryLock.model_validate(lock_payload)

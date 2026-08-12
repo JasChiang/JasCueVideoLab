@@ -1538,6 +1538,31 @@
           <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select></div>
         <div class="field"><label>語音</label>
           <select id="speech"><option value="auto">自動判斷</option><option value="never">不要轉錄</option></select></div>
+        <details class="setup-advanced"><summary>參考影像與身分契約</summary>
+        <div class="fields">
+        <div class="field"><label>要找的身分 ID</label>
+          <input type="text" id="grounding-target-id" value="target.primary" placeholder="例如 device.fold8">
+          <div class="why">穩定的內部名稱，不是顯示文字。</div></div>
+        <div class="field"><label>這是哪一個目標</label>
+          <input type="text" id="grounding-target-description" placeholder="例如：參考圖中這一台摺疊手機">
+          <div class="why">填這欄加參考圖即可，不需要自己寫 spec。</div></div>
+        <div class="field wide"><label>可辨識特徵（選填，一行一項）</label>
+          <textarea id="grounding-identity-cues" placeholder="鏡頭排列、鉸鏈、顏色、標記…"></textarea></div>
+        <div class="field wide"><label>不要混淆（選填，一行一項）</label>
+          <textarea id="grounding-exclusions" placeholder="例如：展開後外形相似的平板、另一個型號、螢幕中的圖片"></textarea></div>
+        <div class="field wide"><label>Grounding spec 路徑</label>
+          <input type="text" id="grounding-spec-path" placeholder="/path/to/grounding-spec.json">
+          <div class="why">使用本機 spec 時填路徑；其中的相對 reference paths 會以 spec 所在資料夾為準。</div></div>
+        <div class="field wide"><label>或上傳 grounding spec</label>
+          <input type="file" id="grounding-spec-file" accept="application/json,.json"></div>
+        <div class="field wide"><label>或貼上 grounding spec JSON</label>
+          <textarea id="grounding-spec-json" placeholder='{"contract_version":"reference-grounding-spec-v1", ...}'></textarea></div>
+        <div class="field wide"><label>本機 reference image 路徑</label>
+          <textarea id="reference-image-paths" placeholder="簡易模式：一行一張正例；完整 spec 模式：名稱須對應 reference_images[].path"></textarea></div>
+        <div class="field wide"><label>或上傳 reference images</label>
+          <input type="file" id="reference-images" accept="image/*" multiple>
+          <div class="why">上傳檔名須對應 spec 內的 path。後端會先驗證 hash 與 anchor，再保存同一份 canonical artifact；這一步不呼叫 Gemini。</div></div>
+        </div></details>
         <details class="setup-advanced"><summary>字幕、可編輯時間軸與預算</summary>
         <div class="fields">
         <div class="field"><label>語言</label><input type="text" id="locale" value="zh-TW"></div>
@@ -4443,6 +4468,20 @@ $('go').addEventListener('click', async () => {
   files.forEach(f => body.append('rushes', f, f.name));
   body.append('source_path', path);
   body.append('music_path', $('music-path').value.trim());
+  body.append('grounding_spec_path', $('grounding-spec-path').value.trim());
+  body.append('grounding_spec_json', $('grounding-spec-json').value.trim());
+  body.append('reference_image_paths', $('reference-image-paths').value.trim());
+  body.append('grounding_target_id', $('grounding-target-id').value.trim());
+  body.append('grounding_target_description', $('grounding-target-description').value.trim());
+  body.append('grounding_identity_cues', $('grounding-identity-cues').value.trim());
+  body.append('grounding_exclusions', $('grounding-exclusions').value.trim());
+  const groundingSpecFile = $('grounding-spec-file').files[0];
+  if (groundingSpecFile) {
+    body.append('grounding_spec_file', groundingSpecFile, groundingSpecFile.name);
+  }
+  [...$('reference-images').files].forEach(file => {
+    body.append('reference_images', file, file.name);
+  });
   body.append('speech', $('speech').value);
   body.append('locale', $('locale').value.trim());
   body.append('brief', $('brief').value);

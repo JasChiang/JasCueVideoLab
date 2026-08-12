@@ -20,6 +20,7 @@ import json
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
@@ -155,6 +156,10 @@ class Report:
     # temporary; downstream layout only needs where the subject was in the
     # source frame at each moment.
     subject_tracks: dict[str, list[dict]] = field(default_factory=dict)
+    # The semantic proof behind reference-conditioned tracks.  SAM boxes say
+    # where pixels went; these records say which locked identity Gemini
+    # confirmed on exact source PTS frames before those boxes were trusted.
+    reference_grounding: dict[str, dict] = field(default_factory=dict)
     # Where a plan contradicted itself, kept rather than printed. These were
     # written to stdout and nowhere else, so the one that mattered -- a shot
     # naming a subject its own window never reaches -- was on screen while
@@ -416,8 +421,6 @@ def probe(source_id: str, path: Path) -> Source:
     width, height = int(stream["width"]), int(stream["height"])
     if rotation in {90, 270}:
         width, height = height, width
-    from fractions import Fraction
-
     native_fps = "30/1"
     for candidate in (
         stream.get("avg_frame_rate"), stream.get("r_frame_rate")
@@ -477,39 +480,79 @@ def _track_subject(
     *,
     seed_time_seconds: float | None = None,
     track_name: str | None = None,
+    semantic_anchors: tuple[
+        tuple[float, tuple[float, float, float, float]], ...
+    ] = (),
+    require_identity_validation: bool = False,
+    seed_lineage: Any | None = None,
 ) -> tuple[list[Observation], dict[str, int]]:
     """Propagate a Gemini seed across every analysed frame of the shot."""
 
     from montagewright.measure.sam_tracking import track_bbox_sam21
 
+    seed_time_ms = int(
+        (seed_time_seconds
+         if seed_time_seconds is not None
+         else clip.approx_in_seconds + 0.1) * 1000
+    )
+    exact_seed: dict[str, Any] = {}
+    if seed_lineage is not None:
+        seed_time_ms = int(seed_lineage.frame_time_ms)
+        if (
+            seed_time_seconds is not None
+            and round(seed_time_seconds * 1000) != seed_time_ms
+        ):
+            raise ValueError(
+                "semantic seed time does not match exact-frame PTS lineage"
+            )
+        exact_seed = {
+            "asset_id": seed_lineage.video_asset_id,
+            "seed_frame_pts": seed_lineage.frame_pts,
+            "seed_frame_sha256": seed_lineage.frame_sha256,
+            "seed_source_width": seed_lineage.width,
+            "seed_source_height": seed_lineage.height,
+        }
+
     track = track_bbox_sam21(
         video_path=source.path,
         checkpoint_path=checkpoint,
-        seed_time_ms=int(
-            (seed_time_seconds
-             if seed_time_seconds is not None
-             else clip.approx_in_seconds + 0.1) * 1000
-        ),
+        seed_time_ms=seed_time_ms,
         seed_box_2d=seed_box,
         target_description=subject_description,
         output_dir=work / (
             f"sam-{clip.clip_id}-{track_name}"
             if track_name else f"sam-{clip.clip_id}"
         ),
-        seed_source="gemini_frame_grounding",
+        seed_source=(
+            "reference_exact_frame_grounding"
+            if seed_lineage is not None
+            else "gemini_frame_grounding"
+        ),
         analysis_fps=TRACK_FPS,
         max_side=960,
         allowed_start_ms=int(clip.approx_in_seconds * 1000),
         allowed_end_ms=int(clip.approx_out_seconds * 1000),
+        **exact_seed,
     )
     return observations_from_sam(
-        track, clip_start_seconds=clip.approx_in_seconds
+        track,
+        clip_start_seconds=clip.approx_in_seconds,
+        semantic_anchors=semantic_anchors,
+        require_identity_validation=require_identity_validation,
     )
 
 
 def _measure_looks(
     looks, source, clip, work: Path, report, client, target_aspect: float,
     checkpoint: Path | None = None,
+    reference_samples: Mapping[
+        str,
+        tuple[
+            list[dict[str, Any]],
+            list[float],
+            tuple[tuple[float, tuple[float, float, float, float]], ...],
+        ],
+    ] | None = None,
 ) -> tuple[
     list[tuple[float, float, float, float]],
     str,
@@ -561,12 +604,29 @@ def _measure_looks(
     tracks: list[list[tuple[float, float, float]]] = []
     missing: list[str] = []
     for look_index, look in enumerate(looks):
-        if look.at not in seen:
-            _afford(report)
-            boxes, usage = _locate_subject(
-                frames, look.at, client=client, report=report
+        subject_key = look.entity_id or look.at
+        if subject_key not in seen:
+            reference = (
+                (reference_samples or {}).get(look.entity_id)
+                if look.entity_id else None
             )
-            _charge(report, "subject", usage)
+            if look.entity_id and reference is None:
+                missing.append(f"{look.at} ({look.entity_id}: identity unverified)")
+                continue
+            if reference is not None:
+                boxes, look_times, semantic_anchors = reference
+                look_moments = [
+                    at - clip.approx_in_seconds for at in look_times
+                ]
+            else:
+                _afford(report)
+                boxes, usage = _locate_subject(
+                    frames, look.at, client=client, report=report
+                )
+                _charge(report, "subject", usage)
+                look_times = times
+                look_moments = moments
+                semantic_anchors = ()
             found = [
                 one for one in boxes
                 if one.get("present") and one.get("centre_x") is not None
@@ -579,31 +639,31 @@ def _measure_looks(
             # is not going anywhere, and it is what the framing and the
             # travel between stops are computed from -- but it is no longer
             # all that is known.
-            seen[look.at] = (
+            seen[subject_key] = (
                 sum(float(one["centre_x"]) for one in found) / len(found),
                 sum(float(one["centre_y"]) for one in found) / len(found),
                 sum(float(one.get("height") or 0.0) for one in found) / len(found),
             )
-            walked[look.at] = sorted(
+            walked[subject_key] = sorted(
                 (
-                    moments[int(one["frame_index"])],
+                    look_moments[int(one["frame_index"])],
                     float(one["centre_x"]),
                     float(one["centre_y"]),
                 )
                 for one in found
-                if 0 <= int(one.get("frame_index", -1)) < len(moments)
+                if 0 <= int(one.get("frame_index", -1)) < len(look_moments)
             )
             # Gemini identifies which object the edit means; SAM turns that
             # semantic seed into the dense trajectory used by the crop. This
             # used to happen only in the single-look branch, so a push or a
             # handoff bypassed SAM precisely when a tight crop made small
             # tracking errors most visible.
-            if checkpoint is not None:
+            if checkpoint is not None and reference is None:
                 seed = found[0]
                 frame_index = int(seed.get("frame_index", -1))
                 seed_time = (
-                    times[frame_index]
-                    if 0 <= frame_index < len(times)
+                    look_times[frame_index]
+                    if 0 <= frame_index < len(look_times)
                     else clip.approx_in_seconds + 0.1
                 )
                 try:
@@ -616,6 +676,8 @@ def _measure_looks(
                         work,
                         seed_time_seconds=seed_time,
                         track_name=str(look_index),
+                        semantic_anchors=semantic_anchors,
+                        require_identity_validation=bool(look.entity_id),
                     )
                 except Exception as error:  # sampled positions remain valid
                     report.subject_notes[clip.clip_id] = (
@@ -638,9 +700,14 @@ def _measure_looks(
                             "width": round(one.width, 6),
                             "height": round(one.height, 6),
                             "subject": look.at,
+                            "entity_id": look.entity_id,
+                            "semantic_identity_status": (
+                                "reference_validated"
+                                if look.entity_id else "description_grounded"
+                            ),
                             "source": "sam2.1",
                         } for one in tracked)
-                        walked[look.at] = [
+                        walked[subject_key] = [
                             (one.seconds, one.centre_x, one.centre_y)
                             for one in tracked
                         ]
@@ -662,9 +729,9 @@ def _measure_looks(
                                 },
                             )
                         )
-        if look.at not in seen:
+        if subject_key not in seen:
             continue
-        centre_x, centre_y, tall = seen[look.at]
+        centre_x, centre_y, tall = seen[subject_key]
         width = base
         if look.framing == "fill" and tall > 0.0:
             # The same reach a push used to compute, bounded the same way.
@@ -682,7 +749,7 @@ def _measure_looks(
         # delivered crop, not of the full source: a tiny source-space drift
         # can become a visible reversal during a tight push.  The path builder
         # applies its deadband after it knows the crop width.
-        path = walked.get(look.at) or []
+        path = walked.get(subject_key) or []
         tracks.append([(when, x, y + lift) for when, x, y in path])
     return stops, "、".join(missing), tracks
 
@@ -773,6 +840,299 @@ def read_crops(source: Path) -> dict[str, CropPath]:
     return paths
 
 
+def _write_grounding_record(path: Path, value: Any) -> None:
+    """Publish one replayable grounding record without exposing half JSON."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _reference_subject_samples(
+    source: Source,
+    clip: Any,
+    target_id: str,
+    *,
+    spec: Any,
+    client: Any,
+    upload_cache: Any | None,
+    report: Report,
+    work: Path,
+    output: Path | None,
+    discoveries: dict[str, Any],
+    checkpoint: Path | None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[float],
+    tuple[tuple[float, tuple[float, float, float, float]], ...],
+]:
+    """Reference-confirm one identity on exact source frames.
+
+    Video grounding supplies coarse candidate intervals only.  Local decoding
+    turns those intervals into immutable source PTS frames; a second,
+    reference-conditioned decision must match the locked identity on at least
+    two distinct PTS values before any box is exposed to SAM or reframing.
+    """
+
+    from montagewright.reference_grounding import (
+        ReferenceGroundingError,
+        CandidateDiscoveryResult,
+        decide_exact_frame_bboxes,
+        discover_reference_candidates,
+        inspect_video_lineage,
+        materialize_frame_at_time,
+    )
+
+    if checkpoint is None:
+        report.reference_grounding[clip.clip_id] = {
+            "target_id": target_id,
+            "status": "local_geometry_unavailable",
+            "reason": "SAM checkpoint is required for reference-critical framing",
+        }
+        raise RuntimeError(
+            f"{clip.clip_id}: reference-critical target {target_id} requires "
+            "SAM/local geometry; Gemini boxes are semantic seeds, not crop geometry"
+        )
+    if not _may_ask(client):
+        return [], [], ()
+    discovery = discoveries.get(source.source_id)
+    if discovery is None:
+        stored = (
+            output / f"{source.source_id}-candidates.json"
+            if output is not None else None
+        )
+        if stored is not None and stored.exists():
+            try:
+                discovery = CandidateDiscoveryResult.model_validate_json(
+                    stored.read_text(encoding="utf-8")
+                )
+                if (
+                    discovery.grounding_spec_sha256 != spec.definition_sha256()
+                    or discovery.video_sha256
+                    != inspect_video_lineage(source.path).content_sha256
+                ):
+                    discovery = None
+            except (OSError, ValueError):
+                discovery = None
+        if discovery is None:
+            _afford(report)
+            discovered = discover_reference_candidates(
+                source.path,
+                spec,
+                client=client,
+                cache=upload_cache,
+                ledger=report.ledger,
+            )
+            if discovered is None:
+                return [], [], ()
+            discovery, usage = discovered
+            _charge(report, "reference_candidate", usage)
+            if stored is not None:
+                _write_grounding_record(
+                    stored, discovery.model_dump(mode="json")
+                )
+        discoveries[source.source_id] = discovery
+
+    clip_start_ms = round(float(clip.approx_in_seconds) * 1000)
+    clip_end_ms = round(float(clip.approx_out_seconds) * 1000)
+    eligible = [
+        candidate for candidate in discovery.candidates
+        if candidate.target_id == target_id
+        and candidate.identity_status != "hard_negative"
+        and candidate.start_ms < clip_end_ms
+        and candidate.end_ms > clip_start_ms
+    ]
+    if not eligible:
+        return [], [], ()
+
+    # Spread exact checkpoints over every overlapping candidate interval.
+    # Reusing one decoded frame twice would satisfy a count while proving
+    # nothing about drift, so frame PTS are deduplicated below.
+    requested: list[tuple[int, str]] = []
+    for candidate in eligible:
+        start = max(candidate.start_ms, clip_start_ms)
+        end = min(candidate.end_ms, clip_end_ms)
+        if end <= start:
+            continue
+        span = end - start
+        points = [
+            max(start, min(end - 1, candidate.recommended_seed_ms)),
+            start + max(0, span // 5),
+            start + max(0, (span * 4) // 5),
+        ]
+        for at in points:
+            requested.append((at, candidate.candidate_id))
+
+    prepared: list[tuple[Any, str]] = []
+    used_pts: set[int] = set()
+    for requested_ms, candidate_id in sorted(requested):
+        candidate = discovery.candidate(candidate_id)
+        destination = work / (
+            f"reference-{clip.clip_id}-{target_id.replace(':', '_')}-"
+            f"{len(prepared):02d}.jpg"
+        )
+        frame = materialize_frame_at_time(
+            source.path, requested_ms, destination, max_width=1440
+        )
+        if frame.lineage.frame_pts in used_pts:
+            destination.unlink(missing_ok=True)
+            continue
+        if not candidate.start_ms <= frame.lineage.frame_time_ms < candidate.end_ms:
+            continue
+        if not clip_start_ms <= frame.lineage.frame_time_ms < clip_end_ms:
+            continue
+        used_pts.add(frame.lineage.frame_pts)
+        prepared.append((frame, candidate_id))
+        if len(prepared) >= 4:
+            break
+    if len(prepared) < 2:
+        return [], [], ()
+
+    _afford(report)
+    try:
+        decided = decide_exact_frame_bboxes(
+            spec,
+            discovery,
+            target_id,
+            [frame for frame, _ in prepared],
+            candidate_ids=[candidate_id for _, candidate_id in prepared],
+            client=client,
+            cache=upload_cache,
+            ledger=report.ledger,
+            minimum_matched_anchors=2,
+        )
+    except ReferenceGroundingError as error:
+        report.subject_notes[clip.clip_id] = (
+            f"reference identity could not be verified: {error}"[:160]
+        )
+        return [], [], ()
+    if decided is None:
+        return [], [], ()
+    batch, usage = decided
+    _charge(report, "reference_exact", usage)
+    if output is not None:
+        _write_grounding_record(
+            output / (
+                f"{clip.clip_id}-{target_id.replace(':', '_')}-exact.json"
+            ),
+            batch.model_dump(mode="json"),
+        )
+    try:
+        matched = batch.sam_seed_evaluations()
+    except ReferenceGroundingError as error:
+        report.subject_notes[clip.clip_id] = str(error)[:160]
+        report.reference_grounding[clip.clip_id] = {
+            "target_id": target_id,
+            "status": "identity_unverified",
+            "matched_anchors": batch.matched_anchor_count,
+        }
+        return [], [], ()
+
+    anchors: list[
+        tuple[float, tuple[float, float, float, float]]
+    ] = []
+    for evaluation in matched:
+        native = evaluation.decision.tracking_box_xyxy_1000
+        if native is None:
+            continue
+        x0, y0, x1, y1 = (float(value) / 1000.0 for value in native)
+        at = evaluation.lineage.frame_time_ms / 1000.0
+        anchors.append((at, (x0, y0, x1, y1)))
+    if len(anchors) < 2:
+        raise RuntimeError(
+            f"{clip.clip_id}: reference-critical target {target_id} has fewer "
+            "than two usable exact semantic anchors"
+        )
+
+    seed = max(
+        matched,
+        key=lambda evaluation: float(evaluation.decision.confidence),
+    )
+    seed_box = seed.decision.tracking_box_xyxy_1000
+    if seed_box is None:
+        raise RuntimeError("matched exact-frame seed has no semantic bbox")
+    try:
+        identity = spec.identity_lock.identity.target(target_id)
+        target_description = identity.target_description
+    except (AttributeError, ValueError):
+        target_description = target_id
+    try:
+        tracked, states = _track_subject(
+            source,
+            clip,
+            target_description,
+            list(seed_box),
+            checkpoint,
+            work,
+            seed_time_seconds=seed.lineage.frame_time_ms / 1000.0,
+            track_name=f"reference-{target_id.replace(':', '_')}",
+            semantic_anchors=tuple(anchors),
+            require_identity_validation=True,
+            seed_lineage=seed.lineage,
+        )
+    except Exception as error:
+        report.reference_grounding[clip.clip_id] = {
+            "target_id": target_id,
+            "status": "local_geometry_failed",
+            "reason": type(error).__name__,
+        }
+        raise RuntimeError(
+            f"{clip.clip_id}: SAM/local geometry failed for locked reference "
+            f"identity {target_id}; refusing Gemini-box crop"
+        ) from error
+    total = sum(states.values()) or 1
+    # Only locally materialized observations can become crop geometry. A
+    # sample labelled tracked but lacking a valid mask-derived box is not a
+    # successful handoff for a reference-critical target.
+    kept = len(tracked)
+    if not tracked or kept / total < TRACK_QUORUM:
+        report.reference_grounding[clip.clip_id] = {
+            "target_id": target_id,
+            "status": "local_geometry_unverified",
+            "tracked_frames": kept,
+            "analysed_frames": total,
+        }
+        raise RuntimeError(
+            f"{clip.clip_id}: SAM/local geometry for locked reference identity "
+            f"{target_id} passed only {kept}/{total} frames; refusing "
+            "Gemini-box fallback"
+        )
+
+    boxes: list[dict[str, Any]] = []
+    times: list[float] = []
+    disambiguation = "; ".join(seed.decision.identity_evidence)
+    for frame_index, observation in enumerate(tracked):
+        times.append(clip.approx_in_seconds + observation.seconds)
+        boxes.append({
+            "frame_index": frame_index,
+            "present": True,
+            "centre_x": observation.centre_x,
+            "centre_y": observation.centre_y,
+            "width": observation.width,
+            "height": observation.height,
+            "disambiguation": disambiguation,
+            "geometry_source": "sam2.1",
+        })
+    report.reference_grounding[clip.clip_id] = {
+        "target_id": target_id,
+        "status": "sam_geometry_validated",
+        "query_lock_sha256": batch.query_lock_sha256,
+        "grounding_spec_sha256": batch.grounding_spec_sha256,
+        "matched_anchors": len(anchors),
+        "source_pts": [item.lineage.frame_pts for item in matched],
+        "sam_seed_pts": seed.lineage.frame_pts,
+        "sam_seed_sha256": seed.lineage.frame_sha256,
+        "sam_seed_width": seed.lineage.width,
+        "sam_seed_height": seed.lineage.height,
+        "tracked_frames": kept,
+        "analysed_frames": total,
+    }
+    return boxes, times, tuple(anchors)
+
+
 def follow_subjects(
     edl: EDL,
     sources: dict[str, Source],
@@ -783,6 +1143,9 @@ def follow_subjects(
     cards: dict[str, Path] | None = None,
     checkpoint: Path | None = None,
     client: Any | None = None,
+    grounding_spec: Any | None = None,
+    grounding_output: Path | None = None,
+    upload_cache: Any | None = None,
 ) -> dict[str, CropPath]:
     """Build a crop path per shot that names a subject.
 
@@ -799,6 +1162,7 @@ def follow_subjects(
     output_size = output_size or delivery_size(target_aspect)
 
     paths: dict[str, CropPath] = {}
+    discoveries: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as raw_work:
         work = Path(raw_work)
         total = len(edl.clips)
@@ -817,6 +1181,57 @@ def follow_subjects(
             )
             source = sources[clip.source_id]
             move = reframe.camera_move
+            reference_samples: dict[
+                str,
+                tuple[
+                    list[dict[str, Any]],
+                    list[float],
+                    tuple[
+                        tuple[float, tuple[float, float, float, float]], ...
+                    ],
+                ],
+            ] = {}
+            if grounding_spec is not None:
+                for entity_id in dict.fromkeys(
+                    look.entity_id
+                    for look in reframe.looks
+                    if look.entity_id
+                ):
+                    samples = _reference_subject_samples(
+                        source,
+                        clip,
+                        entity_id,
+                        spec=grounding_spec,
+                        client=client,
+                        upload_cache=upload_cache,
+                        report=report,
+                        work=work,
+                        output=grounding_output,
+                        discoveries=discoveries,
+                        checkpoint=checkpoint,
+                    )
+                    if samples[0]:
+                        reference_samples[entity_id] = samples
+                    else:
+                        report.degradations.append(
+                            DegradationStep(
+                                clip_id=clip.clip_id,
+                                ladder="center_crop",
+                                trigger=(
+                                    "the locked reference identity "
+                                    f"{entity_id} was not confirmed on two "
+                                    "exact source frames; refusing text-only "
+                                    "or SAM lookalike substitution"
+                                ),
+                                measured={"confirmed_anchors": 0.0},
+                            )
+                        )
+                        raise RuntimeError(
+                            f"{clip.clip_id}: locked reference identity "
+                            f"{entity_id} was selected but could not be "
+                            "confirmed on two exact source frames; reselect "
+                            "the shot instead of substituting a lookalike"
+                        )
             card = (
                 load_card(cards[clip.source_id])
                 if cards and clip.source_id in cards
@@ -830,7 +1245,11 @@ def follow_subjects(
             # an indefensible silence: a whole timeline was rebuilt this way,
             # every crop identical and dead centre, and nothing anywhere said
             # the subject had gone missing.
-            if reframe.subject is not None and card is None:
+            if (
+                reframe.subject is not None
+                and card is None
+                and not reframe.subject.entity_id
+            ):
                 report.degradations.append(
                     DegradationStep(
                         clip_id=clip.clip_id,
@@ -853,7 +1272,10 @@ def follow_subjects(
             # -- and nothing recorded it, because only one of the five path
             # builders reports fit. The check belongs to the clip.
             known = (
-                find_subject(card, reframe.subject.description)
+                find_subject(
+                    card, reframe.subject.description,
+                    entity_id=reframe.subject.entity_id,
+                )
                 if card is not None and reframe.subject is not None
                 else None
             )
@@ -897,7 +1319,9 @@ def follow_subjects(
                 for index, look in enumerate(reframe.looks[1:], start=1):
                     if not look.must_be_whole:
                         continue
-                    box = find_subject(card, look.at)
+                    box = find_subject(
+                        card, look.at, entity_id=look.entity_id
+                    )
                     if box is None or box.width <= crop_width:
                         continue
                     report.degradations.append(
@@ -1005,7 +1429,7 @@ def follow_subjects(
             if len(reframe.looks) >= 2 and _may_ask(client):
                 stops, missing, tracks = _measure_looks(
                     reframe.looks, source, clip, work, report, client,
-                    target_aspect, checkpoint,
+                    target_aspect, checkpoint, reference_samples,
                 )
                 if missing:
                     report.subject_notes[clip.clip_id] = (
@@ -1059,7 +1483,22 @@ def follow_subjects(
                 middles: list[tuple[float, float]] = []
                 boxes = []
                 sampled_at: list[float] = []
-                if reframe.subject is not None and not _may_ask(client):
+                reference = (
+                    reference_samples.get(reframe.subject.entity_id)
+                    if reframe.subject is not None
+                    and reframe.subject.entity_id else None
+                )
+                if reference is not None:
+                    boxes, sampled_at, _ = reference
+                elif (
+                    reframe.subject is not None
+                    and reframe.subject.entity_id
+                ):
+                    # A stable identity may never degrade to matching its
+                    # prose description; that is exactly how a lookalike gets
+                    # substituted confidently.
+                    boxes, sampled_at = [], []
+                elif reframe.subject is not None and not _may_ask(client):
                     # A rebuild, with nothing to ask. Skipping the clip left
                     # no path at all, and the executor fell back to a centred
                     # still -- so a push read back as a hold on the middle of
@@ -1100,6 +1539,16 @@ def follow_subjects(
                         report.subject_notes[clip.clip_id] = (
                             f"{move} on ({centre_x:.3f}, {centre_y:.3f})"
                         )
+                if boxes and not middles:
+                    middles = [
+                        (float(box["centre_x"]), float(box["centre_y"]))
+                        for box in boxes
+                        if box.get("present")
+                        and box.get("centre_x") is not None
+                    ]
+                    if middles:
+                        centre_x = sum(x for x, _ in middles) / len(middles)
+                        centre_y = sum(y for _, y in middles) / len(middles)
                 # Read what the source can supply before choosing how far to
                 # push. A fixed percentage is blind to what it is cropping.
                 out_w, out_h = output_size
@@ -1194,8 +1643,15 @@ def follow_subjects(
                 # where the thing is, and that lesson is written down for
                 # the handoff path, which was fixed and left this one alone.
                 if reframe.subject is not None:
+                    reference = (
+                        reference_samples.get(reframe.subject.entity_id)
+                        if reframe.subject.entity_id else None
+                    )
                     box = (
-                        find_subject(card, reframe.subject.description)
+                        find_subject(
+                            card, reframe.subject.description,
+                            entity_id=reframe.subject.entity_id,
+                        )
                         if card is not None
                         else None
                     )
@@ -1212,7 +1668,26 @@ def follow_subjects(
                         if settled and box is not None
                         else None
                     )
-                    if centre is None:
+                    if reference is not None:
+                        ref_boxes, _, _ = reference
+                        present = [
+                            item for item in ref_boxes
+                            if item.get("present")
+                            and item.get("centre_x") is not None
+                        ]
+                        if present:
+                            count = len(present)
+                            centre = (
+                                sum(float(item["centre_x"]) for item in present)
+                                / count,
+                                sum(float(item["centre_y"]) for item in present)
+                                / count,
+                                sum(float(item.get("width") or 0.0) for item in present)
+                                / count,
+                                sum(float(item.get("height") or 0.0) for item in present)
+                                / count,
+                            )
+                    if centre is None and not reframe.subject.entity_id:
                         # Either the card had no box for what was named, or
                         # it had one that will not hold still. Measure across
                         # this shot's own window: for a held frame the mean
@@ -1285,11 +1760,27 @@ def follow_subjects(
             # so ask it before paying for a fresh grounding on every rhythm
             # tweak, second aspect and review round.
             known = (
-                find_subject(card, reframe.subject.description)
+                find_subject(
+                    card, reframe.subject.description,
+                    entity_id=reframe.subject.entity_id,
+                )
                 if card is not None
                 else None
             )
-            if known is not None and move != "follow_subject":
+            reference = (
+                reference_samples.get(reframe.subject.entity_id)
+                if reframe.subject.entity_id else None
+            )
+            semantic_anchors = reference[2] if reference is not None else ()
+            if reference is not None:
+                boxes, times, _ = reference
+                frames = []
+                report.subject_notes[clip.clip_id] = (
+                    f"reference identity: {reframe.subject.entity_id}"
+                )
+            elif reframe.subject.entity_id:
+                boxes, times, frames = [], [], []
+            elif known is not None and move != "follow_subject":
                 boxes = [
                     {
                         "frame_index": 0,
@@ -1371,7 +1862,7 @@ def follow_subjects(
             # Gemini said which subject; the tracker says where it goes. When
             # a checkpoint is available the trajectory is measured per frame
             # rather than interpolated between five samples.
-            if checkpoint is not None and boxes:
+            if checkpoint is not None and boxes and reference is None:
                 seed = next(
                     (
                         box
@@ -1390,10 +1881,14 @@ def follow_subjects(
                             _seed_box(seed),
                             checkpoint,
                             work,
-                            seed_time_seconds=(
+                        seed_time_seconds=(
                                 times[int(seed.get("frame_index", -1))]
                                 if 0 <= int(seed.get("frame_index", -1)) < len(times)
                                 else None
+                            ),
+                            semantic_anchors=semantic_anchors,
+                            require_identity_validation=bool(
+                                reframe.subject.entity_id
                             ),
                         )
                     except Exception as error:  # tracking is an optimisation
@@ -1438,6 +1933,12 @@ def follow_subjects(
                                 "width": round(one.width, 6),
                                 "height": round(one.height, 6),
                                 "subject": reframe.subject.description,
+                                "entity_id": reframe.subject.entity_id,
+                                "semantic_identity_status": (
+                                    "reference_validated"
+                                    if reframe.subject.entity_id
+                                    else "description_grounded"
+                                ),
                                 "source": "sam2.1",
                             } for one in tracked]
                             observations = tracked
@@ -1533,6 +2034,8 @@ def run(
     under_speech: str = "duck",
     client: Any | None = None,
     transcripts: Mapping[str, dict | None] | None = None,
+    grounding_spec: Any | None = None,
+    upload_cache: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
     """Take an EDL to a finished file.
 
@@ -1681,6 +2184,9 @@ def run(
         cards=cards,
         checkpoint=checkpoint,
         client=client,
+        grounding_spec=grounding_spec,
+        grounding_output=output_dir / "work" / "reference-grounding",
+        upload_cache=upload_cache,
     )
 
     for clip in edl.clips:

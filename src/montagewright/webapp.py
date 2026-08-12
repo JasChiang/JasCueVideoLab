@@ -72,6 +72,9 @@ LEGACY_RUNS_ROOTS = tuple(
 # back out; the bytes were already on disk. Uploading stays for the case where
 # they genuinely are not, and that case has a ceiling.
 MAX_UPLOAD_BYTES = int(os.environ.get("MONTAGEWRIGHT_MAX_UPLOAD", 4 * 1024**3))
+MAX_GROUNDING_UPLOAD_BYTES = int(
+    os.environ.get("MONTAGEWRIGHT_MAX_GROUNDING_UPLOAD", 256 * 1024**2)
+)
 
 
 @dataclass
@@ -1060,6 +1063,110 @@ def _save(upload: UploadFile, destination: Path) -> Path:
     return destination
 
 
+def _reference_path_lines(raw: str) -> list[str]:
+    """Reference paths from the local UI, one per line or as a JSON list."""
+
+    text = raw.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        decoded = json.loads(text)
+        if not isinstance(decoded, list) or not all(
+            isinstance(item, str) for item in decoded
+        ):
+            raise ValueError("reference image paths must be a JSON string list")
+        return [item.strip() for item in decoded if item.strip()]
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _rewrite_uploaded_reference_paths(
+    source: Path,
+    destination: Path,
+    provided: list[tuple[str, Path]],
+    *,
+    require_all: bool = False,
+) -> Path:
+    """Bind browser-provided image bytes to paths already named by the spec.
+
+    This is deliberately transport-only.  It does not interpret targets,
+    anchors, hashes or identity rules; ``load_grounding_spec`` remains the
+    authority for all of those after this staging rewrite.
+    """
+
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("grounding spec must be a JSON object")
+    references = payload.get("reference_images")
+    if not isinstance(references, list):
+        raise ValueError("grounding spec has no reference_images list")
+
+    candidates = []
+    for declared, path in provided:
+        resolved = path.expanduser().resolve()
+        aliases = {
+            declared,
+            Path(declared).as_posix(),
+            Path(declared).name,
+            str(resolved),
+            resolved.as_posix(),
+            resolved.name,
+        }
+        candidates.append((aliases, resolved))
+
+    used: set[Path] = set()
+    unmatched: list[str] = []
+    for reference in references:
+        if not isinstance(reference, dict) or not isinstance(
+            reference.get("path"), str
+        ):
+            continue
+        raw_path = reference["path"]
+        exact = [
+            path for aliases, path in candidates
+            if raw_path in aliases or Path(raw_path).as_posix() in aliases
+        ]
+        matches = exact
+        if not matches:
+            leaf = Path(raw_path).name
+            matches = [
+                path for aliases, path in candidates if leaf in aliases
+            ]
+        matches = list(dict.fromkeys(matches))
+        if len(matches) > 1:
+            raise ValueError(
+                f"more than one uploaded reference matches {raw_path!r}"
+            )
+        if matches:
+            matched = matches[0]
+            used.add(matched)
+            reference["path"] = os.path.relpath(
+                matched, destination.parent
+            ).replace(os.sep, "/")
+        elif require_all:
+            unmatched.append(raw_path)
+
+    unused = [
+        declared for declared, path in provided
+        if path.expanduser().resolve() not in used
+    ]
+    if unused:
+        raise ValueError(
+            "reference images are not named by the spec: " + ", ".join(unused)
+        )
+    if unmatched:
+        raise ValueError(
+            "uploaded or pasted specs require every reference image: "
+            + ", ".join(unmatched)
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    return destination
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="montagewright")
 
@@ -1100,8 +1207,17 @@ def create_app() -> FastAPI:
     async def start(
         rushes: list[UploadFile] | None = None,
         music: UploadFile | None = None,
+        grounding_spec_file: UploadFile | None = None,
+        reference_images: list[UploadFile] | None = None,
         source_path: str = Form(""),
         music_path: str = Form(""),
+        grounding_spec_path: str = Form(""),
+        grounding_spec_json: str = Form(""),
+        reference_image_paths: str = Form(""),
+        grounding_target_id: str = Form(""),
+        grounding_target_description: str = Form(""),
+        grounding_identity_cues: str = Form(""),
+        grounding_exclusions: str = Form(""),
         brief: str = Form(""),
         aspect: str = Form("9:16"),
         seconds: float = Form(0.0),
@@ -1181,12 +1297,161 @@ def create_app() -> FastAPI:
         if not kept:
             raise HTTPException(400, "no video files there")
 
+        # Grounding input is parsed by the exact same loader used by the CLI.
+        # Browser files are merely staged and their declared spec paths are
+        # rewritten before that validation; no model call occurs here.
+        spec_path = _typed_path(grounding_spec_path)
+        spec_upload = (
+            grounding_spec_file
+            if grounding_spec_file is not None and grounding_spec_file.filename
+            else None
+        )
+        spec_json = grounding_spec_json.strip()
+        spec_sources = sum((spec_path is not None, spec_upload is not None,
+                            bool(spec_json)))
+        if spec_sources > 1:
+            if made_root:
+                shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(
+                400,
+                "give one grounding spec: a path, an upload, or pasted JSON",
+            )
+
+        try:
+            typed_references = _reference_path_lines(reference_image_paths)
+        except (json.JSONDecodeError, ValueError) as error:
+            if made_root:
+                shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(400, f"invalid reference image paths: {error}")
+        uploads = [
+            upload for upload in reference_images or [] if upload.filename
+        ]
+        simple_grounding = bool(grounding_target_description.strip())
+        if simple_grounding and spec_sources:
+            if made_root:
+                shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(
+                400, "use either the simple reference fields or a grounding spec"
+            )
+        if (typed_references or uploads) and not (spec_sources or simple_grounding):
+            if made_root:
+                shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(
+                400, "reference images require a target description or grounding spec"
+            )
+        if simple_grounding and not (typed_references or uploads):
+            if made_root:
+                shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(400, "a grounding target needs a reference image")
+
+        canonical_grounding: Path | None = None
+        if spec_sources or simple_grounding:
+            staging = keep() / "grounding-input"
+            staging.mkdir(parents=True, exist_ok=True)
+            grounding_upload_bytes = 0
+
+            def count_grounding_upload(path: Path) -> None:
+                nonlocal grounding_upload_bytes
+                grounding_upload_bytes += path.stat().st_size
+                if grounding_upload_bytes > MAX_GROUNDING_UPLOAD_BYTES:
+                    raise HTTPException(
+                        413,
+                        "grounding spec and reference uploads exceed "
+                        f"{MAX_GROUNDING_UPLOAD_BYTES // 1024**2} MB; "
+                        "use paths on this machine instead",
+                    )
+
+            try:
+                if simple_grounding:
+                    raw_spec = staging / "simple-grounding-spec.json"
+                elif spec_path is not None:
+                    if not spec_path.is_file():
+                        raise ValueError(f"{spec_path} is not there")
+                    raw_spec = spec_path
+                elif spec_upload is not None:
+                    raw_spec = _save(
+                        spec_upload, staging / "uploaded-grounding-spec.json"
+                    )
+                    count_grounding_upload(raw_spec)
+                else:
+                    raw_spec = staging / "pasted-grounding-spec.json"
+                    raw_spec.write_text(spec_json, encoding="utf-8")
+                    count_grounding_upload(raw_spec)
+
+                provided: list[tuple[str, Path]] = []
+                override_root = staging / "reference-overrides"
+                for raw_path in typed_references:
+                    image = _typed_path(raw_path)
+                    if image is None or not image.is_file():
+                        raise ValueError(f"reference image is not there: {raw_path}")
+                    stored = override_root / f"{uuid.uuid4().hex}-{image.name}"
+                    stored.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(image, stored)
+                    provided.append((raw_path, stored))
+                for upload in uploads:
+                    name = Path(upload.filename or "reference-image").name
+                    stored = _save(
+                        upload, override_root / f"{uuid.uuid4().hex}-{name}"
+                    )
+                    count_grounding_upload(stored)
+                    provided.append((upload.filename or name, stored))
+
+                staged_spec = raw_spec
+                portable_upload = spec_upload is not None or bool(spec_json)
+                if simple_grounding:
+                    from montagewright.reference_grounding import (
+                        build_reference_grounding_spec,
+                    )
+
+                    built = build_reference_grounding_spec(
+                        raw_spec,
+                        target_id=(
+                            grounding_target_id.strip() or "target.primary"
+                        ),
+                        target_description=grounding_target_description.strip(),
+                        identity_cues=tuple(
+                            line.strip()
+                            for line in grounding_identity_cues.splitlines()
+                            if line.strip()
+                        ),
+                        stable_exclusions=tuple(
+                            line.strip()
+                            for line in grounding_exclusions.splitlines()
+                            if line.strip()
+                        ),
+                        positive_images=tuple(path for _, path in provided),
+                        created_by="web_user",
+                    )
+                    staged_spec = Path(str(built.source_path))
+                elif provided or portable_upload:
+                    staged_spec = _rewrite_uploaded_reference_paths(
+                        raw_spec,
+                        staging / "staged-grounding-spec.json",
+                        provided,
+                        require_all=portable_upload,
+                    )
+
+                from montagewright.cli import prepare_grounding_spec_artifact
+
+                canonical_grounding, _ = prepare_grounding_spec_artifact(
+                    staged_spec, keep() / "out" / "work" / "grounding-spec.json"
+                )
+                shutil.rmtree(staging, ignore_errors=True)
+            except HTTPException:
+                shutil.rmtree(root, ignore_errors=True)
+                raise
+            except (OSError, ValueError) as error:
+                shutil.rmtree(root, ignore_errors=True)
+                raise HTTPException(400, f"invalid grounding spec: {error}")
+
         command = [
             sys.executable, "-u", "-m", "montagewright.cli", "render",
             str(rush_dir), "--aspect", aspect,
             "--budget", str(budget),
             "--output", str(keep() / "out"),
         ]
+        if canonical_grounding is not None:
+            command += ["--grounding-spec", str(canonical_grounding)]
         if seconds > 0:
             command += ["--seconds", str(seconds)]
         track = _typed_path(music_path)
@@ -1225,6 +1490,8 @@ def create_app() -> FastAPI:
             run_id=run_id, root=keep(), source=str(rush_dir), command=command
         )
         run.lines.append(f"{kept} clips from {rush_dir}")
+        if canonical_grounding is not None:
+            run.lines.append(f"grounding spec {canonical_grounding}")
         try:
             run.remember()
             run.process = subprocess.Popen(
@@ -1263,7 +1530,12 @@ def create_app() -> FastAPI:
             ) from error
         RUNS[run_id] = run
         threading.Thread(target=_collect, args=(run,), daemon=True).start()
-        return JSONResponse({"run_id": run_id})
+        return JSONResponse({
+            "run_id": run_id,
+            "grounding_spec": (
+                str(canonical_grounding) if canonical_grounding else None
+            ),
+        })
 
     @app.get("/api/browse")
     def browse(path: str = "", kind: str = "video") -> JSONResponse:

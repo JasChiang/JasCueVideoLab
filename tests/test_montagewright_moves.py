@@ -4558,7 +4558,8 @@ def test_every_look_that_promised_whole_is_checked_not_only_the_first():
     later = checking[checking.index("for index, look in enumerate(reframe.looks[1:]"):]
     later = later[: later.index("if reframe.subject is not None")]
     assert "look.must_be_whole" in later
-    assert "find_subject(card, look.at)" in later
+    assert "find_subject(" in later
+    assert "entity_id=look.entity_id" in later
     assert "box.width <= crop_width" in later
 
 
@@ -5981,6 +5982,141 @@ def test_timeline_coverage_is_generic_to_visual_and_audio_evidence():
     assert not intentional.faults
 
 
+def test_bounded_visual_hold_repair_removes_only_unsupported_tail():
+    """A model's harmless overshoot is local repair, not another paid call."""
+
+    from montagewright.coverage import repair_bounded_visual_holds
+
+    chosen = {"shots": [
+        {
+            "source_id": "ACTION", "seconds_needed": 8.0,
+            "picture_role": "primary_action",
+            "coverage_claim_seconds": 8.0,
+        },
+        {
+            "source_id": "END", "seconds_needed": 2.0,
+            "picture_role": "end_hold",
+            "coverage_claim_seconds": 2.0,
+        },
+    ]}
+    repairs = repair_bounded_visual_holds(chosen)
+
+    assert chosen["shots"][0]["seconds_needed"] == 8.0
+    assert chosen["shots"][0]["coverage_claim_seconds"] == 8.0
+    assert chosen["shots"][1]["seconds_needed"] == 1.5
+    assert "coverage_claim_seconds" not in chosen["shots"][1]
+    assert repairs == (
+        "k01: shortened end_hold from 2.00s to 1.50s; the removed tail "
+        "had no additional content evidence",
+    )
+
+
+@pytest.mark.parametrize("protected", [
+    {"audio_role": "sync_action", "audio_completion": "complete_action_sound"},
+    {"audio_role": "ambient_texture"},
+])
+def test_bounded_visual_hold_repair_never_cuts_retained_audio(protected):
+    from montagewright.coverage import repair_bounded_visual_holds
+
+    shot = {
+        "source_id": "SOUND", "seconds_needed": 2.0,
+        "picture_role": "reaction", **protected,
+    }
+    assert repair_bounded_visual_holds({"shots": [shot]}) == ()
+    assert shot["seconds_needed"] == 2.0
+
+
+def test_bounded_visual_hold_repair_never_cuts_independent_narrative():
+    from montagewright.coverage import repair_bounded_visual_holds
+
+    shot = {
+        "source_id": "PICTURE", "seconds_needed": 2.0,
+        "picture_role": "end_hold", "audio_role": "discard",
+    }
+    chosen = {
+        "shots": [shot],
+        "audio_assignments": [{
+            "audio_span_id": "t00", "starts_at_shot_index": 0,
+            "offset_seconds": 0.0,
+        }],
+    }
+    assert repair_bounded_visual_holds(chosen) == ()
+    assert shot["seconds_needed"] == 2.0
+
+
+def test_repaired_soft_boundary_is_accepted_without_padding_elsewhere():
+    from montagewright.coverage import (
+        repair_bounded_visual_holds,
+        selection_coverage_audit,
+    )
+    from montagewright.planner import MaterialItem
+
+    shots = [
+        {
+            "source_id": f"S{index:02d}", "seconds_needed": 3.0,
+            "picture_role": "illustrative_broll", "audio_role": "discard",
+        }
+        for index in range(8)
+    ]
+    shots.append({
+        "source_id": "MOVE", "seconds_needed": 4.0,
+        "picture_role": "primary_action", "audio_role": "discard",
+    })
+    shots.append({
+        "source_id": "END", "seconds_needed": 3.0,
+        "picture_role": "end_hold", "audio_role": "discard",
+    })
+    chosen = {"shots": shots, "audio_assignments": []}
+    repair_bounded_visual_holds(chosen)
+    audit = selection_coverage_audit(
+        chosen,
+        [MaterialItem(
+            source_id=shot["source_id"], duration_seconds=4.0, summary="",
+            camera_moves=shot["source_id"] == "MOVE",
+        ) for shot in shots],
+        30.0,
+    )
+    # 29.5 is within the 30s delivery tolerance and needs no filler.
+    assert audit.duration_seconds == pytest.approx(29.5)
+    assert not audit.faults
+
+    # A genuinely short structure stays visible in the accounting, but a
+    # normal duration request is a soft creative target and does not force
+    # unsupported filler.
+    shots[-2]["seconds_needed"] = 3.0
+    shots[-1]["seconds_needed"] = 3.0
+    repair_bounded_visual_holds(chosen)
+    audit = selection_coverage_audit(chosen, [MaterialItem(
+        source_id=shot["source_id"], duration_seconds=4.0, summary="",
+        camera_moves=shot["source_id"] == "MOVE",
+    ) for shot in shots], 30.0)
+    assert audit.duration_seconds == pytest.approx(28.5)
+    assert not audit.faults
+
+    hard = selection_coverage_audit(chosen, [MaterialItem(
+        source_id=shot["source_id"], duration_seconds=4.0, summary="",
+        camera_moves=shot["source_id"] == "MOVE",
+    ) for shot in shots], 30.0, hard_target=True)
+    assert any("short by 1.50s" in fault for fault in hard.faults)
+
+
+def test_rhythm_cannot_stretch_a_proven_visual_window_to_fill_target():
+    from montagewright.planner import _apply
+    from montagewright.schema import Clip, EDL
+
+    edl = EDL(project_id="visual-cap", clips=[Clip(
+        clip_id="k00", source_id="BROLL",
+        approx_in_seconds=1.0, approx_out_seconds=4.0,
+        picture_role="illustrative_broll", audio_role="discard",
+        coverage_claim_seconds=3.0,
+    )])
+    made = _apply(edl, {"k00": {
+        "hold_seconds": 4.0, "cut_on_beat": False,
+        "rhythm_reason": "pad to target",
+    }})
+    assert made.clips[0].approx_out_seconds == pytest.approx(4.0)
+
+
 def test_resolved_edl_coverage_uses_the_same_contract_as_selection():
     from montagewright.coverage import edl_coverage_audit
     from montagewright.schema import AudioClip, Clip, EDL
@@ -6137,3 +6273,325 @@ def test_missing_picture_role_is_bounded_not_assumed_to_be_action():
     )], 10.0)
     assert audit.supported_seconds == pytest.approx(3.0)
     assert audit.faults
+
+
+def test_reference_identity_track_requires_two_agreeing_semantic_anchors():
+    from types import SimpleNamespace
+
+    from montagewright.reframe import observations_from_sam
+
+    samples = [
+        SimpleNamespace(
+            analysis_sample_time_ms=at,
+            tracking_state="tracked",
+            semantic_identity_status=(
+                "seed_grounded" if index == 0 else "not_revalidated"
+            ),
+            derived_tracking_box=[100 + index * 10, 200, 400 + index * 10, 700],
+        )
+        for index, at in enumerate((0, 500, 1000))
+    ]
+    track = SimpleNamespace(samples=samples, analysis_fps=2.0)
+
+    observations, states = observations_from_sam(
+        track,
+        clip_start_seconds=0.0,
+        semantic_anchors=(
+            (0.0, (0.1, 0.2, 0.4, 0.7)),
+            (1.0, (0.12, 0.2, 0.42, 0.7)),
+        ),
+        require_identity_validation=True,
+    )
+    assert len(observations) == 3
+    assert states["tracked"] == 3
+
+
+def test_reference_identity_track_fails_closed_with_one_anchor():
+    from types import SimpleNamespace
+
+    from montagewright.reframe import observations_from_sam
+
+    track = SimpleNamespace(
+        analysis_fps=2.0,
+        samples=[SimpleNamespace(
+            analysis_sample_time_ms=0,
+            tracking_state="tracked",
+            semantic_identity_status="seed_grounded",
+            derived_tracking_box=[100, 200, 400, 700],
+        )],
+    )
+    observations, states = observations_from_sam(
+        track,
+        clip_start_seconds=0.0,
+        semantic_anchors=((0.0, (0.1, 0.2, 0.4, 0.7)),),
+        require_identity_validation=True,
+    )
+    assert observations == []
+    assert states["identity_unverified"] == 1
+
+
+def test_reference_identity_quorum_counts_each_physical_sample_once():
+    from types import SimpleNamespace
+
+    from montagewright.reframe import observations_from_sam
+
+    track = SimpleNamespace(
+        analysis_fps=2.0,
+        samples=[SimpleNamespace(
+            analysis_sample_time_ms=index * 500,
+            tracking_state="tracked",
+            semantic_identity_status="not_revalidated",
+            derived_tracking_box=[100, 100, 400, 400],
+        ) for index in range(10)],
+    )
+    observations, states = observations_from_sam(
+        track,
+        clip_start_seconds=0.0,
+        semantic_anchors=(
+            (0.0, (0.1, 0.1, 0.4, 0.4)),
+            (0.5, (0.1, 0.1, 0.4, 0.4)),
+        ),
+        require_identity_validation=True,
+    )
+
+    assert len(observations) == 2
+    assert states == {"tracked": 2, "identity_unbracketed": 8}
+    assert states["tracked"] / sum(states.values()) == pytest.approx(0.2)
+
+
+def test_selection_requires_every_lock_mandated_grounding_target():
+    from montagewright.planner import grounding_target_disagreements
+
+    shots = [{
+        "looks": [
+            {"entity_id": "target.primary"},
+            {"entity_id": "none"},
+        ],
+    }]
+
+    assert grounding_target_disagreements(
+        shots, ["target.primary", "target.required_detail"]
+    ) == [
+        "selection omits required grounding entity_id "
+        "'target.required_detail'"
+    ]
+    assert grounding_target_disagreements(
+        shots, ["target.primary"]
+    ) == []
+
+
+def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from montagewright.executor import Source
+    from montagewright.pipeline import Report, _reference_subject_samples
+    from montagewright.planner import Usage
+    from montagewright.reframe import Observation
+
+    candidate = SimpleNamespace(
+        candidate_id="candidate.001",
+        target_id="target.fold",
+        identity_status="matched_target",
+        start_ms=1_000,
+        end_ms=4_000,
+        recommended_seed_ms=2_000,
+    )
+    discovery = SimpleNamespace(
+        candidates=(candidate,),
+        grounding_spec_sha256="spec",
+        video_sha256="video",
+        candidate=lambda candidate_id: candidate,
+        model_dump=lambda mode: {},
+    )
+    lineage = SimpleNamespace(
+        source_start_pts=0,
+        source_time_base=SimpleNamespace(numerator=1, denominator=1000),
+        content_sha256="video",
+    )
+
+    monkeypatch.setattr(
+        "montagewright.reference_grounding.discover_reference_candidates",
+        lambda *args, **kwargs: (discovery, Usage(10, 2, 1)),
+    )
+    monkeypatch.setattr(
+        "montagewright.reference_grounding.inspect_video_lineage",
+        lambda path: lineage,
+    )
+
+    def materialize(path, requested_time_ms, destination, max_width=None):
+        return SimpleNamespace(lineage=SimpleNamespace(
+            frame_pts=requested_time_ms,
+            frame_time_ms=requested_time_ms,
+            video_asset_id="sha256:video",
+            frame_sha256=(f"{requested_time_ms:064x}"[-64:]),
+            width=1440,
+            height=810,
+        ))
+
+    monkeypatch.setattr(
+        "montagewright.reference_grounding.materialize_frame_at_time", materialize
+    )
+
+    evaluations = tuple(
+        SimpleNamespace(
+            lineage=SimpleNamespace(
+                frame_pts=at,
+                frame_time_ms=at,
+                video_asset_id="sha256:video",
+                frame_sha256=f"{at:064x}"[-64:],
+                width=1440,
+                height=810,
+            ),
+            decision=SimpleNamespace(
+                tracking_box_xyxy_1000=(100, 200, 500, 800),
+                identity_evidence=("same hinge",),
+                confidence=(0.99 if at == 2_000 else 0.9),
+            ),
+        )
+        for at in (1_600, 2_000, 3_400)
+    )
+    batch = SimpleNamespace(
+        query_lock_sha256="lock",
+        grounding_spec_sha256="spec",
+        matched_anchor_count=3,
+        sam_seed_evaluations=lambda: evaluations,
+        model_dump=lambda mode: {},
+    )
+    monkeypatch.setattr(
+        "montagewright.reference_grounding.decide_exact_frame_bboxes",
+        lambda *args, **kwargs: (batch, Usage(12, 3, 1)),
+    )
+
+    spec = SimpleNamespace(
+        definition_sha256=lambda: "spec",
+    )
+    handed_to_sam = {}
+
+    def tracked(*args, **kwargs):
+        handed_to_sam.update(kwargs)
+        return [
+            Observation(0.6, 0.2, 0.3, 0.2, 0.4),
+            Observation(1.0, 0.4, 0.5, 0.2, 0.4),
+            Observation(2.4, 0.8, 0.7, 0.2, 0.4),
+        ], {"tracked": 3}
+
+    monkeypatch.setattr("montagewright.pipeline._track_subject", tracked)
+    report = Report()
+    boxes, times, anchors = _reference_subject_samples(
+        Source("A", tmp_path / "A.mp4", 5.0, 1920, 1080),
+        SimpleNamespace(
+            clip_id="k00", approx_in_seconds=1.0, approx_out_seconds=4.0
+        ),
+        "target.fold",
+        spec=spec,
+        client=object(),
+        upload_cache=None,
+        report=report,
+        work=tmp_path,
+        output=None,
+        discoveries={},
+        checkpoint=tmp_path / "sam.pt",
+    )
+
+    assert len(boxes) == len(times) == len(anchors) == 3
+    assert boxes[0]["centre_x"] == pytest.approx(0.2)
+    assert boxes[0]["geometry_source"] == "sam2.1"
+    assert anchors[0][1] == pytest.approx((0.1, 0.2, 0.5, 0.8))
+    exact = handed_to_sam["seed_lineage"]
+    assert exact.frame_pts == 2_000
+    assert exact.frame_sha256 == f"{2_000:064x}"[-64:]
+    assert (exact.width, exact.height) == (1440, 810)
+    assert handed_to_sam["require_identity_validation"] is True
+    assert report.reference_grounding["k00"]["status"] == "sam_geometry_validated"
+    assert [usage.input_tokens for usage in report.usages] == [10, 12]
+
+
+def test_reference_critical_grounding_without_sam_fails_before_gemini(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    from montagewright.executor import Source
+    from montagewright.pipeline import Report, _reference_subject_samples
+
+    monkeypatch.setattr(
+        "montagewright.reference_grounding.discover_reference_candidates",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("missing local geometry must fail before Gemini")
+        ),
+    )
+    report = Report()
+    with pytest.raises(RuntimeError, match="requires SAM/local geometry"):
+        _reference_subject_samples(
+            Source("A", tmp_path / "A.mp4", 5.0, 1920, 1080),
+            SimpleNamespace(
+                clip_id="k00", approx_in_seconds=1.0, approx_out_seconds=4.0
+            ),
+            "target.fold",
+            spec=SimpleNamespace(),
+            client=object(),
+            upload_cache=None,
+            report=report,
+            work=tmp_path,
+            output=None,
+            discoveries={},
+            checkpoint=None,
+        )
+    assert report.reference_grounding["k00"]["status"] == (
+        "local_geometry_unavailable"
+    )
+
+
+def test_exact_frame_lineage_reaches_single_target_sam_seed_api(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    from montagewright import pipeline
+    from montagewright.executor import Source
+
+    captured = {}
+
+    def fake_track_bbox_sam21(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(samples=[], analysis_fps=4.0)
+
+    monkeypatch.setattr(
+        "montagewright.measure.sam_tracking.track_bbox_sam21",
+        fake_track_bbox_sam21,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "observations_from_sam",
+        lambda *args, **kwargs: ([], {"tracked": 0}),
+    )
+    lineage = SimpleNamespace(
+        video_asset_id="sha256:" + "a" * 64,
+        frame_pts=2_100,
+        frame_time_ms=2_000,
+        frame_sha256="b" * 64,
+        width=1440,
+        height=810,
+    )
+
+    pipeline._track_subject(
+        Source("A", tmp_path / "A.mp4", 5.0, 1920, 1080),
+        SimpleNamespace(
+            clip_id="k00", approx_in_seconds=1.0, approx_out_seconds=4.0
+        ),
+        "the locked foldable instance",
+        [100, 200, 500, 800],
+        tmp_path / "sam.pt",
+        tmp_path,
+        seed_time_seconds=2.0,
+        require_identity_validation=True,
+        seed_lineage=lineage,
+    )
+
+    assert captured["asset_id"] == lineage.video_asset_id
+    assert captured["seed_time_ms"] == lineage.frame_time_ms
+    assert captured["seed_frame_pts"] == lineage.frame_pts
+    assert captured["seed_frame_sha256"] == lineage.frame_sha256
+    assert captured["seed_source_width"] == lineage.width
+    assert captured["seed_source_height"] == lineage.height
+    assert captured["seed_source"] == "reference_exact_frame_grounding"

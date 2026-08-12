@@ -15,6 +15,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from montagewright.reference_grounding import ReferenceGroundingSpec
 
 from montagewright.clipcard import (
     CARD_VERSION,
@@ -54,7 +58,14 @@ from montagewright.planner import (
     sequence_disagreements,
     select_shots,
 )
-from montagewright.schema import EDL, Clip, move_of_shot, reframe_of, subject_of
+from montagewright.schema import (
+    EDL,
+    Clip,
+    looks_of,
+    move_of_shot,
+    reframe_of,
+    subject_of,
+)
 from montagewright.spans import spans_of
 from montagewright.uploads import (
     UploadCache,
@@ -70,6 +81,119 @@ SAM_CHECKPOINT_NAME = "sam2.1_hiera_tiny.pt"
 # it, scene detection costs more than it can save.
 SPLIT_ABOVE_SECONDS = 90.0
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV"}
+
+
+def prepare_grounding_spec_artifact(
+    source: Path, destination: Path,
+) -> tuple[Path, ReferenceGroundingSpec]:
+    """Validate and make one self-contained, canonical grounding input.
+
+    ``reference_grounding`` owns the schema and every semantic validation.
+    This helper owns only run transport: reference images are copied beside
+    the canonical JSON under content-addressed names, then the rewritten
+    document is loaded a second time.  CLI and Web both call this function so
+    an upload cannot acquire a more permissive interpretation than a path.
+    """
+
+    from montagewright.reference_grounding import (
+        ReferenceGroundingError,
+        load_grounding_spec,
+    )
+
+    def checked_load(path: Path) -> ReferenceGroundingSpec:
+        try:
+            return load_grounding_spec(path)
+        except ReferenceGroundingError as error:
+            raise ValueError(str(error)) from error
+
+    source = source.expanduser().resolve()
+    destination = destination.expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"grounding spec is not there: {source}")
+
+    spec = checked_load(source)
+    canonical = spec.canonical_definition_json()
+    if isinstance(canonical, bytes):
+        canonical = canonical.decode("utf-8")
+    payload = json.loads(canonical)
+    definitions = payload.get("reference_images")
+    references = tuple(spec.reference_images)
+    if not isinstance(definitions, list) or len(definitions) != len(references):
+        raise ValueError(
+            "grounding spec canonical form changed its reference_images"
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image_root = destination.parent / "reference-images"
+    image_root.mkdir(parents=True, exist_ok=True)
+    for definition, reference in zip(definitions, references, strict=True):
+        image = spec.resolve_reference_path(reference).resolve()
+        if not image.is_file():
+            raise ValueError(f"reference image is not there: {image}")
+        digest = str(reference.content_sha256).lower()
+        suffix = Path(str(reference.path)).suffix.lower()
+        stored = image_root / f"{digest}{suffix}"
+        if image != stored:
+            shutil.copyfile(image, stored)
+        definition["path"] = stored.relative_to(destination.parent).as_posix()
+
+    staged = destination.with_name(f".{destination.name}.tmp")
+    staged.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    try:
+        checked = checked_load(staged)
+        rendered = checked.canonical_definition_json()
+        if isinstance(rendered, bytes):
+            rendered = rendered.decode("utf-8")
+        staged.write_text(rendered, encoding="utf-8")
+        staged.replace(destination)
+    finally:
+        staged.unlink(missing_ok=True)
+    # Reload after the atomic rename so the runtime-only source path names the
+    # durable artifact rather than the now-deleted staging file.
+    return destination, checked_load(destination)
+
+
+def _command_with_canonical_grounding(
+    argv: list[str], grounding_spec: Path | None,
+) -> list[str]:
+    """Record the resumable command against the durable canonical artifact."""
+
+    if grounding_spec is None:
+        return list(argv)
+    simple_flags = {
+        "--grounding-target-id", "--grounding-target-description",
+        "--grounding-reference", "--grounding-identity-cue",
+        "--grounding-exclusion",
+    }
+    rewritten: list[str] = []
+    skip_value = False
+    for argument in argv:
+        if skip_value:
+            skip_value = False
+            continue
+        if argument in simple_flags:
+            skip_value = True
+            continue
+        if any(argument.startswith(f"{flag}=") for flag in simple_flags):
+            continue
+        rewritten.append(argument)
+    for index, argument in enumerate(rewritten):
+        if argument == "--grounding-spec" and index + 1 < len(rewritten):
+            rewritten[index + 1] = str(grounding_spec)
+            return rewritten
+        if argument.startswith("--grounding-spec="):
+            rewritten[index] = f"--grounding-spec={grounding_spec}"
+            return rewritten
+    rewritten += ["--grounding-spec", str(grounding_spec)]
+    return rewritten
 
 
 def _default_sam_checkpoint(
@@ -352,6 +476,57 @@ def command_render(args: argparse.Namespace) -> int:
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
 
+    grounding_spec = getattr(args, "grounding_spec", None)
+    simple_description = str(
+        getattr(args, "grounding_target_description", "") or ""
+    ).strip()
+    simple_references = tuple(
+        Path(path) for path in (getattr(args, "grounding_reference", None) or [])
+    )
+    if grounding_spec is not None and simple_description:
+        raise SystemExit(
+            "use either --grounding-spec or the simple grounding target fields"
+        )
+    if simple_description:
+        from montagewright.reference_grounding import build_reference_grounding_spec
+
+        try:
+            built = build_reference_grounding_spec(
+                output / "work" / "simple-grounding-input.json",
+                target_id=(
+                    str(getattr(args, "grounding_target_id", "") or "").strip()
+                    or "target.primary"
+                ),
+                target_description=simple_description,
+                positive_images=simple_references,
+                identity_cues=tuple(
+                    getattr(args, "grounding_identity_cue", None) or ()
+                ),
+                stable_exclusions=tuple(
+                    getattr(args, "grounding_exclusion", None) or ()
+                ),
+                created_by="cli_user",
+            )
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"invalid grounding references: {error}") from error
+        grounding_spec = Path(str(built.source_path))
+    elif simple_references:
+        raise SystemExit(
+            "--grounding-reference requires --grounding-target-description"
+        )
+    args.grounding_spec = grounding_spec
+    args.reference_grounding_spec = None
+    if grounding_spec is not None:
+        try:
+            (
+                args.grounding_spec,
+                args.reference_grounding_spec,
+            ) = prepare_grounding_spec_artifact(
+                grounding_spec, output / "work" / "grounding-spec.json"
+            )
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"invalid grounding spec: {error}") from error
+
     # What produced this, written before anything is attempted. The
     # interface lists every cut in the runs folder and could only see the
     # ones it had started itself, so a render from the command line left a
@@ -372,6 +547,15 @@ def command_render(args: argparse.Namespace) -> int:
     # one resolved value for the command record and every review round.
     args.sam_checkpoint = _sam_checkpoint_for(args)
 
+    recorded_argv = _command_with_canonical_grounding(
+        list(getattr(args, "_argv", sys.argv[1:])),
+        getattr(args, "grounding_spec", None),
+    )
+    reference_grounding_spec = args.reference_grounding_spec
+    grounding_sha256 = (
+        reference_grounding_spec.definition_sha256()
+        if reference_grounding_spec is not None else None
+    )
     (output / "command.json").write_text(
         json.dumps({
             "source": str(rushes),
@@ -379,8 +563,12 @@ def command_render(args: argparse.Namespace) -> int:
             "sam_checkpoint": (
                 str(args.sam_checkpoint) if args.sam_checkpoint else None
             ),
+            "grounding_spec": (
+                str(args.grounding_spec) if args.grounding_spec else None
+            ),
+            "grounding_spec_sha256": grounding_sha256,
             "command": [sys.executable, "-u", "-m", "montagewright.cli"]
-            + sys.argv[1:],
+            + recorded_argv,
         }, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -712,13 +900,19 @@ def command_render(args: argparse.Namespace) -> int:
     asked = _asked(
         catalogue, brief, args.aspect, music_key,
         f"seconds={args.seconds or 0}", direction_contract,
+        (
+            args.reference_grounding_spec.definition_sha256()
+            if args.reference_grounding_spec is not None
+            else "no-reference-grounding"
+        ),
     )
     direction = _decided(work, "direction", asked)
     if direction is None:
         ledger.check()
         direction, usage_direction = decide_direction(
             material, brief=brief, aspect=args.aspect, music=args.music,
-            seconds=args.seconds, cache=cache, client=client, ledger=ledger
+            seconds=args.seconds, cache=cache, client=client, ledger=ledger,
+            grounding_spec=args.reference_grounding_spec,
         )
         _decide(work, "direction", asked, direction)
     else:
@@ -771,6 +965,13 @@ def command_render(args: argparse.Namespace) -> int:
                 for one in brief_document.graphics_candidates()
             ],
             audio_span_ids=list(_audio_spans(transcripts)),
+            grounding_target_ids=(
+                [
+                    target.target_id
+                    for target in args.reference_grounding_spec.identity_lock.identity.targets
+                ]
+                if args.reference_grounding_spec is not None else []
+            ),
         ),
     )
     chose = _asked(
@@ -785,6 +986,7 @@ def command_render(args: argparse.Namespace) -> int:
             material, direction, brief=brief, cache=cache, client=client,
             ledger=ledger,
             graphic_candidates=brief_document.graphics_candidates(),
+            grounding_spec=args.reference_grounding_spec,
         )
         _decide(work, "selection", chose, selection)
     else:
@@ -883,6 +1085,8 @@ def command_render(args: argparse.Namespace) -> int:
             under_speech=str(direction.get("music_under_speech") or "duck"),
             client=client,
             transcripts=transcripts,
+            grounding_spec=args.reference_grounding_spec,
+            upload_cache=cache,
         )
 
     result, plan, report, resolved = cut(edl, sources, rhythm_context)
@@ -1026,6 +1230,7 @@ def command_render(args: argparse.Namespace) -> int:
                           client=client,
                           ledger=ledger,
                           graphic_candidates=brief_document.graphics_candidates(),
+                          grounding_spec=args.reference_grounding_spec,
                       )
                       _decide(work, "selection", chose, selection)
                       edl, snaps = _edl_from_selection(
@@ -1146,6 +1351,7 @@ def command_render(args: argparse.Namespace) -> int:
                       cache=cache,
                       client=client,
                       ledger=ledger,
+                      grounding_spec=args.reference_grounding_spec,
                   )
               except BudgetSpent as error:
                   stopped = str(error)
@@ -1191,6 +1397,7 @@ def command_render(args: argparse.Namespace) -> int:
                           cache=cache,
                           client=client,
                           ledger=ledger,
+                          grounding_spec=args.reference_grounding_spec,
                       )
                   except BudgetSpent as error:
                       stopped = str(error)
@@ -1730,7 +1937,12 @@ def _rhythm_context(
             "source_motion": shot.get("source_motion_role", "locked"),
         }
         if card is not None:
-            box = find_subject(card, subject_of(shot))
+            first_look = (looks_of(shot) or [None])[0]
+            box = find_subject(
+                card,
+                subject_of(shot),
+                entity_id=(first_look.entity_id if first_look else None),
+            )
             if box is not None:
                 entry["subject_share"] = round(box.width * box.height, 4)
             beats = action_beats(card)
@@ -1754,7 +1966,7 @@ def _look_boxes(card: dict, reframe) -> list[tuple[float, float, float]]:
 
     out: list[tuple[float, float, float]] = []
     for look in reframe.looks:
-        box = find_subject(card, look.at)
+        box = find_subject(card, look.at, entity_id=look.entity_id)
         if box is None:
             return []
         # The crop this framing asks for, as a share of the frame. `fill`
@@ -1965,6 +2177,7 @@ def _write_report(output: Path, **parts) -> None:
         "upscales": {k: round(v, 3) for k, v in report.upscales.items()},
         "subject_notes": report.subject_notes,
         "subject_tracks": report.subject_tracks,
+        "reference_grounding": report.reference_grounding,
         "plan_disagreements": report.plan_disagreements,
         "degradations": [
             {
@@ -2419,6 +2632,32 @@ def main(argv: list[str] | None = None) -> int:
     render = sub.add_parser("render", help="Cut a folder of rushes into a film")
     render.add_argument("rushes", type=Path)
     render.add_argument("--brief", type=Path)
+    render.add_argument(
+        "--grounding-spec",
+        type=Path,
+        help="validated reference-identity JSON. A canonical, self-contained "
+             "copy is kept at work/grounding-spec.json for this run.",
+    )
+    render.add_argument(
+        "--grounding-target-id", default="target.primary",
+        help="stable ID for the simple reference-image mode",
+    )
+    render.add_argument(
+        "--grounding-target-description", default="",
+        help="what exact identity the supplied reference images represent",
+    )
+    render.add_argument(
+        "--grounding-reference", type=Path, action="append", default=[],
+        help="positive reference image; repeat for more views",
+    )
+    render.add_argument(
+        "--grounding-identity-cue", action="append", default=[],
+        help="stable visible identity cue; repeat as needed",
+    )
+    render.add_argument(
+        "--grounding-exclusion", action="append", default=[],
+        help="lookalike or depiction that must not be substituted",
+    )
     render.add_argument("--music", type=Path)
     render.add_argument("--music-map", type=Path)
     render.add_argument("--aspect", choices=sorted(ASPECTS), default="9:16")
@@ -2539,7 +2778,9 @@ def main(argv: list[str] | None = None) -> int:
     graphics.add_argument("--graphic-id")
     graphics.set_defaults(handler=command_graphics)
 
-    args = parser.parse_args(argv)
+    effective_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(effective_argv)
+    args._argv = effective_argv
     return args.handler(args)
 
 

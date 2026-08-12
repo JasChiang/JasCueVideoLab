@@ -1624,6 +1624,8 @@ def observations_from_sam(
     *,
     clip_start_seconds: float,
     accept_states: frozenset[str] = frozenset({"tracked"}),
+    semantic_anchors: tuple[tuple[float, tuple[float, float, float, float]], ...] = (),
+    require_identity_validation: bool = False,
 ) -> tuple[list[Observation], dict[str, int]]:
     """Read a propagated track as subject observations.
 
@@ -1644,11 +1646,87 @@ def observations_from_sam(
 
     observations: list[Observation] = []
     states: dict[str, int] = {}
-    for sample in getattr(track, "samples", []) or []:
+    samples = list(getattr(track, "samples", []) or [])
+
+    def overlap(
+        left: tuple[float, float, float, float],
+        right: tuple[float, float, float, float],
+    ) -> float:
+        x0 = max(left[0], right[0])
+        y0 = max(left[1], right[1])
+        x1 = min(left[2], right[2])
+        y1 = min(left[3], right[3])
+        intersection = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        union = (
+            max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+            + max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+            - intersection
+        )
+        return intersection / union if union > 0 else 0.0
+
+    validated_interval: tuple[float, float] | None = None
+    if require_identity_validation:
+        # SAM propagates geometry, not identity. A reference-critical track is
+        # usable only where independent exact-frame grounding brackets it and
+        # agrees with its geometry. This prevents a confident mask that has
+        # switched to a lookalike from becoming an equally confident crop.
+        matched_times: list[float] = []
+        for anchor_time, anchor_box in semantic_anchors:
+            candidates = [
+                sample for sample in samples
+                if sample.derived_tracking_box
+                and abs(sample.analysis_sample_time_ms / 1000.0 - anchor_time)
+                <= max(0.51, 1.0 / max(float(getattr(track, "analysis_fps", 1.0)), 0.1))
+            ]
+            if not candidates:
+                continue
+            nearest = min(
+                candidates,
+                key=lambda sample: abs(
+                    sample.analysis_sample_time_ms / 1000.0 - anchor_time
+                ),
+            )
+            raw_box = nearest.derived_tracking_box
+            sam_box = (
+                float(raw_box[0]) / 1000.0,
+                float(raw_box[1]) / 1000.0,
+                float(raw_box[2]) / 1000.0,
+                float(raw_box[3]) / 1000.0,
+            )
+            if overlap(sam_box, anchor_box) >= 0.35:
+                matched_times.append(anchor_time)
+        if len(matched_times) < 2:
+            states["identity_unverified"] = len(samples)
+            return [], states
+        validated_interval = (min(matched_times), max(matched_times))
+    for sample in samples:
         state = getattr(sample.tracking_state, "value", str(sample.tracking_state))
-        states[state] = states.get(state, 0) + 1
         if state not in accept_states:
+            states[state] = states.get(state, 0) + 1
             continue
+        semantic = getattr(
+            getattr(sample, "semantic_identity_status", ""),
+            "value",
+            str(getattr(sample, "semantic_identity_status", "")),
+        )
+        if require_identity_validation:
+            if semantic in {"revalidation_required", "revalidation_failed"}:
+                states["identity_rejected"] = states.get("identity_rejected", 0) + 1
+                continue
+            at_source = sample.analysis_sample_time_ms / 1000.0
+            if validated_interval is None or not (
+                validated_interval[0] <= at_source <= validated_interval[1]
+            ):
+                states["identity_unbracketed"] = states.get(
+                    "identity_unbracketed", 0
+                ) + 1
+                continue
+        # State counters are a partition of physical samples. Previously a
+        # reference-critical sample counted once as ``tracked`` and again as
+        # ``identity_unbracketed``/``identity_rejected``. The pipeline's
+        # tracked/sum(states) quorum could therefore pass a long track with
+        # only its first two frames semantically bracketed.
+        states[state] = states.get(state, 0) + 1
         box = sample.derived_tracking_box
         if not box or len(box) != 4:
             continue
