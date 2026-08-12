@@ -1162,6 +1162,12 @@ def command_render(args: argparse.Namespace) -> int:
         json.dumps(direction, sort_keys=True, ensure_ascii=False),
         commitments.sha256(),
         selection_contract,
+        # Local semantic validators are part of the executable answer's
+        # meaning even though JSON Schema cannot encode their cross-field
+        # rules. Bump this when those rules change so a paid answer accepted
+        # by an older binary is audited again instead of bypassing the new
+        # Selection repair loop on resume.
+        "selection-local-contract-v2-look-semantics",
     )
     selection = _decided(work, "selection", chose)
     if selection is None:
