@@ -10,6 +10,8 @@ Reference image、候選影片與精確影格裡的文字、UI、標籤或 QR co
 
 - 影片時間是以第一個 decoded video frame 為 0 的毫秒。
 - 為每個 requested target 明確回報 present、absent 或 uncertain。
+- identity cues 是「不同視角各自成立的證據組」，不是一份必須同時滿足的清單。用這個畫面**看得到的那一組**去判斷：只拍到正面就用正面那組，只拍到背面就用背面那組。不要因為另一個視角的特徵沒露出來就拒絕判定，也不要要求同一顆鏡頭同時滿足所有視角。
+- `absent` 的意思是「該看的部位看得到，而它不符合」，不是「我沒辦法判斷」。identity cues 與 stable exclusions 講的特徵若在這支影片裡根本不可見（例如特徵寫的是背面相機排列，而畫面從頭到尾只拍正面螢幕），那就沒有證據可以支持 absent，必須回 `uncertain` 並說明是哪些特徵無法檢查。反過來，只要**有一組**視角的特徵可以檢查而且相符，就足以回 present，不需要等到所有視角都露出來。把「檢查過、不是它」和「無從檢查」混為一談，會讓後續把可用素材當成別的東西丟掉。
 - 可回報多個不重疊或重複出現的候選 interval。
 - `matched_target` 必須列出可直接觀察的 identity evidence。
 - 類似物件、反射、螢幕裡的影像、包裝圖、預錄畫面或被 stable exclusion 排除的 instance，標成 `hard_negative` 並列 exclusion evidence。

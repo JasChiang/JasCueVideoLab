@@ -37,6 +37,18 @@ def rhythm_motion_faults(
         if before is None or before_move != "use_source_motion":
             continue
         required = before.approx_out_seconds - before.approx_in_seconds
+        # Not past the end of the take. A span can outrun its own usable
+        # window by a few milliseconds -- the two are measured by different
+        # passes -- and then the feasibility clamp trims it, correctly, and
+        # this refused the timeline over ten thousandths of a second. What
+        # rhythm may not do is choose to shorten the move; what the material
+        # cannot supply is not rhythm's doing and is already reported as a
+        # note on the shot.
+        window = before.usable_window
+        if window is not None:
+            required = min(
+                required, max(0.0, window[1] - clip.approx_in_seconds)
+            )
         if entry.duration_seconds < required - 1e-6:
             faults.append(
                 f"{clip.clip_id}: native source motion needs its authored "

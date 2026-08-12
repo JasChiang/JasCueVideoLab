@@ -48,7 +48,11 @@ DRAFT_PROMPT_PATH = (
     / "prompts"
     / "reference_identity_draft_zh-TW.txt"
 )
-MAX_OUTPUT_TOKENS = 2_048
+# Enough room to answer about several targets over a long take. At 2,048 a
+# spec with three per-view cue sets and three exclusions started truncating
+# its own evidence, and a truncated structured answer is a refused call --
+# paid for, and worth nothing.
+MAX_OUTPUT_TOKENS = 4_096
 MAX_EXACT_FRAMES_PER_CALL = 8
 TARGET_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -1649,9 +1653,14 @@ def remembered_discovery(
         return None
     video_path = Path(video_path).expanduser().resolve(strict=True)
     digest = sha256_file(video_path)
+    # The prompt is an input to the answer, so it belongs in the name. It was
+    # not, and the first time the wording changed -- to stop "I cannot check
+    # this" being reported as "it is not here" -- seventy-four remembered
+    # verdicts would have gone on answering the old question forever.
     stored = (
         Path(library) / "reference-grounding"
-        / f"{digest[:20]}-{spec.definition_sha256()[:16]}.json"
+        / f"{digest[:20]}-{spec.definition_sha256()[:16]}"
+          f"-{_sha256_text(_read_prompt())[:8]}.json"
         if library is not None else None
     )
     if stored is not None and stored.exists():
