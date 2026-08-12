@@ -1683,6 +1683,7 @@ def command_render(args: argparse.Namespace) -> int:
                       direction=direction["direction"],
                       wanted_seconds=report.target_seconds or 0.0,
                       delivered_seconds=report.delivered_seconds or 0.0,
+                      already=rounds,
                       client=client,
                       cache=cache,
                       ledger=ledger,

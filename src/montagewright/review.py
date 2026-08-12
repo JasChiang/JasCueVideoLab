@@ -116,6 +116,36 @@ class Outcome:
         return bool(self.rounds) and self.rounds[-1].verdict.verdict == "approve"
 
 
+def _what_happened_already(rounds: "list[Round] | None") -> str:
+    """What earlier rounds asked for, so this one is not asked blind."""
+
+    if not rounds:
+        return ""
+    lines = ["\n## 這支片已經被改過，前面幾輪說了什麼\n"]
+    for one in rounds:
+        said = one.verdict
+        lines.append(
+            f"第 {one.index} 輪：{said.verdict}"
+            + (
+                "（"
+                + "；".join(
+                    f"{one.clip_id or '整體'} {one.severity}: {one.description}"
+                    for one in said.issues[:4]
+                )
+                + "）"
+                if said.issues else ""
+            )
+        )
+        if one.actionable:
+            lines.append(
+                "  依此重規劃了：" + "、".join(str(x) for x in one.actionable[:6])
+            )
+    lines.append(
+        "\n已經處理過的問題若已改善就不要重提；仍未改善要說明是同一個問題。\n"
+    )
+    return "\n".join(lines)
+
+
 def review_cut(
     preview: Path,
     *,
@@ -124,6 +154,7 @@ def review_cut(
     client: Any,
     wanted_seconds: float = 0.0,
     delivered_seconds: float = 0.0,
+    already: "list[Round] | None" = None,
     cache: Any = None,
     ledger: Ledger | None = None,
     model_id: str = MODEL_ID,
@@ -179,6 +210,13 @@ def review_cut(
                 "text": (
                     f"{instruction}\n\n## 剪輯 brief\n\n{brief}\n\n"
                     f"## 這支片的創意定調\n\n{direction}\n"
+                    # A second look at a cut that was changed because of the
+                    # first one is a different question from a first look,
+                    # and it was being asked as though it were the same. So
+                    # the reviewer could repeat a complaint that had just
+                    # been acted on, or approve a change without knowing one
+                    # had been made.
+                    + _what_happened_already(already)
                 ),
             },
         ],

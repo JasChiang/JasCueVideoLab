@@ -7289,3 +7289,47 @@ def test_a_failed_span_is_never_offered_as_its_own_alternate():
         dict(shot, span_id="B:s01"), direction,
         taken={"B:s01"}, exhausted={"A:s00", "B:s01"},
     ) is None
+
+
+def test_a_second_review_knows_the_cut_was_changed_for_the_first():
+    """A second look at a changed cut is a different question.
+
+    It was being asked as though it were the first: the reviewer saw the
+    film, the brief and the direction, and nothing about the round that had
+    just rewritten three shots. So it could repeat a complaint that had
+    already been acted on, or approve a change without knowing one was made
+    -- and the loop's own stopping rule reads "the same complaint twice" as
+    proof that nothing can be fixed.
+    """
+
+    import inspect
+
+    from montagewright.review import Round, ReviewVerdict, _what_happened_already
+
+    assert _what_happened_already(None) == "", "a first look stays a first look"
+
+    said = _what_happened_already([
+        Round(
+            index=1,
+            verdict=ReviewVerdict(
+                verdict="revise",
+                overall="one shot outstays its action",
+                issues=[{
+                    "issue_type": "pacing",
+                    "severity": "major",
+                    "clip_id": "k02",
+                    "description": "k02 holds too long after the phone closes",
+                    "fix": "end the shot when the hinge stops",
+                }],
+            ),
+            actionable=("k02",),
+        ),
+    ])
+    assert "第 1 輪" in said
+    assert "k02 holds too long" in said
+    assert "依此重規劃了：k02" in said
+    assert "不要重提" in said
+
+    assert "already=rounds" in inspect.getsource(
+        __import__("montagewright.cli", fromlist=["cli"]).command_render
+    ), "and the run actually hands the history over"
