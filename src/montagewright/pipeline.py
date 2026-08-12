@@ -578,7 +578,18 @@ def _track_subject(
             else "gemini_frame_grounding"
         ),
         analysis_fps=TRACK_FPS,
-        max_side=960,
+        # A handset on a table in a wide event shot is a couple of hundred
+        # pixels across at 960, and the masks came back sparse and broken --
+        # three usable frames out of twelve on one shot, which then failed
+        # the tracking quorum with its identity confirmed on every frame it
+        # was asked about. The decode is local and the model is already
+        # loaded; the pixels are the cheapest thing to give it.
+        max_side=1440,
+        # Prompted with a box drawn tight around the phone, SAM tends to cut
+        # inside it -- the screen, or the lit half of a folded body. A little
+        # room around the prompt lets the mask take the whole object, which
+        # is what the exact-frame box it is being compared against describes.
+        seed_box_padding_ratio=0.06,
         allowed_start_ms=int(clip.approx_in_seconds * 1000),
         allowed_end_ms=int(clip.approx_out_seconds * 1000),
         **exact_seed,
