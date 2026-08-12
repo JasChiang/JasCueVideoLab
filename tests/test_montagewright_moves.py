@@ -6840,11 +6840,11 @@ def test_a_segment_offers_only_the_subjects_it_can_show():
     )])
 
     first, second = described.split("；C1:s01")
-    assert "右側的紫色折疊手機（此段第 1.0 秒處）" in first, "sighted inside the window"
+    assert "右側的紫色折疊手機（此段 0:01.0 處）" in first, "sighted inside the window"
     assert "左側的白色折疊手機" not in first, (
         "a subject seen at 6.0s is not offered from a window ending at 4.0s"
     )
-    assert "左側的白色折疊手機（此段第 2.0 秒處" in second
+    assert "左側的白色折疊手機（此段 0:02.0 處" in second
     assert "此段沒有測到可命名的主體" not in described
 
 
@@ -6882,7 +6882,7 @@ def test_a_panning_take_offers_a_subject_only_while_it_is_on_screen():
         event_id="m0", starts_seconds=0.0, ends_seconds=10.0, state="still",
         peak_vw_s=0.0, travel_vw=0.0, settles=False,
     ),))
-    assert "左側的白色折疊手機（此段第 6.0 秒處）" in still, (
+    assert "左側的白色折疊手機（此段 0:06.0 處）" in still, (
         "a locked-off take keeps a coordinate for the whole span"
     )
 
@@ -6892,7 +6892,10 @@ def test_a_panning_take_offers_a_subject_only_while_it_is_on_screen():
     ),))
     assert "start_offset_seconds 要落在" in panning, "say when it still holds"
     window = panning.split("start_offset_seconds 要落在")[1].split("）")[0]
-    opens, closes = (float(one) for one in window.split("–"))
+    opens, closes = (
+        float(one.split(":")[0]) * 60 + float(one.split(":")[1])
+        for one in window.split("–")
+    )
     assert opens < 6.0 < closes
     assert closes - opens < 10.0, "a travelling frame does not hold it all"
 
@@ -7422,3 +7425,27 @@ def test_a_segment_that_can_carry_a_move_says_so():
     first, second = described.split("；C1:s01")
     assert "可以在它們之間運鏡" in first, "two subjects, one segment: a move is on"
     assert "可以在它們之間運鏡" not in second, "one subject is a hold"
+
+
+def test_the_tracking_floor_counts_observations_not_only_a_fraction():
+    """Six usable frames of thirteen was refused at forty-six per cent.
+
+    A subject a hand covers for a moment, or that leaves the frame and
+    comes back, loses samples for reasons that are facts about the take,
+    and the crop interpolates between the observations it does have. What
+    separates a measurement from a single guess is having several
+    observations spread across the shot, not clearing a half.
+    """
+
+    from montagewright.pipeline import TRACK_MINIMUM_OBSERVATIONS, TRACK_QUORUM
+
+    def passes(kept, total):
+        return not (
+            kept < TRACK_MINIMUM_OBSERVATIONS or kept / total < TRACK_QUORUM
+        )
+
+    assert passes(6, 13), "the shot this was written for"
+    assert passes(5, 13)
+    assert not passes(3, 12), "a quarter is still not a trajectory"
+    assert not passes(2, 4), "two observations are two guesses"
+    assert passes(3, 8)

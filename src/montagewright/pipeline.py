@@ -65,7 +65,17 @@ TRACK_FPS = 4.0
 # more than the sampled positions. Below this the samples are used and the
 # shortfall is recorded, because a track that survived one frame in nine is
 # not a measurement, it is a single guess wearing a measurement's name.
-TRACK_QUORUM = 0.5
+#
+# A half was too much of a fraction and not enough of a floor. A subject a
+# hand covers for a moment, or that leaves the frame and comes back, loses
+# samples for reasons that are facts about the take -- and the crop
+# interpolates between the observations it does have. Measured on an event
+# shoot: six usable frames out of thirteen, identity confirmed on every
+# frame it was asked about, refused at 46%. What actually distinguishes a
+# measurement from a guess is having several observations spread across the
+# shot, so that is what is required.
+TRACK_QUORUM = 0.34
+TRACK_MINIMUM_OBSERVATIONS = 3
 
 
 def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
@@ -1209,7 +1219,7 @@ def _reference_subject_samples(
     # sample labelled tracked but lacking a valid mask-derived box is not a
     # successful handoff for a reference-critical target.
     kept = len(tracked)
-    if not tracked or kept / total < TRACK_QUORUM:
+    if kept < TRACK_MINIMUM_OBSERVATIONS or kept / total < TRACK_QUORUM:
         report.reference_grounding[clip.clip_id] = {
             "target_id": target_id,
             "status": "local_geometry_unverified",

@@ -1286,6 +1286,19 @@ def _travel_seconds(room: float) -> str:
     )
 
 
+def _clock(seconds: float) -> str:
+    """Time the way every field that carries one is written: MM:SS.
+
+    The listing said "start_offset_seconds 要落在 0.0-3.6" beside a field
+    whose own description says to write MM:SS. Decimal seconds and a clock
+    in one sentence, about the same number, and the pass duly picked a
+    window on the far side of a cut.
+    """
+
+    seconds = max(0.0, float(seconds))
+    return f"{int(seconds) // 60}:{seconds % 60:04.1f}"
+
+
 def _framable_window(
     item: MaterialItem, at: float, opens: float, closes: float
 ) -> tuple[float, float] | None:
@@ -1427,11 +1440,11 @@ def _describe_material(material: list[MaterialItem]) -> str:
                     # one line, and the pass duly chose a window on the far
                     # side of a cut from the subject it had named.
                     inside.setdefault(span.span_id, []).append(
-                        f"{label}（此段第 {at - span.starts_seconds:.1f} 秒處"
+                        f"{label}（此段 {_clock(at - span.starts_seconds)} 處"
                         + (
-                            f"，start_offset_seconds 要落在 "
-                            f"{max(0.0, opens - span.starts_seconds):.1f}–"
-                            f"{closes - span.starts_seconds:.1f}"
+                            "，start_offset_seconds 要落在 "
+                            + _clock(max(0.0, opens - span.starts_seconds))
+                            + "–" + _clock(closes - span.starts_seconds)
                             if closes - opens
                             < span.ends_seconds - span.starts_seconds - 0.05
                             else ""
