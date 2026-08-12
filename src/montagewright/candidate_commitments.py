@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Literal, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from montagewright.planning_state import canonical_json
 from montagewright.spans import seconds_of
@@ -164,6 +164,7 @@ def resolve_candidate_commitments(
     span_index = {
         span.span_id: span for item in material for span in item.spans
     }
+    item_index = {str(item.source_id): item for item in material}
     known_targets = {"none", *grounding_target_ids}
     excluded = set(excluded_source_ids)
     options: list[CandidateOption] = []
@@ -199,6 +200,25 @@ def resolve_candidate_commitments(
                 f"whose role is {span.motion_role}"
             )
             continue
+        from montagewright.coverage import visual_supported_max
+
+        supported = visual_supported_max(
+            item_index.get(str(span.source_id)),
+            role=str(raw.get("picture_role") or ""),
+            source_start=float(span.starts_seconds),
+            available_seconds=available,
+            motion_role=(
+                str(span.motion_role or "")
+                if preference == "native_first" else ""
+            ),
+        )
+        if seconds > supported + 0.001:
+            faults.append(
+                f"option {index} needs {seconds:.3f}s but {span_id} has only "
+                f"{supported:.3f}s of locally supported "
+                f"{raw.get('picture_role') or 'visual'} evidence"
+            )
+            continue
         target_id = str(raw.get("target_id") or "none")
         if target_id not in known_targets:
             faults.append(f"option {index} names unknown target {target_id!r}")
@@ -231,19 +251,24 @@ def resolve_candidate_commitments(
         for commitment_id, group in grouped.items()
         if group[0].required and len(group) == 1
     )
-    return CandidateCommitments(
-        contract_version=COMMITMENT_VERSION,
-        material_digest=material_digest,
-        direction_sha256=hashlib.sha256(
-            canonical_json(direction).encode("utf-8")
-        ).hexdigest(),
-        target_aspect=aspect,
-        target_seconds=target_seconds,
-        grounding_sha256=grounding_sha256,
-        options=tuple(options),
-        deferred_span_ids=deferred,
-        warnings=warnings,
-    )
+    try:
+        return CandidateCommitments(
+            contract_version=COMMITMENT_VERSION,
+            material_digest=material_digest,
+            direction_sha256=hashlib.sha256(
+                canonical_json(direction).encode("utf-8")
+            ).hexdigest(),
+            target_aspect=aspect,
+            target_seconds=target_seconds,
+            grounding_sha256=grounding_sha256,
+            options=tuple(options),
+            deferred_span_ids=deferred,
+            warnings=warnings,
+        )
+    except ValidationError as error:
+        raise CommitmentError(
+            f"commitment proposal is internally inconsistent: {error}"
+        ) from error
 
 
 def describe_commitments(commitments: CandidateCommitments) -> str:
@@ -373,3 +398,19 @@ def validate_replacement_commitments(
     if missing:
         faults.append("missing replacements for " + ", ".join(sorted(missing)))
     return faults
+
+
+def minimum_supported_seconds_for_shot(
+    shot: dict[str, Any], commitments: CandidateCommitments | None
+) -> float:
+    """Resolve the immutable candidate minimum selected by ``shot``."""
+
+    if commitments is None:
+        return 0.0
+    commitment_id = str(shot.get("commitment_id") or "")
+    span_id = str(shot.get("span_id") or "")
+    option = next((
+        one for one in commitments.options
+        if one.commitment_id == commitment_id and one.span_id == span_id
+    ), None)
+    return float(option.min_supported_seconds) if option is not None else 0.0

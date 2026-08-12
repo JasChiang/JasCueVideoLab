@@ -88,7 +88,10 @@ class TimelineCoverageError(ValueError):
     """The edit has timeline seconds for which no content evidence exists."""
 
 
-def repair_bounded_visual_holds(chosen: dict[str, Any]) -> tuple[str, ...]:
+def repair_bounded_visual_holds(
+    chosen: dict[str, Any], commitments: Any | None = None,
+    material: Iterable[Any] | None = None,
+) -> tuple[str, ...]:
     """Clamp unsupported pure-visual tails before asking Gemini to replan.
 
     The function deliberately excludes speaker, title/read, B-roll and action
@@ -98,6 +101,9 @@ def repair_bounded_visual_holds(chosen: dict[str, Any]) -> tuple[str, ...]:
 
     repairs: list[str] = []
     shots = chosen.get("shots") or []
+    by_source = {
+        str(item.source_id): item for item in (material or ())
+    }
     # Without canonical span lengths this small selection-stage helper cannot
     # prove that a top-level narrative assignment has ended before a visual
     # hold.  Be conservative: any independent audio keeps duration decisions
@@ -117,13 +123,31 @@ def repair_bounded_visual_holds(chosen: dict[str, Any]) -> tuple[str, ...]:
         requested = max(0.0, float(shot.get("seconds_needed") or 0.0))
         if limit is None or requested <= limit + 1e-9:
             continue
-        shot["seconds_needed"] = round(float(limit), 3)
+        from montagewright.candidate_commitments import (
+            minimum_supported_seconds_for_shot,
+        )
+
+        minimum = minimum_supported_seconds_for_shot(shot, commitments)
+        supported = float(limit)
+        item = by_source.get(str(shot.get("source_id") or ""))
+        if item is not None:
+            supported = visual_supported_max(
+                item,
+                role=role,
+                source_start=float(shot.get("start_seconds") or 0.0),
+                available_seconds=requested,
+                motion_role=str(shot.get("source_motion_role") or ""),
+            )
+        repaired = max(supported, minimum)
+        if requested <= repaired + 1e-9:
+            continue
+        shot["seconds_needed"] = round(repaired, 3)
         # This field is derived by the coverage audit, but clearing a cached
         # value keeps the mutation honest until the audit recomputes it.
         shot.pop("coverage_claim_seconds", None)
         repairs.append(
             f"k{index:02d}: shortened {role} from {requested:.2f}s to "
-            f"{float(limit):.2f}s; the removed tail had no additional "
+            f"{repaired:.2f}s; the removed tail had no additional "
             "content evidence"
         )
     return tuple(repairs)
@@ -151,6 +175,67 @@ def _overlap(
             total += right - left
             left, right = here_left, here_right
     return total + right - left
+
+
+def visual_supported_max(
+    item: Any,
+    *,
+    role: str,
+    source_start: float,
+    available_seconds: float,
+    motion_role: str = "",
+) -> float:
+    """Return the locally supportable visual duration for one source window.
+
+    Role ceilings are conservative defaults, not genre rules.  Canonical
+    action intervals and locally established source motion may prove that a
+    picture continues to develop for longer.  The result is always bounded by
+    the actual source window, so it is safe to use both before selection and
+    when auditing the selected shot.
+    """
+
+    available = max(0.0, float(available_seconds))
+    base = VISUAL_ONLY_LIMITS.get(str(role), 3.0)
+    if base is None:
+        return available
+
+    source_end = float(source_start) + available
+    intervals: list[tuple[float, float, str]] = []
+    # `illustrative_broll` is explicitly carried by another lane (usually
+    # narrative). A source action can make the same picture independently
+    # useful, but then the planner must call it `primary_action`; silently
+    # upgrading the evidence here would make the role contract meaningless.
+    if str(role) != "illustrative_broll":
+        for described in getattr(item, "action", ()):
+            found = _ACTION.search(str(described))
+            if found:
+                intervals.append((
+                    float(found["start"]), float(found["end"]), "action",
+                ))
+    for measured in getattr(item, "motion", ()):
+        if str(getattr(measured, "state", "still")) == "still":
+            continue
+        intervals.append((
+            float(getattr(measured, "starts_seconds", 0.0)),
+            float(getattr(measured, "ends_seconds", 0.0)),
+            "motion",
+        ))
+    measured_seconds = _overlap(
+        float(source_start), source_end, intervals
+    )
+    if measured_seconds <= 0.0 and (
+        str(motion_role) in {"authored", "subject_follow"}
+        or (
+            str(role) == "primary_action"
+            and bool(getattr(item, "camera_moves", False))
+        )
+    ):
+        measured_seconds = available
+
+    # A small comprehension tail is already part of the existing coverage
+    # contract.  It cannot extend beyond source evidence or invent more time.
+    evidenced = measured_seconds + 0.60 if measured_seconds > 0.0 else 0.0
+    return min(available, max(float(base), evidenced))
 
 
 def _entry(
@@ -267,35 +352,18 @@ def _visual_claim(item: Any, shot: dict[str, Any], role: str) -> float:
     """Bound a visual claim with locally measured source-time evidence."""
 
     seconds = max(0.0, float(shot.get("seconds_needed") or 0.0))
-    base = VISUAL_ONLY_LIMITS.get(role, 3.0)
-    if role != "primary_action":
-        return seconds if base is None else min(seconds, base)
-
     source_start = float(shot.get("start_seconds") or 0.0)
-    source_end = source_start + seconds
-    intervals: list[tuple[float, float, str]] = []
-    for described in getattr(item, "action", ()):
-        found = _ACTION.search(str(described))
-        if found:
-            intervals.append((
-                float(found["start"]), float(found["end"]), "action",
-            ))
-    for measured in getattr(item, "motion", ()):
-        if str(getattr(measured, "state", "still")) == "still":
-            continue
-        intervals.append((
-            float(getattr(measured, "starts_seconds", 0.0)),
-            float(getattr(measured, "ends_seconds", 0.0)),
-            "motion",
-        ))
-    measured = _overlap(source_start, source_end, intervals)
-    if measured <= 0.0 and bool(getattr(item, "camera_moves", False)):
-        # Pixel measurement says this usable span moves even when its interval
-        # detail predates the current cache format.
-        measured = seconds
-    # Three seconds is a bounded standalone visual detail; longer claims need
-    # measured action/motion, with a small lead/tail for comprehension.
-    return min(seconds, max(float(base or 0.0), measured + 0.60))
+    return visual_supported_max(
+        item,
+        role=role,
+        source_start=source_start,
+        available_seconds=seconds,
+        motion_role=(
+            str(shot.get("source_motion_role") or "")
+            if str(shot.get("camera_intent") or "") == "use_source_motion"
+            else ""
+        ),
+    )
 
 
 def selection_coverage_audit(

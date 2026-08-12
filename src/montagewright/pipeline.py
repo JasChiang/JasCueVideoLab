@@ -2029,6 +2029,7 @@ def run(
     ledger: Ledger | None = None,
     decide_rhythm_first: bool = True,
     target_seconds: float = 0.0,
+    duration_mode: str = "exact",
     max_static_seconds: float = 0.0,
     keep_voice: bool = False,
     under_speech: str = "duck",
@@ -2065,6 +2066,7 @@ def run(
             context=rhythm_context or {},
             music=music,
             target_seconds=target_seconds,
+            duration_mode=duration_mode,
             client=client,
             ledger=ledger,
         )
@@ -2145,7 +2147,9 @@ def run(
         TimelineCoverageError, edl_coverage_audit,
     )
 
-    coverage = edl_coverage_audit(edl, target_seconds)
+    coverage = edl_coverage_audit(
+        edl, target_seconds, hard_target=duration_mode == "exact"
+    )
     report.coverage_seconds = round(coverage.supported_seconds, 3)
     report.unsupported_seconds = round(coverage.unsupported_seconds, 3)
     report.coverage_details = [

@@ -983,7 +983,8 @@ def command_render(args: argparse.Namespace) -> int:
     )
     asked = _asked(
         catalogue, brief, args.aspect, music_key,
-        f"seconds={args.seconds or 0}", direction_contract,
+        f"seconds={args.seconds or 0}",
+        f"duration_mode={args.duration_mode}", direction_contract,
         (
             args.reference_grounding_spec.definition_sha256()
             if args.reference_grounding_spec is not None
@@ -996,7 +997,8 @@ def command_render(args: argparse.Namespace) -> int:
         direction, usage_direction = decide_direction(
             material, brief=brief, aspect=args.aspect, music=args.music,
             music_grid=grid,
-            seconds=args.seconds, cache=cache, client=client, ledger=ledger,
+            seconds=args.seconds, duration_mode=args.duration_mode,
+            cache=cache, client=client, ledger=ledger,
             grounding_spec=args.reference_grounding_spec,
         )
         _decide(work, "direction", asked, direction)
@@ -1051,35 +1053,40 @@ def command_render(args: argparse.Namespace) -> int:
             )
         return resolved_commitments
 
-    try:
-        commitments = bind_commitments(direction)
-    except CommitmentError as error:
-        # Provider-valid JSON can still make a claim the local material cannot
-        # prove (too little duration, native motion on a locked span, or a
-        # candidate from a take the same answer ruled broken). Give Direction
-        # one bounded correction with those measured facts instead of crashing
-        # or silently dropping the commitment layer.
-        ledger.check()
-        direction, usage_direction = decide_direction(
-            material,
-            brief=(
-                brief
-                + "\n\n## 上一版內容承諾無法執行\n"
-                + str(error)
-                + "\n請重做完整定調與 candidate_options；不可只改理由。"
-            ),
-            aspect=args.aspect,
-            music=args.music,
-            music_grid=grid,
-            seconds=args.seconds,
-            cache=cache,
-            client=client,
-            ledger=ledger,
-            grounding_spec=args.reference_grounding_spec,
-        )
-        beaten, broken = _beaten_and_broken(direction)
-        commitments = bind_commitments(direction)
-        _decide(work, "direction", asked, direction)
+    # Provider-valid JSON can still make a claim the local material cannot
+    # prove. Allow two bounded corrections; never weaken the local contract or
+    # spin indefinitely when the provider repeats a structurally invalid plan.
+    correction_fault: CommitmentError | None = None
+    for correction in range(3):
+        try:
+            commitments = bind_commitments(direction)
+            break
+        except CommitmentError as error:
+            correction_fault = error
+            if correction == 2:
+                raise
+            ledger.check()
+            direction, usage_direction = decide_direction(
+                material,
+                brief=(
+                    brief
+                    + "\n\n## 上一版內容承諾無法執行\n"
+                    + str(error)
+                    + "\n請重做完整定調與 candidate_options；不可只改理由。"
+                ),
+                aspect=args.aspect,
+                music=args.music,
+                music_grid=grid,
+                seconds=args.seconds, duration_mode=args.duration_mode,
+                cache=cache,
+                client=client,
+                ledger=ledger,
+                grounding_spec=args.reference_grounding_spec,
+            )
+            beaten, broken = _beaten_and_broken(direction)
+    else:  # pragma: no cover - the bounded loop either binds or raises.
+        raise correction_fault or CommitmentError("commitment correction failed")
+    _decide(work, "direction", asked, direction)
     publish_planning_state(
         work,
         planning_state,
@@ -1150,6 +1157,7 @@ def command_render(args: argparse.Namespace) -> int:
             grounding_spec=args.reference_grounding_spec,
             music_grid=grid,
             commitments=commitments,
+            duration_mode=args.duration_mode,
         )
         _decide(work, "selection", chose, selection)
     else:
@@ -1243,6 +1251,7 @@ def command_render(args: argparse.Namespace) -> int:
             brief=brief,
             rhythm_context=rhythm_context,
             target_seconds=float(direction["target_seconds"]),
+            duration_mode=args.duration_mode,
             max_static_seconds=float(direction.get("max_static_seconds") or 0.0),
             music=args.music,
             cards=cards,
@@ -2811,6 +2820,11 @@ def main(argv: list[str] | None = None) -> int:
              "pass picks a length, which is the right default when nobody "
              "has a slot to fill and the wrong one when they do -- writing "
              "'make it 15 seconds' in the brief is a request, not a number.",
+    )
+    render.add_argument(
+        "--duration-mode", choices=("exact", "preferred"), default="exact",
+        help="whether --seconds is a hard delivery specification or a preferred "
+             "maximum that may resolve shorter when verified content is insufficient",
     )
     render.add_argument(
         "--sample", type=int, default=0, metavar="N",

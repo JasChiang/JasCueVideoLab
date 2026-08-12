@@ -1221,6 +1221,7 @@ def create_app() -> FastAPI:
         brief: str = Form(""),
         aspect: str = Form("9:16"),
         seconds: float = Form(0.0),
+        duration_mode: str = Form("preferred"),
         budget: float = Form(6.0),
         review: bool = Form(True),
         timeline: str = Form("none"),
@@ -1234,6 +1235,8 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 400, f"aspect must be one of {sorted(ASPECTS)}"
             )
+        if duration_mode not in {"exact", "preferred"}:
+            raise HTTPException(400, "duration_mode must be exact or preferred")
 
         run_id = uuid.uuid4().hex[:12]
         root = RUNS_ROOT / run_id
@@ -1453,7 +1456,9 @@ def create_app() -> FastAPI:
         if canonical_grounding is not None:
             command += ["--grounding-spec", str(canonical_grounding)]
         if seconds > 0:
-            command += ["--seconds", str(seconds)]
+            command += [
+                "--seconds", str(seconds), "--duration-mode", duration_mode,
+            ]
         track = _typed_path(music_path)
         if track is not None:
             if not track.exists():

@@ -386,7 +386,8 @@ def test_rhythm_is_told_the_length_it_is_dividing_up() -> None:
 
     source = inspect.getsource(planner.decide_rhythm)
     assert "target_seconds" in source
-    assert "定調要" in source
+    assert "定調偏好" in source
+    assert "duration_mode" in source
 
 
 def test_selection_is_told_that_shot_count_is_a_length_decision() -> None:

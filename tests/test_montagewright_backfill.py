@@ -1928,7 +1928,9 @@ def test_a_length_the_caller_fixed_is_not_a_length_to_decide():
     from montagewright.planner import decide_direction
 
     said = inspect.getsource(decide_direction)
-    assert "這支片就是" in said
+    assert "精確規格" in said
+    assert "偏好上限" in said
+    assert "duration_mode" in said
     # Overwritten rather than trusted: a pass that occasionally does not
     # repeat the number would silently change the film's length.
     assert 'decided["target_seconds"] = seconds' in said

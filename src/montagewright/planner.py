@@ -556,6 +556,7 @@ def decide_rhythm(
     context: dict[str, dict] | None = None,
     music: Path | None = None,
     target_seconds: float = 0.0,
+    duration_mode: str = "exact",
     client: Any | None = None,
     ledger: Any | None = None,
 ) -> tuple[EDL, Usage]:
@@ -611,11 +612,16 @@ def decide_rhythm(
                     # fourteen-second gesture got four seconds while the
                     # reasoning claimed it played out. The arithmetic has to
                     # be visible to be spent.
-                    f"## 長度\n\n定調要 {target_seconds:.0f} 秒，"
+                    f"## 長度\n\n定調偏好 {target_seconds:.0f} 秒，"
                     f"你手上有 {len(edl.clips)} 顆，"
                     f"平均每顆 {target_seconds / max(len(edl.clips), 1):.1f} 秒。"
-                    "這是總量不是配額——該長的長、該短的短，但加起來要到。"
-                    "素材裡有動作起訖的，動作做完需要多久就是那顆的下限。\n\n"
+                    + (
+                        "這是精確交付規格，必須在內容證據允許下達成。"
+                        if duration_mode == "exact" else
+                        "這是偏好上限，不可用停格或無證據停留補滿；"
+                        "素材不足時應回傳自然且較短的版本。"
+                    )
+                    + "素材裡有動作起訖的，動作做完需要多久就是那顆的下限。\n\n"
                     if target_seconds > 0
                     else ""
                 )
@@ -680,7 +686,9 @@ def decide_rhythm(
         from montagewright.coverage import edl_coverage_audit
         from montagewright.planning_release import rhythm_motion_faults
 
-        coverage = edl_coverage_audit(candidate, target_seconds)
+        coverage = edl_coverage_audit(
+            candidate, target_seconds, hard_target=duration_mode == "exact"
+        )
         coverage_faults = coverage.faults
         release_faults = rhythm_motion_faults(edl, candidate, grid)
         all_faults = (*coverage_faults, *release_faults)
@@ -1412,6 +1420,7 @@ def decide_direction(
     music: Path | None = None,
     music_grid: BeatGrid | None = None,
     seconds: float = 0.0,
+    duration_mode: str = "exact",
     cache: UploadCache | None = None,
     client: Any | None = None,
     ledger: Any | None = None,
@@ -1432,13 +1441,18 @@ def decide_direction(
     # 15 seconds" in the brief is a request the direction pass weighs against
     # everything else; this is the slot the film has to fit.
     fixed = (
-        f"## 片長\n\n這支片就是 {seconds:g} 秒，不是你要決定的事。"
-        f"`target_seconds` 填 {seconds:g}，其他決定都在這個長度裡面做。"
+        f"## 片長\n\n這支片的{'精確規格' if duration_mode == 'exact' else '偏好上限'}是 "
+        f"{seconds:g} 秒。`target_seconds` 填 {seconds:g}。"
+        + (
+            "必須在可驗證內容內達成，不可少也不可用空停留補。"
+            if duration_mode == "exact" else
+            "若素材無法自然支撐，後段可解析成較短成片；不可用空停留補滿。"
+        )
         # The brief is prose and may say a different number. Both reach the
         # model, so which one wins has to be said rather than left to be
         # inferred -- a flag that quietly contradicts the brief makes the
         # reasoning wrong even when the output length is right.
-        "\nbrief 裡如果提到別的長度，以這裡為準，那句話當作沒寫。\n\n"
+        + "\nbrief 裡如果提到別的長度，以這裡為準，那句話當作沒寫。\n\n"
         if seconds > 0 else ""
     )
     request_input: list[dict[str, Any]] = [
@@ -2042,6 +2056,7 @@ def select_shots(
     grounding_spec: Any | None = None,
     music_grid: BeatGrid | None = None,
     commitments: Any | None = None,
+    duration_mode: str = "exact",
 ) -> tuple[dict[str, Any], Usage]:
     """Stage two: which shots, in what order, and why each one."""
 
@@ -2113,7 +2128,8 @@ def select_shots(
             "text": (
                     f"{prompt}\n\n## 已定好的調性\n\n"
                     f"{direction['direction']}\n\n"
-                    f"目標長度 {direction['target_seconds']:.0f} 秒，"
+                    f"{'精確' if duration_mode == 'exact' else '偏好'}長度 "
+                    f"{direction['target_seconds']:.0f} 秒，"
                     f"輸出 {direction['aspect']}。\n\n"
                     f"## 節奏密度\n\n目標約 "
                     f"{direction.get('target_shot_count', 0)} 顆；典型鏡長 "
@@ -2302,10 +2318,11 @@ def select_shots(
         )
 
         chosen["duration_repairs"] = list(
-            repair_bounded_visual_holds(chosen)
+            repair_bounded_visual_holds(chosen, commitments, usable)
         )
         coverage = selection_coverage_audit(
-            chosen, usable, float(direction.get("target_seconds") or 0.0)
+            chosen, usable, float(direction.get("target_seconds") or 0.0),
+            hard_target=duration_mode == "exact",
         )
         faults.extend(coverage.faults)
         faults.extend(sequence_disagreements(chosen.get("shots") or []))

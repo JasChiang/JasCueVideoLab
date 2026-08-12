@@ -17,6 +17,9 @@ from montagewright.spans import Span
 class Material:
     source_id: str
     spans: tuple[Span, ...]
+    action: tuple[str, ...] = ()
+    motion: tuple[object, ...] = ()
+    camera_moves: bool = False
 
 
 def _material():
@@ -72,6 +75,21 @@ def test_each_commitment_requires_exactly_one_primary():
     direction = _direction()
     direction["candidate_options"][0]["tier"] = "alternate"
     with pytest.raises(ValueError, match="exactly one primary"):
+        _resolved(direction)
+
+
+def test_conflicting_group_flags_are_a_retryable_commitment_error():
+    direction = _direction()
+    alternate = dict(direction["candidate_options"][0])
+    alternate.update({
+        "span_id": "C1:s01",
+        "tier": "alternate",
+        "required": False,
+        "motion_preference": "hold",
+        "min_supported_seconds": "0:03",
+    })
+    direction["candidate_options"].append(alternate)
+    with pytest.raises(CommitmentError, match="conflicting required flags"):
         _resolved(direction)
 
 
@@ -146,3 +164,85 @@ def test_selection_must_execute_duration_motion_presentation_and_target():
     assert any("authored source motion" in fault for fault in faults)
     assert any("presentation intent reveal_endpoint" in fault for fault in faults)
     assert any("bind target device.fold" in fault for fault in faults)
+
+
+@pytest.mark.parametrize("role", ["reaction", "end_hold"])
+def test_role_default_rejects_a_commitment_minimum_above_local_evidence(role):
+    direction = _direction(
+        span_id="C1:s01",
+        picture_role=role,
+        min_supported_seconds="0:03",
+        motion_preference="hold",
+        presentation_intent="complete_hold",
+        target_id="none",
+    )
+    with pytest.raises(CommitmentError, match="locally supported"):
+        _resolved(direction)
+
+
+def test_measured_four_second_visual_action_overrides_the_role_default():
+    material = [Material(
+        "C1",
+        (Span("C1:s00", "C1", 0.0, 4.0, "reaction", "locked"),),
+        action=("visible reaction continues 0.0-4.0s",),
+    )]
+    direction = _direction(
+        picture_role="reaction",
+        min_supported_seconds="0:04",
+        motion_preference="hold",
+        presentation_intent="complete_hold",
+        target_id="none",
+    )
+    resolved = resolve_candidate_commitments(
+        direction, material, material_digest="a" * 64,
+        aspect="9:16", target_seconds=4.0,
+    )
+    assert resolved.options[0].min_supported_seconds == 4.0
+
+
+def test_local_hold_repair_never_shortens_below_candidate_minimum():
+    from montagewright.coverage import repair_bounded_visual_holds
+
+    material = [Material(
+        "C1",
+        (Span("C1:s00", "C1", 0.0, 4.0, "reaction", "locked"),),
+        action=("visible reaction continues 0.0-4.0s",),
+    )]
+    direction = _direction(
+        picture_role="reaction",
+        min_supported_seconds="0:02.5",
+        motion_preference="hold",
+        presentation_intent="complete_hold",
+        target_id="none",
+    )
+    commitments = resolve_candidate_commitments(
+        direction, material, material_digest="a" * 64,
+        aspect="9:16", target_seconds=4.0,
+    )
+    shot = {
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "source_id": "C1", "seconds_needed": 4.0,
+        "picture_role": "reaction", "audio_role": "discard",
+    }
+    repairs = repair_bounded_visual_holds({"shots": [shot]}, commitments)
+    assert shot["seconds_needed"] == 2.5
+    assert "to 2.50s" in repairs[0]
+
+
+def test_local_hold_repair_preserves_a_longer_measured_visual_action():
+    from montagewright.coverage import repair_bounded_visual_holds
+
+    material = Material(
+        "C1",
+        (Span("C1:s00", "C1", 0.0, 4.0, "reaction", "locked"),),
+        action=("visible reaction continues 0.0-4.0s",),
+    )
+    shot = {
+        "source_id": "C1", "start_seconds": 0.0, "seconds_needed": 4.0,
+        "picture_role": "reaction", "audio_role": "discard",
+    }
+    repairs = repair_bounded_visual_holds(
+        {"shots": [shot]}, material=[material]
+    )
+    assert repairs == ()
+    assert shot["seconds_needed"] == 4.0

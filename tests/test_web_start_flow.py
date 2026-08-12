@@ -1,8 +1,21 @@
+import io
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 import montagewright.webapp as web
+
+
+class _FinishedProcess:
+    def __init__(self, command, **_):
+        self.command = command
+        self.stdout = io.StringIO("")
+
+    def wait(self):
+        return 0
+
+    def poll(self):
+        return 0
 
 
 def test_new_run_click_replaces_completed_progress_and_recovers_from_failure():
@@ -52,6 +65,35 @@ def test_process_launch_failure_is_visible_and_records_a_failed_run(
     assert run.returncode == -1
     saved = (run.root / "run.json").read_text(encoding="utf-8")
     assert '"state": "failed"' in saved
+
+
+def test_web_duration_contract_is_explicit_and_reaches_the_cli(
+    tmp_path, monkeypatch
+):
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(web.subprocess, "Popen", _FinishedProcess)
+    web.RUNS.clear()
+
+    response = TestClient(web.create_app()).post(
+        "/api/runs",
+        data={
+            "source_path": str(rushes),
+            "seconds": "30",
+            "duration_mode": "preferred",
+            "review": "false",
+        },
+    )
+
+    assert response.status_code == 200
+    run = web.RUNS[response.json()["run_id"]]
+    at = run.command.index("--duration-mode")
+    assert run.command[at + 1] == "preferred"
+    page = (Path(__file__).parents[1] / "src/montagewright/web/index.html").read_text()
+    assert 'id="duration-mode"' in page
+    assert "偏好長度，可自然縮短" in page
 
 
 def test_writable_run_root_can_also_discover_read_only_legacy_runs(
