@@ -7144,3 +7144,31 @@ def test_rhythm_is_given_a_whole_and_a_structure_not_an_average():
     source = inspect.getsource(decide_rhythm)
     assert "平均每顆" not in source, "no per-shot average to anchor on"
     assert "長度是總量，不是每顆的配額" in source
+
+
+def test_the_floor_of_a_shot_has_one_name():
+    """Three runs died over hundredths of a second, one path at a time.
+
+    The beat snap, the content ceiling and the usable-window clamp each had
+    to be taught separately that an authored move may not be cut short, and
+    each lesson cost a whole film. A rule remembered in four places is a
+    rule that will be forgotten in a fifth, so the shortest a shot may be
+    is computed once and every path reads it.
+    """
+
+    import inspect
+
+    from montagewright.grounding import ground_timeline
+
+    source = inspect.getsource(ground_timeline)
+    assert "floor_seconds = wanted if keeps_source_move else 0.0" in source
+    # No path may re-derive it from the intent on its own.
+    after = source.split(
+        "floor_seconds = wanted if keeps_source_move else 0.0", 1
+    )[1]
+    assert "keeps_source_move else" not in after, (
+        "every later path reads the floor rather than recomputing it"
+    )
+    assert after.count("floor_seconds") >= 4, (
+        "the snap, the ceiling and the feasibility clamp all consult it"
+    )

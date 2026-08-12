@@ -632,6 +632,15 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
             clip.reframe is not None
             and clip.reframe.editorial_intent == "use_source_motion"
         )
+        # One name for the shortest this shot may be. Four places below and
+        # above move `end` -- the beat snap, a named cue, the content
+        # ceiling, the usable window -- and each of them was taught
+        # separately not to cut an authored move short. Three of those
+        # lessons were paid for one at a time, on three different runs, each
+        # ending a whole film over hundredths of a second. A rule that has
+        # to be remembered in four places is a rule that will be forgotten
+        # in a fifth.
+        floor_seconds = wanted if keeps_source_move else 0.0
         # Landing on a beat may lengthen a shot that exists to let the
         # source's own move play; it may not shorten one. `nearest_cue`
         # takes the closest event in either direction, so a cue thirteen
@@ -640,8 +649,8 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         # in one evening on two different shots. Take the first cue at or
         # after the length the move needs; if none is near, keep the length
         # and let this cut sit off the grid.
-        if keeps_source_move and end < cursor + wanted - 1e-6:
-            floor_end = cursor + wanted
+        if floor_seconds > 0.0 and end < cursor + floor_seconds - 1e-6:
+            floor_end = cursor + floor_seconds
             later = None
             if grid is not None:
                 later = min(
@@ -692,8 +701,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 # release check refused -- rightly, and after this function
                 # had already been told the shot could show three seconds.
                 soonest = max(
-                    cursor + max(floor, 1e-3),
-                    cursor + wanted if keeps_source_move else 0.0,
+                    cursor + max(floor, floor_seconds, 1e-3),
                     room - grid.seconds_per_beat,
                 )
                 earlier = max(
@@ -714,7 +722,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                     f"the earlier cue {earlier.cue_id} instead"
                 )
             else:
-                end = max(room, cursor + wanted) if keeps_source_move else room
+                end = max(room, cursor + floor_seconds)
                 landed = None
                 landed_kind = None
                 cut_short = (
@@ -739,6 +747,12 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 feasibility_note = (
                     f"usable source ends after {available:.2f}s; could not "
                     + (f"reach cue {missed}" if missed else "hold the requested length")
+                    + (
+                        " -- and it ends before this shot's own move does"
+                        if floor_seconds > 0.0
+                        and end < cursor + floor_seconds - 1e-6
+                        else ""
+                    )
                 )
                 note = f"{note}; {feasibility_note}" if note else feasibility_note
 
