@@ -1552,6 +1552,97 @@ def decide_direction(
     return decided, Usage.from_interaction(interaction)
 
 
+def correct_candidate_options(
+    base_direction: dict[str, Any],
+    material: list[MaterialItem],
+    *,
+    fault: str,
+    grounding_target_ids: list[str] | tuple[str, ...] = (),
+    excluded_source_ids: set[str] | frozenset[str] = frozenset(),
+    client: Any | None = None,
+    ledger: Any | None = None,
+) -> tuple[dict[str, Any], Usage]:
+    """Repair executable candidate claims without replaying the rushes.
+
+    Direction has already watched the complete pool and heard the music. A
+    local contract fault does not authorize another editorial pass, and it
+    certainly does not justify uploading every proxy again. This call can
+    replace only ``candidate_options``; all story, pacing, duration and music
+    fields remain byte-for-byte owned by the cached base direction.
+    """
+
+    if client is None:
+        client = _default_client()
+    from montagewright.candidate_commitments import provider_commitment_schema
+
+    spans = [span for item in material for span in item.spans]
+    span_ids = [
+        span.span_id for span in spans
+        if str(span.source_id) not in excluded_source_ids
+    ]
+    if not span_ids:
+        raise PlannerError("candidate correction has no executable spans")
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["candidate_options", "repair_summary"],
+        "properties": {
+            "candidate_options": provider_commitment_schema(
+                span_ids, grounding_target_ids
+            ),
+            "repair_summary": {"type": "string"},
+        },
+    }
+    immutable = {
+        key: value for key, value in base_direction.items()
+        if key != "candidate_options"
+    }
+    item_by_source = {str(item.source_id): item for item in material}
+    catalog = "\n".join(
+        f"- {span.span_id} | source={span.source_id} | "
+        f"{span.starts_seconds:.3f}-{span.ends_seconds:.3f}s | "
+        f"duration={span.seconds:.3f}s | motion={span.motion_role} | "
+        f"why={span.why or '未標'} | "
+        f"summary={item_by_source[str(span.source_id)].summary}"
+        for span in spans if str(span.source_id) not in excluded_source_ids
+    )
+    interaction = ask(
+        client,
+        model=MODEL_ID,
+        store=False,
+        input=[{
+            "type": "text",
+            "text": (
+                "你只在修正已完成導演定調中的 candidate_options。"
+                "不可改故事方向、片長、節奏、音樂判斷或淘汰清單。"
+                "回傳完整 replacement candidate_options，不要回 patch。"
+                "同一 commitment_id 的 purpose 與 required 必須一致，"
+                "且恰好一個 primary；motion_preference 是偏好，不是硬需求。\n\n"
+                "## 不可修改的既有定調\n"
+                + json.dumps(immutable, ensure_ascii=False, sort_keys=True)
+                + "\n\n## 上一版 candidate_options\n"
+                + json.dumps(
+                    base_direction.get("candidate_options") or [],
+                    ensure_ascii=False, sort_keys=True,
+                )
+                + "\n\n## 本機無法執行的原因\n" + fault
+                + "\n\n## 可用 span 文字目錄\n" + catalog
+            ),
+        }],
+        generation_config={
+            "thinking_level": THINKING_HIGH,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        },
+        response_format=structured_json(schema),
+        ledger=ledger,
+        budget_stage="direction",
+    )
+    repaired = _parse(interaction, what="candidate commitment correction")
+    merged = dict(base_direction)
+    merged["candidate_options"] = repaired["candidate_options"]
+    return merged, Usage.from_interaction(interaction)
+
+
 def _selection_schema(
     span_ids: list[str], *, min_shots: int | None = None,
     max_shots: int | None = None, replace_clip_ids: list[str] | None = None,

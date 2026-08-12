@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +13,7 @@ from montagewright.candidate_commitments import (
     validate_selection_commitments,
 )
 from montagewright.spans import Span
+from montagewright.planner import MaterialItem, correct_candidate_options
 
 
 @dataclass
@@ -27,6 +30,24 @@ def _material():
         Span("C1:s00", "C1", 0.0, 4.0, "reveal", "authored"),
         Span("C1:s01", "C1", 4.0, 8.0, "detail", "locked"),
     ))]
+
+
+class _Interactions:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def create(self, **request):
+        self.calls.append(request)
+        return SimpleNamespace(
+            status="completed", output_text=json.dumps(self.payload),
+            usage={"total_input_tokens": 100, "total_output_tokens": 20},
+        )
+
+
+class _Client:
+    def __init__(self, payload):
+        self.interactions = _Interactions(payload)
 
 
 def _direction(**change):
@@ -93,6 +114,37 @@ def test_grounded_complete_end_hold_can_support_three_seconds():
         presentation_intent="complete_hold",
     ))
     assert resolved.options[0].min_supported_seconds == 3.0
+
+
+def test_candidate_correction_is_text_only_and_cannot_change_direction():
+    replacement = _direction()["candidate_options"]
+    client = _Client({
+        "candidate_options": replacement,
+        "repair_summary": "made the group coherent",
+    })
+    base = {
+        **_direction(), "target_seconds": 29.0,
+        "music_suggestion": "keep the existing musical arc",
+    }
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="foldable detail",
+        spans=_material()[0].spans,
+    )]
+    corrected, _ = correct_candidate_options(
+        base, material, fault="hero has conflicting purposes",
+        grounding_target_ids=("device.fold",), client=client,
+    )
+    request = client.interactions.calls[0]
+    assert [part["type"] for part in request["input"]] == ["text"]
+    assert "video" not in json.dumps(request["input"])
+    assert corrected["candidate_options"] == replacement
+    assert {
+        key: value for key, value in corrected.items()
+        if key != "candidate_options"
+    } == {
+        key: value for key, value in base.items()
+        if key != "candidate_options"
+    }
 
 
 def test_each_commitment_requires_exactly_one_primary():

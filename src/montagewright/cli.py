@@ -68,6 +68,7 @@ from montagewright.planner import (
     _direction_schema,
     _selection_schema,
     _shot_count_bounds,
+    correct_candidate_options,
     decide_direction,
     replan_shots,
     sequence_disagreements,
@@ -1066,27 +1067,42 @@ def command_render(args: argparse.Namespace) -> int:
             if correction == 2:
                 raise
             ledger.check()
-            direction, usage_direction = decide_direction(
-                material,
-                brief=(
-                    brief
-                    + "\n\n## 上一版內容承諾無法執行\n"
-                    + str(error)
-                    + "\n請重做完整定調與 candidate_options；不可只改理由。"
+            correction_key = _asked(
+                json.dumps(direction, ensure_ascii=False, sort_keys=True),
+                planning_state.material_digest,
+                str(error),
+                "candidate-correction-text-v1",
+                (
+                    args.reference_grounding_spec.definition_sha256()
+                    if args.reference_grounding_spec is not None
+                    else "no-reference-grounding"
                 ),
-                aspect=args.aspect,
-                music=args.music,
-                music_grid=grid,
-                seconds=args.seconds, duration_mode=args.duration_mode,
-                cache=cache,
-                client=client,
-                ledger=ledger,
-                grounding_spec=args.reference_grounding_spec,
             )
+            corrected = _decided(
+                work, f"commitment-correction-{correction}", correction_key
+            )
+            if corrected is None:
+                direction, usage_direction = correct_candidate_options(
+                    direction,
+                    material,
+                    fault=str(error),
+                    grounding_target_ids=tuple(grounding_target_refs),
+                    excluded_source_ids=frozenset(broken),
+                    client=client,
+                    ledger=ledger,
+                )
+                _decide(
+                    work, f"commitment-correction-{correction}",
+                    correction_key, direction,
+                )
+            else:
+                direction = corrected
             beaten, broken = _beaten_and_broken(direction)
     else:  # pragma: no cover - the bounded loop either binds or raises.
         raise correction_fault or CommitmentError("commitment correction failed")
-    _decide(work, "direction", asked, direction)
+    # Keep the paid full Direction immutable. Candidate corrections have
+    # their own content-addressed artifacts above and are never allowed to
+    # overwrite the decision that watched all rushes and heard the music.
     publish_planning_state(
         work,
         planning_state,
