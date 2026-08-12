@@ -653,7 +653,7 @@ def decide_rhythm(
     attempt_input = request_input
     coverage_faults: tuple[str, ...] = ()
     release_faults: tuple[str, ...] = ()
-    for attempt in range(2):
+    for attempt in range(3):
         request["input"] = attempt_input
         interaction = ask(
             client, ledger=ledger, budget_stage="rhythm", **request
@@ -2432,9 +2432,39 @@ def select_shots(
                     + json.dumps(chosen, ensure_ascii=False)
                 ),
             }]
+        elif attempt == 1:
+            # The first repair has already watched the same full pool. If it
+            # is still structurally wrong, replaying every proxy, reference
+            # image and the music a third time is expensive and has twice
+            # crossed the provider's multimodal complexity ceiling. Give the
+            # final bounded repair only the complete prior answer, local
+            # executable faults, immutable commitment catalog and factual
+            # card text. It cannot pass by persuasion: this loop reruns every
+            # geometry, grounding, audio, coverage and sequence gate below.
+            attempt_input = [{
+                "type": "text",
+                "text": (
+                    "你只在修正上一版 Selection 的本機執行錯誤。"
+                    "回傳完整 shots/audio_assignments 答案；不可只改理由，"
+                    "不可新增 span 或 commitment。\n\n"
+                    "## 已定方向\n"
+                    + json.dumps(direction, ensure_ascii=False, sort_keys=True)
+                    + (
+                        "\n\n## 已驗證的 commitment 候選\n"
+                        + describe_commitments(commitments)
+                        if commitments is not None else ""
+                    )
+                    + "\n\n## 本機仍無法執行的原因\n- "
+                    + "\n- ".join(faults)
+                    + "\n\n## 上一版完整答案\n"
+                    + json.dumps(chosen, ensure_ascii=False, sort_keys=True)
+                    + "\n\n## 素材文字目錄\n"
+                    + _describe_material(usable)
+                ),
+            }]
     if faults:
         raise PlannerError(
-            "selection remained structurally unrenderable after one repair: "
+            "selection remained structurally unrenderable after two repairs: "
             + "; ".join(faults)
         )
     chosen["frame_disagreements"] = frame_disagreements(
