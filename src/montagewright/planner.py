@@ -264,6 +264,13 @@ def _describe_music(grid: BeatGrid) -> str:
         f"{grid.seconds_per_beat:.3f}s, track runs "
         f"{grid.duration_seconds:.1f}s.",
         f"{len(grid.cuttable())} cuttable events were measured.",
+        # The unit an editor actually plans in. The grid could always answer
+        # this and was never asked, so the pass was handed three hundred
+        # interchangeable beats and no sense of where a bar or a phrase
+        # turns over.
+        f"One bar is {grid.seconds_per_beat * grid.meter:.2f}s; a four-bar "
+        f"phrase is {grid.phrase_seconds():.2f}s. Shots do not have to be "
+        "equal -- a phrase can hold one long shot or four short ones.",
     ]
     if sections:
         lines.append("Section boundaries the analyser found:")
@@ -625,9 +632,19 @@ def decide_rhythm(
                     # fourteen-second gesture got four seconds while the
                     # reasoning claimed it played out. The arithmetic has to
                     # be visible to be spent.
-                    f"## 長度\n\n定調偏好 {target_seconds:.0f} 秒，"
-                    f"你手上有 {len(edl.clips)} 顆，"
-                    f"平均每顆 {target_seconds / max(len(edl.clips), 1):.1f} 秒。"
+                    # An average per shot is an anchor, and it was obeyed:
+                    # eight shots came back inside 2.56-3.88s with six of
+                    # them between 2.5 and 3.0, which is a metronome rather
+                    # than an edit. An editor does not think "3.6s each",
+                    # they think "three shots across these eight bars" --
+                    # so give the whole and the musical structure to spend
+                    # it in, and say outright that equal lengths are the
+                    # failure mode.
+                    f"## 長度\n\n定調偏好全片 {target_seconds:.0f} 秒，"
+                    f"你手上有 {len(edl.clips)} 顆。"
+                    "長度是總量，不是每顆的配額：把它花在該長的地方。"
+                    "疏密對比才是節奏——幾顆短切之後留一顆長的，或反過來；"
+                    "每顆都差不多長的版本聽起來像節拍器，是這一關最常見的失敗。"
                     + (
                         "這是精確交付規格，必須在內容證據允許下達成。"
                         if duration_mode == "exact" else
@@ -3098,9 +3115,26 @@ def replan_shots(
             validate_replacement_commitments,
         )
 
-        commitment_faults = validate_replacement_commitments(
+        commitment_faults = list(validate_replacement_commitments(
             failing, replacement_shots, commitments
-        )
+        ))
+        # The shapes a Look may take are enforced when one is built, which
+        # happens long after this call returns -- so a replan that promised
+        # a complete hold without asking for the whole subject came back
+        # valid, was accepted, and raised a bare ValidationError from inside
+        # the rebuild. The film was already on disk by then; everything after
+        # it was not. Build them here, where there is still a way to ask
+        # again.
+        from montagewright.schema import reframe_of
+
+        for index, shot in enumerate(replacement_shots):
+            try:
+                reframe_of(shot)
+            except Exception as error:  # noqa: BLE001 -- fed back, not hidden
+                commitment_faults.append(
+                    f"replacement {index} cannot be built: "
+                    f"{str(error).splitlines()[-1][:160]}"
+                )
         if not commitment_faults:
             break
         if attempt == 1:
@@ -3111,7 +3145,7 @@ def replan_shots(
         attempt_input = replan_input + [{
             "type": "text",
             "text": (
-                "## 上一版替換偷換或違反內容承諾，請重做全部替換\n\n- "
+                "## 上一版替換違反內容承諾或本機無法組成，請重做全部替換\n\n- "
                 + "\n- ".join(commitment_faults)
                 + "\n每顆保留原 commitment_id，只能從該 commitment 的候選 span 選。"
             ),

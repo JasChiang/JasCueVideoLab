@@ -7083,3 +7083,64 @@ def test_no_silent_exit_from_the_reference_stage():
         f"{exits} ways out, {explained} of them say why -- a silent one "
         "becomes a sentence about a judgement nobody made"
     )
+
+
+def test_a_replacement_that_cannot_be_built_is_asked_again_not_raised():
+    """The film was already on disk; everything after it was not.
+
+    A replan promised `complete_hold` without asking for the whole subject
+    -- a contradiction the Look model refuses, but only when one is built,
+    which happens long after the replan call returns. So it came back
+    valid, was accepted, and raised a bare ValidationError out of the
+    rebuild. Building them inside the retry loop turns that into the one
+    thing this pass is already good at: asking again with the reason.
+    """
+
+    import inspect
+
+    import pytest as _pytest
+
+    from montagewright.planner import replan_shots
+    from montagewright.schema import Look, reframe_of
+
+    with _pytest.raises(Exception):
+        Look(at="the wordmark", presentation_intent="complete_hold")
+
+    # The rule is stated where the model reads it, not only where it is
+    # enforced.
+    fields = Look.model_fields
+    assert "must_be_whole=true" in fields["presentation_intent"].description
+    assert "complete_hold" in fields["must_be_whole"].description
+
+    source = inspect.getsource(replan_shots)
+    assert "reframe_of(shot)" in source, "build them while a retry is possible"
+    assert source.index("reframe_of(shot)") < source.index(
+        "replan violated candidate commitments twice"
+    ), "and feed the failure into the same retry the commitments use"
+
+
+def test_rhythm_is_given_a_whole_and_a_structure_not_an_average():
+    """An average per shot is an anchor, and it was obeyed.
+
+    Eight shots came back between 2.56 and 3.88 seconds with six of them
+    inside 2.5-3.0 -- a metronome, not an edit. The prompt had handed the
+    pass "29 seconds, 8 shots, 3.6 seconds each". An editor thinks in bars:
+    three shots across these eight, then one long one. The grid could
+    always answer how long a bar and a phrase run, and was never asked.
+    """
+
+    import inspect
+
+    from montagewright.grounding import BeatGrid, Cue
+    from montagewright.planner import _describe_music, decide_rhythm
+
+    grid = BeatGrid(bpm=120.0, meter=4, duration_seconds=60.0, cues=(
+        Cue(cue_id="d0", time_seconds=0.0, kind="downbeat"),
+    ))
+    said = _describe_music(grid)
+    assert "One bar is 2.00s" in said
+    assert "four-bar phrase is 8.00s" in said
+
+    source = inspect.getsource(decide_rhythm)
+    assert "平均每顆" not in source, "no per-shot average to anchor on"
+    assert "長度是總量，不是每顆的配額" in source

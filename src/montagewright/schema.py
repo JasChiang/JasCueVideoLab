@@ -254,7 +254,10 @@ class Look(ModelFacing):
             "True only when partial clipping destroys the meaning -- rendered "
             "text, a UI state, a readout. A subject wider than any crop of "
             "its source cannot be whole and still, so this and a single look "
-            "is a contradiction local code will report rather than resolve."
+            "is a contradiction local code will report rather than resolve. "
+            "`presentation_intent=complete_hold` promises the whole subject, "
+            "so it requires this to be true; if you do not want to promise "
+            "that, choose another intent rather than leaving this false."
         ),
     )
     presentation_intent: Literal[
@@ -267,7 +270,9 @@ class Look(ModelFacing):
         default="centered_hold",
         description=(
             "What this look promises to the viewer. complete_hold requires "
-            "the whole subject; centered_hold requires a stable recognizable "
+            "the whole subject and therefore `must_be_whole=true` -- pick "
+            "centered_hold instead when the subject need not be complete; "
+            "centered_hold requires a stable recognizable "
             "landing; reveal_endpoint is the destination of a move; "
             "partial_reveal and transition_pass explicitly allow an object "
             "to enter, leave, or remain partly outside the frame. This is an "
