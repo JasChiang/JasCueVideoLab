@@ -1563,6 +1563,9 @@
           <textarea id="grounding-identity-cues" placeholder="鏡頭排列、鉸鏈、顏色、標記…"></textarea></div>
         <div class="field wide"><label>不要混淆（一行一項）</label>
           <textarea id="grounding-exclusions" placeholder="例如：展開後外形相似的平板、另一個型號、螢幕中的圖片"></textarea></div>
+        <div class="field wide"><label>反例照片（會混淆的那個東西長什麼樣）</label>
+          <input type="file" id="grounding-negatives" accept="image/*" multiple>
+          <div class="why">文字說得出「另一個型號更寬」，說不出它實際長什麼樣。給一張，判定就能直接比對兩張圖，不必靠描述。</div></div>
         </div></details>
         <details class="deeper"><summary>我已經有 grounding spec</summary>
         <div class="fields">
@@ -4644,6 +4647,9 @@ $('go').addEventListener('click', async () => {
   if (groundingSpecFile) {
     body.append('grounding_spec_file', groundingSpecFile, groundingSpecFile.name);
   }
+  [...$('grounding-negatives').files].forEach(file => {
+    body.append('grounding_negatives', file, file.name);
+  });
   [...$('reference-images').files].forEach(file => {
     body.append('reference_images', file, file.name);
   });

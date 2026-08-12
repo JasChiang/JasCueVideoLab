@@ -1261,6 +1261,11 @@ def _reference_subject_samples(
         # 9:16 crop out of 16:9 keeps about a third of the width and can
         # often leave the other one outside the frame -- but nothing could
         # even ask that question while their position was never reported.
+        # A lookalike standing in the same frame is a fact the plan needs to
+        # answer for: on the run this was written from, selection named "the
+        # left unfolded smartphone" and the exact frames judged the left one
+        # to be the excluded model, so the crop went right -- correctly, and
+        # invisibly. The record existed and nothing read it.
         "excluded_instances": [
             {
                 "at_seconds": round(
@@ -1277,6 +1282,15 @@ def _reference_subject_samples(
             for instance in item.decision.excluded_instances
         ],
     }
+    lookalikes = report.reference_grounding[clip.clip_id]["excluded_instances"]
+    if lookalikes:
+        report.plan_disagreements.append(
+            f"{clip.clip_id} shares the frame with "
+            f"{len({one['reason'] for one in lookalikes})} instance(s) the "
+            f"lock excludes ({lookalikes[0]['reason'][:90]}); the crop "
+            "follows the confirmed target, which may not be the one the "
+            "plan described"
+        )
     return boxes, times, tuple(anchors)
 
 

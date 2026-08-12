@@ -1292,6 +1292,7 @@ def create_app() -> FastAPI:
         music: UploadFile | None = None,
         grounding_spec_file: UploadFile | None = None,
         reference_images: list[UploadFile] | None = None,
+        grounding_negatives: list[UploadFile] | None = None,
         source_path: str = Form(""),
         music_path: str = Form(""),
         grounding_spec_path: str = Form(""),
@@ -1484,6 +1485,20 @@ def create_app() -> FastAPI:
                     )
                     count_grounding_upload(stored)
                     provided.append((upload.filename or name, stored))
+                # What the target is not, shown rather than described. The
+                # spec has carried negative anchors since it was written and
+                # neither entry point offered them.
+                refused: list[Path] = []
+                for upload in grounding_negatives or []:
+                    if not upload.filename:
+                        continue
+                    stored = _save(
+                        upload,
+                        override_root
+                        / f"{uuid.uuid4().hex}-{Path(upload.filename).name}",
+                    )
+                    count_grounding_upload(stored)
+                    refused.append(stored)
 
                 staged_spec = raw_spec
                 portable_upload = spec_upload is not None or bool(spec_json)
@@ -1509,6 +1524,7 @@ def create_app() -> FastAPI:
                             if line.strip()
                         ),
                         positive_images=tuple(path for _, path in provided),
+                        negative_images=tuple(refused),
                         created_by="web_user",
                     )
                     staged_spec = Path(str(built.source_path))

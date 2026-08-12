@@ -188,8 +188,8 @@ def _command_with_canonical_grounding(
         return list(argv)
     simple_flags = {
         "--grounding-target-id", "--grounding-target-description",
-        "--grounding-reference", "--grounding-identity-cue",
-        "--grounding-exclusion",
+        "--grounding-reference", "--grounding-negative",
+        "--grounding-identity-cue", "--grounding-exclusion",
     }
     rewritten: list[str] = []
     skip_value = False
@@ -709,6 +709,10 @@ def command_render(args: argparse.Namespace) -> int:
                 ),
                 stable_exclusions=tuple(
                     getattr(args, "grounding_exclusion", None) or ()
+                ),
+                negative_images=tuple(
+                    Path(one)
+                    for one in (getattr(args, "grounding_negative", None) or ())
                 ),
                 created_by="cli_user",
             )
@@ -3148,6 +3152,13 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument(
         "--grounding-reference", type=Path, action="append", default=[],
         help="positive reference image; repeat for more views",
+    )
+    render.add_argument(
+        "--grounding-negative", type=Path, action="append", default=[],
+        help="image of a lookalike that must never be substituted; repeat "
+             "for more. The spec has carried these since it was written and "
+             "no entry point offered them, so telling the difference between "
+             "two similar things rested entirely on prose.",
     )
     render.add_argument(
         "--grounding-identity-cue", action="append", default=[],

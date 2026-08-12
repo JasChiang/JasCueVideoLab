@@ -487,3 +487,45 @@ def test_web_caps_reference_uploads_before_starting_the_run(
     assert not (tmp_path / "runs").exists() or not any(
         (tmp_path / "runs").iterdir()
     )
+
+
+def test_both_entry_points_can_show_what_the_target_is_not(tmp_path):
+    """The spec has carried negative anchors since it was written.
+
+    Neither the CLI nor the form offered them, so telling two similar
+    things apart rested entirely on prose -- and prose is where the
+    mistakes were: a ratio written in the wrong orientation sent the
+    grounding to the other model, confidently, with the reference images
+    for the right one attached the whole time.
+    """
+
+    import inspect
+
+    from montagewright import cli, webapp
+    from montagewright.reference_grounding import build_reference_grounding_spec
+
+    page = (
+        Path(__file__).parents[1] / "src" / "montagewright" / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+    assert "--grounding-negative" in inspect.getsource(cli.main)
+    assert "negative_images=" in inspect.getsource(cli.command_render)
+    assert "grounding_negatives" in inspect.getsource(webapp.create_app)
+    assert 'id="grounding-negatives"' in page
+    assert "grounding_negatives" in page, "and the form actually sends them"
+
+    positive = tmp_path / "target.jpg"
+    lookalike = tmp_path / "other.jpg"
+    positive.write_bytes(b"the one we mean")
+    lookalike.write_bytes(b"the one we do not")
+    spec = build_reference_grounding_spec(
+        tmp_path / "spec.json",
+        target_id="device.fold",
+        target_description="the exact foldable in the reference images",
+        positive_images=(positive,),
+        negative_images=(lookalike,),
+    )
+    target = spec.identity_lock.identity.target("device.fold")
+    assert len(target.negative_anchors) == 1
+    assert {one.polarity for one in spec.reference_images} == {
+        "positive", "negative",
+    }
