@@ -159,6 +159,22 @@ class ReferenceIdentityUnconfirmed(ReferenceShotUnusable):
     """The frames could not show that this is the same instance."""
 
 
+class ReferenceShotsUnusable(RuntimeError):
+    """Every shot that could not be delivered, found in one pass.
+
+    One at a time meant one repair per attempt with a full re-render
+    between them, so a bounded three attempts covered three shots -- and
+    material shot at an event with four similar handsets on the tables has
+    more than three. The work spent on the other shots is discarded either
+    way; doing it once and reporting all of them lets the layer holding the
+    selection fix them together.
+    """
+
+    def __init__(self, faults: "list[ReferenceShotUnusable]") -> None:
+        super().__init__("; ".join(str(one) for one in faults))
+        self.faults = list(faults)
+
+
 class ReferenceGeometryUnavailable(ReferenceShotUnusable):
     """It is the right instance, and nothing local can say where it is.
 
@@ -1236,6 +1252,7 @@ def follow_subjects(
 
     paths: dict[str, CropPath] = {}
     discoveries: dict[str, Any] = {}
+    unusable_shots: list[ReferenceShotUnusable] = []
     with tempfile.TemporaryDirectory() as raw_work:
         work = Path(raw_work)
         total = len(edl.clips)
@@ -1243,534 +1260,355 @@ def follow_subjects(
             reframe = clip.reframe
             if reframe is None:
                 continue
-            # This stage is a grounding call and sometimes a SAM propagation
-            # per shot, and the propagation writes a progress bar with
-            # carriage returns that never reaches a log. Minutes could pass
-            # with the last line still being about the music.
-            print(
-                f"  subject {index}/{total}  {clip.clip_id}  "
-                f"{reframe.camera_move}",
-                flush=True,
-            )
-            source = sources[clip.source_id]
-            move = reframe.camera_move
-            reference_samples: dict[
-                str,
-                tuple[
-                    list[dict[str, Any]],
-                    list[float],
+            try:
+                # This stage is a grounding call and sometimes a SAM propagation
+                # per shot, and the propagation writes a progress bar with
+                # carriage returns that never reaches a log. Minutes could pass
+                # with the last line still being about the music.
+                print(
+                    f"  subject {index}/{total}  {clip.clip_id}  "
+                    f"{reframe.camera_move}",
+                    flush=True,
+                )
+                source = sources[clip.source_id]
+                move = reframe.camera_move
+                reference_samples: dict[
+                    str,
                     tuple[
-                        tuple[float, tuple[float, float, float, float]], ...
+                        list[dict[str, Any]],
+                        list[float],
+                        tuple[
+                            tuple[float, tuple[float, float, float, float]], ...
+                        ],
                     ],
-                ],
-            ] = {}
-            if grounding_spec is not None:
-                for entity_id in dict.fromkeys(
-                    look.entity_id
-                    for look in reframe.looks
-                    if look.entity_id
+                ] = {}
+                if grounding_spec is not None:
+                    for entity_id in dict.fromkeys(
+                        look.entity_id
+                        for look in reframe.looks
+                        if look.entity_id
+                    ):
+                        samples = _reference_subject_samples(
+                            source,
+                            clip,
+                            entity_id,
+                            spec=grounding_spec,
+                            client=client,
+                            upload_cache=upload_cache,
+                            report=report,
+                            work=work,
+                            output=grounding_output,
+                            discoveries=discoveries,
+                            checkpoint=checkpoint,
+                        )
+                        if samples[0]:
+                            reference_samples[entity_id] = samples
+                        else:
+                            report.degradations.append(
+                                DegradationStep(
+                                    clip_id=clip.clip_id,
+                                    ladder="center_crop",
+                                    trigger=(
+                                        "the locked reference identity "
+                                        f"{entity_id} was not confirmed on two "
+                                        "exact source frames; refusing text-only "
+                                        "or SAM lookalike substitution"
+                                    ),
+                                    measured={"confirmed_anchors": 0.0},
+                                )
+                            )
+                            raise ReferenceIdentityUnconfirmed(
+                                clip.clip_id, entity_id,
+                                f"{clip.clip_id}: locked reference identity "
+                                f"{entity_id} was selected but could not be "
+                                "confirmed on two exact source frames; reselect "
+                                "the shot instead of substituting a lookalike",
+                            )
+                card = (
+                    load_card(cards[clip.source_id])
+                    if cards and clip.source_id in cards
+                    else None
+                )
+
+                duration = clip.approx_out_seconds - clip.approx_in_seconds
+
+                # No card means no measured subject, and the reframe below will
+                # quietly centre the crop. That is a defensible last resort and
+                # an indefensible silence: a whole timeline was rebuilt this way,
+                # every crop identical and dead centre, and nothing anywhere said
+                # the subject had gone missing.
+                if (
+                    reframe.subject is not None
+                    and card is None
+                    and not reframe.subject.entity_id
                 ):
-                    samples = _reference_subject_samples(
-                        source,
-                        clip,
-                        entity_id,
-                        spec=grounding_spec,
-                        client=client,
-                        upload_cache=upload_cache,
-                        report=report,
-                        work=work,
-                        output=grounding_output,
-                        discoveries=discoveries,
-                        checkpoint=checkpoint,
+                    report.degradations.append(
+                        DegradationStep(
+                            clip_id=clip.clip_id,
+                            ladder="center_crop",
+                            trigger=(
+                                f"no card describes {clip.source_id}, so there is "
+                                f"no measured position for "
+                                f"\"{reframe.subject.description}\" and the crop "
+                                f"can only be centred"
+                            ),
+                            measured={},
+                        )
                     )
-                    if samples[0]:
-                        reference_samples[entity_id] = samples
-                    else:
+
+                # Whether a subject fits the delivery aspect is a fact about the
+                # material, not a property of the move chosen for it. It used to
+                # be checked inside the hold branch only, so the same wordmark
+                # that a hold would have swept across was quietly cropped to
+                # "Galaxy Unpac" the moment the planner asked for a push instead
+                # -- and nothing recorded it, because only one of the five path
+                # builders reports fit. The check belongs to the clip.
+                known = (
+                    find_subject(
+                        card, reframe.subject.description,
+                        entity_id=reframe.subject.entity_id,
+                    )
+                    if card is not None and reframe.subject is not None
+                    else None
+                )
+                # Two moves stacked. The selection prompt has said since it was
+                # written that a take which moves on its own does not want a
+                # digital move on top -- the real one is real and the added one
+                # is a crop sliding -- and until the span carried the role there
+                # was nothing downstream holding the fact needed to check it.
+                #
+                # Reported rather than repaired: which of the two to give up is
+                # editorial. Dropping the digital move would quietly change what
+                # the shot shows, and dropping the shot would quietly change the
+                # film.
+                if (
+                    reframe.planned_to_move
+                    and reframe.source_motion_role in {"authored", "subject_follow"}
+                ):
+                    report.degradations.append(
+                        DegradationStep(
+                            clip_id=clip.clip_id,
+                            ladder="other",
+                            ladder_other="digital_move_on_a_moving_take",
+                            trigger=(
+                                "this take already moves on its own "
+                                f"({reframe.source_motion_role}) and the plan "
+                                "asks the frame to travel as well, so the two "
+                                "movements are added together on screen"
+                            ),
+                            measured={"looks": float(len(reframe.looks))},
+                        )
+                    )
+
+                # Every look, not only the first. `reframe.subject` is built from
+                # `looks[0]`, so a shot that settles on a face and then on a
+                # wordmark that has to be whole had the promise on the second one
+                # read by nothing at all -- and `must_be_whole` moved onto the
+                # look precisely because a shot can make different promises about
+                # different parts of itself.
+                if card is not None:
+                    crop_width = target_aspect / source.aspect_ratio
+                    for index, look in enumerate(reframe.looks[1:], start=1):
+                        if not look.must_be_whole:
+                            continue
+                        box = find_subject(
+                            card, look.at, entity_id=look.entity_id
+                        )
+                        if box is None or box.width <= crop_width:
+                            continue
                         report.degradations.append(
                             DegradationStep(
                                 clip_id=clip.clip_id,
-                                ladder="center_crop",
+                                ladder="other",
+                                ladder_other="whole_subject_promised_without_a_move",
                                 trigger=(
-                                    "the locked reference identity "
-                                    f"{entity_id} was not confirmed on two "
-                                    "exact source frames; refusing text-only "
-                                    "or SAM lookalike substitution"
+                                    f"look {index + 1} of this shot was declared "
+                                    "whole and no crop of this source can hold "
+                                    "it, so settling on it shows part of it"
                                 ),
-                                measured={"confirmed_anchors": 0.0},
+                                measured={
+                                    "look": float(index + 1),
+                                    "subject_width_vw": round(box.width, 4),
+                                    "widest_crop_vw": round(crop_width, 4),
+                                    "most_visible_fraction": round(
+                                        crop_width / box.width, 4
+                                    ),
+                                },
                             )
                         )
-                        raise ReferenceIdentityUnconfirmed(
-                            clip.clip_id, entity_id,
-                            f"{clip.clip_id}: locked reference identity "
-                            f"{entity_id} was selected but could not be "
-                            "confirmed on two exact source frames; reselect "
-                            "the shot instead of substituting a lookalike",
-                        )
-            card = (
-                load_card(cards[clip.source_id])
-                if cards and clip.source_id in cards
-                else None
-            )
-
-            duration = clip.approx_out_seconds - clip.approx_in_seconds
-
-            # No card means no measured subject, and the reframe below will
-            # quietly centre the crop. That is a defensible last resort and
-            # an indefensible silence: a whole timeline was rebuilt this way,
-            # every crop identical and dead centre, and nothing anywhere said
-            # the subject had gone missing.
-            if (
-                reframe.subject is not None
-                and card is None
-                and not reframe.subject.entity_id
-            ):
-                report.degradations.append(
-                    DegradationStep(
-                        clip_id=clip.clip_id,
-                        ladder="center_crop",
-                        trigger=(
-                            f"no card describes {clip.source_id}, so there is "
-                            f"no measured position for "
-                            f"\"{reframe.subject.description}\" and the crop "
-                            f"can only be centred"
-                        ),
-                        measured={},
-                    )
-                )
-
-            # Whether a subject fits the delivery aspect is a fact about the
-            # material, not a property of the move chosen for it. It used to
-            # be checked inside the hold branch only, so the same wordmark
-            # that a hold would have swept across was quietly cropped to
-            # "Galaxy Unpac" the moment the planner asked for a push instead
-            # -- and nothing recorded it, because only one of the five path
-            # builders reports fit. The check belongs to the clip.
-            known = (
-                find_subject(
-                    card, reframe.subject.description,
-                    entity_id=reframe.subject.entity_id,
-                )
-                if card is not None and reframe.subject is not None
-                else None
-            )
-            # Two moves stacked. The selection prompt has said since it was
-            # written that a take which moves on its own does not want a
-            # digital move on top -- the real one is real and the added one
-            # is a crop sliding -- and until the span carried the role there
-            # was nothing downstream holding the fact needed to check it.
-            #
-            # Reported rather than repaired: which of the two to give up is
-            # editorial. Dropping the digital move would quietly change what
-            # the shot shows, and dropping the shot would quietly change the
-            # film.
-            if (
-                reframe.planned_to_move
-                and reframe.source_motion_role in {"authored", "subject_follow"}
-            ):
-                report.degradations.append(
-                    DegradationStep(
-                        clip_id=clip.clip_id,
-                        ladder="other",
-                        ladder_other="digital_move_on_a_moving_take",
-                        trigger=(
-                            "this take already moves on its own "
-                            f"({reframe.source_motion_role}) and the plan "
-                            "asks the frame to travel as well, so the two "
-                            "movements are added together on screen"
-                        ),
-                        measured={"looks": float(len(reframe.looks))},
-                    )
-                )
-
-            # Every look, not only the first. `reframe.subject` is built from
-            # `looks[0]`, so a shot that settles on a face and then on a
-            # wordmark that has to be whole had the promise on the second one
-            # read by nothing at all -- and `must_be_whole` moved onto the
-            # look precisely because a shot can make different promises about
-            # different parts of itself.
-            if card is not None:
-                crop_width = target_aspect / source.aspect_ratio
-                for index, look in enumerate(reframe.looks[1:], start=1):
-                    if not look.must_be_whole:
-                        continue
-                    box = find_subject(
-                        card, look.at, entity_id=look.entity_id
-                    )
-                    if box is None or box.width <= crop_width:
-                        continue
-                    report.degradations.append(
-                        DegradationStep(
-                            clip_id=clip.clip_id,
-                            ladder="other",
-                            ladder_other="whole_subject_promised_without_a_move",
-                            trigger=(
-                                f"look {index + 1} of this shot was declared "
-                                "whole and no crop of this source can hold "
-                                "it, so settling on it shows part of it"
-                            ),
-                            measured={
-                                "look": float(index + 1),
-                                "subject_width_vw": round(box.width, 4),
-                                "widest_crop_vw": round(crop_width, 4),
-                                "most_visible_fraction": round(
-                                    crop_width / box.width, 4
+                if reframe.subject is not None and card is not None:
+                    crop_width = target_aspect / source.aspect_ratio
+                    # A promise that the subject must be whole, on a subject no
+                    # crop of this source can hold, with a move that does not
+                    # travel across it. The three cannot all be true, and the
+                    # planner was told the fraction when it made the promise --
+                    # the wordmark it marked whole could only ever show 51%.
+                    #
+                    # Said here rather than left to be discovered in the output,
+                    # because a contradiction between two fields of one plan is
+                    # visible before anything is rendered, and the reviewer that
+                    # would otherwise find it costs a paid call and a round.
+                    # Not corrected: which of the three to give up is the
+                    # planner's to choose.
+                    if (
+                        known is not None
+                        and known.width > crop_width
+                        and reframe.subject.min_visible >= 0.99
+                        and reframe.camera_move not in {"pan", "tilt"}
+                    ):
+                        report.degradations.append(
+                            DegradationStep(
+                                clip_id=clip.clip_id,
+                                ladder="other",
+                                ladder_other="whole_subject_promised_without_a_move",
+                                trigger=(
+                                    "the subject was declared whole, no crop of "
+                                    f"this source can hold it, and {reframe.camera_move} "
+                                    "does not travel across it -- one of the three "
+                                    "has to give"
                                 ),
-                            },
+                                measured={
+                                    "subject_width_vw": round(known.width, 4),
+                                    "widest_crop_vw": round(crop_width, 4),
+                                    "most_visible_fraction": round(
+                                        crop_width / known.width, 4
+                                    ),
+                                },
+                            )
                         )
-                    )
-            if reframe.subject is not None and card is not None:
-                crop_width = target_aspect / source.aspect_ratio
-                # A promise that the subject must be whole, on a subject no
-                # crop of this source can hold, with a move that does not
-                # travel across it. The three cannot all be true, and the
-                # planner was told the fraction when it made the promise --
-                # the wordmark it marked whole could only ever show 51%.
+                    if known is not None and known.width > crop_width:
+                        report.degradations.append(
+                            DegradationStep(
+                                clip_id=clip.clip_id,
+                                ladder="other",
+                                ladder_other="subject_wider_than_delivery",
+                                trigger=(
+                                    f"the subject is wider than any crop of this "
+                                    f"source at the delivery aspect, so a {move} "
+                                    f"can only ever hold part of it"
+                                ),
+                                measured={
+                                    "subject_width_vw": round(known.width, 4),
+                                    "widest_crop_vw": round(crop_width, 4),
+                                    "most_visible_fraction": round(
+                                        crop_width / known.width, 4
+                                    ),
+                                    "requested_min_visible": (
+                                        reframe.subject.min_visible
+                                    ),
+                                },
+                            )
+                        )
+
+                # The two-subject pan used to be handled here, above the looks
+                # branch below -- and `then_subject` is set exactly when there is
+                # a second look, so it shadowed it completely. Every pan went to
+                # the old builder and the third look of a row of three watches
+                # was still being dropped, which is the whole thing the refactor
+                # was for. Deleted rather than reordered: build_look_path does
+                # what it did, for any number of stops.
+
+
+                # Every shot that settles somewhere more than once, whatever the
+                # move turned out to be called. One builder walks the list; the
+                # older branches below stay for a single look, where following a
+                # moving subject still needs the tracker.
                 #
-                # Said here rather than left to be discovered in the output,
-                # because a contradiction between two fields of one plan is
-                # visible before anything is rendered, and the reviewer that
-                # would otherwise find it costs a paid call and a round.
-                # Not corrected: which of the three to give up is the
-                # planner's to choose.
-                if (
-                    known is not None
-                    and known.width > crop_width
-                    and reframe.subject.min_visible >= 0.99
-                    and reframe.camera_move not in {"pan", "tilt"}
-                ):
-                    report.degradations.append(
-                        DegradationStep(
-                            clip_id=clip.clip_id,
-                            ladder="other",
-                            ladder_other="whole_subject_promised_without_a_move",
-                            trigger=(
-                                "the subject was declared whole, no crop of "
-                                f"this source can hold it, and {reframe.camera_move} "
-                                "does not travel across it -- one of the three "
-                                "has to give"
-                            ),
-                            measured={
-                                "subject_width_vw": round(known.width, 4),
-                                "widest_crop_vw": round(crop_width, 4),
-                                "most_visible_fraction": round(
-                                    crop_width / known.width, 4
-                                ),
-                            },
-                        )
+                # Three looks used to be silently truncated to two -- `pan` read
+                # `subject` and `then_subject` and there was nowhere for a third
+                # to go, so a row of three watches lost its middle stop with
+                # nothing recorded.
+                if len(reframe.looks) >= 2 and _may_ask(client):
+                    stops, missing, tracks = _measure_looks(
+                        reframe.looks, source, clip, work, report, client,
+                        target_aspect, checkpoint, reference_samples,
                     )
-                if known is not None and known.width > crop_width:
-                    report.degradations.append(
-                        DegradationStep(
-                            clip_id=clip.clip_id,
-                            ladder="other",
-                            ladder_other="subject_wider_than_delivery",
-                            trigger=(
-                                f"the subject is wider than any crop of this "
-                                f"source at the delivery aspect, so a {move} "
-                                f"can only ever hold part of it"
-                            ),
-                            measured={
-                                "subject_width_vw": round(known.width, 4),
-                                "widest_crop_vw": round(crop_width, 4),
-                                "most_visible_fraction": round(
-                                    crop_width / known.width, 4
-                                ),
-                                "requested_min_visible": (
-                                    reframe.subject.min_visible
-                                ),
-                            },
-                        )
-                    )
-
-            # The two-subject pan used to be handled here, above the looks
-            # branch below -- and `then_subject` is set exactly when there is
-            # a second look, so it shadowed it completely. Every pan went to
-            # the old builder and the third look of a row of three watches
-            # was still being dropped, which is the whole thing the refactor
-            # was for. Deleted rather than reordered: build_look_path does
-            # what it did, for any number of stops.
-
-
-            # Every shot that settles somewhere more than once, whatever the
-            # move turned out to be called. One builder walks the list; the
-            # older branches below stay for a single look, where following a
-            # moving subject still needs the tracker.
-            #
-            # Three looks used to be silently truncated to two -- `pan` read
-            # `subject` and `then_subject` and there was nowhere for a third
-            # to go, so a row of three watches lost its middle stop with
-            # nothing recorded.
-            if len(reframe.looks) >= 2 and _may_ask(client):
-                stops, missing, tracks = _measure_looks(
-                    reframe.looks, source, clip, work, report, client,
-                    target_aspect, checkpoint, reference_samples,
-                )
-                if missing:
-                    report.subject_notes[clip.clip_id] = (
-                        f"could not find {missing} in any sampled frame"[:160]
-                    )
-                if len(stops) >= 2:
-                    out_w, out_h = output_size
-                    paths[clip.clip_id] = build_look_path(
-                        stops,
-                        source_aspect=source.aspect_ratio,
-                        target_aspect=target_aspect,
-                        duration_seconds=duration,
-                        energy=reframe.camera_energy,
-                        clip_id=clip.clip_id,
-                        degradations=report.degradations,
-                        # Without these it can crop as tightly as a framing
-                        # asks and the upscale is only discovered below, on
-                        # a shot that has already been rendered soft.
-                        source_width=source.width,
-                        source_height=source.height,
-                        output_width=out_w,
-                        output_height=out_h,
-                        # Where each subject went while the frame was looking
-                        # at it. Without these a stop is a place, and a shot
-                        # planned to follow somebody walking held on a point
-                        # halfway along the walk.
-                        tracks=tracks,
-                    )
-                    tightest = min(
-                        paths[clip.clip_id].keyframes,
-                        key=lambda one: one.crop.width,
-                    ).crop
-                    report.upscales[clip.clip_id] = achieved_upscale(
-                        tightest,
-                        source_width=source.width,
-                        source_height=source.height,
-                        output_width=out_w,
-                        output_height=out_h,
-                    )
-                    report.following_shots += 1
-                    continue
-
-            if move in {"push_in", "pull_out"}:
-                # Push toward the subject, not toward the middle of the frame.
-                # Zooming on the geometric centre put a coin-against-a-hinge
-                # shot in the bottom third with 40% of the frame empty above
-                # it -- and a zoom is the only move that can change vertical
-                # framing at all when the crop is otherwise full height, so
-                # aiming it blindly wastes the one chance the shot has.
-                centre_x, centre_y = 0.5, 0.5
-                middles: list[tuple[float, float]] = []
-                boxes = []
-                sampled_at: list[float] = []
-                reference = (
-                    reference_samples.get(reframe.subject.entity_id)
-                    if reframe.subject is not None
-                    and reframe.subject.entity_id else None
-                )
-                if reference is not None:
-                    boxes, sampled_at, _ = reference
-                elif (
-                    reframe.subject is not None
-                    and reframe.subject.entity_id
-                ):
-                    # A stable identity may never degrade to matching its
-                    # prose description; that is exactly how a lookalike gets
-                    # substituted confidently.
-                    boxes, sampled_at = [], []
-                elif reframe.subject is not None and not _may_ask(client):
-                    # A rebuild, with nothing to ask. Skipping the clip left
-                    # no path at all, and the executor fell back to a centred
-                    # still -- so a push read back as a hold on the middle of
-                    # the frame, and the interface drew that as what had been
-                    # rendered. A zoom needs one point to aim at, and the
-                    # card has one.
-                    if known is not None:
-                        centre_x, centre_y = known.centre_x, known.centre_y
+                    if missing:
                         report.subject_notes[clip.clip_id] = (
-                            f"{move} on ({centre_x:.3f}, {centre_y:.3f}) "
-                            f"from the card"
+                            f"could not find {missing} in any sampled frame"[:160]
                         )
-                elif reframe.subject is not None:
-                    # The sample times were being discarded here. They are
-                    # what turns five positions into a path: without them a
-                    # push can only aim at their mean, and a subject that
-                    # walks is squeezed out of the closing frame.
-                    frames, sampled_at = _sample_frames(
-                        source,
-                        clip.approx_in_seconds,
-                        clip.approx_out_seconds,
-                        work,
-                    )
-                    _afford(report)
-                    boxes, usage = _locate_subject(
-                        frames, reframe.subject.description, client=client,
-                        report=report,
-                    )
-                    _charge(report, "subject", usage)
-                    middles = [
-                        (float(b["centre_x"]), float(b["centre_y"]))
-                        for b in boxes
-                        if b.get("present") and b.get("centre_x") is not None
-                    ]
-                    if middles:
-                        centre_x = sum(x for x, _ in middles) / len(middles)
-                        centre_y = sum(y for _, y in middles) / len(middles)
-                        report.subject_notes[clip.clip_id] = (
-                            f"{move} on ({centre_x:.3f}, {centre_y:.3f})"
+                    if len(stops) >= 2:
+                        out_w, out_h = output_size
+                        paths[clip.clip_id] = build_look_path(
+                            stops,
+                            source_aspect=source.aspect_ratio,
+                            target_aspect=target_aspect,
+                            duration_seconds=duration,
+                            energy=reframe.camera_energy,
+                            clip_id=clip.clip_id,
+                            degradations=report.degradations,
+                            # Without these it can crop as tightly as a framing
+                            # asks and the upscale is only discovered below, on
+                            # a shot that has already been rendered soft.
+                            source_width=source.width,
+                            source_height=source.height,
+                            output_width=out_w,
+                            output_height=out_h,
+                            # Where each subject went while the frame was looking
+                            # at it. Without these a stop is a place, and a shot
+                            # planned to follow somebody walking held on a point
+                            # halfway along the walk.
+                            tracks=tracks,
                         )
-                if boxes and not middles:
-                    middles = [
-                        (float(box["centre_x"]), float(box["centre_y"]))
-                        for box in boxes
-                        if box.get("present")
-                        and box.get("centre_x") is not None
-                    ]
-                    if middles:
-                        centre_x = sum(x for x, _ in middles) / len(middles)
-                        centre_y = sum(y for _, y in middles) / len(middles)
-                # Read what the source can supply before choosing how far to
-                # push. A fixed percentage is blind to what it is cropping.
-                out_w, out_h = output_size
-                budget = zoom_budget(
-                    source_width=source.width,
-                    source_height=source.height,
-                    source_aspect=source.aspect_ratio,
-                    target_aspect=target_aspect,
-                    output_width=out_w,
-                    output_height=out_h,
-                )
-                subject_height = known.height if known is not None else None
-                if middles:
-                    heights = [
-                        float(b["height"])
-                        for b in boxes
-                        if b.get("present") and b.get("height") is not None
-                    ]
-                    if heights:
-                        subject_height = sum(heights) / len(heights)
-                track = []
-                for box in boxes:
-                    index = int(box.get("frame_index", -1))
-                    if not box.get("present") or box.get("centre_x") is None:
+                        tightest = min(
+                            paths[clip.clip_id].keyframes,
+                            key=lambda one: one.crop.width,
+                        ).crop
+                        report.upscales[clip.clip_id] = achieved_upscale(
+                            tightest,
+                            source_width=source.width,
+                            source_height=source.height,
+                            output_width=out_w,
+                            output_height=out_h,
+                        )
+                        report.following_shots += 1
                         continue
-                    if not 0 <= index < len(sampled_at):
-                        continue
-                    track.append((
-                        sampled_at[index] - clip.approx_in_seconds,
-                        float(box["centre_x"]),
-                        float(box["centre_y"]),
-                    ))
-                path = build_zoom_path(
-                    source_aspect=source.aspect_ratio,
-                    target_aspect=target_aspect,
-                    duration_seconds=duration,
-                    direction=move,
-                    centre_x=centre_x,
-                    centre_y=centre_y,
-                    track=track or None,
-                    energy=reframe.camera_energy,
-                    framing=reframe.framing,
-                    budget=budget,
-                    subject_height=subject_height,
-                    clip_id=clip.clip_id,
-                    degradations=report.degradations,
-                )
-                tightest = min(path.keyframes, key=lambda k: k.crop.width).crop
-                report.upscales[clip.clip_id] = achieved_upscale(
-                    tightest,
-                    source_width=source.width,
-                    source_height=source.height,
-                    output_width=out_w,
-                    output_height=out_h,
-                )
-                paths[clip.clip_id] = path
-                report.following_shots += 1
-                continue
 
-            if move in {"sweep_left", "sweep_right"}:  # legacy names
-                # A designed move across a still arrangement. Nothing is
-                # tracked because nothing is moving, so this costs no call.
-                paths[clip.clip_id] = build_sweep_path(
-                    source_aspect=source.aspect_ratio,
-                    target_aspect=target_aspect,
-                    duration_seconds=duration,
-                    direction=move,
-                    energy=reframe.camera_energy,
-                )
-                report.following_shots += 1
-                continue
-
-            if move == "hold" or reframe.subject is None:
-                # No substitution here. This branch used to notice that a
-                # subject too wide to sit in the crop could be read across
-                # instead, and swap the hold for a sweep. It looks like help
-                # and it is the execution layer deciding: a replan that had
-                # just chosen hold *because* travelling across the title was
-                # what cut it came back describing a sweep across the title,
-                # having been overruled by a layer it cannot see or argue
-                # with. The fit is recorded above; whether to answer it with
-                # a different move, a different take or a partial view is a
-                # planning question, and the shot reviewer now puts it to the
-                # planner in those terms.
-                #
-                # A held shot still has to be aimed. Every other move
-                # measures where its subject is; this one fell through to
-                # the executor's fallback, which reads the nine-box name as
-                # a coordinate -- "mid_right" became x=0.61 and a phone
-                # spanning 0.475 to 0.825 arrived half out of frame with the
-                # wall behind it filling the rest. The card already knows
-                # where the thing is, and that lesson is written down for
-                # the handoff path, which was fixed and left this one alone.
-                if reframe.subject is not None:
+                if move in {"push_in", "pull_out"}:
+                    # Push toward the subject, not toward the middle of the frame.
+                    # Zooming on the geometric centre put a coin-against-a-hinge
+                    # shot in the bottom third with 40% of the frame empty above
+                    # it -- and a zoom is the only move that can change vertical
+                    # framing at all when the crop is otherwise full height, so
+                    # aiming it blindly wastes the one chance the shot has.
+                    centre_x, centre_y = 0.5, 0.5
+                    middles: list[tuple[float, float]] = []
+                    boxes = []
+                    sampled_at: list[float] = []
                     reference = (
                         reference_samples.get(reframe.subject.entity_id)
-                        if reframe.subject.entity_id else None
-                    )
-                    box = (
-                        find_subject(
-                            card, reframe.subject.description,
-                            entity_id=reframe.subject.entity_id,
-                        )
-                        if card is not None
-                        else None
-                    )
-                    # A card box is one moment. That is the whole answer for
-                    # a locked-off frame and a snapshot for anything else --
-                    # the subject the card saw at 1.2s is somewhere else by
-                    # the end of a take whose camera pans. The card says
-                    # which of those this is, in a field nothing read.
-                    settled = box is not None and not box.moves and not (
-                        card or {}
-                    ).get("camera_motion")
-                    centre = (
-                        (box.centre_x, box.centre_y, box.width, box.height)
-                        if settled and box is not None
-                        else None
+                        if reframe.subject is not None
+                        and reframe.subject.entity_id else None
                     )
                     if reference is not None:
-                        ref_boxes, _, _ = reference
-                        present = [
-                            item for item in ref_boxes
-                            if item.get("present")
-                            and item.get("centre_x") is not None
-                        ]
-                        if present:
-                            count = len(present)
-                            centre = (
-                                sum(float(item["centre_x"]) for item in present)
-                                / count,
-                                sum(float(item["centre_y"]) for item in present)
-                                / count,
-                                sum(float(item.get("width") or 0.0) for item in present)
-                                / count,
-                                sum(float(item.get("height") or 0.0) for item in present)
-                                / count,
+                        boxes, sampled_at, _ = reference
+                    elif (
+                        reframe.subject is not None
+                        and reframe.subject.entity_id
+                    ):
+                        # A stable identity may never degrade to matching its
+                        # prose description; that is exactly how a lookalike gets
+                        # substituted confidently.
+                        boxes, sampled_at = [], []
+                    elif reframe.subject is not None and not _may_ask(client):
+                        # A rebuild, with nothing to ask. Skipping the clip left
+                        # no path at all, and the executor fell back to a centred
+                        # still -- so a push read back as a hold on the middle of
+                        # the frame, and the interface drew that as what had been
+                        # rendered. A zoom needs one point to aim at, and the
+                        # card has one.
+                        if known is not None:
+                            centre_x, centre_y = known.centre_x, known.centre_y
+                            report.subject_notes[clip.clip_id] = (
+                                f"{move} on ({centre_x:.3f}, {centre_y:.3f}) "
+                                f"from the card"
                             )
-                    if centre is None and not reframe.subject.entity_id:
-                        # Either the card had no box for what was named, or
-                        # it had one that will not hold still. Measure across
-                        # this shot's own window: for a held frame the mean
-                        # of the trajectory is the placement that keeps the
-                        # subject inside for all of it, rather than framing
-                        # where it started and letting it walk out.
-                        if not _may_ask(client):
-                            continue
-                        frames, _ = _sample_frames(
+                    elif reframe.subject is not None:
+                        # The sample times were being discarded here. They are
+                        # what turns five positions into a path: without them a
+                        # push can only aim at their mean, and a subject that
+                        # walks is squeezed out of the closing frame.
+                        frames, sampled_at = _sample_frames(
                             source,
                             clip.approx_in_seconds,
                             clip.approx_out_seconds,
@@ -1782,266 +1620,458 @@ def follow_subjects(
                             report=report,
                         )
                         _charge(report, "subject", usage)
-                        present = [
-                            b for b in boxes
+                        middles = [
+                            (float(b["centre_x"]), float(b["centre_y"]))
+                            for b in boxes
                             if b.get("present") and b.get("centre_x") is not None
                         ]
-                        if present:
-                            count = len(present)
-                            centre = (
-                                sum(float(b["centre_x"]) for b in present) / count,
-                                sum(float(b["centre_y"]) for b in present) / count,
-                                sum(float(b.get("width") or 0.0) for b in present) / count,
-                                sum(float(b.get("height") or 0.0) for b in present) / count,
+                        if middles:
+                            centre_x = sum(x for x, _ in middles) / len(middles)
+                            centre_y = sum(y for _, y in middles) / len(middles)
+                            report.subject_notes[clip.clip_id] = (
+                                f"{move} on ({centre_x:.3f}, {centre_y:.3f})"
                             )
-                    if centre is not None:
-                        cx, cy, bw, bh = centre
-                        paths[clip.clip_id] = build_crop_path(
-                            [
-                                Observation(
-                                    seconds=0.0,
-                                    centre_x=cx,
-                                    centre_y=cy,
-                                    width=bw,
-                                    height=bh,
-                                )
-                            ],
-                            source_aspect=source.aspect_ratio,
-                            target_aspect=target_aspect,
-                            energy=reframe.camera_energy,
-                            # A shot that said it settles is not a follow
-                            # that was downgraded. One look means "stay on
-                            # this", which for something that walks is a
-                            # follow and for something standing still is a
-                            # held frame -- both are the plan being carried
-                            # out, and only one of them used to say so.
-                            planned_to_move=reframe.planned_to_move,
-                            framing=reframe.framing,
-                            clip_id=clip.clip_id,
-                            min_visible=reframe.subject.min_visible,
-                            degradations=report.degradations,
-                        )
-                        report.subject_notes[clip.clip_id] = (
-                            f"hold on ({cx:.3f}, {cy:.3f})"
-                        )
-                        report.static_shots += 1
-                        continue
-                report.static_shots += 1
-                continue
-
-            # A follow needs to know where the subject is. The card answered
-            # that when it was written and the answer has not changed since,
-            # so ask it before paying for a fresh grounding on every rhythm
-            # tweak, second aspect and review round.
-            known = (
-                find_subject(
-                    card, reframe.subject.description,
-                    entity_id=reframe.subject.entity_id,
-                )
-                if card is not None
-                else None
-            )
-            reference = (
-                reference_samples.get(reframe.subject.entity_id)
-                if reframe.subject.entity_id else None
-            )
-            semantic_anchors = reference[2] if reference is not None else ()
-            if reference is not None:
-                boxes, times, _ = reference
-                frames = []
-                report.subject_notes[clip.clip_id] = (
-                    f"reference identity: {reframe.subject.entity_id}"
-                )
-            elif reframe.subject.entity_id:
-                boxes, times, frames = [], [], []
-            elif known is not None and move != "follow_subject":
-                boxes = [
-                    {
-                        "frame_index": 0,
-                        "present": True,
-                        "centre_x": known.centre_x,
-                        "centre_y": known.centre_y,
-                        "width": known.width,
-                        "height": known.height,
-                    }
-                ]
-                times = [clip.approx_in_seconds]
-                frames = []
-                report.subject_notes[clip.clip_id] = f"card: {known.label}"
-            else:
-                if not _may_ask(client):
-                    continue
-                # A card box is one observed place, not a trajectory.  It is
-                # enough to aim a hold and categorically insufficient for an
-                # explicit follow: without SAM, one observation made every
-                # follow static while the report claimed the chosen intent.
-                frames, times = _sample_frames(
-                    source, clip.approx_in_seconds, clip.approx_out_seconds, work
-                )
-                _afford(report)
-                boxes, usage = _locate_subject(
-                    frames, reframe.subject.description, client=client,
-                    report=report,
-                )
-                _charge(report, "subject", usage)
-
-            wants_tilt = move == "tilt"
-            observations = []
-            for box in boxes:
-                if not box.get("present"):
-                    continue
-                index = int(box.get("frame_index", -1))
-                if not 0 <= index < len(times):
-                    continue
-                try:
-                    observations.append(
-                        Observation(
-                            seconds=times[index] - clip.approx_in_seconds,
-                            centre_x=float(box["centre_x"]),
-                            centre_y=float(box["centre_y"]),
-                            width=float(box["width"]),
-                            height=float(box["height"]),
-                        )
+                    if boxes and not middles:
+                        middles = [
+                            (float(box["centre_x"]), float(box["centre_y"]))
+                            for box in boxes
+                            if box.get("present")
+                            and box.get("centre_x") is not None
+                        ]
+                        if middles:
+                            centre_x = sum(x for x, _ in middles) / len(middles)
+                            centre_y = sum(y for _, y in middles) / len(middles)
+                    # Read what the source can supply before choosing how far to
+                    # push. A fixed percentage is blind to what it is cropping.
+                    out_w, out_h = output_size
+                    budget = zoom_budget(
+                        source_width=source.width,
+                        source_height=source.height,
+                        source_aspect=source.aspect_ratio,
+                        target_aspect=target_aspect,
+                        output_width=out_w,
+                        output_height=out_h,
                     )
-                except (OutOfFrame, KeyError, TypeError, ValueError) as error:
-                    # One unusable observation is not a reason to abandon the
-                    # shot; the remaining samples still describe the motion.
-                    report.subject_notes[clip.clip_id] = str(error)[:160]
-
-            if not observations:
-                report.degradations.append(
-                    DegradationStep(
+                    subject_height = known.height if known is not None else None
+                    if middles:
+                        heights = [
+                            float(b["height"])
+                            for b in boxes
+                            if b.get("present") and b.get("height") is not None
+                        ]
+                        if heights:
+                            subject_height = sum(heights) / len(heights)
+                    track = []
+                    for box in boxes:
+                        index = int(box.get("frame_index", -1))
+                        if not box.get("present") or box.get("centre_x") is None:
+                            continue
+                        if not 0 <= index < len(sampled_at):
+                            continue
+                        track.append((
+                            sampled_at[index] - clip.approx_in_seconds,
+                            float(box["centre_x"]),
+                            float(box["centre_y"]),
+                        ))
+                    path = build_zoom_path(
+                        source_aspect=source.aspect_ratio,
+                        target_aspect=target_aspect,
+                        duration_seconds=duration,
+                        direction=move,
+                        centre_x=centre_x,
+                        centre_y=centre_y,
+                        track=track or None,
+                        energy=reframe.camera_energy,
+                        framing=reframe.framing,
+                        budget=budget,
+                        subject_height=subject_height,
                         clip_id=clip.clip_id,
-                        ladder="center_crop",
-                        trigger=(
-                            "the subject was not located in any sampled "
-                            "frame, so the shot is framed centrally"
-                        ),
-                        measured={"samples": float(len(times))},
+                        degradations=report.degradations,
                     )
-                )
-                continue
+                    tightest = min(path.keyframes, key=lambda k: k.crop.width).crop
+                    report.upscales[clip.clip_id] = achieved_upscale(
+                        tightest,
+                        source_width=source.width,
+                        source_height=source.height,
+                        output_width=out_w,
+                        output_height=out_h,
+                    )
+                    paths[clip.clip_id] = path
+                    report.following_shots += 1
+                    continue
 
-            note = next(
-                (
-                    str(box["disambiguation"])
-                    for box in boxes
-                    if box.get("disambiguation")
-                ),
-                "",
-            )
-            if note:
-                report.subject_notes[clip.clip_id] = note
+                if move in {"sweep_left", "sweep_right"}:  # legacy names
+                    # A designed move across a still arrangement. Nothing is
+                    # tracked because nothing is moving, so this costs no call.
+                    paths[clip.clip_id] = build_sweep_path(
+                        source_aspect=source.aspect_ratio,
+                        target_aspect=target_aspect,
+                        duration_seconds=duration,
+                        direction=move,
+                        energy=reframe.camera_energy,
+                    )
+                    report.following_shots += 1
+                    continue
 
-            # Gemini said which subject; the tracker says where it goes. When
-            # a checkpoint is available the trajectory is measured per frame
-            # rather than interpolated between five samples.
-            if checkpoint is not None and boxes and reference is None:
-                seed = next(
-                    (
-                        box
-                        for box in boxes
-                        if box.get("present")
-                        and box.get("centre_x") is not None
-                    ),
-                    None,
-                )
-                if seed is not None:
-                    try:
-                        tracked, states = _track_subject(
-                            source,
-                            clip,
-                            reframe.subject.description,
-                            _seed_box(seed),
-                            checkpoint,
-                            work,
-                        seed_time_seconds=(
-                                times[int(seed.get("frame_index", -1))]
-                                if 0 <= int(seed.get("frame_index", -1)) < len(times)
-                                else None
-                            ),
-                            semantic_anchors=semantic_anchors,
-                            require_identity_validation=bool(
-                                reframe.subject.entity_id
-                            ),
+                if move == "hold" or reframe.subject is None:
+                    # No substitution here. This branch used to notice that a
+                    # subject too wide to sit in the crop could be read across
+                    # instead, and swap the hold for a sweep. It looks like help
+                    # and it is the execution layer deciding: a replan that had
+                    # just chosen hold *because* travelling across the title was
+                    # what cut it came back describing a sweep across the title,
+                    # having been overruled by a layer it cannot see or argue
+                    # with. The fit is recorded above; whether to answer it with
+                    # a different move, a different take or a partial view is a
+                    # planning question, and the shot reviewer now puts it to the
+                    # planner in those terms.
+                    #
+                    # A held shot still has to be aimed. Every other move
+                    # measures where its subject is; this one fell through to
+                    # the executor's fallback, which reads the nine-box name as
+                    # a coordinate -- "mid_right" became x=0.61 and a phone
+                    # spanning 0.475 to 0.825 arrived half out of frame with the
+                    # wall behind it filling the rest. The card already knows
+                    # where the thing is, and that lesson is written down for
+                    # the handoff path, which was fixed and left this one alone.
+                    if reframe.subject is not None:
+                        reference = (
+                            reference_samples.get(reframe.subject.entity_id)
+                            if reframe.subject.entity_id else None
                         )
-                    except Exception as error:  # tracking is an optimisation
-                        report.subject_notes[clip.clip_id] = (
-                            f"tracking unavailable, using sampled positions: "
-                            f"{type(error).__name__}"
-                        )
-                    else:
-                        report.subject_notes[clip.clip_id] = f"tracked {states}"
-                        total = sum(states.values()) or 1
-                        kept = states.get("tracked", 0)
-                        if kept / total < TRACK_QUORUM:
-                            # Most of the shot was not tracked. Falling back to
-                            # the sampled positions is right, but doing it
-                            # quietly is how a nine-frame trajectory becomes a
-                            # single observation and the crop lands wherever
-                            # that one frame happened to be -- on a hand rather
-                            # than the phone it was holding, in one case.
-                            report.degradations.append(
-                                DegradationStep(
-                                    clip_id=clip.clip_id,
-                                    ladder="other",
-                                    ladder_other="tracking_lost_most_frames",
-                                    trigger=(
-                                        "the tracker held the subject in "
-                                        f"{kept} of {total} analysed frames, "
-                                        "so the framing rests on sampled "
-                                        "positions instead"
-                                    ),
-                                    measured={
-                                        "tracked_frames": float(kept),
-                                        "analysed_frames": float(total),
-                                        "kept_fraction": round(kept / total, 3),
-                                    },
-                                )
+                        box = (
+                            find_subject(
+                                card, reframe.subject.description,
+                                entity_id=reframe.subject.entity_id,
                             )
-                        elif tracked:
-                            report.subject_tracks[clip.clip_id] = [{
-                                "seconds": round(one.seconds, 4),
-                                "centre_x": round(one.centre_x, 6),
-                                "centre_y": round(one.centre_y, 6),
-                                "width": round(one.width, 6),
-                                "height": round(one.height, 6),
-                                "subject": reframe.subject.description,
-                                "entity_id": reframe.subject.entity_id,
-                                "semantic_identity_status": (
-                                    "reference_validated"
-                                    if reframe.subject.entity_id
-                                    else "description_grounded"
-                                ),
-                                "source": "sam2.1",
-                            } for one in tracked]
-                            observations = tracked
+                            if card is not None
+                            else None
+                        )
+                        # A card box is one moment. That is the whole answer for
+                        # a locked-off frame and a snapshot for anything else --
+                        # the subject the card saw at 1.2s is somewhere else by
+                        # the end of a take whose camera pans. The card says
+                        # which of those this is, in a field nothing read.
+                        settled = box is not None and not box.moves and not (
+                            card or {}
+                        ).get("camera_motion")
+                        centre = (
+                            (box.centre_x, box.centre_y, box.width, box.height)
+                            if settled and box is not None
+                            else None
+                        )
+                        if reference is not None:
+                            ref_boxes, _, _ = reference
+                            present = [
+                                item for item in ref_boxes
+                                if item.get("present")
+                                and item.get("centre_x") is not None
+                            ]
+                            if present:
+                                count = len(present)
+                                centre = (
+                                    sum(float(item["centre_x"]) for item in present)
+                                    / count,
+                                    sum(float(item["centre_y"]) for item in present)
+                                    / count,
+                                    sum(float(item.get("width") or 0.0) for item in present)
+                                    / count,
+                                    sum(float(item.get("height") or 0.0) for item in present)
+                                    / count,
+                                )
+                        if centre is None and not reframe.subject.entity_id:
+                            # Either the card had no box for what was named, or
+                            # it had one that will not hold still. Measure across
+                            # this shot's own window: for a held frame the mean
+                            # of the trajectory is the placement that keeps the
+                            # subject inside for all of it, rather than framing
+                            # where it started and letting it walk out.
+                            if not _may_ask(client):
+                                continue
+                            frames, _ = _sample_frames(
+                                source,
+                                clip.approx_in_seconds,
+                                clip.approx_out_seconds,
+                                work,
+                            )
+                            _afford(report)
+                            boxes, usage = _locate_subject(
+                                frames, reframe.subject.description, client=client,
+                                report=report,
+                            )
+                            _charge(report, "subject", usage)
+                            present = [
+                                b for b in boxes
+                                if b.get("present") and b.get("centre_x") is not None
+                            ]
+                            if present:
+                                count = len(present)
+                                centre = (
+                                    sum(float(b["centre_x"]) for b in present) / count,
+                                    sum(float(b["centre_y"]) for b in present) / count,
+                                    sum(float(b.get("width") or 0.0) for b in present) / count,
+                                    sum(float(b.get("height") or 0.0) for b in present) / count,
+                                )
+                        if centre is not None:
+                            cx, cy, bw, bh = centre
+                            paths[clip.clip_id] = build_crop_path(
+                                [
+                                    Observation(
+                                        seconds=0.0,
+                                        centre_x=cx,
+                                        centre_y=cy,
+                                        width=bw,
+                                        height=bh,
+                                    )
+                                ],
+                                source_aspect=source.aspect_ratio,
+                                target_aspect=target_aspect,
+                                energy=reframe.camera_energy,
+                                # A shot that said it settles is not a follow
+                                # that was downgraded. One look means "stay on
+                                # this", which for something that walks is a
+                                # follow and for something standing still is a
+                                # held frame -- both are the plan being carried
+                                # out, and only one of them used to say so.
+                                planned_to_move=reframe.planned_to_move,
+                                framing=reframe.framing,
+                                clip_id=clip.clip_id,
+                                min_visible=reframe.subject.min_visible,
+                                degradations=report.degradations,
+                            )
+                            report.subject_notes[clip.clip_id] = (
+                                f"hold on ({cx:.3f}, {cy:.3f})"
+                            )
+                            report.static_shots += 1
+                            continue
+                    report.static_shots += 1
+                    continue
 
-            if wants_tilt:
-                path = build_tilt_path(
-                    observations,
-                    source_aspect=source.aspect_ratio,
-                    target_aspect=target_aspect,
-                    energy=reframe.camera_energy,
-                    clip_id=clip.clip_id,
-                    degradations=report.degradations,
+                # A follow needs to know where the subject is. The card answered
+                # that when it was written and the answer has not changed since,
+                # so ask it before paying for a fresh grounding on every rhythm
+                # tweak, second aspect and review round.
+                known = (
+                    find_subject(
+                        card, reframe.subject.description,
+                        entity_id=reframe.subject.entity_id,
+                    )
+                    if card is not None
+                    else None
                 )
-            else:
-                path = build_crop_path(
-                    observations,
-                    source_aspect=source.aspect_ratio,
-                    target_aspect=target_aspect,
-                    energy=reframe.camera_energy,
-                    framing=reframe.framing,
-                    clip_id=clip.clip_id,
-                    min_visible=reframe.subject.min_visible,
-                    degradations=report.degradations,
+                reference = (
+                    reference_samples.get(reframe.subject.entity_id)
+                    if reframe.subject.entity_id else None
                 )
-            paths[clip.clip_id] = path
-            if path.is_static:
-                report.static_shots += 1
-            else:
-                report.following_shots += 1
+                semantic_anchors = reference[2] if reference is not None else ()
+                if reference is not None:
+                    boxes, times, _ = reference
+                    frames = []
+                    report.subject_notes[clip.clip_id] = (
+                        f"reference identity: {reframe.subject.entity_id}"
+                    )
+                elif reframe.subject.entity_id:
+                    boxes, times, frames = [], [], []
+                elif known is not None and move != "follow_subject":
+                    boxes = [
+                        {
+                            "frame_index": 0,
+                            "present": True,
+                            "centre_x": known.centre_x,
+                            "centre_y": known.centre_y,
+                            "width": known.width,
+                            "height": known.height,
+                        }
+                    ]
+                    times = [clip.approx_in_seconds]
+                    frames = []
+                    report.subject_notes[clip.clip_id] = f"card: {known.label}"
+                else:
+                    if not _may_ask(client):
+                        continue
+                    # A card box is one observed place, not a trajectory.  It is
+                    # enough to aim a hold and categorically insufficient for an
+                    # explicit follow: without SAM, one observation made every
+                    # follow static while the report claimed the chosen intent.
+                    frames, times = _sample_frames(
+                        source, clip.approx_in_seconds, clip.approx_out_seconds, work
+                    )
+                    _afford(report)
+                    boxes, usage = _locate_subject(
+                        frames, reframe.subject.description, client=client,
+                        report=report,
+                    )
+                    _charge(report, "subject", usage)
+
+                wants_tilt = move == "tilt"
+                observations = []
+                for box in boxes:
+                    if not box.get("present"):
+                        continue
+                    index = int(box.get("frame_index", -1))
+                    if not 0 <= index < len(times):
+                        continue
+                    try:
+                        observations.append(
+                            Observation(
+                                seconds=times[index] - clip.approx_in_seconds,
+                                centre_x=float(box["centre_x"]),
+                                centre_y=float(box["centre_y"]),
+                                width=float(box["width"]),
+                                height=float(box["height"]),
+                            )
+                        )
+                    except (OutOfFrame, KeyError, TypeError, ValueError) as error:
+                        # One unusable observation is not a reason to abandon the
+                        # shot; the remaining samples still describe the motion.
+                        report.subject_notes[clip.clip_id] = str(error)[:160]
+
+                if not observations:
+                    report.degradations.append(
+                        DegradationStep(
+                            clip_id=clip.clip_id,
+                            ladder="center_crop",
+                            trigger=(
+                                "the subject was not located in any sampled "
+                                "frame, so the shot is framed centrally"
+                            ),
+                            measured={"samples": float(len(times))},
+                        )
+                    )
+                    continue
+
+                note = next(
+                    (
+                        str(box["disambiguation"])
+                        for box in boxes
+                        if box.get("disambiguation")
+                    ),
+                    "",
+                )
+                if note:
+                    report.subject_notes[clip.clip_id] = note
+
+                # Gemini said which subject; the tracker says where it goes. When
+                # a checkpoint is available the trajectory is measured per frame
+                # rather than interpolated between five samples.
+                if checkpoint is not None and boxes and reference is None:
+                    seed = next(
+                        (
+                            box
+                            for box in boxes
+                            if box.get("present")
+                            and box.get("centre_x") is not None
+                        ),
+                        None,
+                    )
+                    if seed is not None:
+                        try:
+                            tracked, states = _track_subject(
+                                source,
+                                clip,
+                                reframe.subject.description,
+                                _seed_box(seed),
+                                checkpoint,
+                                work,
+                            seed_time_seconds=(
+                                    times[int(seed.get("frame_index", -1))]
+                                    if 0 <= int(seed.get("frame_index", -1)) < len(times)
+                                    else None
+                                ),
+                                semantic_anchors=semantic_anchors,
+                                require_identity_validation=bool(
+                                    reframe.subject.entity_id
+                                ),
+                            )
+                        except Exception as error:  # tracking is an optimisation
+                            report.subject_notes[clip.clip_id] = (
+                                f"tracking unavailable, using sampled positions: "
+                                f"{type(error).__name__}"
+                            )
+                        else:
+                            report.subject_notes[clip.clip_id] = f"tracked {states}"
+                            total = sum(states.values()) or 1
+                            kept = states.get("tracked", 0)
+                            if kept / total < TRACK_QUORUM:
+                                # Most of the shot was not tracked. Falling back to
+                                # the sampled positions is right, but doing it
+                                # quietly is how a nine-frame trajectory becomes a
+                                # single observation and the crop lands wherever
+                                # that one frame happened to be -- on a hand rather
+                                # than the phone it was holding, in one case.
+                                report.degradations.append(
+                                    DegradationStep(
+                                        clip_id=clip.clip_id,
+                                        ladder="other",
+                                        ladder_other="tracking_lost_most_frames",
+                                        trigger=(
+                                            "the tracker held the subject in "
+                                            f"{kept} of {total} analysed frames, "
+                                            "so the framing rests on sampled "
+                                            "positions instead"
+                                        ),
+                                        measured={
+                                            "tracked_frames": float(kept),
+                                            "analysed_frames": float(total),
+                                            "kept_fraction": round(kept / total, 3),
+                                        },
+                                    )
+                                )
+                            elif tracked:
+                                report.subject_tracks[clip.clip_id] = [{
+                                    "seconds": round(one.seconds, 4),
+                                    "centre_x": round(one.centre_x, 6),
+                                    "centre_y": round(one.centre_y, 6),
+                                    "width": round(one.width, 6),
+                                    "height": round(one.height, 6),
+                                    "subject": reframe.subject.description,
+                                    "entity_id": reframe.subject.entity_id,
+                                    "semantic_identity_status": (
+                                        "reference_validated"
+                                        if reframe.subject.entity_id
+                                        else "description_grounded"
+                                    ),
+                                    "source": "sam2.1",
+                                } for one in tracked]
+                                observations = tracked
+
+                if wants_tilt:
+                    path = build_tilt_path(
+                        observations,
+                        source_aspect=source.aspect_ratio,
+                        target_aspect=target_aspect,
+                        energy=reframe.camera_energy,
+                        clip_id=clip.clip_id,
+                        degradations=report.degradations,
+                    )
+                else:
+                    path = build_crop_path(
+                        observations,
+                        source_aspect=source.aspect_ratio,
+                        target_aspect=target_aspect,
+                        energy=reframe.camera_energy,
+                        framing=reframe.framing,
+                        clip_id=clip.clip_id,
+                        min_visible=reframe.subject.min_visible,
+                        degradations=report.degradations,
+                    )
+                paths[clip.clip_id] = path
+                if path.is_static:
+                    report.static_shots += 1
+                else:
+                    report.following_shots += 1
+            except ReferenceShotUnusable as unusable:
+                # Find every shot that cannot be delivered, not the
+                # first. Raising here meant one swap per attempt and a
+                # full re-render between them, so three attempts covered
+                # three shots -- and this material had more than three.
+                # The work already done on the others is thrown away
+                # either way; doing it once and reporting all of them
+                # lets the selection repair them in a single pass.
+                unusable_shots.append(unusable)
+                continue
+    if unusable_shots:
+        raise ReferenceShotsUnusable(unusable_shots)
     return paths
 
 

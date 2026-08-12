@@ -35,7 +35,7 @@ from montagewright.grounding import (
     analyse_track, beat_grid_payload, load_beat_grid, read_runtime_beat_grid,
     shots_in,
 )
-from montagewright.pipeline import ReferenceShotUnusable, probe, run
+from montagewright.pipeline import ReferenceShotsUnusable, probe, run
 from montagewright.planning_bridge import (
     material_planning_state,
     publish_planning_state,
@@ -1484,40 +1484,55 @@ def command_render(args: argparse.Namespace) -> int:
         try:
             result, plan, report, resolved = cut(edl, sources, rhythm_context)
             break
-        except ReferenceShotUnusable as unproved:
-            index = next(
-                (
-                    at for at, shot in enumerate(selection["shots"])
-                    if f"k{at:02d}" == unproved.clip_id
-                ),
-                None,
-            )
-            if index is None or attempt == 2:
+        except ReferenceShotsUnusable as unproved:
+            if attempt == 2:
                 raise
-            shot = selection["shots"][index]
-            swapped = _swap_for_alternate(
-                shot, direction, taken={
-                    str(one.get("span_id") or "")
-                    for one in selection["shots"]
-                },
-            )
-            if swapped is not None:
-                selection["shots"][index] = swapped
-                identity_swaps.append(
-                    f"{unproved.clip_id}: {shot.get('span_id')} could not "
-                    f"deliver {unproved.entity_id} ({unproved}); took the "
-                    f"alternate {swapped.get('span_id')}"
+            # Repair them all at once, from the end backwards so that
+            # dropping one does not renumber the shots still to be handled.
+            repaired = 0
+            for fault in sorted(
+                unproved.faults, key=lambda one: one.clip_id, reverse=True
+            ):
+                index = next(
+                    (
+                        at for at, shot in enumerate(selection["shots"])
+                        if f"k{at:02d}" == fault.clip_id
+                    ),
+                    None,
                 )
-            elif args.duration_mode != "exact" and len(selection["shots"]) > 2:
-                selection["shots"].pop(index)
-                identity_swaps.append(
-                    f"{unproved.clip_id}: {shot.get('span_id')} could not "
-                    f"deliver {unproved.entity_id} and its commitment has no "
-                    "alternate left; dropped the shot and delivered shorter"
+                if index is None:
+                    continue
+                shot = selection["shots"][index]
+                swapped = _swap_for_alternate(
+                    shot, direction, taken={
+                        str(one.get("span_id") or "")
+                        for one in selection["shots"]
+                    },
                 )
-            else:
+                if swapped is not None:
+                    selection["shots"][index] = swapped
+                    identity_swaps.append(
+                        f"{fault.clip_id}: {shot.get('span_id')} could not "
+                        f"deliver {fault.entity_id}; took the alternate "
+                        f"{swapped.get('span_id')}"
+                    )
+                elif (
+                    args.duration_mode != "exact"
+                    and len(selection["shots"]) > 2
+                ):
+                    selection["shots"].pop(index)
+                    identity_swaps.append(
+                        f"{fault.clip_id}: {shot.get('span_id')} could not "
+                        f"deliver {fault.entity_id} and its commitment has "
+                        "no alternate left; dropped the shot and delivered "
+                        "shorter"
+                    )
+                else:
+                    continue
+                repaired += 1
+                print(f"  {identity_swaps[-1]}", flush=True)
+            if not repaired:
                 raise
-            print(f"  {identity_swaps[-1]}", flush=True)
             edl, snaps = _edl_from_selection(
                 selection, rushes, cards, transcripts=transcripts
             )

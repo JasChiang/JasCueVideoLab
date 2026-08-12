@@ -312,10 +312,13 @@ def test_a_subject_wider_than_the_delivery_is_recorded_under_every_move() -> Non
     # happen to be called today. This named the two-subject pan branch,
     # which has since been deleted -- the property is "before all of them",
     # not "before these two". Guards that only skip or warn do not count.
+    # Indentation is not the property. The loop body has been wrapped in a
+    # try since this was written -- everything moved four spaces right and
+    # the check silently found nothing to enforce.
     branches = [
         line
         for line in source.splitlines()
-        if line.startswith("            if ")
+        if line.strip().startswith("if ")
         and ("move ==" in line or "move in " in line or "reframe.looks" in line)
     ]
     assert len(branches) >= 3, branches
@@ -6997,3 +7000,35 @@ def test_an_unverified_track_says_so_instead_of_counting_frames():
     assert 0 < states["_best_agreement_pct"] < 35, (
         "record how close it came, or nobody can tell 34% from 3%"
     )
+
+
+def test_every_undeliverable_shot_is_found_in_one_pass():
+    """One at a time meant one repair per attempt and a re-render between.
+
+    Three bounded attempts therefore covered three shots, and material shot
+    at an event with four similar handsets on the tables has more than
+    three. The work spent on the other shots is discarded either way, so
+    finding all of them costs nothing extra and lets the selection repair
+    them together.
+    """
+
+    import inspect
+
+    from montagewright import pipeline
+
+    source = inspect.getsource(pipeline.follow_subjects)
+    assert "except ReferenceShotUnusable" in source, (
+        "a shot that cannot be delivered must not end the pass"
+    )
+    assert "unusable_shots.append" in source and "continue" in source
+    assert "raise ReferenceShotsUnusable(unusable_shots)" in source, (
+        "and the whole list has to reach the layer that owns the selection"
+    )
+
+    faults = [
+        pipeline.ReferenceIdentityUnconfirmed("k03", "device.fold", "k03: no"),
+        pipeline.ReferenceGeometryUnavailable("k05", "device.fold", "k05: no"),
+    ]
+    batched = pipeline.ReferenceShotsUnusable(faults)
+    assert [one.clip_id for one in batched.faults] == ["k03", "k05"]
+    assert "k03: no" in str(batched) and "k05: no" in str(batched)
