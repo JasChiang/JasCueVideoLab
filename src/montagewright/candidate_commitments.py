@@ -192,14 +192,6 @@ def resolve_candidate_commitments(
             )
             continue
         preference = str(raw.get("motion_preference") or "")
-        if preference == "native_first" and span.motion_role not in {
-            "authored", "subject_follow"
-        }:
-            faults.append(
-                f"option {index} requests native motion from {span_id}, "
-                f"whose role is {span.motion_role}"
-            )
-            continue
         from montagewright.coverage import visual_supported_max
 
         supported = visual_supported_max(
@@ -211,6 +203,8 @@ def resolve_candidate_commitments(
                 str(span.motion_role or "")
                 if preference == "native_first" else ""
             ),
+            presentation_intent=str(raw.get("presentation_intent") or ""),
+            target_id=str(raw.get("target_id") or "none"),
         )
         if seconds > supported + 0.001:
             faults.append(
@@ -317,13 +311,9 @@ def validate_selection_commitments(
                 f"shot {index} gives {commitment_id} {seconds:.3f}s but its "
                 f"content needs {option.min_supported_seconds:.3f}s"
             )
-        intent = str(shot.get("camera_intent") or "hold")
-        if option.motion_preference == "native_first" and intent != "use_source_motion":
-            faults.append(
-                f"shot {index} must use the authored source motion for {commitment_id}"
-            )
-        if option.motion_preference == "hold" and intent != "hold":
-            faults.append(f"shot {index} must hold for {commitment_id}")
+        # Motion is an editorial preference, not a content invariant. A
+        # locked source can fulfil `native_first` with a safe virtual move or
+        # hold; true motion requirements need a separate explicit contract.
         looks = list(shot.get("looks") or [])
         presentations = {
             str(look.get("presentation_intent") or "") for look in looks

@@ -184,6 +184,8 @@ def visual_supported_max(
     source_start: float,
     available_seconds: float,
     motion_role: str = "",
+    presentation_intent: str = "",
+    target_id: str = "none",
 ) -> float:
     """Return the locally supportable visual duration for one source window.
 
@@ -198,6 +200,15 @@ def visual_supported_max(
     base = VISUAL_ONLY_LIMITS.get(str(role), 3.0)
     if base is None:
         return available
+    if (
+        str(role) == "end_hold"
+        and str(presentation_intent) in {"complete_hold", "centered_hold"}
+        and str(target_id) not in {"", "none"}
+    ):
+        # A grounded, deliberately complete final identity is content rather
+        # than an arbitrary frozen tail. Geometry and identity are still
+        # proven later; this only permits a conservative three-second hold.
+        base = max(float(base), 3.0)
 
     source_end = float(source_start) + available
     intervals: list[tuple[float, float, str]] = []
@@ -363,6 +374,16 @@ def _visual_claim(item: Any, shot: dict[str, Any], role: str) -> float:
             if str(shot.get("camera_intent") or "") == "use_source_motion"
             else ""
         ),
+        presentation_intent=next((
+            str(look.get("presentation_intent") or "")
+            for look in shot.get("looks") or []
+            if look.get("presentation_intent")
+        ), ""),
+        target_id=next((
+            str(look.get("entity_id") or "none")
+            for look in shot.get("looks") or []
+            if str(look.get("entity_id") or "none") != "none"
+        ), "none"),
     )
 
 

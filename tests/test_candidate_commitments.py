@@ -62,13 +62,37 @@ def test_local_resolver_keeps_the_full_pool_and_marks_unoffered_spans_deferred()
     ({"span_id": "missing"}, "unknown span"),
     ({"min_supported_seconds": "0:05"}, "has 4.000s"),
     ({"target_id": "device.other"}, "unknown target"),
-    ({"span_id": "C1:s01"}, "requests native motion"),
 ])
 def test_local_facts_reject_provider_claims_the_material_cannot_execute(
     change, message
 ):
     with pytest.raises(CommitmentError, match=message):
         _resolved(_direction(**change))
+
+
+def test_motion_preference_can_fallback_when_source_has_no_authored_move():
+    resolved = _resolved(_direction(
+        span_id="C1:s01", min_supported_seconds="0:03",
+    ))
+    assert resolved.options[0].motion_preference == "native_first"
+    faults = validate_selection_commitments([{
+        "commitment_id": "hero", "span_id": "C1:s01",
+        "seconds_needed": 3.0, "camera_intent": "hold",
+        "looks": [{
+            "presentation_intent": "reveal_endpoint",
+            "entity_id": "device.fold",
+        }],
+    }], resolved)
+    assert not any("source motion" in fault for fault in faults)
+
+
+def test_grounded_complete_end_hold_can_support_three_seconds():
+    resolved = _resolved(_direction(
+        span_id="C1:s01", picture_role="end_hold",
+        min_supported_seconds="0:03", motion_preference="hold",
+        presentation_intent="complete_hold",
+    ))
+    assert resolved.options[0].min_supported_seconds == 3.0
 
 
 def test_each_commitment_requires_exactly_one_primary():
@@ -161,7 +185,7 @@ def test_selection_must_execute_duration_motion_presentation_and_target():
     }
     faults = validate_selection_commitments([shot], commitments)
     assert any("content needs 3.500s" in fault for fault in faults)
-    assert any("authored source motion" in fault for fault in faults)
+    assert not any("source motion" in fault for fault in faults)
     assert any("presentation intent reveal_endpoint" in fault for fault in faults)
     assert any("bind target device.fold" in fault for fault in faults)
 
