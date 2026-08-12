@@ -798,6 +798,23 @@ def materialize_frame_at_time(
     )
 
 
+class ExcludedInstance(FrozenStrictModel):
+    """A stable exclusion seen in this frame, reported to be avoided.
+
+    Never a tracking seed and never evidence of the target: it exists so the
+    crop can be composed to leave it out, and so a shot that cannot leave it
+    out can say which pixels were the problem.
+    """
+
+    native_box_yxyx_1000: tuple[int, int, int, int]
+    reason: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_instance(self) -> "ExcludedInstance":
+        native_yxyx_to_canonical_xyxy(self.native_box_yxyx_1000)
+        return self
+
+
 class ExactFrameBBoxDecision(FrozenStrictModel):
     contract_version: Literal["reference-exact-frame-bbox-v1"] = (
         "reference-exact-frame-bbox-v1"
@@ -822,6 +839,15 @@ class ExactFrameBBoxDecision(FrozenStrictModel):
     touches_frame_edges: tuple[FrameEdge, ...] = ()
     identity_evidence: tuple[str, ...] = ()
     exclusion_evidence: tuple[str, ...] = ()
+    # Where the lookalikes are, so the frame can be composed away from them.
+    # Deliberately a separate field from the target's box: the rule that only
+    # a matched target may carry `native_box_yxyx_1000` is what stops a
+    # tracker being seeded on the wrong instance, and it stays. Saying "the
+    # other model is over there" is the opposite request -- a shot with both
+    # devices in it was previously unusable in full, when a 9:16 crop out of
+    # 16:9 keeps barely a third of the width and can often simply leave the
+    # other one outside the frame.
+    excluded_instances: tuple[ExcludedInstance, ...] = ()
     reason: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -1105,6 +1131,7 @@ def _exact_frame_schema_for_candidates(
             "touches_frame_edges",
             "identity_evidence",
             "exclusion_evidence",
+            "excluded_instances",
             "reason",
         ],
         "properties": {
@@ -1166,6 +1193,24 @@ def _exact_frame_schema_for_candidates(
             },
             "identity_evidence": string_array,
             "exclusion_evidence": string_array,
+            "excluded_instances": {
+                "type": "array",
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["native_box_yxyx_1000", "reason"],
+                    "properties": {
+                        "native_box_yxyx_1000": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                        },
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
             "reason": {"type": "string"},
         },
     }
@@ -1565,6 +1610,65 @@ def discover_reference_candidates(
         target_ids=selected,
     )
     return result, Usage.from_interaction(interaction)
+
+
+def remembered_discovery(
+    video_path: Path,
+    spec: ReferenceGroundingSpec,
+    *,
+    client: Any | None,
+    cache: UploadCache | Any | None = None,
+    ledger: Any | None = None,
+    library: Path | None = None,
+    target_ids: Sequence[str] | None = None,
+) -> tuple[CandidateDiscoveryResult, Usage | None] | None:
+    """Discovery for one source, remembered where the cards are remembered.
+
+    Whether a source contains the locked identity is a fact about those
+    pixels and that lock, not about this cut -- the same shape as a clip
+    card, which costs ninety cents once and nothing ever after. Keeping the
+    answer in the run directory instead meant a second cut of the same
+    rushes paid for all of it again, and a run that stopped early paid twice
+    in one afternoon.
+    """
+
+    if client is None:
+        return None
+    video_path = Path(video_path).expanduser().resolve(strict=True)
+    digest = sha256_file(video_path)
+    stored = (
+        Path(library) / "reference-grounding"
+        / f"{digest[:20]}-{spec.definition_sha256()[:16]}.json"
+        if library is not None else None
+    )
+    if stored is not None and stored.exists():
+        try:
+            remembered = CandidateDiscoveryResult.model_validate_json(
+                stored.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            remembered = None
+        else:
+            # The name says which bytes and which lock; verifying it says so
+            # too keeps a truncated or hand-edited file from being believed.
+            if (
+                remembered.video_sha256 == digest
+                and remembered.grounding_spec_sha256 == spec.definition_sha256()
+            ):
+                return remembered, None
+    discovered = discover_reference_candidates(
+        video_path, spec, client=client, cache=cache, ledger=ledger,
+        target_ids=target_ids,
+    )
+    if discovered is None:
+        return None
+    result, usage = discovered
+    if stored is not None:
+        stored.parent.mkdir(parents=True, exist_ok=True)
+        stored.write_text(
+            _canonical_json(result.model_dump(mode="json")), encoding="utf-8"
+        )
+    return result, usage
 
 
 def _validate_discovery_for_spec(

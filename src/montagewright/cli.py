@@ -14,8 +14,9 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from montagewright.reference_grounding import ReferenceGroundingSpec
@@ -34,7 +35,9 @@ from montagewright.grounding import (
     analyse_track, beat_grid_payload, load_beat_grid, read_runtime_beat_grid,
     shots_in,
 )
-from montagewright.pipeline import probe, run
+from montagewright.pipeline import (
+    ReferenceIdentityUnconfirmed, probe, run,
+)
 from montagewright.planning_bridge import (
     material_planning_state,
     publish_planning_state,
@@ -270,6 +273,144 @@ def _client():
     from montagewright.planner import _http_options
 
     return genai.Client(api_key=key, http_options=_http_options(types))
+
+
+def _swap_for_alternate(
+    shot: dict[str, Any], direction: dict[str, Any], *, taken: set[str]
+) -> dict[str, Any] | None:
+    """The other take the direction named for this same commitment.
+
+    Every commitment came back with a primary and an alternate, sixteen
+    options for eight commitments, and until now nothing had ever read the
+    second one: a shot that failed on delivery ended the run while its
+    replacement sat in the artifact, paid for.
+    """
+
+    commitment = str(shot.get("commitment_id") or "")
+    if not commitment:
+        return None
+    here = str(shot.get("span_id") or "")
+    for option in direction.get("candidate_options") or []:
+        if str(option.get("commitment_id") or "") != commitment:
+            continue
+        span_id = str(option.get("span_id") or "")
+        if not span_id or span_id == here or span_id in taken:
+            continue
+        source_id = span_id.split(":")[0]
+        return {
+            **shot,
+            "span_id": span_id,
+            "source_id": source_id,
+            "why": str(option.get("why") or shot.get("why") or ""),
+            # The window belongs to the new span, and the old one's offset
+            # meant nothing here. Everything else -- role, commitment, the
+            # length its content proved -- is about the job, not the take.
+            "start_offset_seconds": 0.0,
+        }
+    return None
+
+
+def _screen_material_identity(
+    material: list[Any],
+    spec: Any,
+    *,
+    client: Any,
+    cache: Any,
+    ledger: Any,
+    library: Path,
+) -> tuple[list[Any], dict[str, str]]:
+    """Keep only material that can still contain the locked identity.
+
+    Runs on the proxy, which is what the planning stages watch anyway and is
+    already uploaded -- measured against the rushes this was written for, a
+    640-wide proxy answers "two camera rings or three" at 0.98 confidence,
+    so the screen does not need the master. The per-shot check still decodes
+    the original at 1440 for the frames it authorises a track from; this only
+    decides what selection is allowed to see.
+
+    Absent means the source goes; present narrows nothing away that the card
+    already offered but drops the spans no sighting overlaps. Uncertain is
+    kept, because a screen that discards on doubt would quietly delete
+    material and report a smaller edit as a smaller pile of rushes.
+    """
+
+    from montagewright.reference_grounding import remembered_discovery
+
+    required = tuple(
+        spec.identity_lock.framing.required_target_ids
+        or [
+            target.target_id
+            for target in spec.identity_lock.identity.targets
+        ]
+    )
+    if not required:
+        return material, {}
+
+    kept: list[Any] = []
+    aside: dict[str, str] = {}
+    print(
+        f"identity screen: {len(material)} sources against "
+        f"{', '.join(required)}",
+        flush=True,
+    )
+    paid = 0
+    for item in material:
+        proxy = getattr(item, "proxy", None)
+        if proxy is None or not Path(proxy).exists():
+            kept.append(item)
+            continue
+        ledger.check()
+        screened = remembered_discovery(
+            proxy, spec,
+            client=client, cache=cache, ledger=ledger,
+            library=library, target_ids=required,
+        )
+        if screened is None:
+            kept.append(item)
+            continue
+        discovery, usage = screened
+        paid += 1 if usage is not None else 0
+        absent = [
+            summary for summary in discovery.target_summaries
+            if summary.target_id in required and summary.verdict == "absent"
+        ]
+        if absent:
+            aside[item.source_id] = (
+                f"reference identity {absent[0].target_id} is not in this "
+                f"source: {absent[0].reason}"
+            )
+            continue
+        # Sightings are in milliseconds from the first decoded frame, which
+        # is the clock the card's segments are on too.
+        seen = [
+            (candidate.start_ms / 1000.0, candidate.end_ms / 1000.0)
+            for candidate in discovery.candidates
+            if candidate.target_id in required
+            and candidate.identity_status != "hard_negative"
+        ]
+        if not seen:
+            kept.append(item)
+            continue
+        surviving = tuple(
+            span for span in item.spans
+            if any(
+                span.starts_seconds < ends and span.ends_seconds > starts
+                for starts, ends in seen
+            )
+        )
+        if not surviving:
+            aside[item.source_id] = (
+                "the locked identity was seen in this source but never "
+                "inside a usable span"
+            )
+            continue
+        kept.append(replace(item, spans=surviving))
+    print(
+        f"  {len(kept)} sources kept, {len(aside)} set aside "
+        f"({paid} newly screened, ${ledger.spent_usd:.4f} so far)",
+        flush=True,
+    )
+    return kept, aside
 
 
 def _travel(source: Path, target_aspect: float) -> tuple[float, float]:
@@ -855,6 +996,28 @@ def command_render(args: argparse.Namespace) -> int:
             )
         )
 
+    # Which sources actually contain the locked identity is a question about
+    # the material, and it belongs here -- beside "is this take usable" --
+    # rather than after a whole film has been planned around them. The
+    # methodology this project started from says it in one line: pick the
+    # right object first, then talk about grounding. Selection reads text
+    # cards and watches 640-wide proxies with the reference images attached,
+    # which is enough to choose a shot and not enough to tell two rear
+    # cameras from three; the run that made this necessary planned eight
+    # shots, laid them on the music, and only then discovered that its
+    # close-up of "the rear camera module" was a different model. Its
+    # alternate was too.
+    if args.reference_grounding_spec is not None:
+        material, identity_aside = _screen_material_identity(
+            material,
+            args.reference_grounding_spec,
+            client=client,
+            cache=cache,
+            ledger=ledger,
+            library=library,
+        )
+        set_aside.update(identity_aside)
+
     if set_aside:
         print(
             f"set aside: {len(set_aside)} clips the cards called unusable",
@@ -1298,7 +1461,67 @@ def command_render(args: argparse.Namespace) -> int:
             upload_cache=cache,
         )
 
-    result, plan, report, resolved = cut(edl, sources, rhythm_context)
+    # A shot whose identity cannot be proved is one shot, not the film. The
+    # direction paid for an alternate against every commitment and nothing
+    # had ever read them; failing that, the brief for these rushes says in
+    # as many words that a short cut beats a padded one. Bounded, because
+    # each attempt renders again, and swapping forever would be a planner.
+    identity_swaps: list[str] = []
+    for attempt in range(3):
+        try:
+            result, plan, report, resolved = cut(edl, sources, rhythm_context)
+            break
+        except ReferenceIdentityUnconfirmed as unproved:
+            index = next(
+                (
+                    at for at, shot in enumerate(selection["shots"])
+                    if f"k{at:02d}" == unproved.clip_id
+                ),
+                None,
+            )
+            if index is None or attempt == 2:
+                raise
+            shot = selection["shots"][index]
+            swapped = _swap_for_alternate(
+                shot, direction, taken={
+                    str(one.get("span_id") or "")
+                    for one in selection["shots"]
+                },
+            )
+            if swapped is not None:
+                selection["shots"][index] = swapped
+                identity_swaps.append(
+                    f"{unproved.clip_id}: {shot.get('span_id')} could not "
+                    f"prove {unproved.entity_id}; took the alternate "
+                    f"{swapped.get('span_id')}"
+                )
+            elif args.duration_mode != "exact" and len(selection["shots"]) > 2:
+                selection["shots"].pop(index)
+                identity_swaps.append(
+                    f"{unproved.clip_id}: {shot.get('span_id')} could not "
+                    f"prove {unproved.entity_id} and its commitment has no "
+                    "alternate left; dropped the shot and delivered shorter"
+                )
+            else:
+                raise
+            print(f"  {identity_swaps[-1]}", flush=True)
+            edl, snaps = _edl_from_selection(
+                selection, rushes, cards, transcripts=transcripts
+            )
+            sources = {
+                one["source_id"]: probe(one["source_id"], found[one["source_id"]])
+                for one in selection["shots"]
+                if one["source_id"] in found
+            }
+            sources.update({
+                source_id: probe(source_id, found[source_id])
+                for source_id in {audio.source_id for audio in edl.audio_clips}
+                if source_id in found and source_id not in sources
+            })
+            rhythm_context = _rhythm_context(selection, cards)
+    else:  # pragma: no cover - the bounded loop either cuts or raises.
+        raise RuntimeError("identity recovery did not converge")
+    report.plan_disagreements.extend(identity_swaps)
     if grid is not None:
         from montagewright.measure.storage import write_json
 

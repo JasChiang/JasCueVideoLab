@@ -940,3 +940,135 @@ def test_identity_draft_without_a_client_spends_nothing(tmp_path):
     picture = tmp_path / "front.jpg"
     picture.write_bytes(b"front bytes")
     assert draft_identity_from_references([picture], client=None) is None
+
+
+def test_identity_screening_is_remembered_where_the_cards_are(tmp_path):
+    """Whether a source contains the locked identity is a material fact.
+
+    The same shape as a clip card: true of those pixels and that lock, not
+    of this cut. Keeping the answer in the run directory made a second cut
+    of the same rushes pay for all of it again -- and on the afternoon this
+    was written, a run that stopped early paid for it twice before dinner.
+    """
+
+    from montagewright.planner import Usage
+    from montagewright.reference_grounding import (
+        CandidateDiscoveryResult, remembered_discovery, sha256_file,
+    )
+
+    spec = _write_spec(tmp_path)
+    video = tmp_path / "take.mp4"
+    video.write_bytes(b"video bytes")
+    library = tmp_path / "library"
+    digest = sha256_file(video)
+    answer = CandidateDiscoveryResult.model_validate({
+        "contract_version": "reference-candidate-discovery-v1",
+        "query_id": spec.identity_lock.query_id,
+        "query_lock_sha256": spec.identity_lock.definition_sha256(),
+        "grounding_spec_sha256": spec.definition_sha256(),
+        "video_asset_id": f"sha256:{digest}",
+        "video_sha256": digest,
+        "duration_ms": 15015,
+        "candidates": [],
+        "target_summaries": [{
+            "target_id": "device.fold",
+            "verdict": "absent",
+            "reason": "a three-camera device, not this one",
+        }],
+        "warnings": [],
+    })
+    asked = {"times": 0}
+
+    def instead(*_args, **_kwargs):
+        asked["times"] += 1
+        return answer, Usage(input_tokens=10, output_tokens=1, thought_tokens=0)
+
+    # A different lock over the same bytes is a different question, so it is
+    # asked again and remembered under its own name.
+    second = tmp_path / "second"
+    second.mkdir()
+    other = _write_spec(second, include_negative=True)
+    original = grounding.discover_reference_candidates
+    grounding.discover_reference_candidates = instead
+    try:
+        first = remembered_discovery(
+            video, spec, client=object(), library=library,
+        )
+        again = remembered_discovery(
+            video, spec, client=object(), library=library,
+        )
+        after_the_same_question_twice = asked["times"]
+        remembered_discovery(video, other, client=object(), library=library)
+    finally:
+        grounding.discover_reference_candidates = original
+
+    assert first is not None and again is not None
+    assert after_the_same_question_twice == 1, "the second run asks nobody"
+    assert again[1] is None, "a remembered answer has no usage to charge"
+    assert again[0].target_summaries[0].verdict == "absent"
+    assert len(list((library / "reference-grounding").glob("*.json"))) == 2, (
+        "one file per (bytes, lock) pair"
+    )
+
+    assert asked["times"] == 2
+    assert len(list((library / "reference-grounding").glob("*.json"))) == 2
+
+
+def test_a_lookalike_reports_where_it_is_without_becoming_a_seed(tmp_path):
+    """Two devices in one frame is a composition problem, not a dead shot.
+
+    A 9:16 crop out of 16:9 keeps about a third of the width, so the other
+    model can often simply be left outside the frame -- but nothing could
+    even ask while its position was never reported. The rule that only a
+    matched target carries `native_box_yxyx_1000` is what stops a tracker
+    seeding on the wrong instance, so avoidance gets its own field instead
+    of relaxing that.
+    """
+
+    from montagewright.reference_grounding import (
+        ExactFrameBBoxDecision, ExcludedInstance,
+    )
+
+    spec = _write_spec(tmp_path)
+    decision = ExactFrameBBoxDecision(
+        query_id=spec.identity_lock.query_id,
+        query_lock_sha256=spec.identity_lock.definition_sha256(),
+        grounding_spec_sha256=spec.definition_sha256(),
+        video_asset_id=f"sha256:{'a' * 64}",
+        video_sha256="a" * 64,
+        target_id="device.fold",
+        candidate_id="cand_001",
+        frame_pts=18018,
+        frame_time_ms=600,
+        frame_sha256="b" * 64,
+        width=1440,
+        height=810,
+        verdict="matched_target",
+        confidence=0.95,
+        native_box_yxyx_1000=(100, 200, 700, 800),
+        visibility_state="full",
+        occlusion_state="none",
+        identity_evidence=("same hinge and corner mark",),
+        excluded_instances=(
+            ExcludedInstance(
+                native_box_yxyx_1000=(120, 780, 640, 980),
+                reason="the three-camera model, right of frame",
+            ),
+        ),
+        reason="judged independently on this exact frame",
+    )
+
+    assert decision.tracking_box_xyxy_1000 == (200, 100, 800, 700), (
+        "the seed still comes from the target's own box"
+    )
+    assert len(decision.excluded_instances) == 1
+    assert decision.excluded_instances[0].reason.startswith("the three-camera")
+
+    with pytest.raises(Exception):
+        ExactFrameBBoxDecision.model_validate(dict(
+            decision.model_dump(mode="json"),
+            excluded_instances=[{
+                "native_box_yxyx_1000": [900, 100, 100, 200],
+                "reason": "bottom edge above top edge",
+            }],
+        ))

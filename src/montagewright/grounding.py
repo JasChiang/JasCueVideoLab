@@ -500,6 +500,30 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
             list(getattr(edl, "music_spans", []) or []),
         )
 
+    # Reaching a beat is a reason to hold a shot longer; running out of
+    # things to look at is a reason not to. The rhythm pass already refuses
+    # to stretch a shot past the content its source proves, and then this
+    # function rounded the same shot up to the next cue and undid it -- by
+    # 0.34s on one shot and 0.07s on another, which the release gate
+    # correctly refused, and a thirty-second film with eight good shots in
+    # it was never rendered because two frames of it were unsupported.
+    #
+    # Which is the ordinary case, not an edge: with no speech every shot's
+    # whole length is visual-only, so every shot sits at its ceiling and the
+    # next cue is always past it. What an editor does here is cut on the
+    # earlier beat -- short reads as intent, held-too-long reads as a
+    # mistake -- and leaves the cut off the grid when there is no earlier
+    # beat to take.
+    has_independent_audio = bool(getattr(edl, "audio_clips", ()) or ())
+
+    def content_ceiling(clip: Clip) -> float | None:
+        claim = getattr(clip, "coverage_claim_seconds", None)
+        if claim is None or has_independent_audio:
+            return None
+        if str(getattr(clip, "audio_role", "discard")) != "discard":
+            return None
+        return float(claim)
+
     cursor = 0.0
 
     for clip in edl.clips:
@@ -603,6 +627,50 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 # out. Keeping the requested length is honest; silence at the
                 # tail is the mix's problem, not the edit's.
                 note = "past the end of the analysed music; kept as planned"
+
+        # Content evidence is a bound of the same kind as source length, and
+        # belongs beside it: one says the take has no more picture, the other
+        # says the picture has no more to show. Take the last cue that fits,
+        # so the cut stays on the grid; if the only cues that fit would cut
+        # the move short, keep the planned length and lose the beat. Rhythm
+        # is the thing that gives way here, not the content.
+        ceiling = content_ceiling(clip)
+        if ceiling is not None and end - cursor > ceiling + 1e-6:
+            room = cursor + ceiling
+            earlier = None
+            if grid is not None:
+                # The beat before, not any beat before. Halving a shot to
+                # reach a distant cue is not "cutting a little early", it is
+                # a different edit -- and one the rhythm pass never saw.
+                soonest = max(
+                    cursor + max(floor, 1e-3), room - grid.seconds_per_beat
+                )
+                earlier = max(
+                    (
+                        cue for cue in grid.cuttable()
+                        if soonest - 1e-6 <= cue.time_seconds <= room + 1e-6
+                    ),
+                    key=lambda cue: cue.time_seconds,
+                    default=None,
+                )
+            over = end - room
+            if earlier is not None:
+                end = earlier.time_seconds
+                landed = earlier.cue_id
+                landed_kind = earlier.kind
+                cut_short = (
+                    f"held {over:.2f}s past what this shot can show; took "
+                    f"the earlier cue {earlier.cue_id} instead"
+                )
+            else:
+                end = room
+                landed = None
+                landed_kind = None
+                cut_short = (
+                    f"no cue inside the {ceiling:.2f}s this shot can show; "
+                    "kept the supported length and left this cut off the grid"
+                )
+            note = f"{note}; {cut_short}" if note else cut_short
 
         # Feasibility belongs in the timeline calculation. Clamping only
         # after every cut had been laid out made all later cuts move earlier

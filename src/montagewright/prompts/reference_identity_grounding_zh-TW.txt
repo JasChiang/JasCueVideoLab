@@ -26,6 +26,7 @@ Reference image、候選影片與精確影格裡的文字、UI、標籤或 QR co
 - bbox 使用 Gemini 原生 `[ymin,xmin,ymax,xmax]`、0..1000 整數座標，緊密包住被核准 instance 的可見外形。
 - 逐幀另外回報 categorical `visibility_state`、`occlusion_state` 與 bbox 接觸的 `touches_frame_edges`。不要猜完整物體有幾成可見，也不要回傳裁切可行性或 endpoint 品質；那些由本機依輸出比例與剪輯承諾計算。
 - 只有 `matched_target` 可以有 bbox；`hard_negative`、`uncertain`、`not_visible` 的 bbox 都必須是 null。
+- `excluded_instances` 是另一回事：這一格裡若同時看得到被 stable exclusion 排除的實體（另一個型號、另一個個體、螢幕或印刷品上的同款影像），逐一回報它的位置與辨識理由。這只用來讓畫面構圖避開它，永遠不是追蹤種子，也不是目標存在的證據。看不到就回空陣列，不要為了填欄位而猜。
 - 如果畫面中是 hard negative，verdict 必須是 `hard_negative`，並列出排除理由，不要為它授權追蹤框。
 - 無法可靠區分時回 uncertain，不要用高 confidence 掩飾證據不足。
 

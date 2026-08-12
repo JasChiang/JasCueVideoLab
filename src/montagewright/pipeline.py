@@ -136,6 +136,23 @@ def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
     return edl.model_copy(update={"clips": aligned}), notes
 
 
+class ReferenceIdentityUnconfirmed(RuntimeError):
+    """This shot cannot prove its subject; another shot might.
+
+    Refusing to track a lookalike is right and is not negotiable. Ending the
+    run over it is a separate decision, and it was being made by accident:
+    the message said "reselect the shot", which is advice to a person, and
+    no caller could act on a bare RuntimeError anyway. Naming the shot and
+    the identity lets the layer that owns the selection swap in the
+    alternate its own planning already paid for.
+    """
+
+    def __init__(self, clip_id: str, entity_id: str, message: str) -> None:
+        super().__init__(message)
+        self.clip_id = clip_id
+        self.entity_id = entity_id
+
+
 @dataclass
 class Report:
     """What the run did, in the terms someone would ask about it."""
@@ -1116,6 +1133,8 @@ def _reference_subject_samples(
             "disambiguation": disambiguation,
             "geometry_source": "sam2.1",
         })
+    from montagewright.measure.geometry import native_yxyx_to_canonical_xyxy
+
     report.reference_grounding[clip.clip_id] = {
         "target_id": target_id,
         "status": "sam_geometry_validated",
@@ -1129,6 +1148,26 @@ def _reference_subject_samples(
         "sam_seed_height": seed.lineage.height,
         "tracked_frames": kept,
         "analysed_frames": total,
+        # Where the lookalikes were, in the frames that proved the target.
+        # A shot with both devices in it is not automatically unusable -- a
+        # 9:16 crop out of 16:9 keeps about a third of the width and can
+        # often leave the other one outside the frame -- but nothing could
+        # even ask that question while their position was never reported.
+        "excluded_instances": [
+            {
+                "at_seconds": round(
+                    item.lineage.frame_time_ms / 1000.0, 3
+                ),
+                "box_xyxy_1000": list(
+                    native_yxyx_to_canonical_xyxy(
+                        instance.native_box_yxyx_1000
+                    )
+                ),
+                "reason": instance.reason,
+            }
+            for item in matched
+            for instance in item.decision.excluded_instances
+        ],
     }
     return boxes, times, tuple(anchors)
 
@@ -1226,11 +1265,12 @@ def follow_subjects(
                                 measured={"confirmed_anchors": 0.0},
                             )
                         )
-                        raise RuntimeError(
+                        raise ReferenceIdentityUnconfirmed(
+                            clip.clip_id, entity_id,
                             f"{clip.clip_id}: locked reference identity "
                             f"{entity_id} was selected but could not be "
                             "confirmed on two exact source frames; reselect "
-                            "the shot instead of substituting a lookalike"
+                            "the shot instead of substituting a lookalike",
                         )
             card = (
                 load_card(cards[clip.source_id])

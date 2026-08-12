@@ -6516,6 +6516,7 @@ def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatc
                 height=810,
             ),
             decision=SimpleNamespace(
+                excluded_instances=(),
                 tracking_box_xyxy_1000=(100, 200, 500, 800),
                 identity_evidence=("same hinge",),
                 confidence=(0.99 if at == 2_000 else 0.9),
@@ -6694,3 +6695,64 @@ def test_exact_frame_lineage_reaches_single_target_sam_seed_api(
     assert captured["seed_source_width"] == lineage.width
     assert captured["seed_source_height"] == lineage.height
     assert captured["seed_source"] == "reference_exact_frame_grounding"
+
+
+def test_the_beat_may_not_hold_a_shot_past_what_it_can_show():
+    """Two frames of unsupported picture threw away a whole film.
+
+    Selection asked for 3.00s and 5.00s -- exactly the visual-only ceilings
+    those roles prove -- the rhythm pass honoured them, and then grounding
+    rounded both up to the next cue: 3.34s and 5.07s. The release gate
+    refused the timeline, correctly, and eight good shots were never
+    rendered. With no speech every shot's whole length is visual-only, so
+    every shot sits at its ceiling and the next cue is always past it: the
+    ordinary case for a music-only cut, not an edge.
+
+    What an editor does is take the beat before. Short reads as intent;
+    held-too-long reads as a mistake. The beat before, though -- reaching
+    back for a distant cue would halve the shot, which is a different edit
+    and one the rhythm pass never saw.
+    """
+
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.schema import EDL, Clip, MusicSync
+
+    def film(cues, claim, wanted, audio_role="discard"):
+        grid = BeatGrid(
+            bpm=120.0, meter=4, duration_seconds=60.0,
+            cues=tuple(
+                Cue(cue_id=name, time_seconds=at, kind="beat")
+                for name, at in cues
+            ),
+        )
+        return ground_timeline(EDL(project_id="p", clips=[Clip(
+            clip_id="k00", source_id="C1",
+            approx_in_seconds=0.0, approx_out_seconds=wanted,
+            audio_role=audio_role,
+            coverage_claim_seconds=claim,
+            music_sync=MusicSync(cut_on_beat=True),
+        )]), grid).clips[0]
+
+    # The nearest cue to the 3.00s this shot proves sits at 3.34 -- the exact
+    # shape of the failure. The beat at 2.60 is inside the evidence and
+    # within a beat of it, so that is where the cut goes.
+    over = [("b0", 0.0), ("b1", 2.60), ("b2", 3.34)]
+    held = film(over, claim=3.0, wanted=3.0)
+    assert held.duration_seconds <= 3.0 + 1e-6, "never past the evidence"
+    assert abs(held.duration_seconds - 2.60) < 1e-6, "the beat before"
+    assert held.landed_on == "b1", "still on the grid, and says which cue"
+    assert "past what this shot can show" in (held.note or "")
+
+    # The only earlier cue is a second and a half back. Taking it would be a
+    # different edit, so the supported length is kept and this one cut is
+    # simply not on the music.
+    distant = [("b0", 0.0), ("b1", 1.50), ("b2", 3.34)]
+    off = film(distant, claim=3.0, wanted=3.0)
+    assert abs(off.duration_seconds - 3.0) < 1e-6
+    assert off.landed_on is None
+    assert "off the grid" in (off.note or "")
+
+    # A shot carrying its own audio is not bounded by a visual-only ceiling:
+    # how long it runs is a question about the sound, answered elsewhere.
+    speaking = film(over, claim=3.0, wanted=3.0, audio_role="narrative")
+    assert abs(speaking.duration_seconds - 3.34) < 1e-6, "unchanged behaviour"
