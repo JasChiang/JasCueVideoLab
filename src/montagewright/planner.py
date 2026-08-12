@@ -1323,11 +1323,31 @@ def _describe_material(material: list[MaterialItem]) -> str:
         # this line describes the take; this is the part that is choosable,
         # and the stretches that failed are absent rather than warned about.
         if item.spans:
+            # Which subjects are visible in which segment, rather than a list
+            # of everything the clip contains anywhere in its length. A plan
+            # named "the white foldable on the left", sighted at 0:06, from a
+            # window ending at 0:04 -- and the local check could only refuse
+            # it afterwards, twice, before the run ended. A subject the
+            # chosen seconds cannot show is not a thing to be talked out of
+            # naming; it is a thing that should never have been on the menu.
+            inside: dict[str, list[str]] = {}
+            for label, at in item.sightings:
+                for span in item.spans:
+                    if span.starts_seconds <= at <= span.ends_seconds:
+                        inside.setdefault(span.span_id, []).append(
+                            f"{label}（{at:.1f}s）"
+                        )
             head += "\n    可選片段：" + "；".join(
                 f"{span.span_id}（{span.starts_seconds:.1f}–"
                 f"{span.ends_seconds:.1f}s，{span.seconds:.1f} 秒"
                 f"，原素材運動={span.motion_role}"
-                + (f"，{span.why}" if span.why else "") + "）"
+                + (f"，{span.why}" if span.why else "")
+                + (
+                    "，此段看得到：" + "、".join(inside[span.span_id])
+                    if span.span_id in inside
+                    else "，此段沒有測到可命名的主體"
+                )
+                + "）"
                 for span in item.spans
             )
         if item.action:

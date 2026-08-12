@@ -6756,3 +6756,38 @@ def test_the_beat_may_not_hold_a_shot_past_what_it_can_show():
     # how long it runs is a question about the sound, answered elsewhere.
     speaking = film(over, claim=3.0, wanted=3.0, audio_role="narrative")
     assert abs(speaking.duration_seconds - 3.34) < 1e-6, "unchanged behaviour"
+
+
+def test_a_segment_offers_only_the_subjects_it_can_show():
+    """A plan named a subject sighted two seconds after its window ended.
+
+    The listing described subjects as properties of the clip, so everything
+    the take contained anywhere in its length looked available from any
+    segment of it. The local check could only refuse the plan afterwards --
+    twice, and then the run ended. A subject the chosen seconds cannot show
+    should never have been on the menu.
+    """
+
+    from montagewright.planner import MaterialItem, _describe_material
+    from montagewright.spans import Span
+
+    described = _describe_material([MaterialItem(
+        source_id="C1",
+        duration_seconds=10.0,
+        summary="a table of devices",
+        proxy=None,
+        spans=(
+            Span("C1:s00", "C1", 0.0, 4.0, "locked", "still on the right"),
+            Span("C1:s01", "C1", 4.0, 10.0, "authored", "pans left"),
+        ),
+        sightings=(("左側的白色折疊手機", 6.0), ("右側的紫色折疊手機", 1.0)),
+        subjects=("左側的白色折疊手機", "右側的紫色折疊手機"),
+    )])
+
+    first, second = described.split("；C1:s01")
+    assert "右側的紫色折疊手機（1.0s）" in first, "sighted inside the window"
+    assert "左側的白色折疊手機" not in first, (
+        "a subject seen at 6.0s is not offered from a window ending at 4.0s"
+    )
+    assert "左側的白色折疊手機（6.0s）" in second
+    assert "此段沒有測到可命名的主體" not in described
