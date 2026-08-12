@@ -360,11 +360,26 @@ def _screen_material_identity(
             kept.append(item)
             continue
         ledger.check()
-        screened = remembered_discovery(
-            proxy, spec,
-            client=client, cache=cache, ledger=ledger,
-            library=library, target_ids=required,
-        )
+        try:
+            screened = remembered_discovery(
+                proxy, spec,
+                client=client, cache=cache, ledger=ledger,
+                library=library, target_ids=required,
+            )
+        except BudgetSpent:
+            raise
+        except Exception as error:  # noqa: BLE001 -- reported, not swallowed
+            # One source nobody could answer for is not a reason to abandon
+            # the screen, and it is certainly not a reason to lose the film:
+            # keeping it means selection may still offer it and the per-shot
+            # check still has to prove it before anything is tracked.
+            print(
+                f"  {item.source_id} — not screened: "
+                f"{type(error).__name__}: {error}"[:160],
+                flush=True,
+            )
+            kept.append(item)
+            continue
         if screened is None:
             kept.append(item)
             continue

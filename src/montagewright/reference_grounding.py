@@ -578,12 +578,25 @@ class CandidateInterval(FrozenStrictModel):
             raise ValueError("candidate interval must be non-empty")
         if not self.start_ms <= self.recommended_seed_ms < self.end_ms:
             raise ValueError("recommended seed must lie inside its candidate interval")
-        for name, value in (
-            ("frame_entry_ms", self.frame_entry_ms),
-            ("frame_exit_ms", self.frame_exit_ms),
+        if (
+            self.frame_entry_ms is not None
+            and not self.start_ms <= self.frame_entry_ms < self.end_ms
         ):
-            if value is not None and not self.start_ms <= value < self.end_ms:
-                raise ValueError(f"{name} must lie inside its candidate interval")
+            raise ValueError(
+                "frame_entry_ms must lie inside its candidate interval"
+            )
+        # Leaving is a boundary, not a sample. A subject still on screen when
+        # the interval ends exits at exactly `end_ms`, and the half-open rule
+        # borrowed from `recommended_seed_ms` -- which has to name a frame
+        # somebody can decode -- rejected that entirely correct answer and
+        # took the whole run down with it on the fourth source of seventy-four.
+        if (
+            self.frame_exit_ms is not None
+            and not self.start_ms < self.frame_exit_ms <= self.end_ms
+        ):
+            raise ValueError(
+                "frame_exit_ms must lie inside its candidate interval"
+            )
         if (
             self.frame_entry_ms is not None
             and self.frame_exit_ms is not None

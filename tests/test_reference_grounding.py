@@ -1072,3 +1072,46 @@ def test_a_lookalike_reports_where_it_is_without_becoming_a_seed(tmp_path):
                 "reason": "bottom edge above top edge",
             }],
         ))
+
+
+def test_a_subject_may_leave_exactly_when_its_interval_ends(tmp_path):
+    """Leaving is a boundary, not a sample.
+
+    `recommended_seed_ms` is half-open because it has to name a frame
+    somebody can decode. `frame_exit_ms` answers a different question: a
+    subject still on screen when the interval ends exits at exactly
+    `end_ms`. Borrowing the seed's rule rejected that answer and took a
+    whole seventy-four-source screen down on the fourth one.
+    """
+
+    from pydantic import ValidationError
+
+    from montagewright.reference_grounding import CandidateInterval
+
+    def interval(**changes):
+        return CandidateInterval.model_validate({
+            "candidate_id": "cand_001",
+            "target_id": "device.fold",
+            "start_ms": 0,
+            "end_ms": 15015,
+            "recommended_seed_ms": 7000,
+            "identity_status": "matched_target",
+            "confidence": 0.9,
+            "visible_state": "unfolded, held",
+            "visibility_state": "full",
+            "occlusion_state": "none",
+            "identity_evidence": ["the hinge and the corner mark"],
+            **changes,
+        })
+
+    assert interval(frame_exit_ms=15015).frame_exit_ms == 15015
+    assert interval(frame_entry_ms=0).frame_entry_ms == 0
+
+    with pytest.raises(ValidationError):
+        interval(frame_exit_ms=15016)
+    with pytest.raises(ValidationError):
+        interval(frame_exit_ms=0)
+    with pytest.raises(ValidationError):
+        interval(frame_entry_ms=15015)
+    with pytest.raises(ValidationError):
+        interval(recommended_seed_ms=15015)
