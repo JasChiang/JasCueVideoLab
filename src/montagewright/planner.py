@@ -1442,9 +1442,15 @@ def _describe_material(material: list[MaterialItem]) -> str:
                     inside.setdefault(span.span_id, []).append(
                         f"{label}（此段 {_clock(at - span.starts_seconds)} 處"
                         + (
-                            "，start_offset_seconds 要落在 "
+                            # The whole shot, not only where it starts. This
+                            # bounded `start_offset_seconds` alone, so a
+                            # window opened inside the range and ran out the
+                            # far side of a cut, and the local check -- which
+                            # reads the middle of the shot -- refused it.
+                            "，這顆要整個落在此段 "
                             + _clock(max(0.0, opens - span.starts_seconds))
                             + "–" + _clock(closes - span.starts_seconds)
+                            + " 之間才看得到它"
                             if closes - opens
                             < span.ends_seconds - span.starts_seconds - 0.05
                             else ""
@@ -2647,6 +2653,37 @@ def select_shots(
                     + "\n\n只有上述錯誤鏡頭可改；其他 shots 必須原樣保留。"
                 ),
             }] + _attach_material(scoped_material, cache, client, beaten)
+    if faults:
+        # A look nobody can reach is one look, not the film. Two repairs
+        # have already been spent asking for a different plan; dropping the
+        # unreachable look leaves the shot as a hold on the look that does
+        # work, which is what an editor does with a move that turns out not
+        # to be there. Only looks are given up this way -- a shot with
+        # nothing left to name still ends the pass.
+        salvaged: list[str] = []
+        for note in list(faults):
+            local = note.split(" ", 1)[0]
+            try:
+                index = int(local[1:])
+                shot = (chosen.get("shots") or [])[index]
+            except (IndexError, KeyError, TypeError, ValueError):
+                continue
+            looks = shot.get("looks") or []
+            named = note.split("looks at '", 1)[-1].split("'", 1)[0]
+            keep = [one for one in looks if str(one.get("at")) != named]
+            if not keep or len(keep) == len(looks):
+                continue
+            shot["looks"] = keep
+            shot["camera_intent"] = "hold"
+            shot["frame"] = "settles"
+            salvaged.append(
+                f"{local}: dropped the look at '{named}' -- the local "
+                "measurement could not reach it from this window; the shot "
+                "holds on what it can see"
+            )
+        if salvaged:
+            faults = frame_disagreements(chosen.get("shots") or [], material)
+            chosen.setdefault("plan_disagreements", []).extend(salvaged)
     if faults:
         raise PlannerError(
             "selection remained structurally unrenderable after two repairs: "

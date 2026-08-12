@@ -6890,8 +6890,8 @@ def test_a_panning_take_offers_a_subject_only_while_it_is_on_screen():
         event_id="m0", starts_seconds=0.0, ends_seconds=10.0, state="moving",
         peak_vw_s=0.2, travel_vw=1.0, settles=True,
     ),))
-    assert "start_offset_seconds 要落在" in panning, "say when it still holds"
-    window = panning.split("start_offset_seconds 要落在")[1].split("）")[0]
+    assert "這顆要整個落在此段" in panning, "say when it still holds"
+    window = panning.split("這顆要整個落在此段 ")[1].split(" 之間")[0]
     opens, closes = (
         float(one.split(":")[0]) * 60 + float(one.split(":")[1])
         for one in window.split("–")
@@ -7449,3 +7449,27 @@ def test_the_tracking_floor_counts_observations_not_only_a_fraction():
     assert not passes(3, 12), "a quarter is still not a trajectory"
     assert not passes(2, 4), "two observations are two guesses"
     assert passes(3, 8)
+
+
+def test_an_unreachable_look_is_dropped_rather_than_ending_the_pass():
+    """A look nobody can reach is one look, not the film.
+
+    Two repairs have already been spent asking for a different plan. What
+    an editor does with a move that turns out not to be there is hold on
+    the part that works; what this did was end the run, three times in one
+    evening, each time after paying for the plan twice over.
+    """
+
+    import inspect
+
+    from montagewright.planner import select_shots
+
+    source = inspect.getsource(select_shots)
+    salvage = source.split("if faults:", 1)[1]
+    assert 'shot["camera_intent"] = "hold"' in salvage, "a move becomes a hold"
+    assert "if not keep or len(keep) == len(looks):" in salvage, (
+        "a shot with nothing left to name still ends the pass"
+    )
+    assert salvage.index("plan_disagreements") < salvage.index(
+        "raise PlannerError"
+    ), "and what was given up is reported, not swallowed"
