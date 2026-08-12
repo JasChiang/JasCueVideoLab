@@ -1944,6 +1944,26 @@ async function openRun(id, where, how) {
   if (data.report) {
     for (const t of document.querySelectorAll('.tab')) t.classList.remove('hide');
     render(data.report); showExtras(); showTab('pane-shots');
+  } else {
+    // A cut still being made has no report, and the header only ever learned
+    // its name from one. Opening a running cut therefore said "nothing is
+    // open" over a workspace that plainly had something in it.
+    $('crumb-what').textContent =
+      data.source_path || data.source || runId;
+    $('crumb-meta').textContent =
+      ({ running: '執行中', failed: '失敗', stopped: '已停止',
+         interrupted: '中斷' }[data.state] || data.state)
+      + `　·　${data.lines.length} 行`;
+  }
+  // And it never started the clock. Polling began only when this tab was the
+  // one that pressed start, so a cut opened from its own URL -- a reload, a
+  // link, the back button -- showed one frozen snapshot of a run that was
+  // still working, and went on showing it.
+  clearInterval(timer); clearInterval(ticker);
+  if (data.state === 'running') {
+    seen = data.total_lines ?? data.lines.length;
+    timer = setInterval(poll, 1200);
+    ticker = setInterval(() => { if (allLines.length) paintSteps(allLines); }, 1000);
   }
   window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
 }

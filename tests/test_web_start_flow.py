@@ -197,3 +197,25 @@ def test_opening_a_cut_is_addressable_and_survives_a_reload():
     )
     assert "history.pushState" in page and "popstate" in page
     assert "function runIdInUrl" in page
+
+
+def test_opening_a_running_cut_names_it_and_starts_the_clock():
+    """A cut still being made showed a frozen, anonymous workspace.
+
+    The header only ever learned a cut's name from its report, so a run
+    without one said "nothing is open" over a workspace that plainly had
+    something in it. Worse, polling started only in the tab that pressed
+    start -- so a cut opened from its own URL, by reload, link or back
+    button, showed one snapshot of a working run and kept showing it.
+    """
+
+    page = (
+        Path(__file__).parents[1] / "src" / "montagewright" / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    opening = page.split("async function openRun(")[1].split("\nfunction ")[0]
+    assert "crumb-what" in opening, "name the cut before its report exists"
+    assert "timer = setInterval(poll" in opening, "and start the clock"
+    assert opening.count("clearInterval(timer)") >= 1, (
+        "without leaving the previous cut's timer running"
+    )
