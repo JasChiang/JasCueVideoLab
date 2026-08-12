@@ -6880,3 +6880,29 @@ def test_the_beat_never_cuts_an_authored_move_short():
         "the source move runs to the end it was measured to need"
     )
     assert authored.landed_on is None, "and this cut is simply not on a beat"
+
+
+def test_a_tracker_that_holds_nothing_is_one_shot_not_the_run():
+    """Right instance, no local geometry: still a recoverable shot.
+
+    Refusing to crop a reference-critical target on a model's box from a
+    sampled frame is the substitution the whole reference path exists to
+    refuse, and it stays refused. But a tracker that passed 0 of 12 frames
+    ends one shot, and the layer holding the selection has an alternate for
+    that commitment -- so the failure has to arrive as something it can
+    catch, not as a bare RuntimeError from four frames deep.
+    """
+
+    from montagewright.pipeline import (
+        ReferenceGeometryUnavailable,
+        ReferenceIdentityUnconfirmed,
+        ReferenceShotUnusable,
+    )
+
+    for kind in (ReferenceGeometryUnavailable, ReferenceIdentityUnconfirmed):
+        fault = kind("k03", "device.fold", "passed only 0/12 frames")
+        assert isinstance(fault, ReferenceShotUnusable), (
+            "one catch covers both ways a shot fails its identity"
+        )
+        assert fault.clip_id == "k03" and fault.entity_id == "device.fold"
+        assert "0/12" in str(fault)

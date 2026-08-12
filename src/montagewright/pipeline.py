@@ -136,21 +136,36 @@ def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
     return edl.model_copy(update={"clips": aligned}), notes
 
 
-class ReferenceIdentityUnconfirmed(RuntimeError):
-    """This shot cannot prove its subject; another shot might.
+class ReferenceShotUnusable(RuntimeError):
+    """This shot cannot be delivered against the locked identity.
 
-    Refusing to track a lookalike is right and is not negotiable. Ending the
-    run over it is a separate decision, and it was being made by accident:
-    the message said "reselect the shot", which is advice to a person, and
-    no caller could act on a bare RuntimeError anyway. Naming the shot and
-    the identity lets the layer that owns the selection swap in the
-    alternate its own planning already paid for.
+    Refusing to track a lookalike, and refusing to crop a reference-critical
+    target on a box no local geometry ever confirmed, are both right and
+    neither is negotiable. Ending the run over one shot is a separate
+    decision, and it was being made by accident: the messages said "reselect
+    the shot", which is advice to a person, and no caller could act on a
+    bare RuntimeError anyway. Naming the shot and the identity lets the
+    layer that owns the selection swap in the alternate its own planning
+    already paid for.
     """
 
     def __init__(self, clip_id: str, entity_id: str, message: str) -> None:
         super().__init__(message)
         self.clip_id = clip_id
         self.entity_id = entity_id
+
+
+class ReferenceIdentityUnconfirmed(ReferenceShotUnusable):
+    """The frames could not show that this is the same instance."""
+
+
+class ReferenceGeometryUnavailable(ReferenceShotUnusable):
+    """It is the right instance, and nothing local can say where it is.
+
+    A tracker that holds nothing is not a smaller amount of tracking: the
+    crop would have to come from a model's box on a sampled frame, which is
+    the substitution the whole reference path exists to refuse.
+    """
 
 
 @dataclass
@@ -1059,9 +1074,10 @@ def _reference_subject_samples(
         at = evaluation.lineage.frame_time_ms / 1000.0
         anchors.append((at, (x0, y0, x1, y1)))
     if len(anchors) < 2:
-        raise RuntimeError(
+        raise ReferenceGeometryUnavailable(
+            clip.clip_id, target_id,
             f"{clip.clip_id}: reference-critical target {target_id} has fewer "
-            "than two usable exact semantic anchors"
+            "than two usable exact semantic anchors",
         )
 
     seed = max(
@@ -1096,9 +1112,10 @@ def _reference_subject_samples(
             "status": "local_geometry_failed",
             "reason": type(error).__name__,
         }
-        raise RuntimeError(
+        raise ReferenceGeometryUnavailable(
+            clip.clip_id, target_id,
             f"{clip.clip_id}: SAM/local geometry failed for locked reference "
-            f"identity {target_id}; refusing Gemini-box crop"
+            f"identity {target_id}; refusing Gemini-box crop",
         ) from error
     total = sum(states.values()) or 1
     # Only locally materialized observations can become crop geometry. A
@@ -1112,10 +1129,11 @@ def _reference_subject_samples(
             "tracked_frames": kept,
             "analysed_frames": total,
         }
-        raise RuntimeError(
+        raise ReferenceGeometryUnavailable(
+            clip.clip_id, target_id,
             f"{clip.clip_id}: SAM/local geometry for locked reference identity "
             f"{target_id} passed only {kept}/{total} frames; refusing "
-            "Gemini-box fallback"
+            "Gemini-box fallback",
         )
 
     boxes: list[dict[str, Any]] = []

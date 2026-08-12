@@ -35,9 +35,7 @@ from montagewright.grounding import (
     analyse_track, beat_grid_payload, load_beat_grid, read_runtime_beat_grid,
     shots_in,
 )
-from montagewright.pipeline import (
-    ReferenceIdentityUnconfirmed, probe, run,
-)
+from montagewright.pipeline import ReferenceShotUnusable, probe, run
 from montagewright.planning_bridge import (
     material_planning_state,
     publish_planning_state,
@@ -1486,7 +1484,7 @@ def command_render(args: argparse.Namespace) -> int:
         try:
             result, plan, report, resolved = cut(edl, sources, rhythm_context)
             break
-        except ReferenceIdentityUnconfirmed as unproved:
+        except ReferenceShotUnusable as unproved:
             index = next(
                 (
                     at for at, shot in enumerate(selection["shots"])
@@ -1507,14 +1505,14 @@ def command_render(args: argparse.Namespace) -> int:
                 selection["shots"][index] = swapped
                 identity_swaps.append(
                     f"{unproved.clip_id}: {shot.get('span_id')} could not "
-                    f"prove {unproved.entity_id}; took the alternate "
-                    f"{swapped.get('span_id')}"
+                    f"deliver {unproved.entity_id} ({unproved}); took the "
+                    f"alternate {swapped.get('span_id')}"
                 )
             elif args.duration_mode != "exact" and len(selection["shots"]) > 2:
                 selection["shots"].pop(index)
                 identity_swaps.append(
                     f"{unproved.clip_id}: {shot.get('span_id')} could not "
-                    f"prove {unproved.entity_id} and its commitment has no "
+                    f"deliver {unproved.entity_id} and its commitment has no "
                     "alternate left; dropped the shot and delivered shorter"
                 )
             else:
