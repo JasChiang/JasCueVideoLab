@@ -7261,3 +7261,31 @@ def test_a_span_is_offered_only_where_the_identity_was_seen():
     assert spans[0].starts_seconds == 2.0 and spans[0].ends_seconds == 6.0, (
         "and what is left is the part the identity was actually seen in"
     )
+
+
+def test_a_failed_span_is_never_offered_as_its_own_alternate():
+    """Two candidates traded places until the retry budget ran out.
+
+    A span that had just failed stopped being "taken" the moment it was
+    swapped out, so the next round found it again and swapped back. Three
+    rounds, no progress, and every round paid to judge both of them again.
+    """
+
+    from montagewright.cli import _swap_for_alternate
+
+    direction = {"candidate_options": [
+        {"commitment_id": "c1", "span_id": "A:s00", "tier": "primary"},
+        {"commitment_id": "c1", "span_id": "B:s01", "tier": "alternate"},
+    ]}
+    shot = {"commitment_id": "c1", "span_id": "A:s00", "seconds_needed": 3.0}
+
+    first = _swap_for_alternate(shot, direction, taken={"A:s00"}, exhausted={"A:s00"})
+    assert first is not None and first["span_id"] == "B:s01"
+    assert first["source_id"] == "B"
+
+    # B failed too: there is nothing left, and going back to A is not an
+    # answer -- the caller drops the shot and delivers shorter.
+    assert _swap_for_alternate(
+        dict(shot, span_id="B:s01"), direction,
+        taken={"B:s01"}, exhausted={"A:s00", "B:s01"},
+    ) is None

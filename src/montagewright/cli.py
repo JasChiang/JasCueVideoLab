@@ -275,7 +275,11 @@ def _client():
 
 
 def _swap_for_alternate(
-    shot: dict[str, Any], direction: dict[str, Any], *, taken: set[str]
+    shot: dict[str, Any],
+    direction: dict[str, Any],
+    *,
+    taken: set[str],
+    exhausted: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """The other take the direction named for this same commitment.
 
@@ -294,6 +298,12 @@ def _swap_for_alternate(
             continue
         span_id = str(option.get("span_id") or "")
         if not span_id or span_id == here or span_id in taken:
+            continue
+        # A span that already failed is not an alternate. Without this the
+        # swap walked back to it the moment it stopped being "taken": two
+        # candidates, one failing each round, traded places until the retry
+        # budget ran out -- and every round paid to judge them both again.
+        if exhausted is not None and span_id in exhausted:
             continue
         source_id = span_id.split(":")[0]
         return {
@@ -1506,6 +1516,7 @@ def command_render(args: argparse.Namespace) -> int:
     # as many words that a short cut beats a padded one. Bounded, because
     # each attempt renders again, and swapping forever would be a planner.
     identity_swaps: list[str] = []
+    exhausted_spans: set[str] = set()
     for attempt in range(3):
         try:
             result, plan, report, resolved = cut(edl, sources, rhythm_context)
@@ -1529,11 +1540,14 @@ def command_render(args: argparse.Namespace) -> int:
                 if index is None:
                     continue
                 shot = selection["shots"][index]
+                exhausted_spans.add(str(shot.get("span_id") or ""))
                 swapped = _swap_for_alternate(
-                    shot, direction, taken={
+                    shot, direction,
+                    taken={
                         str(one.get("span_id") or "")
                         for one in selection["shots"]
                     },
+                    exhausted=exhausted_spans,
                 )
                 if swapped is not None:
                     selection["shots"][index] = swapped
