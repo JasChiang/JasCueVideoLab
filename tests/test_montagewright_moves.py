@@ -6840,11 +6840,11 @@ def test_a_segment_offers_only_the_subjects_it_can_show():
     )])
 
     first, second = described.split("；C1:s01")
-    assert "右側的紫色折疊手機（1.0s）" in first, "sighted inside the window"
+    assert "右側的紫色折疊手機（此段第 1.0 秒處）" in first, "sighted inside the window"
     assert "左側的白色折疊手機" not in first, (
         "a subject seen at 6.0s is not offered from a window ending at 4.0s"
     )
-    assert "左側的白色折疊手機（6.0s）" in second
+    assert "左側的白色折疊手機（此段第 2.0 秒處" in second
     assert "此段沒有測到可命名的主體" not in described
 
 
@@ -6882,7 +6882,7 @@ def test_a_panning_take_offers_a_subject_only_while_it_is_on_screen():
         event_id="m0", starts_seconds=0.0, ends_seconds=10.0, state="still",
         peak_vw_s=0.0, travel_vw=0.0, settles=False,
     ),))
-    assert "左側的白色折疊手機（6.0s）" in still, (
+    assert "左側的白色折疊手機（此段第 6.0 秒處）" in still, (
         "a locked-off take keeps a coordinate for the whole span"
     )
 
@@ -6890,8 +6890,8 @@ def test_a_panning_take_offers_a_subject_only_while_it_is_on_screen():
         event_id="m0", starts_seconds=0.0, ends_seconds=10.0, state="moving",
         peak_vw_s=0.2, travel_vw=1.0, settles=True,
     ),))
-    assert "取用時窗要落在" in panning, "say when the coordinate still holds"
-    window = panning.split("取用時窗要落在")[1].split("s")[0]
+    assert "start_offset_seconds 要落在" in panning, "say when it still holds"
+    window = panning.split("start_offset_seconds 要落在")[1].split("）")[0]
     opens, closes = (float(one) for one in window.split("–"))
     assert opens < 6.0 < closes
     assert closes - opens < 10.0, "a travelling frame does not hold it all"

@@ -1421,10 +1421,17 @@ def _describe_material(material: list[MaterialItem]) -> str:
                     if reach is None:
                         continue
                     opens, closes = reach
+                    # In the same units the answer is written in. This said
+                    # "4.3-7.6s" in source time while `start_offset_seconds`
+                    # counts from the start of the span -- two conventions in
+                    # one line, and the pass duly chose a window on the far
+                    # side of a cut from the subject it had named.
                     inside.setdefault(span.span_id, []).append(
-                        f"{label}（{at:.1f}s"
+                        f"{label}（此段第 {at - span.starts_seconds:.1f} 秒處"
                         + (
-                            f"，取用時窗要落在 {opens:.1f}–{closes:.1f}s"
+                            f"，start_offset_seconds 要落在 "
+                            f"{max(0.0, opens - span.starts_seconds):.1f}–"
+                            f"{closes - span.starts_seconds:.1f}"
                             if closes - opens
                             < span.ends_seconds - span.starts_seconds - 0.05
                             else ""
