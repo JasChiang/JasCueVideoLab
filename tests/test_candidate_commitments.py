@@ -356,3 +356,28 @@ def test_local_hold_repair_preserves_a_longer_measured_visual_action():
     )
     assert repairs == ()
     assert shot["seconds_needed"] == 4.0
+
+
+def test_the_planner_is_told_the_budget_it_will_be_judged_against():
+    """Three paid corrections in a row asked for a three-second transition.
+
+    Which is an ordinary connective shot in a music cut and a contract
+    violation here: `transition` carries 0.50s of visual-only time, and with
+    no narration every second of a shot is visual-only. The schema asked for
+    a role and a length while saying nothing about how long each role can
+    hold, so the model could not have known -- and the sentence is generated
+    from the table that does the refusing, so they cannot drift apart.
+    """
+
+    from montagewright.candidate_commitments import provider_commitment_schema
+    from montagewright.coverage import VISUAL_ONLY_LIMITS
+
+    schema = provider_commitment_schema(["C1:s00"], ["device.fold"])
+    role = schema["items"]["properties"]["picture_role"]["description"]
+    length = schema["items"]["properties"]["min_supported_seconds"]["description"]
+
+    for name, limit in VISUAL_ONLY_LIMITS.items():
+        assert name in role, f"{name} has a ceiling the planner never sees"
+        if limit is not None:
+            assert f"{limit:.2f}" in role, f"{name}'s ceiling is not stated"
+    assert "transition" in length, "name the trap that was actually fallen into"

@@ -100,6 +100,25 @@ class CandidateCommitments(StrictFrozen):
         ))
 
 
+def _role_budget_sentence() -> str:
+    """The ceilings, said in the schema that is judged against them.
+
+    The planner was asked for a role and a length, told nothing about how
+    long each role can carry, and then had its answer refused locally --
+    three paid corrections in a row proposing a three-second `transition`,
+    which is an ordinary connective shot in a music cut and a contract
+    violation here. Generated from the table that does the refusing, so the
+    two cannot drift apart.
+    """
+
+    from montagewright.coverage import VISUAL_ONLY_LIMITS
+
+    return "、".join(
+        f"{role} {limit:.2f}" if limit is not None else f"{role} 由內容決定"
+        for role, limit in VISUAL_ONLY_LIMITS.items()
+    )
+
+
 def provider_commitment_schema(
     span_ids: Sequence[str], grounding_target_ids: Sequence[str]
 ) -> dict[str, Any]:
@@ -126,12 +145,27 @@ def provider_commitment_schema(
                 "commitment_id": {"type": "string"},
                 "purpose": {"type": "string"},
                 "required": {"type": "boolean"},
-                "picture_role": {"type": "string", "enum": list(PictureRole.__args__)},
+                "picture_role": {
+                    "type": "string",
+                    "enum": list(PictureRole.__args__),
+                    "description": (
+                        "這顆為什麼要被看見。每個角色能自己撐住的畫面時間有"
+                        "上限（秒）：" + _role_budget_sentence() + "。"
+                        "沒有旁白時整顆的長度都要由畫面自己證明，所以這些"
+                        "上限就是實際可用秒數；該區段有實測到的動作或運鏡時"
+                        "才可以超過。"
+                    ),
+                },
                 "span_id": {"type": "string", "enum": list(span_ids)},
                 "tier": {"type": "string", "enum": ["primary", "alternate"]},
                 "min_supported_seconds": {
                     "type": "string",
-                    "description": "完成這個可見承諾至少要多久，MM:SS。",
+                    "description": (
+                        "完成這個可見承諾至少要多久，MM:SS。不能超過所選 "
+                        "picture_role 的上限；要更長就換一個撐得住的角色"
+                        "（例如 establishing 或 music_montage），不要用 "
+                        "transition 去要三秒。"
+                    ),
                 },
                 "presentation_intent": {
                     "type": "string", "enum": list(PresentationIntent.__args__)
