@@ -16,6 +16,7 @@ indistinguishable from one that did both.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -912,6 +913,7 @@ def _reference_subject_samples(
     output: Path | None,
     discoveries: dict[str, Any],
     checkpoint: Path | None,
+    memory: Path | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[float],
@@ -928,6 +930,7 @@ def _reference_subject_samples(
     from montagewright.reference_grounding import (
         ReferenceGroundingError,
         CandidateDiscoveryResult,
+        ExactFrameBBoxBatchResult,
         decide_exact_frame_bboxes,
         discover_reference_candidates,
         inspect_video_lineage,
@@ -1039,28 +1042,60 @@ def _reference_subject_samples(
     if len(prepared) < 2:
         return [], [], ()
 
-    _afford(report)
-    try:
-        decided = decide_exact_frame_bboxes(
-            spec,
-            discovery,
+    # What this call answers is a fact about specific decoded frames under
+    # one identity lock, and the frames are content-hashed on the way in --
+    # so the question has a name. It was written down and never read back,
+    # so every repair attempt re-paid for every shot it had already judged,
+    # including the shots it was not repairing.
+    batch = None
+    remembered = None
+    if memory is not None:
+        key = hashlib.sha256(json.dumps([
+            spec.definition_sha256(),
             target_id,
-            [frame for frame, _ in prepared],
-            candidate_ids=[candidate_id for _, candidate_id in prepared],
-            client=client,
-            cache=upload_cache,
-            ledger=report.ledger,
-            minimum_matched_anchors=2,
-        )
-    except ReferenceGroundingError as error:
-        report.subject_notes[clip.clip_id] = (
-            f"reference identity could not be verified: {error}"[:160]
-        )
-        return [], [], ()
-    if decided is None:
-        return [], [], ()
-    batch, usage = decided
-    _charge(report, "reference_exact", usage)
+            [
+                [frame.lineage.frame_pts, frame.lineage.frame_sha256]
+                for frame, _ in prepared
+            ],
+        ], sort_keys=True).encode("utf-8")).hexdigest()
+        remembered = Path(memory) / f"exact-{key[:24]}.json"
+        if remembered.exists():
+            try:
+                batch = ExactFrameBBoxBatchResult.model_validate_json(
+                    remembered.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                batch = None
+
+    if batch is None:
+        _afford(report)
+        try:
+            decided = decide_exact_frame_bboxes(
+                spec,
+                discovery,
+                target_id,
+                [frame for frame, _ in prepared],
+                candidate_ids=[candidate_id for _, candidate_id in prepared],
+                client=client,
+                cache=upload_cache,
+                ledger=report.ledger,
+                minimum_matched_anchors=2,
+            )
+        except ReferenceGroundingError as error:
+            report.subject_notes[clip.clip_id] = (
+                f"reference identity could not be verified: {error}"[:160]
+            )
+            return [], [], ()
+        if decided is None:
+            return [], [], ()
+        batch, usage = decided
+        _charge(report, "reference_exact", usage)
+        if remembered is not None:
+            remembered.parent.mkdir(parents=True, exist_ok=True)
+            remembered.write_text(
+                json.dumps(batch.model_dump(mode="json"), ensure_ascii=False),
+                encoding="utf-8",
+            )
     if output is not None:
         _write_grounding_record(
             output / (
@@ -1234,6 +1269,7 @@ def follow_subjects(
     client: Any | None = None,
     grounding_spec: Any | None = None,
     grounding_output: Path | None = None,
+    grounding_memory: Path | None = None,
     upload_cache: Any | None = None,
 ) -> dict[str, CropPath]:
     """Build a crop path per shot that names a subject.
@@ -1300,6 +1336,7 @@ def follow_subjects(
                             output=grounding_output,
                             discoveries=discoveries,
                             checkpoint=checkpoint,
+                            memory=grounding_memory,
                         )
                         if samples[0]:
                             reference_samples[entity_id] = samples
@@ -2140,6 +2177,7 @@ def run(
     client: Any | None = None,
     transcripts: Mapping[str, dict | None] | None = None,
     grounding_spec: Any | None = None,
+    grounding_memory: Path | None = None,
     upload_cache: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
     """Take an EDL to a finished file.
@@ -2294,6 +2332,7 @@ def run(
         client=client,
         grounding_spec=grounding_spec,
         grounding_output=output_dir / "work" / "reference-grounding",
+        grounding_memory=grounding_memory,
         upload_cache=upload_cache,
     )
 

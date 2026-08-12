@@ -1471,6 +1471,7 @@ def command_render(args: argparse.Namespace) -> int:
             client=client,
             transcripts=transcripts,
             grounding_spec=args.reference_grounding_spec,
+            grounding_memory=library / "reference-grounding",
             upload_cache=cache,
         )
 

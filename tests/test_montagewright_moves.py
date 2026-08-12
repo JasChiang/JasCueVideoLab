@@ -7032,3 +7032,35 @@ def test_every_undeliverable_shot_is_found_in_one_pass():
     batched = pipeline.ReferenceShotsUnusable(faults)
     assert [one.clip_id for one in batched.faults] == ["k03", "k05"]
     assert "k03: no" in str(batched) and "k05: no" in str(batched)
+
+
+def test_an_exact_frame_verdict_is_remembered_by_the_frames_it_judged():
+    """It was written down and never read back.
+
+    Every repair attempt therefore re-paid for every shot it had already
+    judged, including the shots it was not repairing -- three attempts over
+    eight shots at three cents a call. What the verdict answers is a fact
+    about specific decoded frames under one identity lock, and those frames
+    are content-hashed on the way in, so the question has a name.
+    """
+
+    import inspect
+
+    from montagewright import pipeline
+
+    source = inspect.getsource(pipeline._reference_subject_samples)
+    key = source.split("hashlib.sha256")[1].split(")).hexdigest()")[0]
+    assert "spec.definition_sha256()" in key, "a different lock is a different question"
+    assert "target_id" in key
+    assert "frame_pts" in key and "frame_sha256" in key, (
+        "name the frames that were actually judged, not the shot they came from"
+    )
+    assert "if batch is None:" in source, "a remembered verdict skips the call"
+    # The call, not the import of its name, and not the earlier `_afford`
+    # that belongs to discovery.
+    assert source.index("remembered.exists()") < source.index(
+        "decide_exact_frame_bboxes(\n"
+    ), "look before paying"
+
+    # And the path reaches it from the run, not from the output directory.
+    assert "grounding_memory" in inspect.getsource(pipeline.follow_subjects)
