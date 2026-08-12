@@ -887,3 +887,56 @@ def test_exact_batch_requires_two_distinct_matched_decisions_for_sam(tmp_path):
     assert not result.sam_ready
     with pytest.raises(ReferenceGroundingError, match="at least 2 matched"):
         result.sam_seed_evaluations()
+
+
+def test_identity_draft_reads_the_pictures_and_stays_a_draft(tmp_path):
+    """Nobody types "5.5-inch 10:16 cover display" into an empty box.
+
+    That cue is what made the Fold8 lock work, and it is a specification
+    somebody looked up. Asking every user to be that person means the ones
+    who are not leave the field blank and grounding silently gets worse. The
+    draft is proposed from the pictures and remains editable text: it is not
+    a lock, and nothing downstream may read it.
+    """
+
+    from montagewright.reference_grounding import draft_identity_from_references
+
+    one = tmp_path / "front.jpg"
+    two = tmp_path / "back.png"
+    one.write_bytes(b"front bytes")
+    two.write_bytes(b"back bytes")
+    client = _Client({
+        "contract_version": "reference-identity-draft-v1",
+        "target_description": "參考圖中這一隻黑白花貓，站姿與趴姿都算同一隻。",
+        "identity_cues": ["左耳尖有一撮白毛", "右前腳白襪只到腕部"],
+        "stable_exclusions": ["另一隻全黑的貓：沒有白襪"],
+        "caveat": "",
+    })
+    cache = _Cache()
+
+    drafted = draft_identity_from_references(
+        [one, two], client=client, cache=cache, ledger=Ledger(cap_usd=1.0)
+    )
+
+    assert drafted is not None
+    draft, usage = drafted
+    assert draft.identity_cues[0] == "左耳尖有一撮白毛"
+    assert usage.input_tokens == 100
+    assert [path.name for path, _ in cache.paths] == ["front.jpg", "back.png"], (
+        "both pictures are read, in the order they were given"
+    )
+    sent = client.interactions.calls[0]["input"]
+    assert sum(1 for part in sent if part["type"] == "image") == 2
+    assert not any(part["type"] == "video" for part in sent), (
+        "drafting looks at references only; it never pays to watch the rushes"
+    )
+
+
+def test_identity_draft_without_a_client_spends_nothing(tmp_path):
+    """Assembling a spec offline must not acquire a client or upload bytes."""
+
+    from montagewright.reference_grounding import draft_identity_from_references
+
+    picture = tmp_path / "front.jpg"
+    picture.write_bytes(b"front bytes")
+    assert draft_identity_from_references([picture], client=None) is None

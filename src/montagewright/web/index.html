@@ -1553,9 +1553,10 @@
           <div class="why">這一欄加參考圖就夠了，不需要自己寫 spec。留空＝不鎖身分。</div></div>
         <div class="field wide"><label>參考圖</label>
           <input type="file" id="reference-images" accept="image/*" multiple>
-          <div class="why">後端先驗 hash 與 anchor 再保存一份 canonical artifact；這一步不呼叫 Gemini。</div></div>
-        <div class="field wide"><label>或用本機路徑（一行一張）</label>
-          <textarea id="reference-image-paths" placeholder="/Users/…/fold8-front.jpg"></textarea></div>
+          <div class="row" style="gap:8px;align-items:center;margin-top:7px">
+            <button type="button" class="ghost" id="draft-identity" disabled>讀這幾張圖，幫我寫</button>
+            <span class="why" id="draft-note">選好圖之後，讓它先寫一份草稿，你再改。</span>
+          </div></div>
         <details class="deeper"><summary>再講細一點（選填）</summary>
         <div class="fields">
         <div class="field wide"><label>可辨識特徵（一行一項）</label>
@@ -1573,7 +1574,10 @@
           <div class="why">spec 裡的相對 reference path 以 spec 所在資料夾為準。</div></div>
         <div class="field wide"><label>或上傳 spec 檔</label>
           <input type="file" id="grounding-spec-file" accept="application/json,.json">
-          <div class="why">用 spec 時，上面的參考圖檔名須對應 reference_images[].path；spec 與「這是什麼」二選一，不能同時給。</div></div>
+          <div class="why">spec 與上面的「這是什麼」二選一，不能同時給。</div></div>
+        <div class="field wide"><label>reference image 的本機路徑（一行一張）</label>
+          <textarea id="reference-image-paths" placeholder="/Users/…/fold8-front.jpg"></textarea>
+          <div class="why">上傳的 spec 宣告的圖不在這台機器上時才需要，檔名須對應 reference_images[].path。spec 用路徑給的話，圖就在 spec 旁邊，這裡留空。</div></div>
         </div></details>
         </div></details>
         <details class="setup-advanced"><summary>字幕、可編輯時間軸與預算</summary>
@@ -1711,6 +1715,60 @@ $('use-here').addEventListener('click', () => {
 
 $('show-upload').addEventListener('click', (e) => {
   e.preventDefault(); $('upload-row').classList.remove('hide');
+});
+
+// Writing a usable identity cue means knowing that the cover display is
+// 5.5 inches. Reading one and correcting it does not. The pictures are
+// already here, so the first draft can come from them -- and it stays a
+// draft: it lands in the same editable fields and is only locked when the
+// run starts.
+function draftableImages() {
+  return [...$('reference-images').files];
+}
+function refreshDraftButton() {
+  const ready = draftableImages().length > 0;
+  $('draft-identity').disabled = !ready;
+  if (!$('draft-identity').dataset.said) {
+    $('draft-note').textContent = ready
+      ? `${draftableImages().length} 張圖，讀一次大約幾分錢`
+      : '選好圖之後，讓它先寫一份草稿，你再改。';
+  }
+}
+$('reference-images').addEventListener('change', () => {
+  $('draft-identity').dataset.said = '';
+  refreshDraftButton();
+});
+refreshDraftButton();
+
+$('draft-identity').addEventListener('click', async () => {
+  const images = draftableImages();
+  if (!images.length) return;
+  const button = $('draft-identity');
+  button.disabled = true;
+  button.dataset.said = '1';
+  $('draft-note').textContent = '正在看圖…';
+  const body = new FormData();
+  images.forEach(file => body.append('reference_images', file, file.name));
+  body.append('reference_image_paths', $('reference-image-paths').value.trim());
+  try {
+    const res = await fetch('/api/grounding/draft', { method: 'POST', body });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '寫不出來');
+    $('grounding-target-description').value = data.target_description || '';
+    $('grounding-identity-cues').value = (data.identity_cues || []).join('\n');
+    $('grounding-exclusions').value = (data.stable_exclusions || []).join('\n');
+    // Nothing to review is worse than nothing written: open the section so
+    // the sentences are on screen before anyone presses start.
+    const deeper = $('grounding-identity-cues').closest('details');
+    if (deeper) deeper.open = true;
+    $('draft-note').textContent = data.caveat
+      ? `它自己有疑慮：${data.caveat}`
+      : `草稿寫好了（$${(data.spent_usd || 0).toFixed(4)}）——請改成你要的，這只是草稿`;
+  } catch (error) {
+    $('draft-note').textContent = `讀不出來：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
 });
 
 async function loadPast() {

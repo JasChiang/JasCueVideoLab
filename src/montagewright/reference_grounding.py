@@ -43,6 +43,11 @@ PROMPT_PATH = (
     / "prompts"
     / "reference_identity_grounding_zh-TW.txt"
 )
+DRAFT_PROMPT_PATH = (
+    Path(__file__).resolve().parent
+    / "prompts"
+    / "reference_identity_draft_zh-TW.txt"
+)
 MAX_OUTPUT_TOKENS = 2_048
 MAX_EXACT_FRAMES_PER_CALL = 8
 TARGET_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
@@ -270,6 +275,125 @@ def load_grounding_spec(path: Path) -> ReferenceGroundingSpec:
                 f"{reference.path}: expected {reference.content_sha256}, got {actual}"
             )
     return spec
+
+
+class ReferenceIdentityDraft(FrozenStrictModel):
+    """A proposed identity, written from the reference images alone.
+
+    Not a lock and not evidence: nothing downstream may read this. It exists
+    so the person holding the pictures is editing sentences rather than
+    inventing them -- the cue that actually worked on the Fold8 run named a
+    5.5-inch cover display and a 7.6-inch inner one, which is a specification
+    somebody had to go and look up. An empty textarea asks every user to be
+    that person, and the ones who are not simply leave it blank, which costs
+    grounding quality silently.
+    """
+
+    contract_version: Literal["reference-identity-draft-v1"] = (
+        "reference-identity-draft-v1"
+    )
+    target_description: str = Field(min_length=1)
+    identity_cues: tuple[str, ...] = ()
+    stable_exclusions: tuple[str, ...] = ()
+    # Reference images do not always agree on one identity, and a draft that
+    # cannot say so would be a confident sentence about nothing.
+    caveat: str = ""
+
+
+def _identity_draft_schema() -> dict[str, Any]:
+    line = {"type": "string", "minLength": 1, "maxLength": 400}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "contract_version", "target_description",
+            "identity_cues", "stable_exclusions", "caveat",
+        ],
+        "properties": {
+            "contract_version": {
+                "type": "string", "enum": ["reference-identity-draft-v1"],
+            },
+            "target_description": line,
+            "identity_cues": {
+                "type": "array", "minItems": 1, "maxItems": 5, "items": line,
+            },
+            "stable_exclusions": {
+                "type": "array", "minItems": 0, "maxItems": 5, "items": line,
+            },
+            "caveat": {"type": "string", "maxLength": 400},
+        },
+    }
+
+
+def draft_identity_from_references(
+    images: Sequence[Path],
+    *,
+    client: Any | None,
+    cache: UploadCache | Any | None = None,
+    ledger: Any | None = None,
+    model_id: str = MODEL_ID,
+    resolution: MediaResolution = "high",
+) -> tuple[ReferenceIdentityDraft, Usage] | None:
+    """Propose a description, cues and exclusions from the pictures.
+
+    ``None`` without a client, for the same reason discovery returns it: a
+    caller assembling a spec offline must not silently acquire a client,
+    upload anything or spend money.
+    """
+
+    if client is None:
+        return None
+    paths = [Path(one).expanduser().resolve(strict=True) for one in images]
+    if not paths:
+        raise ValueError("at least one reference image is required")
+    parts: list[dict[str, Any]] = []
+    for index, path in enumerate(paths, start=1):
+        mime = _media_mime_type(path, FRAME_MIME_BY_SUFFIX, "reference image")
+        parts.append({"type": "text", "text": f"REFERENCE {index}: {path.name}"})
+        parts.append({
+            "type": "image",
+            "mime_type": mime,
+            "uri": _media_uri(
+                path,
+                client=client,
+                cache=cache,
+                mime_type=mime,
+                expected_sha256=sha256_file(path),
+                immutable_snapshot=True,
+            ),
+            "resolution": resolution,
+        })
+    parts.append({
+        "type": "text",
+        "text": (
+            f"{DRAFT_PROMPT_PATH.read_text(encoding='utf-8')}\n\n"
+            "TASK=reference_identity_draft\n"
+            f"REFERENCE_COUNT={len(paths)}\n"
+            "Return only the requested structured object."
+        ),
+    })
+    interaction = ask(
+        client,
+        model=model_id,
+        store=False,
+        input=parts,
+        patience_seconds=120.0,
+        generation_config={
+            "thinking_level": "low",
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        },
+        response_format=structured_json(_identity_draft_schema()),
+        ledger=ledger,
+        budget_stage="reference_identity_draft",
+    )
+    payload = _parse_payload(interaction, "reference identity draft")
+    try:
+        draft = ReferenceIdentityDraft.model_validate(payload)
+    except ValidationError as error:
+        raise ReferenceGroundingError(
+            f"invalid reference identity draft: {error}"
+        ) from error
+    return draft, Usage.from_interaction(interaction)
 
 
 def build_reference_grounding_spec(

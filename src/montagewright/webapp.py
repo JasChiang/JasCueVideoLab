@@ -77,6 +77,9 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MONTAGEWRIGHT_MAX_UPLOAD", 4 * 1024**3))
 MAX_GROUNDING_UPLOAD_BYTES = int(
     os.environ.get("MONTAGEWRIGHT_MAX_GROUNDING_UPLOAD", 256 * 1024**2)
 )
+# A few pictures and one structured answer. Its own ceiling because it is
+# spent before a run exists, so the run's --budget cannot cover it.
+DRAFT_BUDGET_USD = float(os.environ.get("MONTAGEWRIGHT_DRAFT_BUDGET", "0.25"))
 
 
 @dataclass
@@ -1569,6 +1572,100 @@ def create_app() -> FastAPI:
                 str(canonical_grounding) if canonical_grounding else None
             ),
         })
+
+    @app.post("/api/grounding/draft")
+    async def grounding_draft(
+        reference_images: list[UploadFile] | None = None,
+        reference_image_paths: str = Form(""),
+    ) -> JSONResponse:
+        """Read the reference pictures and propose what to say about them.
+
+        The identity cue that made the Fold8 run work names a 5.5-inch cover
+        display and a 7.6-inch inner one -- a specification someone looked
+        up. Three empty textareas ask every user to be that person; the ones
+        who are not leave them blank, and grounding quietly gets worse with
+        nothing on screen to say so. One cheap call against the pictures the
+        user already has turns writing into reviewing.
+
+        Nothing here is authority. The draft goes back to the form as
+        editable text and only becomes a lock when the person submits it.
+        """
+
+        try:
+            typed = _reference_path_lines(reference_image_paths)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise HTTPException(400, f"invalid reference image paths: {error}")
+        uploads = [
+            upload for upload in reference_images or [] if upload.filename
+        ]
+        if not typed and not uploads:
+            raise HTTPException(400, "give at least one reference image")
+
+        staging = Path(tempfile.mkdtemp(prefix="montagewright-draft-"))
+        try:
+            images: list[Path] = []
+            budgeted = MAX_GROUNDING_UPLOAD_BYTES
+            for raw_path in typed:
+                image = _typed_path(raw_path)
+                if image is None or not image.is_file():
+                    raise HTTPException(
+                        400, f"reference image is not there: {raw_path}"
+                    )
+                images.append(image)
+            for upload in uploads:
+                name = Path(upload.filename or "reference-image").name
+                stored = _save(upload, staging / f"{uuid.uuid4().hex}-{name}")
+                budgeted -= stored.stat().st_size
+                if budgeted < 0:
+                    raise HTTPException(
+                        413,
+                        "reference images exceed "
+                        f"{MAX_GROUNDING_UPLOAD_BYTES // 1024**2} MB",
+                    )
+                images.append(stored)
+
+            from starlette.concurrency import run_in_threadpool
+
+            from montagewright.cli import _client
+            from montagewright.cost import Ledger
+            from montagewright.planner import MODEL_ID
+            from montagewright.reference_grounding import (
+                ReferenceGroundingError,
+                draft_identity_from_references,
+            )
+            from montagewright.uploads import UploadCache, default_cache_path
+
+            try:
+                client = _client()
+            except SystemExit as error:
+                raise HTTPException(400, str(error))
+            # The same cache the run uses. These bytes are about to be
+            # uploaded again as approved anchors, and they hash the same.
+            cache = UploadCache.load(default_cache_path())
+            ledger = Ledger(cap_usd=DRAFT_BUDGET_USD, model_id=MODEL_ID)
+            try:
+                drafted = await run_in_threadpool(
+                    draft_identity_from_references,
+                    images, client=client, cache=cache, ledger=ledger,
+                )
+            except ReferenceGroundingError as error:
+                raise HTTPException(502, f"draft failed: {error}")
+            except Exception as error:  # noqa: BLE001 -- reported, not swallowed
+                raise HTTPException(
+                    502, f"draft failed: {type(error).__name__}: {error}"
+                )
+            if drafted is None:  # pragma: no cover -- a client exists here
+                raise HTTPException(400, "no Gemini client")
+            draft, _ = drafted
+            return JSONResponse({
+                "target_description": draft.target_description,
+                "identity_cues": list(draft.identity_cues),
+                "stable_exclusions": list(draft.stable_exclusions),
+                "caveat": draft.caveat,
+                "spent_usd": round(ledger.spent_usd, 4),
+            })
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     @app.get("/api/browse")
     def browse(path: str = "", kind: str = "video") -> JSONResponse:
