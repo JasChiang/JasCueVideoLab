@@ -258,3 +258,35 @@ def test_a_cut_made_from_the_command_line_reads_as_running(tmp_path, monkeypatch
     (out / "run-state.json").unlink()
     (out / "report.json").write_text("{}", encoding="utf-8")
     assert _state_of_a_foreign_run(out) == "done", "older runs still read right"
+
+
+def test_a_live_pid_survives_the_line_that_distrusts_running(tmp_path, monkeypatch):
+    """The check was made and overruled one line later.
+
+    "Anything found on disk is finished as far as this process is
+    concerned" was right while the only way to be running was to have been
+    started by this server. A cut from the command line leaves a pid, so
+    the claim can be checked -- and the very next line still rewrote a
+    verified "running" to "interrupted".
+    """
+
+    import json
+    import os
+
+    import montagewright.webapp as webapp
+
+    runs = tmp_path / "runs"
+    folder = runs / "from-the-command-line"
+    (folder / "out").mkdir(parents=True)
+    (folder / "out" / "command.json").write_text(
+        json.dumps({"command": ["montagewright", "render"], "state": "running"}),
+        encoding="utf-8",
+    )
+    (folder / "out" / "run-state.json").write_text(
+        json.dumps({"state": "running", "pid": os.getpid()}), encoding="utf-8"
+    )
+    monkeypatch.setattr(webapp, "RUNS_ROOT", runs)
+    monkeypatch.setattr(webapp, "RUNS", {})
+    webapp.recall()
+
+    assert webapp.RUNS["from-the-command-line"].state == "running"

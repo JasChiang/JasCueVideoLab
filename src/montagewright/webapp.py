@@ -222,9 +222,18 @@ def recall() -> None:
             lines=saved.get("log", []),
             # Anything found on disk is finished as far as this process is
             # concerned: the thing that was running died with the last server.
-            state=saved.get("state", "done")
-            if saved.get("state") != "running"
-            else "interrupted",
+            # "Anything found on disk is finished as far as this process is
+            # concerned" was right while the only way to be running was to
+            # have been started by this server. A cut from the command line
+            # leaves a pid, so "running" can now be checked rather than
+            # disbelieved -- and this line was quietly overruling the check
+            # one line after it was made.
+            state=(
+                saved.get("state", "done")
+                if saved.get("state") != "running"
+                or _state_of_a_foreign_run(folder / "out") == "running"
+                else "interrupted"
+            ),
             started_at=float(saved.get("started_at", 0.0)),
             source=saved.get("source", ""),
             command=saved.get("command", []),
