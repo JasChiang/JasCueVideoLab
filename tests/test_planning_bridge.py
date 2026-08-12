@@ -99,7 +99,46 @@ def test_publish_resume_accepts_identical_state_and_rejects_split_truth(
     changed = material_planning_state(
         [Material("C2", 4.0, (Span("C2:s00", "C2", 0.0, 4.0),))], {}
     )
-    with pytest.raises(RuntimeError, match="conflicts"):
+    with pytest.raises(RuntimeError, match="no longer describes"):
         publish_planning_state(
             tmp_path, changed, request={}, response={}, validation={}
         )
+
+
+def test_a_conflicting_revision_says_what_moved_and_how_to_recover(
+    tmp_path: Path,
+):
+    """A path and the word "conflict" is not something anyone can act on.
+
+    The case this is written from: a run described twenty-one of seventy-four
+    rushes before the provider's credits ran out, froze that inventory as
+    revision zero, and the next run -- with the full library -- could only
+    say that the two disagreed.
+    """
+
+    incomplete = material_planning_state(
+        [Material("C1", 4.0, (Span("C1:s00", "C1", 0.0, 4.0),))], {}
+    )
+    publish_planning_state(
+        tmp_path, incomplete, request={}, response={}, validation={},
+    )
+    complete = material_planning_state(
+        [
+            Material("C1", 4.0, (Span("C1:s00", "C1", 0.0, 4.0),)),
+            Material("C2", 4.0, (Span("C2:s00", "C2", 0.0, 4.0),)),
+            Material("C3", 4.0, (Span("C3:s00", "C3", 0.0, 4.0),)),
+        ],
+        {},
+    )
+
+    with pytest.raises(RuntimeError) as fault:
+        publish_planning_state(
+            tmp_path, complete, request={}, response={}, validation={}
+        )
+
+    said = str(fault.value)
+    assert "C2" in said and "C3" in said, "name the material that appeared"
+    assert "C1" not in said.split("are new:")[1].split("\n")[0], (
+        "the unchanged source is not what moved"
+    )
+    assert str(tmp_path / "planning" / "edit") in said, "say what to remove"

@@ -161,6 +161,72 @@ def selection_planning_state(
     return apply_planning_delta(base, delta)
 
 
+def _sources_of(records: Sequence[MaterialSpanRecord], span_ids: set[str]) -> list[str]:
+    return sorted({
+        one.source_id for one in records if one.span_id in span_ids
+    })
+
+
+def _named(sources: Sequence[str], limit: int = 6) -> str:
+    shown = ", ".join(sources[:limit])
+    return shown + (f" and {len(sources) - limit} more" if len(sources) > limit else "")
+
+
+def _revision_difference(
+    stored: PlanningState, current: PlanningState
+) -> list[str]:
+    """Say what moved between two revisions, in operator terms.
+
+    The check that calls this is right to refuse, but "conflicts with
+    current material: <path>" is not something anyone can act on.  The
+    common cause is a run that published revision zero from an incomplete
+    card library -- so the useful answer is which sources appeared, and
+    that the frozen revision is the thing to remove.
+    """
+
+    notes: list[str] = []
+    was = {one.span_id for one in stored.spans}
+    now = {one.span_id for one in current.spans}
+    appeared = _sources_of(current.spans, now - was)
+    vanished = _sources_of(stored.spans, was - now)
+    if appeared:
+        notes.append(
+            f"{len(now - was)} spans on {len(appeared)} sources are new: "
+            f"{_named(appeared)}"
+        )
+    if vanished:
+        notes.append(
+            f"{len(was - now)} spans on {len(vanished)} sources are gone: "
+            f"{_named(vanished)}"
+        )
+    stored_by_id = {one.span_id: one for one in stored.spans}
+    moved = sorted(
+        one.span_id for one in current.spans
+        if one.span_id in stored_by_id and (
+            (one.in_seconds, one.out_seconds, one.eligibility, one.evidence)
+            != (
+                stored_by_id[one.span_id].in_seconds,
+                stored_by_id[one.span_id].out_seconds,
+                stored_by_id[one.span_id].eligibility,
+                stored_by_id[one.span_id].evidence,
+            )
+        )
+    )
+    if moved:
+        notes.append(f"{len(moved)} spans changed shape: {_named(moved)}")
+    for field in (
+        "story_obligations", "coverage_obligations",
+        "music_cue_refs", "grounding_target_refs",
+    ):
+        before = tuple(getattr(stored, field))
+        after = tuple(getattr(current, field))
+        if before != after:
+            notes.append(
+                f"{field}: {len(before)} entries became {len(after)}"
+            )
+    return notes
+
+
 def publish_planning_state(
     work: Path,
     state: PlanningState,
@@ -183,9 +249,17 @@ def publish_planning_state(
                 f"stored planning revision is unreadable: {destination}"
             ) from error
         if stored.sha256() != state.sha256():
+            told = "\n".join(
+                f"  {note}" for note in _revision_difference(stored, state)
+            )
             raise RuntimeError(
-                f"stored planning revision conflicts with current material: "
-                f"{destination}"
+                "stored planning revision no longer describes the current "
+                f"material: {destination}\n{told}\n"
+                "  the revision is frozen on purpose -- selections downstream "
+                "name spans in it. If it was published by an incomplete run "
+                "(one that stopped on budget, say), remove "
+                f"{destination.parent} and run again; cards, proxies and "
+                "transcripts are cached and are not paid for twice."
             )
         return destination
     return write_planning_revision(
