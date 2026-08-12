@@ -6791,3 +6791,52 @@ def test_a_segment_offers_only_the_subjects_it_can_show():
     )
     assert "左側的白色折疊手機（6.0s）" in second
     assert "此段沒有測到可命名的主體" not in described
+
+
+def test_a_panning_take_offers_a_subject_only_while_it_is_on_screen():
+    """Inside the seconds is not the same as inside the picture.
+
+    On a take whose own camera travels, a subject measured at 0:06 has left
+    the frame by 0:08 -- and the listing that offered it said only that the
+    segment contained it. Selection named it from the far end twice, the
+    local check refused both times, and the run ended. The window where the
+    coordinate still holds is computed with the same measurement the check
+    refuses by.
+    """
+
+    from montagewright.motion import MotionInterval
+    from montagewright.planner import MaterialItem, _describe_material
+    from montagewright.spans import Span
+
+    def listing(motion):
+        return _describe_material([MaterialItem(
+            source_id="C1",
+            duration_seconds=10.0,
+            summary="a row of devices",
+            proxy=None,
+            # A 16:9 source cropped to 9:16 keeps about a third of the width,
+            # so a coordinate survives about a sixth of a width of travel.
+            crop_width=0.32,
+            spans=(Span("C1:s00", "C1", 0.0, 10.0, "authored", "pans left"),),
+            sightings=(("左側的白色折疊手機", 6.0),),
+            subjects=("左側的白色折疊手機",),
+            motion=motion,
+        )])
+
+    still = listing((MotionInterval(
+        event_id="m0", starts_seconds=0.0, ends_seconds=10.0, state="still",
+        peak_vw_s=0.0, travel_vw=0.0, settles=False,
+    ),))
+    assert "左側的白色折疊手機（6.0s）" in still, (
+        "a locked-off take keeps a coordinate for the whole span"
+    )
+
+    panning = listing((MotionInterval(
+        event_id="m0", starts_seconds=0.0, ends_seconds=10.0, state="moving",
+        peak_vw_s=0.2, travel_vw=1.0, settles=True,
+    ),))
+    assert "取用時窗要落在" in panning, "say when the coordinate still holds"
+    window = panning.split("取用時窗要落在")[1].split("s")[0]
+    opens, closes = (float(one) for one in window.split("–"))
+    assert opens < 6.0 < closes
+    assert closes - opens < 10.0, "a travelling frame does not hold it all"

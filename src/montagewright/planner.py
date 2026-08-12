@@ -1248,6 +1248,42 @@ def _travel_seconds(room: float) -> str:
     )
 
 
+def _framable_window(
+    item: MaterialItem, at: float, opens: float, closes: float
+) -> tuple[float, float] | None:
+    """When a coordinate measured at `at` still names something on screen.
+
+    A locked-off take answers "the whole span"; one that pans answers with
+    the stretch either side of the sighting where the frame has not yet
+    travelled further than its own crop is wide. Beyond that the subject is
+    not in the picture, which is exactly what `frame_disagreements` refuses
+    -- so both read the same measurement rather than two descriptions of it.
+    """
+
+    from montagewright.motion import travelled_between
+
+    carries = max(0.02, item.crop_width / 2)
+    step = 0.1
+    first, last = at, at
+    time = at
+    while time > opens:
+        time = max(opens, time - step)
+        gone = travelled_between(item.motion, at, time)
+        if gone is None or gone > carries:
+            break
+        first = time
+    time = at
+    while time < closes:
+        time = min(closes, time + step)
+        gone = travelled_between(item.motion, at, time)
+        if gone is None or gone > carries:
+            break
+        last = time
+    if last - first < 0.2:
+        return None
+    return first, last
+
+
 def _describe_material(material: list[MaterialItem]) -> str:
     """The card's measurements alongside the description.
 
@@ -1333,10 +1369,30 @@ def _describe_material(material: list[MaterialItem]) -> str:
             inside: dict[str, list[str]] = {}
             for label, at in item.sightings:
                 for span in item.spans:
-                    if span.starts_seconds <= at <= span.ends_seconds:
-                        inside.setdefault(span.span_id, []).append(
-                            f"{label}（{at:.1f}s）"
+                    if not span.starts_seconds <= at <= span.ends_seconds:
+                        continue
+                    # Being inside the seconds is not the same as being in
+                    # the picture: on a take whose own camera travels, a
+                    # subject measured at 0:06 is gone by 0:08. The window
+                    # where a coordinate still holds is computed with the
+                    # function the local check uses to refuse plans, so the
+                    # menu and the judgement cannot disagree.
+                    reach = _framable_window(
+                        item, at, span.starts_seconds, span.ends_seconds
+                    )
+                    if reach is None:
+                        continue
+                    opens, closes = reach
+                    inside.setdefault(span.span_id, []).append(
+                        f"{label}（{at:.1f}s"
+                        + (
+                            f"，取用時窗要落在 {opens:.1f}–{closes:.1f}s"
+                            if closes - opens
+                            < span.ends_seconds - span.starts_seconds - 0.05
+                            else ""
                         )
+                        + "）"
+                    )
             head += "\n    可選片段：" + "；".join(
                 f"{span.span_id}（{span.starts_seconds:.1f}–"
                 f"{span.ends_seconds:.1f}s，{span.seconds:.1f} 秒"
