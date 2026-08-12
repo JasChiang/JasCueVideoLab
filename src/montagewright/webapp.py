@@ -42,6 +42,7 @@ from montagewright.uploads import default_library
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".aiff", ".MP3", ".M4A", ".WAV"}
 BRIEF_SUFFIXES = {".md", ".markdown", ".txt", ".MD", ".TXT"}
+SPEC_SUFFIXES = {".json", ".JSON"}
 # The names a request may ask for, and what each one is as a ratio. These
 # were two different shapes with one name -- a tuple to validate against and
 # a dict to look up -- and the lookup silently returned nothing.
@@ -1591,6 +1592,7 @@ def create_app() -> FastAPI:
         looking = (
             AUDIO_SUFFIXES if kind == "audio"
             else BRIEF_SUFFIXES if kind == "file"
+            else SPEC_SUFFIXES if kind == "spec"
             else VIDEO_SUFFIXES
         )
         folders = []

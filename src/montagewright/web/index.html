@@ -1098,6 +1098,14 @@
   .setup-advanced { grid-column: 1 / -1; border-top: 1px solid var(--line); padding-top: 8px; }
   .setup-advanced summary { cursor: pointer; color: var(--soft); font-weight: 600; }
   .setup-advanced .fields { margin-top: 10px; }
+  /* Two modes and their options, stacked flat, read as one twelve-field
+     form -- and the constraint that they are exclusive was only spoken by a
+     400 from the server. One level deeper each, so what is open says which
+     mode you are in. */
+  .deeper { grid-column: 1 / -1; margin-top: 2px; padding-left: 11px;
+    border-left: 2px solid var(--line); }
+  .deeper summary { cursor: pointer; color: var(--dim); font-size: 12.5px; }
+  .deeper .fields { margin-top: 8px; }
 
   /* Editorial surfaces. Each column has a different job, so its blocks
      should be recognisable before their copy is read: browse, judge, edit. */
@@ -1538,30 +1546,35 @@
           <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select></div>
         <div class="field"><label>語音</label>
           <select id="speech"><option value="auto">自動判斷</option><option value="never">不要轉錄</option></select></div>
-        <details class="setup-advanced"><summary>參考影像與身分契約</summary>
+        <details class="setup-advanced"><summary>參考影像（讓它認得同一台）</summary>
         <div class="fields">
-        <div class="field"><label>要找的身分 ID</label>
-          <input type="text" id="grounding-target-id" value="target.primary" placeholder="例如 device.fold8">
-          <div class="why">穩定的內部名稱，不是顯示文字。</div></div>
-        <div class="field"><label>這是哪一個目標</label>
+        <div class="field wide"><label>這是什麼</label>
           <input type="text" id="grounding-target-description" placeholder="例如：參考圖中這一台摺疊手機">
-          <div class="why">填這欄加參考圖即可，不需要自己寫 spec。</div></div>
-        <div class="field wide"><label>可辨識特徵（選填，一行一項）</label>
-          <textarea id="grounding-identity-cues" placeholder="鏡頭排列、鉸鏈、顏色、標記…"></textarea></div>
-        <div class="field wide"><label>不要混淆（選填，一行一項）</label>
-          <textarea id="grounding-exclusions" placeholder="例如：展開後外形相似的平板、另一個型號、螢幕中的圖片"></textarea></div>
-        <div class="field wide"><label>Grounding spec 路徑</label>
-          <input type="text" id="grounding-spec-path" placeholder="/path/to/grounding-spec.json">
-          <div class="why">使用本機 spec 時填路徑；其中的相對 reference paths 會以 spec 所在資料夾為準。</div></div>
-        <div class="field wide"><label>或上傳 grounding spec</label>
-          <input type="file" id="grounding-spec-file" accept="application/json,.json"></div>
-        <div class="field wide"><label>或貼上 grounding spec JSON</label>
-          <textarea id="grounding-spec-json" placeholder='{"contract_version":"reference-grounding-spec-v1", ...}'></textarea></div>
-        <div class="field wide"><label>本機 reference image 路徑</label>
-          <textarea id="reference-image-paths" placeholder="簡易模式：一行一張正例；完整 spec 模式：名稱須對應 reference_images[].path"></textarea></div>
-        <div class="field wide"><label>或上傳 reference images</label>
+          <div class="why">這一欄加參考圖就夠了，不需要自己寫 spec。留空＝不鎖身分。</div></div>
+        <div class="field wide"><label>參考圖</label>
           <input type="file" id="reference-images" accept="image/*" multiple>
-          <div class="why">上傳檔名須對應 spec 內的 path。後端會先驗證 hash 與 anchor，再保存同一份 canonical artifact；這一步不呼叫 Gemini。</div></div>
+          <div class="why">後端先驗 hash 與 anchor 再保存一份 canonical artifact；這一步不呼叫 Gemini。</div></div>
+        <div class="field wide"><label>或用本機路徑（一行一張）</label>
+          <textarea id="reference-image-paths" placeholder="/Users/…/fold8-front.jpg"></textarea></div>
+        <details class="deeper"><summary>再講細一點（選填）</summary>
+        <div class="fields">
+        <div class="field wide"><label>可辨識特徵（一行一項）</label>
+          <textarea id="grounding-identity-cues" placeholder="鏡頭排列、鉸鏈、顏色、標記…"></textarea></div>
+        <div class="field wide"><label>不要混淆（一行一項）</label>
+          <textarea id="grounding-exclusions" placeholder="例如：展開後外形相似的平板、另一個型號、螢幕中的圖片"></textarea></div>
+        </div></details>
+        <details class="deeper"><summary>我已經有 grounding spec</summary>
+        <div class="fields">
+        <div class="field wide"><label>spec 路徑</label>
+          <div class="row" style="gap:8px;flex-wrap:nowrap">
+            <input type="text" id="grounding-spec-path" placeholder="/path/to/grounding-spec.json">
+            <button type="button" class="ghost" id="browse-spec" style="white-space:nowrap">瀏覽…</button>
+          </div>
+          <div class="why">spec 裡的相對 reference path 以 spec 所在資料夾為準。</div></div>
+        <div class="field wide"><label>或上傳 spec 檔</label>
+          <input type="file" id="grounding-spec-file" accept="application/json,.json">
+          <div class="why">用 spec 時，上面的參考圖檔名須對應 reference_images[].path；spec 與「這是什麼」二選一，不能同時給。</div></div>
+        </div></details>
         </div></details>
         <details class="setup-advanced"><summary>字幕、可編輯時間軸與預算</summary>
         <div class="fields">
@@ -1655,16 +1668,19 @@ async function browseTo(path) {
       <span class="ico">▸</span>${esc(f.name)}` +
       (f.clips ? `<span class="count">${f.clips} 支</span>` : '') + `</div>`);
   }
+  const picksAFile = pickKind === 'audio' || pickKind === 'file' || pickKind === 'spec';
   for (const v of d.videos) {
-    rows.push(pickKind === 'audio' || pickKind === 'file'
-      ? `<div class="pick" data-file="${esc(v.path)}"><span class="ico">${pickKind === 'audio' ? '♪' : '§'}</span>${esc(v.name)}</div>`
+    rows.push(picksAFile
+      ? `<div class="pick" data-file="${esc(v.path)}"><span class="ico">${pickKind === 'audio' ? '♪' : pickKind === 'spec' ? '{}' : '§'}</span>${esc(v.name)}</div>`
       : `<div class="pick file"><span class="ico">·</span>${esc(v.name)}</div>`);
   }
   $('listing').innerHTML = rows.join('') ||
     '<div class="pick file"><span class="ico">·</span>這裡沒有東西</div>';
   $('picker-note').textContent = d.videos.length
-    ? (pickKind === 'audio' || pickKind === 'file' ? `點一個檔案選它` : `這層有 ${d.videos.length} 支影片`)
-    : (pickKind === 'audio' ? '這層沒有音檔，往下點' : pickKind === 'file' ? '這層沒有 Brief 檔，往下點' : '這層沒有影片，往下點');
+    ? (picksAFile ? `點一個檔案選它` : `這層有 ${d.videos.length} 支影片`)
+    : (pickKind === 'audio' ? '這層沒有音檔，往下點'
+      : pickKind === 'file' ? '這層沒有 Brief 檔，往下點'
+      : pickKind === 'spec' ? '這層沒有 JSON，往下點' : '這層沒有影片，往下點');
   for (const el of $('listing').querySelectorAll('.pick[data-path]')) {
     el.onclick = () => browseTo(el.dataset.path);
   }
@@ -1678,13 +1694,15 @@ async function browseTo(path) {
 
 function openPicker(target, kind) {
   pickTarget = target; pickKind = kind;
-  $('use-here').style.display = kind === 'audio' || kind === 'file' ? 'none' : '';
+  $('use-here').style.display =
+    kind === 'audio' || kind === 'file' || kind === 'spec' ? 'none' : '';
   $('picker').classList.remove('hide');
   browseTo($(target).value.trim());
 }
 $('browse').addEventListener('click', () => openPicker('path', 'video'));
 $('browse-music').addEventListener('click', () => openPicker('music-path', 'audio'));
 $('browse-brief').addEventListener('click', () => openPicker('brief-path', 'file'));
+$('browse-spec').addEventListener('click', () => openPicker('grounding-spec-path', 'spec'));
 $('close-picker').addEventListener('click', () => $('picker').classList.add('hide'));
 $('use-here').addEventListener('click', () => {
   $(pickTarget).value = picking;
@@ -4478,9 +4496,11 @@ $('go').addEventListener('click', async () => {
   body.append('source_path', path);
   body.append('music_path', $('music-path').value.trim());
   body.append('grounding_spec_path', $('grounding-spec-path').value.trim());
-  body.append('grounding_spec_json', $('grounding-spec-json').value.trim());
   body.append('reference_image_paths', $('reference-image-paths').value.trim());
-  body.append('grounding_target_id', $('grounding-target-id').value.trim());
+  // The simple mode locks exactly one identity, so its internal name is a
+  // constant and asking for it only invited someone to type a display
+  // string into a field the planning state keys obligations on. The server
+  // still accepts grounding_target_id for spec authors and API callers.
   body.append('grounding_target_description', $('grounding-target-description').value.trim());
   body.append('grounding_identity_cues', $('grounding-identity-cues').value.trim());
   body.append('grounding_exclusions', $('grounding-exclusions').value.trim());
