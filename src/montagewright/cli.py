@@ -692,10 +692,21 @@ def command_render(args: argparse.Namespace) -> int:
             return None
 
     print(f"measuring camera motion across {len(proxies)} clips", flush=True)
-    cards, stats = build_library(
-        proxies, library / "cards", client=client, cache=cache, progress=wrote,
-        motion_of=motion_of, ledger=ledger,
-    )
+    try:
+        cards, stats = build_library(
+            proxies, library / "cards", client=client, cache=cache,
+            progress=wrote, motion_of=motion_of, ledger=ledger,
+        )
+    except BudgetSpent as error:
+        # Say it here rather than let the traceback speak: the rushes that
+        # were described are cached under their own content hashes, so
+        # resuming after topping up costs only the ones still missing.
+        print(
+            f"\nstopped before the library was complete: {error}\n"
+            "described clips are cached; resume once the budget allows",
+            flush=True,
+        )
+        raise
     print(
         f"cards: {stats['written']} written, {stats['reused']} reused, "
         f"{stats['failed']} failed  (${ledger.spent_usd:.4f})",

@@ -679,6 +679,44 @@ def test_a_library_that_wrote_nothing_stops_the_run() -> None:
             raise AssertionError("an empty library must not pass silently")
 
 
+def test_money_running_out_stops_the_library_instead_of_truncating_it() -> None:
+    """Twenty-one of seventy-four rushes is not a library, it is an accident.
+
+    The credits ran out at clip twenty-two, the remaining fifty-three were
+    recorded as ordinary per-clip failures, and the run planned from what it
+    had -- freezing an inventory of twenty-one sources as revision zero of
+    the planning authority. The next run, after a top-up, described all
+    seventy-four and could no longer agree with what had been written down.
+    Whose money ran out says nothing about the clip that was next in line.
+    """
+
+    import tempfile
+    from pathlib import Path
+
+    from montagewright.clipcard import build_library
+    from montagewright.cost import BudgetSpent
+
+    described: list[str] = []
+
+    class RunsOutAfterOne:
+        class files:
+            @staticmethod
+            def upload(**_):
+                if described:
+                    raise BudgetSpent("Gemini Prepay credits are depleted")
+                described.append("one")
+                raise RuntimeError("this one is merely unreadable")
+
+    with tempfile.TemporaryDirectory() as work:
+        clips = {}
+        for name in ("a", "b", "c"):
+            clip = Path(work) / f"{name}.mp4"
+            clip.write_bytes(f"not really a video {name}".encode())
+            clips[name] = clip
+        with pytest.raises(BudgetSpent):
+            build_library(clips, Path(work) / "cards", client=RunsOutAfterOne())
+
+
 def test_clip_cards_can_be_written_at_all() -> None:
     """The request referenced a name the module never imported."""
 

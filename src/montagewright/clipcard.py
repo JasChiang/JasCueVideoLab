@@ -922,6 +922,7 @@ def build_library(
     # the same bytes under any name in any folder -- keeping them per run
     # meant "content-addressed" and "written once per output directory" at
     # the same time, so a second cut of the same rushes rewrote all of them.
+    from montagewright.cost import BudgetSpent
     from montagewright.uploads import content_hash
     paths: dict[str, Path] = {}
     stats: dict[str, Any] = {
@@ -951,6 +952,18 @@ def build_library(
                 # content addressed.
                 thinking="medium",
             )
+        except BudgetSpent:
+            # Not a fact about this clip. The money ran out, so every clip
+            # after it fails for the same reason, and none of those failures
+            # says anything about the material. Swallowing them produced a
+            # library covering twenty-one of seventy-four rushes that looked
+            # exactly like a library of rushes where fifty-three were
+            # unreadable -- and the run went on to freeze that inventory as
+            # revision zero of the planning authority, which the next run
+            # (after the credits were topped up) could no longer agree with.
+            # Stop here instead: what is described is cached and costs
+            # nothing to resume.
+            raise
         except Exception as error:
             # One unreadable clip is not a reason to abandon the library.
             # Losing why it failed is a different matter: a NameError in the
