@@ -628,6 +628,49 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 # tail is the mix's problem, not the edit's.
                 note = "past the end of the analysed music; kept as planned"
 
+        keeps_source_move = (
+            clip.reframe is not None
+            and clip.reframe.editorial_intent == "use_source_motion"
+        )
+        # Landing on a beat may lengthen a shot that exists to let the
+        # source's own move play; it may not shorten one. `nearest_cue`
+        # takes the closest event in either direction, so a cue thirteen
+        # milliseconds early won, the move lost its ending, and the release
+        # check refused the timeline -- over a hundredth of a second, twice
+        # in one evening on two different shots. Take the first cue at or
+        # after the length the move needs; if none is near, keep the length
+        # and let this cut sit off the grid.
+        if keeps_source_move and end < cursor + wanted - 1e-6:
+            floor_end = cursor + wanted
+            later = None
+            if grid is not None:
+                later = min(
+                    (
+                        cue for cue in grid.cuttable()
+                        if floor_end - 1e-6 <= cue.time_seconds
+                        <= floor_end + grid.seconds_per_beat + 1e-6
+                    ),
+                    key=lambda cue: cue.time_seconds,
+                    default=None,
+                )
+            missed = landed
+            if later is not None:
+                end, landed, landed_kind = (
+                    later.time_seconds, later.cue_id, later.kind
+                )
+            else:
+                end, landed, landed_kind = floor_end, None, None
+            held = (
+                f"the source move needs {wanted:.2f}s, past "
+                + (f"cue {missed}" if missed else "the nearest cue")
+                + "; "
+                + (
+                    f"held to {landed} instead"
+                    if landed else "kept the move whole and left the grid"
+                )
+            )
+            note = f"{note}; {held}" if note else held
+
         # Content evidence is a bound of the same kind as source length, and
         # belongs beside it: one says the take has no more picture, the other
         # says the picture has no more to show. Take the last cue that fits,
@@ -635,10 +678,6 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         # the move short, keep the planned length and lose the beat. Rhythm
         # is the thing that gives way here, not the content.
         ceiling = content_ceiling(clip)
-        keeps_source_move = (
-            clip.reframe is not None
-            and clip.reframe.editorial_intent == "use_source_motion"
-        )
         if ceiling is not None and end - cursor > ceiling + 1e-6:
             room = cursor + ceiling
             earlier = None

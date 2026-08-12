@@ -6882,6 +6882,51 @@ def test_the_beat_never_cuts_an_authored_move_short():
     assert authored.landed_on is None, "and this cut is simply not on a beat"
 
 
+def test_a_beat_may_lengthen_an_authored_move_but_never_shorten_it():
+    """`nearest_cue` takes the closest event in either direction.
+
+    So a cue thirteen milliseconds early won, an authored three-second pan
+    was delivered in 2.987s, and the release check refused the timeline --
+    over a hundredth of a second, twice in one evening on two shots. The
+    move completing is the point of the shot; landing on the music is not.
+    """
+
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.schema import EDL, Clip, MusicSync, Reframe
+
+    def film(cues, intent):
+        grid = BeatGrid(bpm=120.0, meter=4, duration_seconds=60.0, cues=tuple(
+            Cue(cue_id=name, time_seconds=at, kind="beat") for name, at in cues
+        ))
+        return ground_timeline(EDL(project_id="p", clips=[Clip(
+            clip_id="k00", source_id="C1",
+            approx_in_seconds=0.0, approx_out_seconds=3.0,
+            audio_role="discard",
+            reframe=Reframe(editorial_intent=intent, intent="let it play"),
+            music_sync=MusicSync(cut_on_beat=True),
+        )]), grid).clips[0]
+
+    # The nearest cue sits 13ms before the move finishes; the next one is a
+    # third of a second after it.
+    cues = [("b0", 0.0), ("b1", 2.987), ("b2", 3.33)]
+
+    held = film(cues, "hold")
+    assert abs(held.duration_seconds - 2.987) < 1e-6, (
+        "an ordinary shot still takes the nearest cue"
+    )
+
+    authored = film(cues, "use_source_motion")
+    assert authored.duration_seconds >= 3.0 - 1e-6
+    assert authored.landed_on == "b2", "the first cue that lets it finish"
+    assert "source move needs" in (authored.note or "")
+
+    # Nothing within a beat after it: keep the move whole, lose the grid.
+    lonely = film([("b0", 0.0), ("b1", 2.987)], "use_source_motion")
+    assert abs(lonely.duration_seconds - 3.0) < 1e-6
+    assert lonely.landed_on is None
+    assert "left the grid" in (lonely.note or "")
+
+
 def test_a_tracker_that_holds_nothing_is_one_shot_not_the_run():
     """Right instance, no local geometry: still a recoverable shot.
 
