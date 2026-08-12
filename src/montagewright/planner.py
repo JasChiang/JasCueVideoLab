@@ -646,6 +646,7 @@ def decide_rhythm(
     usage_total = Usage(0, 0, 0)
     attempt_input = request_input
     coverage_faults: tuple[str, ...] = ()
+    release_faults: tuple[str, ...] = ()
     for attempt in range(2):
         request["input"] = attempt_input
         interaction = ask(
@@ -677,10 +678,13 @@ def decide_rhythm(
             payload.get("music_spans"),
         )
         from montagewright.coverage import edl_coverage_audit
+        from montagewright.planning_release import rhythm_motion_faults
 
         coverage = edl_coverage_audit(candidate, target_seconds)
         coverage_faults = coverage.faults
-        if target_seconds <= 0 or not coverage_faults:
+        release_faults = rhythm_motion_faults(edl, candidate, grid)
+        all_faults = (*coverage_faults, *release_faults)
+        if (target_seconds <= 0 or not coverage_faults) and not release_faults:
             return candidate, usage_total
         if attempt == 0:
             attempt_input = request_input + [{
@@ -692,7 +696,7 @@ def decide_rhythm(
                     " speaker、B-roll 或靜態畫面一起拉長來湊總秒數。"
                     "若這組 shots 本身不足，仍請給最自然、無死空氣的"
                     "版本，本機會把它交回結構選片重規劃。\n\n- "
-                    + "\n- ".join(coverage_faults)
+                    + "\n- ".join(all_faults)
                     + "\n\n上一版答案：\n"
                     + json.dumps(payload, ensure_ascii=False)
                 ),
@@ -700,7 +704,7 @@ def decide_rhythm(
     raise PlannerError(
         "rhythm cannot satisfy the target with evidence from the selected "
         "shots; structural selection must add content or shorten the target: "
-        + "; ".join(coverage_faults)
+        + "; ".join((*coverage_faults, *release_faults))
     )
 
 
@@ -1081,8 +1085,11 @@ class MaterialItem:
     audio_spans: tuple[tuple[str, float, float], ...] = ()
 
 
-def _direction_schema() -> dict[str, Any]:
-    return {
+def _direction_schema(
+    span_ids: list[str] | None = None,
+    grounding_target_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    schema = {
         "type": "object",
         "additionalProperties": False,
         "required": [
@@ -1187,6 +1194,14 @@ def _direction_schema() -> dict[str, Any]:
             },
         },
     }
+    if span_ids is not None:
+        from montagewright.candidate_commitments import provider_commitment_schema
+
+        schema["required"].append("candidate_options")
+        schema["properties"]["candidate_options"] = provider_commitment_schema(
+            span_ids, grounding_target_ids or []
+        )
+    return schema
 
 
 def _describe_one(item: MaterialItem) -> str:
@@ -1395,6 +1410,7 @@ def decide_direction(
     brief: str,
     aspect: str = "9:16",
     music: Path | None = None,
+    music_grid: BeatGrid | None = None,
     seconds: float = 0.0,
     cache: UploadCache | None = None,
     client: Any | None = None,
@@ -1433,6 +1449,16 @@ def decide_direction(
                 f"## 交付比例\n\n這支片輸出 {aspect}，這是需求規格，不是你的選擇。"
                 f"所有調性與節奏的判斷都要建立在這個比例上。\n\n"
                 f"## 剪輯 brief\n\n{brief}\n\n"
+                + (
+                    "## 音樂結構（本機量測）\n\n"
+                    + _describe_music(music_grid)
+                    + "\n\n下列 cue/section ID 是之後選片與本機對齊的"
+                    "共用座標；請從實際聽到的音樂判斷宏觀節奏，"
+                    "不要自創時間點。\n\n"
+                    if music_grid is not None
+                    else ""
+                )
+                +
                 f"## 執行層做得到什麼\n\n{describe_for_prompt()}\n\n"
                 f"## 執行層做不到什麼\n\n{describe_limits_for_prompt()}\n\n"
                 f"## 素材\n\n以下 {len(material)} 支，每一支的說明就寫在它自己那段影片前面。\n"
@@ -1456,6 +1482,10 @@ def decide_direction(
     if music is not None:
         request_input.append(_attach_music(music, cache, client))
 
+    grounding_target_ids = (
+        [target.target_id for target in grounding_spec.identity_lock.identity.targets]
+        if grounding_spec is not None else []
+    )
     interaction = ask(
         client,
         model=MODEL_ID,
@@ -1465,7 +1495,10 @@ def decide_direction(
             "thinking_level": THINKING_HIGH,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
-        response_format=structured_json(_direction_schema()),
+        response_format=structured_json(_direction_schema(
+            [span.span_id for item in material for span in item.spans],
+            grounding_target_ids,
+        )),
         ledger=ledger,
         budget_stage="direction",
     )
@@ -1511,6 +1544,7 @@ def _selection_schema(
     graphic_candidate_ids: list[str] | None = None,
     audio_span_ids: list[str] | None = None,
     grounding_target_ids: list[str] | None = None,
+    commitment_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Flat shots plus flat coverage. Nothing nests more than one level.
 
@@ -1563,8 +1597,18 @@ def _selection_schema(
                         "picture_role",
                         "audio_reason",
                         "why",
+                        *(["commitment_id"] if commitment_ids else []),
                     ],
                     "properties": {
+                        **({
+                            "commitment_id": {
+                                "type": "string", "enum": commitment_ids,
+                                "description": (
+                                    "這顆履行哪個已驗證的內容承諾。只能從候選承諾"
+                                    "中選；音樂與運鏡不能創造新的承諾。"
+                                ),
+                            }
+                        } if commitment_ids else {}),
                         **({
                             "replace_clip_id": {
                                 "type": "string",
@@ -1996,6 +2040,8 @@ def select_shots(
     ledger: Any | None = None,
     graphic_candidates: list[Any] | tuple[Any, ...] | None = None,
     grounding_spec: Any | None = None,
+    music_grid: BeatGrid | None = None,
+    commitments: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage two: which shots, in what order, and why each one."""
 
@@ -2019,6 +2065,7 @@ def select_shots(
     prompt = (PROMPTS / "selection_zh-TW.txt").read_text(encoding="utf-8")
     from montagewright.brief import parse_brief_markdown
     from montagewright.graphics import graphic_family_prompt
+    from montagewright.candidate_commitments import describe_commitments
 
     graphic_candidates = (
         tuple(graphic_candidates)
@@ -2075,6 +2122,22 @@ def select_shots(
                     f"{direction.get('max_static_seconds', 0):.1f} 秒。"
                     f"理由：{direction.get('pacing_reason', '')}\n\n"
                     f"## 剪輯 brief\n\n{brief}\n\n"
+                    + (
+                        "## 音樂結構（本機量測）\n\n"
+                        + _describe_music(music_grid)
+                        + "\n\n先選能完成內容承諾的片段；音樂 cue "
+                        "是安排候選與運鏡落點的節奏座標，不能讓"
+                        "不合格的畫面因為踩拍而入選。\n\n"
+                        if music_grid is not None
+                        else ""
+                    )
+                    + (
+                        "## 已驗證的內容承諾候選\n\n"
+                        + describe_commitments(commitments)
+                        + "\n\n每顆必須引用 commitment_id，且只能選該承諾列出的"
+                        " span。先履約，再用音樂與原生／虛擬運鏡安排節奏。\n\n"
+                        if commitments is not None else ""
+                    )
                     + graphic_copy
                     +
                     f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
@@ -2103,6 +2166,11 @@ def select_shots(
             graphic_candidate_ids=graphic_candidate_ids,
             audio_span_ids=audio_span_ids,
             grounding_target_ids=grounding_target_ids,
+            commitment_ids=(
+                list(dict.fromkeys(
+                    option.commitment_id for option in commitments.options
+                )) if commitments is not None else None
+            ),
         )
     )
     usage_total = Usage(0, 0, 0)
@@ -2151,6 +2219,14 @@ def select_shots(
         # the window and mark it partial_reveal/transition_pass.  It only
         # rejects promising a different moment of the take.
         faults.extend(frame_disagreements(chosen.get("shots") or [], material))
+        if commitments is not None:
+            from montagewright.candidate_commitments import (
+                validate_selection_commitments,
+            )
+
+            faults.extend(validate_selection_commitments(
+                chosen.get("shots") or [], commitments
+            ))
         if grounding_target_ids:
             known_grounding_targets = set(grounding_target_ids)
             for shot_index, shot in enumerate(chosen.get("shots") or []):
@@ -2608,6 +2684,7 @@ def replan_shots(
     client: Any | None = None,
     ledger: Any | None = None,
     grounding_spec: Any | None = None,
+    commitments: Any | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Plan the shots that did not deliver, again, from what was seen.
 
@@ -2637,6 +2714,16 @@ def replan_shots(
     usable = [item for item in material if item.source_id not in broken]
     offered = [span for item in usable for span in item.spans]
     prompt = (PROMPTS / "replan_zh-TW.txt").read_text(encoding="utf-8")
+    if commitments is not None:
+        from montagewright.candidate_commitments import describe_commitments
+
+        commitment_context = (
+            "\n\n## 不可偷換的內容承諾\n\n"
+            + describe_commitments(commitments)
+            + "\n替換可以改候選 span 與運鏡，但 commitment_id 必須和原鏡頭相同。"
+        )
+    else:
+        commitment_context = ""
     problems = "\n\n".join(
         f"### 第 {index + 1} 顆（{shot['source_id']}）\n"
         f"原本的規劃：{move_of_shot(shot)}，畫面停在 "
@@ -2659,6 +2746,7 @@ def replan_shots(
                 + f"## 運鏡能力\n\n{describe_for_prompt()}\n\n"
                 + f"## 做不到的事\n\n{describe_limits_for_prompt()}\n\n"
                 + (f"## 這支片其他顆在講什麼\n\n{context}\n\n" if context else "")
+                + commitment_context
                 + f"## 要重新規劃的鏡頭\n\n{problems}\n\n"
                 f"## 可用素材\n\n以下 {len(usable)} 支，"
                 f"每一支的說明就寫在它自己那段影片前面。\n"
@@ -2681,30 +2769,67 @@ def replan_shots(
         )
     replan_input += _attach_material(usable, cache, client, beaten)
 
-    interaction = ask(
-        client,
-        model=MODEL_ID,
-        store=False,
-        input=replan_input,
-        generation_config={
-            "thinking_level": THINKING_HIGH,
-            "max_output_tokens": MAX_OUTPUT_TOKENS,
-        },
-        response_format=structured_json(
-            _selection_schema(
-                [one.span_id for one in offered],
-                replace_clip_ids=[f"k{index:02d}" for index, _, _ in failing],
-                grounding_target_ids=grounding_target_ids,
+    schema = structured_json(_selection_schema(
+        [one.span_id for one in offered],
+        replace_clip_ids=[f"k{index:02d}" for index, _, _ in failing],
+        grounding_target_ids=grounding_target_ids,
+        commitment_ids=list(dict.fromkeys(
+            option.commitment_id for option in commitments.options
+        )) if commitments is not None else None,
+    ))
+    usage_total = Usage(0, 0, 0)
+    attempt_input = replan_input
+    again: dict[str, Any] = {}
+    for attempt in range(2):
+        interaction = ask(
+            client,
+            model=MODEL_ID,
+            store=False,
+            input=attempt_input,
+            generation_config={
+                "thinking_level": THINKING_HIGH,
+                "max_output_tokens": MAX_OUTPUT_TOKENS,
+            },
+            response_format=schema,
+            ledger=ledger,
+            budget_stage="replan",
+        )
+        used = Usage.from_interaction(interaction)
+        usage_total = Usage(
+            usage_total.input_tokens + used.input_tokens,
+            usage_total.output_tokens + used.output_tokens,
+            usage_total.thought_tokens + used.thought_tokens,
+        )
+        again = _parse(interaction, what="replan pass")
+        expand_spans(
+            again, offered,
+            source_motion={item.source_id: item.camera_motion for item in usable},
+        )
+        replacement_shots = again.get("shots") or []
+        if commitments is None:
+            break
+        from montagewright.candidate_commitments import (
+            validate_replacement_commitments,
+        )
+
+        commitment_faults = validate_replacement_commitments(
+            failing, replacement_shots, commitments
+        )
+        if not commitment_faults:
+            break
+        if attempt == 1:
+            raise ValueError(
+                "replan violated candidate commitments twice: "
+                + "; ".join(commitment_faults)
             )
-        ),
-        ledger=ledger,
-        budget_stage="replan",
-    )
-    again = _parse(interaction, what="replan pass")
-    expand_spans(
-        again, offered,
-        source_motion={item.source_id: item.camera_motion for item in usable},
-    )
+        attempt_input = replan_input + [{
+            "type": "text",
+            "text": (
+                "## 上一版替換偷換或違反內容承諾，請重做全部替換\n\n- "
+                + "\n- ".join(commitment_faults)
+                + "\n每顆保留原 commitment_id，只能從該 commitment 的候選 span 選。"
+            ),
+        }]
     # The same check the selection pass runs, on the path that was left
     # without it. A replan is where a shot that failed for want of a move is
     # most likely to be answered with the word and not the thing -- the
@@ -2722,6 +2847,4 @@ def replan_shots(
             stable_id = local_id
         stable_disagreements.append(note.replace(local_id, stable_id, 1))
     again["frame_disagreements"] = stable_disagreements
-    return again, Usage.from_interaction(
-        interaction
-    )
+    return again, usage_total

@@ -1335,6 +1335,24 @@ def test_rhythm_is_decided_whether_or_not_there_is_music() -> None:
     assert "if decide_rhythm_first:" in source
 
 
+def test_music_is_measured_before_direction_and_reused_after_selection() -> None:
+    """Direction, selection and execution must share one measured clock."""
+
+    import inspect
+
+    from montagewright import cli, planner
+
+    command = inspect.getsource(cli.command_render)
+    measured = command.index("grid = analyse_track(args.music)")
+    directed = command.index("direction, usage_direction = decide_direction(")
+    selected = command.index("selection, usage_selection = select_shots(")
+    assert measured < directed < selected
+    assert command.count("music_grid=grid") >= 2
+    assert "music_grid: BeatGrid | None = None" in inspect.getsource(
+        planner.select_shots
+    )
+
+
 def test_a_film_with_no_track_is_told_so_rather_than_shown_an_empty_grid() -> None:
     from montagewright.planner import decide_rhythm
     import inspect

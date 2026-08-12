@@ -35,6 +35,21 @@ from montagewright.grounding import (
     shots_in,
 )
 from montagewright.pipeline import probe, run
+from montagewright.planning_bridge import (
+    material_planning_state,
+    publish_planning_state,
+    selection_planning_state,
+)
+from montagewright.planning_artifacts import (
+    asked as _asked,
+    decide as _decide,
+    decided as _decided,
+    planning_contract as _planning_contract,
+)
+from montagewright.candidate_commitments import (
+    CommitmentError,
+    resolve_candidate_commitments,
+)
 from montagewright.review import (
     Round,
     actionable_keys,
@@ -869,6 +884,70 @@ def command_render(args: argparse.Namespace) -> int:
         )
     else:
         brief_candidates.unlink(missing_ok=True)
+
+    # Music is one planning fact, measured once and shared by every stage.
+    # Previously direction heard the track, selection received only a prose
+    # memory of it, and the exact BeatGrid did not exist until both decisions
+    # had already been paid for.  Measuring it here lets content selection
+    # refer to the same stable cue IDs that local rhythm resolution executes.
+    if args.music_map:
+        grid = load_beat_grid(args.music_map)
+    elif args.music:
+        print("no music map given; measuring the track", flush=True)
+        grid = analyse_track(args.music)
+    else:
+        grid = None
+        print("no music; lengths will be led by content", flush=True)
+
+    grounding_target_refs = tuple(
+        target.target_id
+        for target in (
+            args.reference_grounding_spec.identity_lock.identity.targets
+            if args.reference_grounding_spec is not None
+            else ()
+        )
+    )
+    planning_state = material_planning_state(
+        material,
+        {
+            source_id: load_card(path)
+            for source_id, path in cards.items()
+            if path.exists()
+        },
+        story_obligations=tuple(
+            instruction.text for instruction in brief_document.instructions
+        ),
+        coverage_obligations=tuple(
+            f"recognizably_present:{target_id}"
+            for target_id in grounding_target_refs
+        ),
+        music_cue_refs=tuple(
+            cue.cue_id
+            for cue in (grid.cues if grid is not None else ())
+            if cue.kind in {"section_boundary", "downbeat", "accent"}
+        ),
+        grounding_target_refs=grounding_target_refs,
+    )
+    publish_planning_state(
+        work,
+        planning_state,
+        request={
+            "stage": "material_inventory",
+            "brief_sha256": brief_document.sha256,
+            "aspect": args.aspect,
+            "target_seconds": float(args.seconds or 0.0),
+        },
+        response={"material_digest": planning_state.material_digest},
+        validation={
+            "valid": True,
+            "available": sum(
+                one.disposition == "available" for one in planning_state.spans
+            ),
+            "deferred": sum(
+                one.disposition == "deferred" for one in planning_state.spans
+            ),
+        },
+    )
     # What was decided has to be keyed on everything it was decided from.
     # This was source ids, brief, aspect and the music path -- so a card
     # rewritten with better segments, a span boundary moved, or a schema
@@ -890,12 +969,17 @@ def command_render(args: argparse.Namespace) -> int:
         for item in sorted(material, key=lambda one: one.source_id)
     ))
     music_key = (
-        content_hash(args.music)
+        content_hash(args.music_map)
+        if args.music_map is not None and args.music_map.exists()
+        else content_hash(args.music)
         if args.music is not None and args.music.exists()
         else "no-music"
     )
     direction_contract = _planning_contract(
-        "direction_zh-TW.txt", _direction_schema()
+        "direction_zh-TW.txt", _direction_schema(
+            [span.span_id for item in material for span in item.spans],
+            list(grounding_target_refs),
+        )
     )
     asked = _asked(
         catalogue, brief, args.aspect, music_key,
@@ -911,6 +995,7 @@ def command_render(args: argparse.Namespace) -> int:
         ledger.check()
         direction, usage_direction = decide_direction(
             material, brief=brief, aspect=args.aspect, music=args.music,
+            music_grid=grid,
             seconds=args.seconds, cache=cache, client=client, ledger=ledger,
             grounding_spec=args.reference_grounding_spec,
         )
@@ -938,6 +1023,78 @@ def command_render(args: argparse.Namespace) -> int:
     from montagewright.planner import _beaten_and_broken
 
     beaten, broken = _beaten_and_broken(direction)
+    def bind_commitments(answer):
+        resolved_commitments = resolve_candidate_commitments(
+            answer,
+            material,
+            material_digest=planning_state.material_digest,
+            aspect=args.aspect,
+            target_seconds=float(args.seconds or answer["target_seconds"]),
+            grounding_target_ids=grounding_target_refs,
+            grounding_sha256=(
+                args.reference_grounding_spec.definition_sha256()
+                if args.reference_grounding_spec is not None else None
+            ),
+            excluded_source_ids=tuple(sorted(broken)),
+        )
+        offered_count = sum(
+            len(item.spans) for item in material if item.source_id not in broken
+        )
+        needed, _ = _shot_count_bounds(answer, offered_count)
+        unique = len({
+            option.commitment_id for option in resolved_commitments.options
+        })
+        if needed is not None and unique < needed:
+            raise CommitmentError(
+                f"direction supplied {unique} per-shot commitments, but its "
+                f"pacing requires at least {needed} shots"
+            )
+        return resolved_commitments
+
+    try:
+        commitments = bind_commitments(direction)
+    except CommitmentError as error:
+        # Provider-valid JSON can still make a claim the local material cannot
+        # prove (too little duration, native motion on a locked span, or a
+        # candidate from a take the same answer ruled broken). Give Direction
+        # one bounded correction with those measured facts instead of crashing
+        # or silently dropping the commitment layer.
+        ledger.check()
+        direction, usage_direction = decide_direction(
+            material,
+            brief=(
+                brief
+                + "\n\n## 上一版內容承諾無法執行\n"
+                + str(error)
+                + "\n請重做完整定調與 candidate_options；不可只改理由。"
+            ),
+            aspect=args.aspect,
+            music=args.music,
+            music_grid=grid,
+            seconds=args.seconds,
+            cache=cache,
+            client=client,
+            ledger=ledger,
+            grounding_spec=args.reference_grounding_spec,
+        )
+        beaten, broken = _beaten_and_broken(direction)
+        commitments = bind_commitments(direction)
+        _decide(work, "direction", asked, direction)
+    publish_planning_state(
+        work,
+        planning_state,
+        stage=f"commitments-{commitments.sha256()[:16]}",
+        request={
+            "stage": "candidate_commitments",
+            "direction_key": asked,
+            "material_digest": planning_state.material_digest,
+        },
+        response=commitments.model_dump(mode="json"),
+        validation={
+            "valid": True,
+            "warnings": list(commitments.warnings),
+        },
+    )
     for entry in direction.get("unusable", []) or []:
         source_id = str(entry.get("source_id", ""))
         if source_id in broken:
@@ -972,11 +1129,15 @@ def command_render(args: argparse.Namespace) -> int:
                 ]
                 if args.reference_grounding_spec is not None else []
             ),
+            commitment_ids=list(dict.fromkeys(
+                option.commitment_id for option in commitments.options
+            )),
         ),
     )
     chose = _asked(
         asked,
         json.dumps(direction, sort_keys=True, ensure_ascii=False),
+        commitments.sha256(),
         selection_contract,
     )
     selection = _decided(work, "selection", chose)
@@ -987,6 +1148,8 @@ def command_render(args: argparse.Namespace) -> int:
             ledger=ledger,
             graphic_candidates=brief_document.graphics_candidates(),
             grounding_spec=args.reference_grounding_spec,
+            music_grid=grid,
+            commitments=commitments,
         )
         _decide(work, "selection", chose, selection)
     else:
@@ -1004,6 +1167,27 @@ def command_render(args: argparse.Namespace) -> int:
         f"selection: {len(selection['shots'])} shots, {travelling} with the "
         f"frame travelling",
         flush=True,
+    )
+    planning_state = selection_planning_state(
+        planning_state, selection.get("shots") or []
+    )
+    publish_planning_state(
+        work,
+        planning_state,
+        request={
+            "stage": "selection",
+            "direction_key": asked,
+            "selection_key": chose,
+        },
+        response={
+            "selected_span_ids": list(planning_state.selected_span_ids),
+            "alternate_span_ids": list(planning_state.alternate_span_ids),
+        },
+        validation={
+            "valid": True,
+            "pool_size": len(planning_state.spans),
+            "selected_count": len(planning_state.selected_span_ids),
+        },
     )
     # A plan whose prose and whose structure describe different shots is not
     # a rendering problem -- both halves came from the same answer, so it
@@ -1029,23 +1213,6 @@ def command_render(args: argparse.Namespace) -> int:
         for source_id in audio_source_ids
         if source_id in found and source_id not in sources
     })
-    if args.music_map:
-        grid = load_beat_grid(args.music_map)
-    elif args.music:
-        # A reviewed lock proves which analysis a delivery was cut against.
-        # Requiring one before the tool will run at all turns "let me see
-        # what this does" into a two-step errand, and the measurement is the
-        # same either way.
-        print("no music map given; measuring the track", flush=True)
-        grid = analyse_track(args.music)
-    else:
-        # A cut carried by what people say does not need a bed, and refusing
-        # to run without one was the tool making an editorial decision on the
-        # way in. Without a grid every length is content-led, which is what a
-        # speech cut wants anyway.
-        grid = None
-        print("no music; lengths will be led by content", flush=True)
-
     rhythm_context = _rhythm_context(selection, cards)
 
     aspect = ASPECTS[args.aspect]
@@ -1231,8 +1398,9 @@ def command_render(args: argparse.Namespace) -> int:
                           ledger=ledger,
                           graphic_candidates=brief_document.graphics_candidates(),
                           grounding_spec=args.reference_grounding_spec,
+                          music_grid=grid,
+                          commitments=commitments,
                       )
-                      _decide(work, "selection", chose, selection)
                       edl, snaps = _edl_from_selection(
                           selection, rushes, cards, transcripts=transcripts
                       )
@@ -1352,6 +1520,7 @@ def command_render(args: argparse.Namespace) -> int:
                       client=client,
                       ledger=ledger,
                       grounding_spec=args.reference_grounding_spec,
+                      commitments=commitments,
                   )
               except BudgetSpent as error:
                   stopped = str(error)
@@ -1398,6 +1567,7 @@ def command_render(args: argparse.Namespace) -> int:
                           client=client,
                           ledger=ledger,
                           grounding_spec=args.reference_grounding_spec,
+                          commitments=commitments,
                       )
                   except BudgetSpent as error:
                       stopped = str(error)
@@ -1485,6 +1655,34 @@ def command_render(args: argparse.Namespace) -> int:
         crashed = error
         stopped = f"{type(error).__name__}: {error}"[:400]
         traceback.print_exc()
+
+    final_selected_spans = tuple(dict.fromkeys(
+        str(shot.get("span_id") or "")
+        for shot in selection.get("shots") or [] if shot.get("span_id")
+    ))
+    if crashed is None and final_selected_spans != planning_state.selected_span_ids:
+        planning_state = selection_planning_state(
+            planning_state, selection.get("shots") or []
+        )
+        publish_planning_state(
+            work,
+            planning_state,
+            stage="edit",
+            request={
+                "stage": "reviewed_selection",
+                "selection_key": chose,
+                "review_rounds": len(rounds),
+            },
+            response={
+                "selected_span_ids": list(planning_state.selected_span_ids),
+                "alternate_span_ids": list(planning_state.alternate_span_ids),
+            },
+            validation={
+                "valid": True,
+                "reviewed": True,
+                "selected_count": len(planning_state.selected_span_ids),
+            },
+        )
 
     _write_report(
         output,
@@ -1858,60 +2056,6 @@ def _aspect(path: Path) -> float:
     )
     stream = json.loads(completed.stdout)["streams"][0]
     return float(stream["width"]) / float(stream["height"])
-
-
-def _decided(work: Path, name: str, key: str) -> dict | None:
-    """A decision already paid for, if it was the same question.
-
-    Cards and transcripts survive a crash because they are keyed by the
-    content they describe. Direction and selection were not kept at all, so a
-    run that died after them -- on a quota, on a bad path -- paid for them
-    again on the way back. They are keyed the same way: the same material,
-    brief and aspect is the same question, and a different one is a different
-    key rather than a stale answer.
-    """
-
-    path = work / f"{name}.json"
-    try:
-        saved = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return saved.get("value") if saved.get("key") == key else None
-
-
-def _decide(work: Path, name: str, key: str, value: dict) -> dict:
-    path = work / f"{name}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"key": key, "value": value}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    return value
-
-
-def _asked(*parts: str) -> str:
-    import hashlib
-
-    return hashlib.sha256("\u0000".join(parts).encode("utf-8")).hexdigest()[:16]
-
-
-def _planning_contract(prompt_name: str, schema: dict) -> str:
-    """Everything that gives a planning answer its meaning."""
-
-    from montagewright.capabilities import (
-        describe_for_prompt,
-        describe_limits_for_prompt,
-    )
-
-    prompt = (PROMPTS / prompt_name).read_text(encoding="utf-8")
-    return _asked(
-        MODEL_ID,
-        f"thinking={THINKING_HIGH}|max_output={MAX_OUTPUT_TOKENS}",
-        prompt,
-        json.dumps(schema, ensure_ascii=False, sort_keys=True),
-        describe_for_prompt(),
-        describe_limits_for_prompt(),
-    )
 
 
 def _rhythm_context(

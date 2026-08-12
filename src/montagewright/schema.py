@@ -357,6 +357,14 @@ class Reframe(ModelFacing):
     # the warning was advice with no way to check it.
     source_motion_role: str = "locked"
     source_motion_description: str = ""
+    editorial_intent: str = Field(
+        default="hold",
+        description=(
+            "The planner's semantic camera intent before it is compiled to a "
+            "renderer move. In particular use_source_motion renders as a hold "
+            "crop but still promises that the authored take is allowed to play."
+        ),
+    )
     pacing_exception: bool = False
     pacing_exception_reason: str = ""
     camera_energy: CameraEnergy = Field(
@@ -980,6 +988,7 @@ def reframe_of(shot: dict) -> Reframe:
         source_motion_description=str(
             shot.get("source_motion_description", "") or ""
         )[:240],
+        editorial_intent=editorial_intent,
         pacing_exception=bool(shot.get("pacing_exception", False)),
         pacing_exception_reason=str(
             shot.get("pacing_exception_reason", "") or ""

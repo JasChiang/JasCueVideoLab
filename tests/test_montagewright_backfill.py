@@ -2080,6 +2080,51 @@ def test_the_delivery_aspect_is_the_request_not_the_model_s_choice():
     assert decided["aspect"] == "9:16"
 
 
+def test_direction_receives_the_same_measured_music_map_as_local_rhythm():
+    """Listening to a track and executing unrelated clocks is two truths."""
+
+    import json as _json
+
+    from montagewright import planner
+    from montagewright.grounding import BeatGrid, Cue
+
+    class Reply:
+        status = "complete"
+        usage = {}
+
+        def __init__(self, payload):
+            self.output_text = _json.dumps(payload)
+
+    class Client:
+        def __init__(self):
+            self.request = None
+
+        @property
+        def interactions(self):
+            return self
+
+        def create(self, **request):
+            self.request = request
+            return Reply({
+                "reasoning": "r", "material_assessment": "m",
+                "direction": "d", "target_seconds": "0:20",
+                "music_under_speech": "duck", "unusable": [],
+            })
+
+    grid = BeatGrid(
+        bpm=120.0, meter=4, duration_seconds=20.0,
+        cues=(Cue("section-opening", 0.0, "section_boundary", 1.0),),
+    )
+    client = Client()
+    planner.decide_direction(
+        [], brief="", aspect="9:16", music_grid=grid, client=client,
+    )
+    prompt = str(client.request["input"][0]["text"])
+    assert "section-opening" in prompt
+    assert "BPM 120" in prompt
+    assert "不要自創時間點" in prompt
+
+
 def test_the_card_version_moves_when_the_card_s_shape_does():
     """Two required fields were added and no card was rewritten.
 
