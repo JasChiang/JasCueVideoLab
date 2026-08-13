@@ -7497,15 +7497,28 @@ def test_a_cut_is_tracked_from_the_frame_that_proved_the_identity():
     assert source.index("if confirmed:") < source.index(
         "The window this shot uses IS the question"
     ), "the settled answer is used before the window is re-interrogated"
-    assert "CONFIRMED_REACH_SECONDS" in source, "and only from within reach"
+    assert "_reaches(" in source, "and only from a confirmation that reaches"
+    reach = inspect.getsource(pipeline._reaches)
+    assert "CONFIRMED_REACH_SECONDS" in reach, "reach is bounded in time"
+    assert "sighting_window" in reach, "and bounded to one appearance"
+    assert "usable = near if (inside or len(near) >= 2) else []" in source, (
+        "one confirmation outside the cut is the tracker agreeing with its "
+        "own prompt, and nothing then speaks for the seconds used"
+    )
 
     carried = inspect.getsource(pipeline._geometry_from_confirmed)
     assert "require_identity_validation=True" in carried, (
         "the track is still checked against the confirmed boxes"
     )
     assert "TRACK_MINIMUM_OBSERVATIONS" in carried and "TRACK_QUORUM" in carried
-    assert "the reach exists to find a seed" in carried, (
+    assert "The reach exists to find a seed" in carried, (
         "reaching back for a seed must not lengthen the shot"
+    )
+    assert '"frame_index"' in carried, (
+        "without it every crop builder but the held frame drops the box"
+    )
+    assert "over the reach" in carried or "Over the cut" in carried, (
+        "coverage is earned over the cut, not over the pre-roll"
     )
     assert pipeline.CONFIRMED_REACH_SECONDS <= 10.0, (
         "far enough for a take's own close-up, not far enough to cross a scene"

@@ -1160,7 +1160,9 @@ def test_identity_is_sampled_where_the_screen_says_it_is_clearest(tmp_path):
             "exclusion_evidence": [] if status == "matched_target" else ["another model"],
         }
 
-    short = sampling_times_for(screened([sighting(0, 11_000, 5_000)]), "device.fold")
+    short = [at for at, _ in sampling_times_for(
+        screened([sighting(0, 11_000, 5_000)]), "device.fold"
+    )]
     assert 5_000 in short, "the moment the screen picked is always looked at"
     assert len(short) == 3, "首中尾 for an ordinary take"
 
@@ -1169,10 +1171,24 @@ def test_identity_is_sampled_where_the_screen_says_it_is_clearest(tmp_path):
     )
     assert len(long_take) == 5, "a long take gets more, not the same three"
 
-    twice = sampling_times_for(
-        screened([sighting(0, 8_000, 4_000), sighting(14_000, 22_000, 18_000)]),
+    # Five sightings overflow the per-call limit. Round robin, so the later
+    # ones still get a moment -- taking the earliest eight would leave them
+    # with none, and a seed cannot cross the gap to reach them.
+    many = sampling_times_for(
+        screened([
+            sighting(n * 6_000, n * 6_000 + 5_000, n * 6_000 + 2_000)
+            for n in range(5)
+        ]),
         "device.fold",
     )
+    assert len({name for _, name in many}) == 5, (
+        "every appearance gets at least one moment"
+    )
+
+    twice = [at for at, _ in sampling_times_for(
+        screened([sighting(0, 8_000, 4_000), sighting(14_000, 22_000, 18_000)]),
+        "device.fold",
+    )]
     assert any(t < 8_000 for t in twice) and any(t > 14_000 for t in twice), (
         "each appearance is proved on its own; a seed from one is no use in "
         "the other"
@@ -1193,3 +1209,37 @@ def test_identity_is_sampled_where_the_screen_says_it_is_clearest(tmp_path):
         "device.fold",
     )
     assert refused == [], "nothing is sampled where the screen saw a lookalike"
+
+
+def test_a_confirmation_only_speaks_for_the_appearance_it_belongs_to():
+    """A box proved before the subject left says nothing after it returns.
+
+    The tracker cannot cross that gap either, so reaching across one would
+    seed a cut from whatever the mask drifted onto. The rule was written in
+    a comment and enforced by nothing: the filter was pure arithmetic on
+    seconds, and the sighting a confirmation came from had already been
+    flattened away before the filter could see it.
+    """
+
+    from montagewright.pipeline import CONFIRMED_REACH_SECONDS, _reaches
+    from montagewright.reference_grounding import ConfirmedFrame
+
+    def proved(at, window):
+        return ConfirmedFrame(
+            at_seconds=at, box=(0.2, 0.2, 0.4, 0.6), sighting="c1",
+            sighting_window=window, frame_pts=int(at * 1000),
+            frame_sha256="a" * 64,
+        )
+
+    # Proved at 2.5s during an appearance that runs 0-3s; the cut is at
+    # 4.5-6.5s, after the subject left. Close in time, wrong appearance.
+    assert not _reaches(proved(2.5, (0.0, 3.0)), 4.5, 6.5)
+
+    # Same instant, but the appearance covers the cut: this is the case the
+    # reach exists for -- a close-up that opens a take.
+    assert _reaches(proved(2.5, (0.0, 12.0)), 4.5, 6.5)
+
+    # Still bounded in time even inside one long appearance.
+    assert not _reaches(
+        proved(2.0, (0.0, 60.0)), 2.0 + CONFIRMED_REACH_SECONDS + 1.0, 30.0
+    )

@@ -1693,6 +1693,23 @@ def remembered_discovery(
     return result, usage
 
 
+class ConfirmedFrame(FrozenStrictModel):
+    """One moment where the locked identity was proved, and where it was.
+
+    Carries which sighting it belongs to, because a box proved during one
+    appearance is no use during the next, and the frame's own lineage, so
+    the tracker can be handed the exact judged frame rather than the
+    nearest analysis sample to it.
+    """
+
+    at_seconds: float = Field(ge=0.0)
+    box: tuple[float, float, float, float]
+    sighting: str = Field(min_length=1)
+    sighting_window: tuple[float, float]
+    frame_pts: int
+    frame_sha256: str = Field(pattern=SHA256_PATTERN)
+
+
 def confirm_source_identity(
     video_path: Path,
     spec: ReferenceGroundingSpec,
@@ -1704,7 +1721,7 @@ def confirm_source_identity(
     cache: UploadCache | Any | None = None,
     ledger: Any | None = None,
     library: Path | None = None,
-) -> tuple[tuple[float, tuple[float, float, float, float]], ...]:
+) -> tuple["ConfirmedFrame", ...]:
     """Prove the identity once per source, where it is clearest.
 
     Returns the moments it was confirmed at and the box it was confirmed in,
@@ -1734,12 +1751,23 @@ def confirm_source_identity(
         except (OSError, ValueError):
             remembered = None
         if isinstance(remembered, dict) and remembered.get("target") == target_id:
-            return tuple(
-                (float(one["at_seconds"]), tuple(float(v) for v in one["box"]))
-                for one in remembered.get("confirmed") or ()
-            )
+            try:
+                return tuple(
+                    ConfirmedFrame.model_validate(one)
+                    for one in remembered.get("confirmed") or ()
+                )
+            except ValidationError:
+                pass
 
-    times = sampling_times_for(discovery, target_id)
+    sampled = sampling_times_for(discovery, target_id)
+    times = [at for at, _ in sampled]
+    sighting_of = {at: name for at, name in sampled}
+    windows = {
+        candidate.candidate_id: (
+            candidate.start_ms / 1000.0, candidate.end_ms / 1000.0
+        )
+        for candidate in discovery.candidates
+    }
     if len(times) < 2:
         return ()
     video = inspect_video_lineage(video_path)
@@ -1809,18 +1837,23 @@ def confirm_source_identity(
         native = evaluation.decision.tracking_box_xyxy_1000
         if native is None:
             continue
-        confirmed.append((
-            evaluation.lineage.frame_time_ms / 1000.0,
-            tuple(float(value) / 1000.0 for value in native),
+        at_ms = int(evaluation.lineage.frame_time_ms)
+        nearest = min(times, key=lambda one: abs(one - at_ms))
+        name = sighting_of.get(nearest, "sighting")
+        confirmed.append(ConfirmedFrame(
+            at_seconds=at_ms / 1000.0,
+            box=tuple(float(value) / 1000.0 for value in native),
+            sighting=name,
+            sighting_window=windows.get(name, (0.0, float(video.duration_ms) / 1000.0)),
+            frame_pts=int(evaluation.lineage.frame_pts),
+            frame_sha256=str(evaluation.lineage.frame_sha256),
         ))
     if stored is not None:
         stored.parent.mkdir(parents=True, exist_ok=True)
         stored.write_text(json.dumps({
             "target": target_id,
             "video_sha256": digest,
-            "confirmed": [
-                {"at_seconds": at, "box": list(box)} for at, box in confirmed
-            ],
+            "confirmed": [one.model_dump(mode="json") for one in confirmed],
         }), encoding="utf-8")
     return tuple(confirmed)
 
@@ -1843,7 +1876,7 @@ def sampling_times_for(
     appearance is no use during the next.
     """
 
-    times: list[int] = []
+    per_sighting: list[list[tuple[int, str]]] = []
     for candidate in discovery.candidates:
         if candidate.target_id != target_id:
             continue
@@ -1860,11 +1893,24 @@ def sampling_times_for(
         ]
         if span > 15_000:
             wanted += [opens + span // 2, opens + (span * 7) // 8]
+        kept: list[tuple[int, str]] = []
         for at in wanted:
             at = max(opens, min(closes - 1, at))
-            if all(abs(at - seen) > 250 for seen in times):
-                times.append(at)
-    return sorted(times)[:MAX_EXACT_FRAMES_PER_CALL]
+            if all(abs(at - seen) > 250 for seen, _ in kept):
+                kept.append((at, candidate.candidate_id))
+        if kept:
+            per_sighting.append(kept)
+    # Round robin, not the earliest eight. Sorting everything together and
+    # truncating gave the whole budget to the first sightings and left the
+    # later ones with no confirmed frame at all -- which is exactly the case
+    # this function exists to serve, since a seed cannot cross the gap
+    # between one appearance and the next.
+    ordered: list[tuple[int, str]] = []
+    for rank in range(max((len(one) for one in per_sighting), default=0)):
+        for one in per_sighting:
+            if rank < len(one):
+                ordered.append(one[rank])
+    return ordered[:MAX_EXACT_FRAMES_PER_CALL]
 
 
 def _validate_discovery_for_spec(

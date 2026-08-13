@@ -926,11 +926,32 @@ def _write_grounding_record(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def _reaches(one: Any, opens: float, closes: float) -> bool:
+    """Whether a confirmed frame speaks for this cut.
+
+    Within reach in time, and belonging to a sighting that the cut sits in:
+    the two together are what make it safe to carry a box forward.
+    """
+
+    if not (
+        opens - CONFIRMED_REACH_SECONDS
+        <= one.at_seconds
+        <= closes + CONFIRMED_REACH_SECONDS
+    ):
+        return False
+    window = getattr(one, "sighting_window", None)
+    if window is None:
+        return True
+    starts, ends = window
+    return starts - 1e-6 <= opens and closes <= ends + 1e-6
+
+
 def _geometry_from_confirmed(
     source: Source,
     clip: Any,
     target_id: str,
-    confirmed: "list[tuple[float, tuple[float, float, float, float]]]",
+    confirmed: "list[Any]",
+    inside: "list[Any]",
     *,
     report: Report,
     work: Path,
@@ -942,83 +963,96 @@ def _geometry_from_confirmed(
 ]:
     """Track from a frame whose identity is already settled.
 
-    The seed is the confirmed frame closest to this cut, and the analysed
-    range stretches to include it, so a box proved during the close-up that
-    opens a take can be carried into the seconds an edit actually wants.
-    Everything the tracker then produces is checked against the confirmed
-    boxes exactly as before -- what changed is where the proof came from,
-    not whether it is required.
+    The seed is the confirmed frame closest to this cut -- preferring one
+    inside it -- and the analysed range stretches to reach it, so a box
+    proved during the close-up that opens a take can be carried into the
+    seconds an edit actually wants. What the tracker produces is checked
+    against every confirmed box as before; the coverage it has to earn is
+    measured over the cut, not over the reach, or a shot could ride in on a
+    pre-roll it does not use.
     """
 
-    seed_at, seed_box = min(
-        confirmed,
+    seed = min(
+        inside or confirmed,
         key=lambda one: abs(
-            one[0] - (clip.approx_in_seconds + clip.approx_out_seconds) / 2
+            one.at_seconds
+            - (clip.approx_in_seconds + clip.approx_out_seconds) / 2
         ),
     )
-    reach_in = min(clip.approx_in_seconds, seed_at)
-    reach_out = max(clip.approx_out_seconds, seed_at + 0.1)
+    reach_in = max(0.0, min(clip.approx_in_seconds, seed.at_seconds))
+    reach_out = max(clip.approx_out_seconds, seed.at_seconds + 0.1)
     widened = clip.model_copy(update={
         "approx_in_seconds": reach_in, "approx_out_seconds": reach_out,
     })
     tracked, states = _track_subject(
         source, widened, f"the locked identity {target_id}",
-        [int(value * 1000) for value in seed_box],
+        [int(value * 1000) for value in seed.box],
         checkpoint, work,
-        seed_time_seconds=seed_at,
+        seed_time_seconds=seed.at_seconds,
         track_name=f"confirmed-{target_id.replace(':', '_')}",
-        semantic_anchors=tuple(confirmed),
+        semantic_anchors=tuple((one.at_seconds, one.box) for one in confirmed),
         require_identity_validation=True,
     )
-    total = sum(
-        count for name, count in states.items() if not name.startswith("_")
-    ) or 1
-    kept = len(tracked)
-    if kept < TRACK_MINIMUM_OBSERVATIONS or kept / total < TRACK_QUORUM:
+    boxes: list[dict[str, Any]] = []
+    times: list[float] = []
+    for observation in tracked:
+        at = reach_in + observation.seconds
+        if not (
+            clip.approx_in_seconds - 1e-6 <= at <= clip.approx_out_seconds + 1e-6
+        ):
+            # The reach exists to find a seed, not to lengthen the shot.
+            continue
+        # The index the crop builders look this observation's moment up by.
+        # Without it every consumer but the held-frame branch drops the box
+        # and reports that the subject was never located.
+        boxes.append({
+            "frame_index": len(times),
+            "present": True,
+            "centre_x": observation.centre_x,
+            "centre_y": observation.centre_y,
+            "width": observation.width,
+            "height": observation.height,
+            "disambiguation": (
+                f"identity confirmed at {seed.at_seconds:.2f}s"
+            ),
+            "geometry_source": "sam2.1",
+        })
+        times.append(at)
+
+    # Over the cut. `states` counts every sample across the reach, so a long
+    # pre-roll the tracker held would otherwise pay for seconds it lost.
+    analysed = max(
+        1,
+        round(
+            (clip.approx_out_seconds - clip.approx_in_seconds) * TRACK_FPS
+        ),
+    )
+    kept = len(boxes)
+    report.reference_grounding[clip.clip_id].update({
+        "matched_anchors": len(confirmed),
+        "tracked_frames": kept,
+        "analysed_frames": analysed,
+        "sam_seed_seconds": round(seed.at_seconds, 3),
+        "sam_seed_pts": seed.frame_pts,
+        "sam_seed_sha256": seed.frame_sha256,
+        "identity_by_continuity": bool(states.get("_identity_by_continuity")),
+    })
+    if kept < TRACK_MINIMUM_OBSERVATIONS or kept / analysed < TRACK_QUORUM:
         report.reference_grounding[clip.clip_id]["status"] = (
             "local_geometry_unverified"
         )
         raise ReferenceGeometryUnavailable(
             clip.clip_id, target_id,
             f"{clip.clip_id}: tracking from the confirmed frame at "
-            f"{seed_at:.2f}s held {kept}/{total} samples; refusing "
-            "Gemini-box fallback",
+            f"{seed.at_seconds:.2f}s covered {kept}/{analysed} of the cut; "
+            "refusing Gemini-box fallback",
         )
-    boxes: list[dict[str, Any]] = []
-    times: list[float] = []
-    for observation in tracked:
-        # Only what the cut actually uses; the reach exists to find a seed,
-        # not to lengthen the shot.
-        if not (
-            clip.approx_in_seconds - 1e-6
-            <= observation.seconds + reach_in
-            <= clip.approx_out_seconds + 1e-6
-        ):
-            continue
-        times.append(reach_in + observation.seconds)
-        boxes.append({
-            "present": True,
-            "centre_x": observation.centre_x,
-            "centre_y": observation.centre_y,
-            "width": observation.width,
-            "height": observation.height,
-            "disambiguation": f"identity confirmed at {seed_at:.2f}s",
-            "geometry_source": "sam2.1",
-        })
-    report.reference_grounding[clip.clip_id].update({
-        "status": "sam_geometry_validated",
-        "matched_anchors": len(confirmed),
-        "tracked_frames": kept,
-        "analysed_frames": total,
-        "sam_seed_seconds": round(seed_at, 3),
-    })
-    if len(boxes) < 2:
-        raise ReferenceGeometryUnavailable(
-            clip.clip_id, target_id,
-            f"{clip.clip_id}: the confirmed track covers only "
-            f"{len(boxes)} of the seconds this cut uses",
-        )
-    return boxes, times, tuple(confirmed)
+    report.reference_grounding[clip.clip_id]["status"] = "sam_geometry_validated"
+    return (
+        boxes,
+        times,
+        tuple((one.at_seconds, one.box) for one in confirmed),
+    )
 
 
 def _reference_subject_samples(
@@ -1035,7 +1069,7 @@ def _reference_subject_samples(
     discoveries: dict[str, Any],
     checkpoint: Path | None,
     memory: Path | None = None,
-    confirmed: "tuple[tuple[float, tuple[float, float, float, float]], ...] | None" = None,
+    confirmed: "tuple[Any, ...] | None" = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[float],
@@ -1083,25 +1117,44 @@ def _reference_subject_samples(
     # subject was in shot says nothing after it left and came back, and the
     # tracker cannot cross that gap either.
     if confirmed:
+        # Only from inside a sighting that this cut is part of. A box proved
+        # while the subject was in shot says nothing after it left and came
+        # back -- and the tracker cannot cross that gap either, so reaching
+        # across one would seed the cut from whatever the mask drifted onto.
         near = [
-            (at, box) for at, box in confirmed
-            if clip_start_ms / 1000.0 - CONFIRMED_REACH_SECONDS
-            <= at <= clip_end_ms / 1000.0 + CONFIRMED_REACH_SECONDS
+            one for one in confirmed
+            if _reaches(one, clip_start_ms / 1000.0, clip_end_ms / 1000.0)
         ]
-        if near:
-            inside = [one for one in near if
-                      clip_start_ms / 1000.0 <= one[0] <= clip_end_ms / 1000.0]
-            chosen = inside or near
+        inside = [
+            one for one in near
+            if clip_start_ms / 1000.0 <= one.at_seconds <= clip_end_ms / 1000.0
+        ]
+        # Seeding from outside the cut on a single confirmation is not a
+        # check at all: SAM is prompted with that exact box at that exact
+        # time, so it agrees with itself, and nothing then speaks for the
+        # seconds the cut actually uses. Two confirmations, or one inside.
+        usable = near if (inside or len(near) >= 2) else []
+        if usable:
             report.reference_grounding[clip.clip_id] = {
                 "target_id": target_id,
                 "status": "identity_from_source",
-                "confirmed_at": [round(at, 3) for at, _ in chosen],
+                "confirmed_at": [round(one.at_seconds, 3) for one in usable],
                 "seeded_inside_cut": bool(inside),
             }
-            return _geometry_from_confirmed(
-                source, clip, target_id, chosen,
-                report=report, work=work, checkpoint=checkpoint,
-            )
+            try:
+                return _geometry_from_confirmed(
+                    source, clip, target_id, usable, inside,
+                    report=report, work=work, checkpoint=checkpoint,
+                )
+            except ReferenceShotUnusable as unusable:
+                # Fall through and ask inside the cut's own window, which is
+                # what this did before there was anything to fall back from.
+                report.subject_notes[clip.clip_id] = str(unusable)[:200]
+            except Exception as error:  # noqa: BLE001 -- reported, not fatal
+                report.subject_notes[clip.clip_id] = (
+                    f"tracking from the confirmed frame failed: "
+                    f"{type(error).__name__}: {error}"[:200]
+                )
 
     # The window this shot uses IS the question, so ask it directly.
     #
