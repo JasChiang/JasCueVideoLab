@@ -344,6 +344,7 @@ def _confirm_material_identity(
     ledger: Any,
     library: Path,
     work: Path,
+    spread: bool = False,
 ) -> dict[str, tuple[tuple[float, tuple[float, float, float, float]], ...]]:
     """Where each source's identity was proved, on the master's clock."""
 
@@ -377,6 +378,15 @@ def _confirm_material_identity(
                 client=client,
                 frames_dir=work / "identity-frames" / item.source_id,
                 cache=cache, ledger=ledger, library=library,
+                # A promoted source has no sightings to sample -- the screen
+                # recorded none because it decided against it. Five moments
+                # across the take, and the master decides.
+                at_ms=(
+                    tuple(
+                        int(item.duration_seconds * 1000 * share)
+                        for share in (0.1, 0.3, 0.5, 0.7, 0.9)
+                    ) if spread else ()
+                ),
             )
         except BudgetSpent:
             raise
@@ -1423,7 +1433,7 @@ def command_render(args: argparse.Namespace) -> int:
                 sightings, args.reference_grounding_spec,
                 masters=originals,
                 client=client, cache=cache, ledger=ledger, library=library,
-                work=work,
+                work=work, spread=True,
             ))
     def bind_commitments(answer):
         resolved_commitments = resolve_candidate_commitments(

@@ -1721,6 +1721,7 @@ def confirm_source_identity(
     cache: UploadCache | Any | None = None,
     ledger: Any | None = None,
     library: Path | None = None,
+    at_ms: "tuple[int, ...]" = (),
 ) -> tuple["ConfirmedFrame", ...]:
     """Prove the identity once per source, where it is clearest.
 
@@ -1760,6 +1761,15 @@ def confirm_source_identity(
                 pass
 
     sampled = sampling_times_for(discovery, target_id)
+    if not sampled and at_ms:
+        # A source the screen refused, that direction says holds the target
+        # anyway. The screen's own sightings are no help here -- it recorded
+        # none, having decided against the source -- so the frames to look at
+        # come from the caller, spread across the take. This is the whole
+        # point of promoting it: the question moves from a 640-pixel proxy at
+        # a frame a second to the master at 1440, where two camera rings are
+        # two camera rings.
+        sampled = [(int(at), "promoted") for at in at_ms]
     times = [at for at, _ in sampled]
     sighting_of = {at: name for at, name in sampled}
     windows = {
