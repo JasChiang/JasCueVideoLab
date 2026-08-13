@@ -54,6 +54,7 @@ DRAFT_PROMPT_PATH = (
 # paid for, and worth nothing.
 MAX_OUTPUT_TOKENS = 4_096
 MAX_EXACT_FRAMES_PER_CALL = 8
+SOURCE_CONFIRMATION_VERSION = "adaptive-seed-v1"
 TARGET_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 ReferencePolarity = Literal["positive", "negative"]
@@ -1808,7 +1809,8 @@ def confirm_source_identity(
     stored = (
         Path(library) / "reference-grounding"
         / f"identity-{digest[:20]}-{spec.definition_sha256()[:16]}"
-          f"-{_sha256_text(_read_prompt())[:8]}.json"
+          f"-{_sha256_text(_read_prompt())[:8]}"
+          f"-{SOURCE_CONFIRMATION_VERSION}.json"
         if library is not None else None
     )
     if stored is not None and stored.exists():
