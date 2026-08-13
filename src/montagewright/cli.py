@@ -360,6 +360,10 @@ def _confirm_material_identity(
     paid_before = float(getattr(ledger, "spent_usd", 0.0))
     total = len(material)
     for index, item in enumerate(material, start=1):
+        if not getattr(item, "carries_identity", True):
+            # The screen already answered this one. Asking again costs money
+            # to be told the same thing.
+            continue
         discovery = sightings.get(item.source_id)
         # The master: these frames are decoded at 1440 and their boxes are
         # handed to a tracker that reads the master too.
@@ -436,6 +440,7 @@ def _screen_material_identity(
 
     kept: list[Any] = []
     aside: dict[str, str] = {}
+    context: dict[str, str] = {}
     found: dict[str, Any] = {}
     print(
         f"identity screen: {len(material)} sources against "
@@ -485,10 +490,18 @@ def _screen_material_identity(
             if summary.target_id in required and summary.verdict == "absent"
         ]
         if absent:
-            aside[item.source_id] = (
-                f"reference identity {absent[0].target_id} is not in this "
-                f"source: {absent[0].reason}"
+            # Not the subject, still the film. The brief that locks a product
+            # also asks for the venue it was shown in, and says in as many
+            # words that those shots need not contain it. Deleting the source
+            # answered a question nobody asked -- whether every clip has the
+            # product -- and threw away the entrance, the main visual and the
+            # people at the stand. Mark it: selection may use it for context,
+            # and the look-semantics gate refuses to let it claim the target.
+            context[item.source_id] = (
+                f"{absent[0].target_id} is not in this source: "
+                f"{absent[0].reason}"
             )
+            kept.append(replace(item, carries_identity=False))
             continue
         # Sightings are in milliseconds from the first decoded frame, which
         # is the clock the card's segments are on too.
@@ -533,14 +546,18 @@ def _screen_material_identity(
             ))
         surviving = tuple(surviving)
         if not surviving:
-            aside[item.source_id] = (
+            # Seen, but never in a stretch anything can be cut from. Same
+            # treatment: it is still material, it is just not the subject.
+            context[item.source_id] = (
                 "the locked identity was seen in this source but never "
                 "inside a usable span"
             )
+            kept.append(replace(item, carries_identity=False))
             continue
         kept.append(replace(item, spans=surviving))
     print(
-        f"  {len(kept)} sources kept, {len(aside)} set aside "
+        f"  {len(kept) - len(context)} sources carry the identity, "
+        f"{len(context)} kept for context only, {len(aside)} set aside "
         f"({paid} newly screened, ${ledger.spent_usd:.4f} so far)",
         flush=True,
     )
@@ -1492,7 +1509,7 @@ def command_render(args: argparse.Namespace) -> int:
         # rules. Bump this when those rules change so a paid answer accepted
         # by an older binary is audited again instead of bypassing the new
         # Selection repair loop on resume.
-        "selection-local-contract-v2-look-semantics",
+        "selection-local-contract-v3-context-only-sources",
     )
     selection = _decided(work, "selection", chose)
     if selection is None:

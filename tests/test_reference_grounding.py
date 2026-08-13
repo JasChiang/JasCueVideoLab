@@ -1243,3 +1243,47 @@ def test_a_confirmation_only_speaks_for_the_appearance_it_belongs_to():
     assert not _reaches(
         proved(2.0, (0.0, 60.0)), 2.0 + CONFIRMED_REACH_SECONDS + 1.0, 30.0
     )
+
+
+def test_a_source_without_the_identity_is_context_not_rubbish():
+    """The venue is not the product, and a launch film needs both.
+
+    The screen used to delete a source the locked identity was absent from,
+    which threw away the entrance, the main visual and the people at the
+    stand -- every establishing shot the brief asked for in the same breath
+    as it said those shots need not contain the product.
+    """
+
+    from montagewright.planner import MaterialItem, context_only_disagreements
+
+    venue = MaterialItem(
+        source_id="C8370", duration_seconds=5.0,
+        summary="Galaxy Unpacked main visual", carries_identity=False,
+    )
+    product = MaterialItem(
+        source_id="C8340", duration_seconds=5.0, summary="rear camera module",
+    )
+    targets = {"device.galaxy_z_fold8"}
+
+    # Context, used as context: nothing to say.
+    assert context_only_disagreements(
+        [{"source_id": "C8370", "looks": [{"entity_id": "none"}]}],
+        [venue, product], targets,
+    ) == []
+
+    # Context, claiming the product: refused before geometry goes looking
+    # for a subject that was never in the frame.
+    refused = context_only_disagreements(
+        [{"source_id": "C8370",
+          "looks": [{"entity_id": "device.galaxy_z_fold8"}]}],
+        [venue, product], targets,
+    )
+    assert len(refused) == 1
+    assert "C8370" in refused[0]
+
+    # A source that carries it may of course name it.
+    assert context_only_disagreements(
+        [{"source_id": "C8340",
+          "looks": [{"entity_id": "device.galaxy_z_fold8"}]}],
+        [venue, product], targets,
+    ) == []

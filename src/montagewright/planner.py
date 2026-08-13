@@ -1088,6 +1088,15 @@ class MaterialItem:
     # watching the clip -- and neither can be derived from geometry.
     shot_size: str = ""
     facing: str = ""
+    # Whether the locked identity is anywhere in this source. A brief that
+    # locks a product still asks for the room it was launched in: "這些可以
+    # 是純環境鏡頭，不需要 Fold8 入鏡". The screen used to delete a source the
+    # identity was absent from, which threw away every establishing shot, the
+    # main visual and the people at the stand before planning saw them --
+    # enforcing "the subject is the product" as "the product is in every
+    # frame of every clip". Kept and marked instead: usable as context,
+    # never as the subject.
+    carries_identity: bool = True
     # Which stretch is worth cutting into, what happens where, and what the
     # material was judged to need. Selection picks a start second, and it was
     # picking one blind: a shot whose first second is the camera still
@@ -1405,6 +1414,11 @@ def _describe_material(material: list[MaterialItem]) -> str:
             facts.append("、".join(room))
         else:
             facts.append("這個交付比例下橫向縱向都沒有空間，鏡頭移不了")
+        if not item.carries_identity:
+            # Said first, in the fact list, because it changes what the whole
+            # line is for: this source is where the event was, not where the
+            # product is.
+            facts.insert(1, "鎖定的主角不在這支裡：只能當環境／氣氛，不能當主體")
         head = f"- {item.source_id}（{'、'.join(facts)}）：{item.summary}"
         # The ids a plan may name, with what is in each. Everything else on
         # this line describes the take; this is the part that is choosable,
@@ -2502,6 +2516,9 @@ def select_shots(
             faults.extend(grounding_target_disagreements(
                 chosen.get("shots") or [], grounding_required_target_ids
             ))
+            faults.extend(context_only_disagreements(
+                chosen.get("shots") or [], usable, known_grounding_targets
+            ))
         expand_audio_assignments(chosen, audio_span_ids)
         faults.extend(audio_assignment_disagreements(
             chosen.get("shots") or [], usable
@@ -2725,6 +2742,48 @@ def _shot_count_bounds(
     lower = max(1, min(available_spans, target - slack))
     upper = max(lower, min(available_spans, target + slack))
     return lower, upper
+
+
+def context_only_disagreements(
+    shots: list[dict[str, Any]],
+    material: "list[MaterialItem]",
+    grounding_target_ids: set[str],
+) -> list[str]:
+    """A source without the identity may set the scene, never claim it.
+
+    Sources the screen found the locked identity absent from are offered to
+    selection now instead of being deleted, because a launch film wants the
+    room it was launched in. What must not follow is a shot cut from one of
+    them promising the product: the geometry stage would go looking for a
+    subject that was never there, and the shot would die four stages later
+    with the frames judged and nothing in them.
+    """
+
+    context = {
+        item.source_id for item in material
+        if not getattr(item, "carries_identity", True)
+    }
+    if not context:
+        return []
+    notes: list[str] = []
+    for index, shot in enumerate(shots):
+        source = str(
+            shot.get("source_id")
+            or str(shot.get("span_id") or "").split(":")[0]
+        )
+        if source not in context:
+            continue
+        for look in shot.get("looks") or []:
+            entity = str(look.get("entity_id") or "").strip()
+            if entity in grounding_target_ids:
+                notes.append(
+                    f"k{index:02d} looks at {entity} in {source}, which the "
+                    "identity screen found it absent from; use this source "
+                    "for context with entity_id none, or cut the shot from "
+                    "a source that carries the identity"
+                )
+                break
+    return notes
 
 
 def grounding_target_disagreements(
