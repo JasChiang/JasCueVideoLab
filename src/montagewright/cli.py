@@ -332,6 +332,65 @@ def _swap_for_alternate(
     return None
 
 
+def _confirm_material_identity(
+    material: list[Any],
+    sightings: dict[str, Any],
+    spec: Any,
+    *,
+    masters: dict[str, Path],
+    client: Any,
+    cache: Any,
+    ledger: Any,
+    library: Path,
+    work: Path,
+) -> dict[str, tuple[tuple[float, tuple[float, float, float, float]], ...]]:
+    """Where each source's identity was proved, on the master's clock."""
+
+    from montagewright.reference_grounding import confirm_source_identity
+
+    required = tuple(
+        spec.identity_lock.framing.required_target_ids
+        or [target.target_id for target in spec.identity_lock.identity.targets]
+    )
+    if not required:
+        return {}
+    target = required[0]
+    confirmed: dict[str, tuple[tuple[float, tuple[float, float, float, float]], ...]] = {}
+    paid_before = float(getattr(ledger, "spent_usd", 0.0))
+    for item in material:
+        discovery = sightings.get(item.source_id)
+        # The master: these frames are decoded at 1440 and their boxes are
+        # handed to a tracker that reads the master too.
+        source = masters.get(item.source_id)
+        if discovery is None or source is None:
+            continue
+        ledger.check()
+        try:
+            found = confirm_source_identity(
+                Path(source), spec, discovery, target,
+                client=client,
+                frames_dir=work / "identity-frames" / item.source_id,
+                cache=cache, ledger=ledger, library=library,
+            )
+        except BudgetSpent:
+            raise
+        except Exception as error:  # noqa: BLE001 -- reported, not swallowed
+            print(
+                f"  {item.source_id} — identity not confirmed: "
+                f"{type(error).__name__}: {error}"[:150],
+                flush=True,
+            )
+            continue
+        if found:
+            confirmed[item.source_id] = found
+    print(
+        f"identity confirmed on {len(confirmed)}/{len(material)} sources "
+        f"(${float(getattr(ledger, 'spent_usd', 0.0)) - paid_before:.4f})",
+        flush=True,
+    )
+    return confirmed
+
+
 def _screen_material_identity(
     material: list[Any],
     spec: Any,
@@ -340,7 +399,7 @@ def _screen_material_identity(
     cache: Any,
     ledger: Any,
     library: Path,
-) -> tuple[list[Any], dict[str, str]]:
+) -> tuple[list[Any], dict[str, str], dict[str, Any]]:
     """Keep only material that can still contain the locked identity.
 
     Runs on the proxy, which is what the planning stages watch anyway and is
@@ -366,10 +425,11 @@ def _screen_material_identity(
         ]
     )
     if not required:
-        return material, {}
+        return material, {}, {}
 
     kept: list[Any] = []
     aside: dict[str, str] = {}
+    found: dict[str, Any] = {}
     print(
         f"identity screen: {len(material)} sources against "
         f"{', '.join(required)}",
@@ -407,6 +467,7 @@ def _screen_material_identity(
             continue
         discovery, usage = screened
         paid += 1 if usage is not None else 0
+        found[item.source_id] = discovery
         absent = [
             summary for summary in discovery.target_summaries
             if summary.target_id in required and summary.verdict == "absent"
@@ -471,7 +532,7 @@ def _screen_material_identity(
         f"({paid} newly screened, ${ledger.spent_usd:.4f} so far)",
         flush=True,
     )
-    return kept, aside
+    return kept, aside, found
 
 
 def _travel(source: Path, target_aspect: float) -> tuple[float, float]:
@@ -986,6 +1047,7 @@ def command_render(args: argparse.Namespace) -> int:
     # identical to one that had all of them -- and "why didn't it use the
     # good coin shot" had no answer anywhere in the output.
     set_aside: dict[str, str] = {}
+    confirmed_identities: dict[str, Any] = {}
     for source_id, proxy in proxies.items():
         card = load_card(cards[source_id]) if source_id in cards else None
         if card is not None and not card.get("usable", True):
@@ -1073,7 +1135,7 @@ def command_render(args: argparse.Namespace) -> int:
     # close-up of "the rear camera module" was a different model. Its
     # alternate was too.
     if args.reference_grounding_spec is not None:
-        material, identity_aside = _screen_material_identity(
+        material, identity_aside, sightings = _screen_material_identity(
             material,
             args.reference_grounding_spec,
             client=client,
@@ -1082,6 +1144,18 @@ def command_render(args: argparse.Namespace) -> int:
             library=library,
         )
         set_aside.update(identity_aside)
+        # Prove the identity now, at the moments the screen says are
+        # clearest, once per source and remembered for good. Doing it later
+        # meant doing it inside whichever seconds an edit wanted -- three
+        # views of a folded handset's edge, or the moment a camera had
+        # pulled back off a close-up -- and paying for it again on every
+        # repair round.
+        confirmed_identities = _confirm_material_identity(
+            material, sightings, args.reference_grounding_spec,
+            masters=originals,
+            client=client, cache=cache, ledger=ledger, library=library,
+            work=work,
+        )
 
     if set_aside:
         print(
@@ -1524,6 +1598,7 @@ def command_render(args: argparse.Namespace) -> int:
             transcripts=transcripts,
             grounding_spec=args.reference_grounding_spec,
             grounding_memory=library / "reference-grounding",
+            confirmed_identities=confirmed_identities,
             # The pass that decides how long each shot runs should be able
             # to see the shots. They are the material items selection chose,
             # in the order it chose them.

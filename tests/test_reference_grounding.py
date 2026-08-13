@@ -1115,3 +1115,81 @@ def test_a_subject_may_leave_exactly_when_its_interval_ends(tmp_path):
         interval(frame_entry_ms=15015)
     with pytest.raises(ValidationError):
         interval(recommended_seed_ms=15015)
+
+
+def test_identity_is_sampled_where_the_screen_says_it_is_clearest(tmp_path):
+    """Per sighting, not per source and not per cut.
+
+    The screen already says where the target is and which moment shows it
+    most clearly, and every one of those answers was thrown away: the
+    frames were taken from the seconds an edit happened to want, so a
+    sixteen-second take of a handset seen edge-on beside a coin was judged
+    on three views of an edge. Each sighting needs its own moments, because
+    a tracker cannot carry a box across a gap where the subject left.
+    """
+
+    from montagewright.reference_grounding import (
+        CandidateDiscoveryResult, sampling_times_for,
+    )
+
+    def screened(candidates):
+        return CandidateDiscoveryResult.model_validate({
+            "contract_version": "reference-candidate-discovery-v1",
+            "query_id": "grounding:device.fold",
+            "query_lock_sha256": "a" * 64,
+            "grounding_spec_sha256": "b" * 64,
+            "video_asset_id": "sha256:" + "c" * 64,
+            "video_sha256": "c" * 64,
+            "duration_ms": 31_000,
+            "candidates": candidates,
+            "target_summaries": [{
+                "target_id": "device.fold", "verdict": "present",
+                "reason": "seen",
+            }],
+            "warnings": [],
+        })
+
+    def sighting(start, end, seed, status="matched_target"):
+        return {
+            "candidate_id": f"c{start}", "target_id": "device.fold",
+            "start_ms": start, "end_ms": end, "recommended_seed_ms": seed,
+            "identity_status": status, "confidence": 0.9,
+            "visible_state": "folded", "visibility_state": "full",
+            "occlusion_state": "none",
+            "identity_evidence": ["the hinge"] if status == "matched_target" else [],
+            "exclusion_evidence": [] if status == "matched_target" else ["another model"],
+        }
+
+    short = sampling_times_for(screened([sighting(0, 11_000, 5_000)]), "device.fold")
+    assert 5_000 in short, "the moment the screen picked is always looked at"
+    assert len(short) == 3, "首中尾 for an ordinary take"
+
+    long_take = sampling_times_for(
+        screened([sighting(0, 31_000, 15_000)]), "device.fold"
+    )
+    assert len(long_take) == 5, "a long take gets more, not the same three"
+
+    twice = sampling_times_for(
+        screened([sighting(0, 8_000, 4_000), sighting(14_000, 22_000, 18_000)]),
+        "device.fold",
+    )
+    assert any(t < 8_000 for t in twice) and any(t > 14_000 for t in twice), (
+        "each appearance is proved on its own; a seed from one is no use in "
+        "the other"
+    )
+
+    # A summary of "present" needs a matched candidate, so the refusal case
+    # is written as the screen would really write it.
+    lookalike = screened([sighting(0, 9_000, 4_000)])
+    refused = sampling_times_for(
+        lookalike.model_copy(update={"candidates": tuple(
+            one.model_copy(update={
+                "identity_status": "hard_negative",
+                "identity_evidence": (),
+                "exclusion_evidence": ("another model",),
+            })
+            for one in lookalike.candidates
+        )}),
+        "device.fold",
+    )
+    assert refused == [], "nothing is sampled where the screen saw a lookalike"

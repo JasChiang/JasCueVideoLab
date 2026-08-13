@@ -1693,6 +1693,180 @@ def remembered_discovery(
     return result, usage
 
 
+def confirm_source_identity(
+    video_path: Path,
+    spec: ReferenceGroundingSpec,
+    discovery: CandidateDiscoveryResult,
+    target_id: str,
+    *,
+    client: Any | None,
+    frames_dir: Path,
+    cache: UploadCache | Any | None = None,
+    ledger: Any | None = None,
+    library: Path | None = None,
+) -> tuple[tuple[float, tuple[float, float, float, float]], ...]:
+    """Prove the identity once per source, where it is clearest.
+
+    Returns the moments it was confirmed at and the box it was confirmed in,
+    on the master's clock. Those are two things at once: the evidence that
+    this source holds the locked identity, and the places a tracker can be
+    started from -- which is why they are worth finding at the moments the
+    screen picked rather than the ones an edit happened to want.
+
+    Remembered beside the cards: the answer is about these pixels and this
+    lock, so a second cut of the same rushes, and every repair round inside
+    one cut, is free.
+    """
+
+    if client is None:
+        return ()
+    video_path = Path(video_path).expanduser().resolve(strict=True)
+    digest = sha256_file(video_path)
+    stored = (
+        Path(library) / "reference-grounding"
+        / f"identity-{digest[:20]}-{spec.definition_sha256()[:16]}"
+          f"-{_sha256_text(_read_prompt())[:8]}.json"
+        if library is not None else None
+    )
+    if stored is not None and stored.exists():
+        try:
+            remembered = json.loads(stored.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            remembered = None
+        if isinstance(remembered, dict) and remembered.get("target") == target_id:
+            return tuple(
+                (float(one["at_seconds"]), tuple(float(v) for v in one["box"]))
+                for one in remembered.get("confirmed") or ()
+            )
+
+    times = sampling_times_for(discovery, target_id)
+    if len(times) < 2:
+        return ()
+    video = inspect_video_lineage(video_path)
+    local = CandidateDiscoveryResult.model_validate({
+        "contract_version": "reference-candidate-discovery-v1",
+        "query_id": spec.identity_lock.query_id,
+        "query_lock_sha256": spec.identity_lock.definition_sha256(),
+        "grounding_spec_sha256": spec.definition_sha256(),
+        "video_asset_id": video.asset_id,
+        "video_sha256": video.content_sha256,
+        "duration_ms": int(video.duration_ms),
+        "candidates": [{
+            "candidate_id": "sighting",
+            "target_id": target_id,
+            "start_ms": max(0, min(times) - 500),
+            "end_ms": min(int(video.duration_ms), max(times) + 500),
+            "recommended_seed_ms": times[len(times) // 2],
+            "identity_status": "uncertain",
+            "confidence": 0.5,
+            "visible_state": "unjudged; the screen placed the target here",
+            "visibility_state": "unknown",
+            "occlusion_state": "unknown",
+            "identity_evidence": [],
+            "exclusion_evidence": [],
+        }],
+        "target_summaries": [{
+            "target_id": target_id,
+            "verdict": "uncertain",
+            "reason": "these frames decide whether this source holds it",
+        }],
+        "warnings": [],
+    })
+
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    prepared = []
+    seen_pts: set[int] = set()
+    for index, at in enumerate(times):
+        try:
+            frame = materialize_frame_at_time(
+                video_path, at, frames_dir / f"identity-{index:02d}.jpg",
+                max_width=1440,
+            )
+        except Exception:
+            continue
+        if frame.lineage.frame_pts in seen_pts:
+            continue
+        seen_pts.add(frame.lineage.frame_pts)
+        prepared.append(frame)
+    if len(prepared) < 2:
+        return ()
+
+    decided = decide_exact_frame_bboxes(
+        spec, local, target_id, prepared,
+        candidate_ids=["sighting"] * len(prepared),
+        client=client, cache=cache, ledger=ledger,
+        minimum_matched_anchors=2,
+    )
+    if decided is None:
+        return ()
+    batch, _usage = decided
+    try:
+        matched = batch.sam_seed_evaluations()
+    except ReferenceGroundingError:
+        matched = ()
+    confirmed = []
+    for evaluation in matched:
+        native = evaluation.decision.tracking_box_xyxy_1000
+        if native is None:
+            continue
+        confirmed.append((
+            evaluation.lineage.frame_time_ms / 1000.0,
+            tuple(float(value) / 1000.0 for value in native),
+        ))
+    if stored is not None:
+        stored.parent.mkdir(parents=True, exist_ok=True)
+        stored.write_text(json.dumps({
+            "target": target_id,
+            "video_sha256": digest,
+            "confirmed": [
+                {"at_seconds": at, "box": list(box)} for at, box in confirmed
+            ],
+        }), encoding="utf-8")
+    return tuple(confirmed)
+
+
+def sampling_times_for(
+    discovery: CandidateDiscoveryResult, target_id: str
+) -> list[int]:
+    """When to look, to find out whether this source holds the identity.
+
+    Per sighting, not per source and not per cut. The screen already says
+    where the target is and which moment shows it most clearly, and every
+    one of those answers was thrown away: the frames were taken from the
+    seconds an edit happened to want, so a sixteen-second take of a folded
+    handset seen edge-on beside a coin was judged on three views of an edge,
+    and a shot of three models was judged on the moment the camera had
+    pulled back rather than the two seconds of close-up that opened it.
+
+    Each sighting needs its own moments because a tracker cannot carry a box
+    across a gap where the subject left the frame: a seed proved during one
+    appearance is no use during the next.
+    """
+
+    times: list[int] = []
+    for candidate in discovery.candidates:
+        if candidate.target_id != target_id:
+            continue
+        if candidate.identity_status == "hard_negative":
+            continue
+        opens, closes = int(candidate.start_ms), int(candidate.end_ms)
+        span = max(0, closes - opens)
+        if span <= 0:
+            continue
+        wanted = [
+            max(opens, min(closes - 1, int(candidate.recommended_seed_ms))),
+            opens + span // 4,
+            opens + (span * 3) // 4,
+        ]
+        if span > 15_000:
+            wanted += [opens + span // 2, opens + (span * 7) // 8]
+        for at in wanted:
+            at = max(opens, min(closes - 1, at))
+            if all(abs(at - seen) > 250 for seen in times):
+                times.append(at)
+    return sorted(times)[:MAX_EXACT_FRAMES_PER_CALL]
+
+
 def _validate_discovery_for_spec(
     spec: ReferenceGroundingSpec,
     discovery: CandidateDiscoveryResult,

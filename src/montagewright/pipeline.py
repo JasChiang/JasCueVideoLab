@@ -77,6 +77,11 @@ TRACK_FPS = 4.0
 TRACK_QUORUM = 0.34
 TRACK_MINIMUM_OBSERVATIONS = 3
 
+# How far outside a cut a confirmed frame may sit and still be worth seeding
+# from. Far enough to reach the close-up that opens a take; not so far that
+# the tracker is asked to cross a scene.
+CONFIRMED_REACH_SECONDS = 6.0
+
 
 def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
     """Put every lip-synced picture on the independent audio source clock.
@@ -921,6 +926,101 @@ def _write_grounding_record(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def _geometry_from_confirmed(
+    source: Source,
+    clip: Any,
+    target_id: str,
+    confirmed: "list[tuple[float, tuple[float, float, float, float]]]",
+    *,
+    report: Report,
+    work: Path,
+    checkpoint: Path,
+) -> tuple[
+    list[dict[str, Any]],
+    list[float],
+    tuple[tuple[float, tuple[float, float, float, float]], ...],
+]:
+    """Track from a frame whose identity is already settled.
+
+    The seed is the confirmed frame closest to this cut, and the analysed
+    range stretches to include it, so a box proved during the close-up that
+    opens a take can be carried into the seconds an edit actually wants.
+    Everything the tracker then produces is checked against the confirmed
+    boxes exactly as before -- what changed is where the proof came from,
+    not whether it is required.
+    """
+
+    seed_at, seed_box = min(
+        confirmed,
+        key=lambda one: abs(
+            one[0] - (clip.approx_in_seconds + clip.approx_out_seconds) / 2
+        ),
+    )
+    reach_in = min(clip.approx_in_seconds, seed_at)
+    reach_out = max(clip.approx_out_seconds, seed_at + 0.1)
+    widened = clip.model_copy(update={
+        "approx_in_seconds": reach_in, "approx_out_seconds": reach_out,
+    })
+    tracked, states = _track_subject(
+        source, widened, f"the locked identity {target_id}",
+        [int(value * 1000) for value in seed_box],
+        checkpoint, work,
+        seed_time_seconds=seed_at,
+        track_name=f"confirmed-{target_id.replace(':', '_')}",
+        semantic_anchors=tuple(confirmed),
+        require_identity_validation=True,
+    )
+    total = sum(
+        count for name, count in states.items() if not name.startswith("_")
+    ) or 1
+    kept = len(tracked)
+    if kept < TRACK_MINIMUM_OBSERVATIONS or kept / total < TRACK_QUORUM:
+        report.reference_grounding[clip.clip_id]["status"] = (
+            "local_geometry_unverified"
+        )
+        raise ReferenceGeometryUnavailable(
+            clip.clip_id, target_id,
+            f"{clip.clip_id}: tracking from the confirmed frame at "
+            f"{seed_at:.2f}s held {kept}/{total} samples; refusing "
+            "Gemini-box fallback",
+        )
+    boxes: list[dict[str, Any]] = []
+    times: list[float] = []
+    for observation in tracked:
+        # Only what the cut actually uses; the reach exists to find a seed,
+        # not to lengthen the shot.
+        if not (
+            clip.approx_in_seconds - 1e-6
+            <= observation.seconds + reach_in
+            <= clip.approx_out_seconds + 1e-6
+        ):
+            continue
+        times.append(reach_in + observation.seconds)
+        boxes.append({
+            "present": True,
+            "centre_x": observation.centre_x,
+            "centre_y": observation.centre_y,
+            "width": observation.width,
+            "height": observation.height,
+            "disambiguation": f"identity confirmed at {seed_at:.2f}s",
+            "geometry_source": "sam2.1",
+        })
+    report.reference_grounding[clip.clip_id].update({
+        "status": "sam_geometry_validated",
+        "matched_anchors": len(confirmed),
+        "tracked_frames": kept,
+        "analysed_frames": total,
+        "sam_seed_seconds": round(seed_at, 3),
+    })
+    if len(boxes) < 2:
+        raise ReferenceGeometryUnavailable(
+            clip.clip_id, target_id,
+            f"{clip.clip_id}: the confirmed track covers only "
+            f"{len(boxes)} of the seconds this cut uses",
+        )
+    return boxes, times, tuple(confirmed)
+
+
 def _reference_subject_samples(
     source: Source,
     clip: Any,
@@ -935,6 +1035,7 @@ def _reference_subject_samples(
     discoveries: dict[str, Any],
     checkpoint: Path | None,
     memory: Path | None = None,
+    confirmed: "tuple[tuple[float, tuple[float, float, float, float]], ...] | None" = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[float],
@@ -970,6 +1071,38 @@ def _reference_subject_samples(
         )
     if not _may_ask(client):
         return [], [], ()
+    clip_start_ms = round(float(clip.approx_in_seconds) * 1000)
+    clip_end_ms = round(float(clip.approx_out_seconds) * 1000)
+    # Identity was settled for this source, at the moments it was clearest,
+    # before anything chose which seconds to cut. Use it: seed the tracker
+    # from the confirmed frame nearest this cut and let SAM carry the box
+    # in, rather than asking again inside seconds that may show nothing
+    # identifiable -- an edge beside a coin, or three handsets at a distance.
+    #
+    # Only from inside the same sighting, though. A box proved while the
+    # subject was in shot says nothing after it left and came back, and the
+    # tracker cannot cross that gap either.
+    if confirmed:
+        near = [
+            (at, box) for at, box in confirmed
+            if clip_start_ms / 1000.0 - CONFIRMED_REACH_SECONDS
+            <= at <= clip_end_ms / 1000.0 + CONFIRMED_REACH_SECONDS
+        ]
+        if near:
+            inside = [one for one in near if
+                      clip_start_ms / 1000.0 <= one[0] <= clip_end_ms / 1000.0]
+            chosen = inside or near
+            report.reference_grounding[clip.clip_id] = {
+                "target_id": target_id,
+                "status": "identity_from_source",
+                "confirmed_at": [round(at, 3) for at, _ in chosen],
+                "seeded_inside_cut": bool(inside),
+            }
+            return _geometry_from_confirmed(
+                source, clip, target_id, chosen,
+                report=report, work=work, checkpoint=checkpoint,
+            )
+
     # The window this shot uses IS the question, so ask it directly.
     #
     # This used to pay for a second discovery, on the master, over a source
@@ -988,8 +1121,6 @@ def _reference_subject_samples(
     # nothing about identity -- `uncertain` is exactly what is known before
     # the frames are judged -- and the judgement comes where it always came
     # from, the exact frames themselves.
-    clip_start_ms = round(float(clip.approx_in_seconds) * 1000)
-    clip_end_ms = round(float(clip.approx_out_seconds) * 1000)
     video = inspect_video_lineage(source.path)
     window_end = min(clip_end_ms, int(video.duration_ms))
     if window_end <= clip_start_ms:
@@ -1328,6 +1459,7 @@ def follow_subjects(
     grounding_spec: Any | None = None,
     grounding_output: Path | None = None,
     grounding_memory: Path | None = None,
+    confirmed_identities: "dict[str, Any] | None" = None,
     upload_cache: Any | None = None,
 ) -> dict[str, CropPath]:
     """Build a crop path per shot that names a subject.
@@ -1395,6 +1527,9 @@ def follow_subjects(
                             discoveries=discoveries,
                             checkpoint=checkpoint,
                             memory=grounding_memory,
+                            confirmed=(confirmed_identities or {}).get(
+                                clip.source_id
+                            ),
                         )
                         if samples[0]:
                             reference_samples[entity_id] = samples
@@ -2241,6 +2376,7 @@ def run(
     transcripts: Mapping[str, dict | None] | None = None,
     grounding_spec: Any | None = None,
     grounding_memory: Path | None = None,
+    confirmed_identities: "dict[str, Any] | None" = None,
     rhythm_shots: "list[Any] | None" = None,
     upload_cache: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
@@ -2399,6 +2535,7 @@ def run(
         grounding_spec=grounding_spec,
         grounding_output=output_dir / "work" / "reference-grounding",
         grounding_memory=grounding_memory,
+        confirmed_identities=confirmed_identities,
         upload_cache=upload_cache,
     )
 

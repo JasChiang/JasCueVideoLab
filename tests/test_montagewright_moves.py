@@ -7302,7 +7302,7 @@ def test_a_span_is_offered_only_where_the_identity_was_seen():
                     "identity": type("I", (), {"targets": []})(),
                 })(),
             })()
-            kept, aside = _screen_material_identity(
+            kept, aside, _sightings = _screen_material_identity(
                 [Item("C1", proxy, item.spans)], spec,
                 client=object(), cache=None,
                 ledger=type("L", (), {"check": lambda self: None,
@@ -7473,3 +7473,40 @@ def test_an_unreachable_look_is_dropped_rather_than_ending_the_pass():
     assert salvage.index("plan_disagreements") < salvage.index(
         "raise PlannerError"
     ), "and what was given up is reported, not swallowed"
+
+
+def test_a_cut_is_tracked_from_the_frame_that_proved_the_identity():
+    """Where the proof came from changed; whether it is required did not.
+
+    Identity is settled per source, at the moments the screen calls
+    clearest, before anything picks which seconds to cut. The tracker is
+    seeded from the confirmed frame nearest the cut and the analysed range
+    stretches to include it -- so a box proved during the close-up that
+    opens a take can be carried into the seconds an edit wants, instead of
+    the identity being re-argued inside seconds that show an edge beside a
+    coin. Only within one sighting: a box proved before the subject left
+    the frame says nothing after it came back.
+    """
+
+    import inspect
+
+    from montagewright import pipeline
+
+    source = inspect.getsource(pipeline._reference_subject_samples)
+    assert "if confirmed:" in source
+    assert source.index("if confirmed:") < source.index(
+        "The window this shot uses IS the question"
+    ), "the settled answer is used before the window is re-interrogated"
+    assert "CONFIRMED_REACH_SECONDS" in source, "and only from within reach"
+
+    carried = inspect.getsource(pipeline._geometry_from_confirmed)
+    assert "require_identity_validation=True" in carried, (
+        "the track is still checked against the confirmed boxes"
+    )
+    assert "TRACK_MINIMUM_OBSERVATIONS" in carried and "TRACK_QUORUM" in carried
+    assert "the reach exists to find a seed" in carried, (
+        "reaching back for a seed must not lengthen the shot"
+    )
+    assert pipeline.CONFIRMED_REACH_SECONDS <= 10.0, (
+        "far enough for a take's own close-up, not far enough to cross a scene"
+    )
