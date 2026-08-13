@@ -251,23 +251,17 @@ def resolve_candidate_commitments(
         if target_id not in known_targets:
             faults.append(f"option {index} names unknown target {target_id!r}")
             continue
-        # Sources the screen found the identity absent from are offered as
-        # context, so a commitment may be cut from one -- but not one that
-        # promises the identity. Caught here rather than at selection: the
-        # same round that proposed it can fix it, and a promise nothing can
-        # keep costs a repair round every stage it survives.
-        carrier = item_index.get(str(span.source_id))
-        if (
-            target_id != "none"
-            and carrier is not None
-            and not getattr(carrier, "carries_identity", True)
-        ):
-            faults.append(
-                f"option {index} promises {target_id} from {span_id}, whose "
-                "source the identity screen found it absent from; use this "
-                "span for context with target_id none"
-            )
-            continue
+        # A source the screen found the identity absent from may still be
+        # promised it here, and that disagreement is not this stage's to
+        # settle. The screen reads a 640-pixel proxy at a frame a second and
+        # is wrong in exactly the way that resolution predicts: it called a
+        # table of three handsets absent because the two rings on the middle
+        # one are small at that size. Direction watched the same clip and
+        # said the product was there -- and it was. Refusing the option
+        # spent two paid corrections arguing with a model that was right,
+        # and then killed the run. The promotion happens before this, in the
+        # caller; what is left here catches a source that was never offered
+        # for promotion at all.
         try:
             options.append(CandidateOption(
                 commitment_id=raw.get("commitment_id"),

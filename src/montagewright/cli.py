@@ -1093,6 +1093,7 @@ def command_render(args: argparse.Namespace) -> int:
     # good coin shot" had no answer anywhere in the output.
     set_aside: dict[str, str] = {}
     confirmed_identities: dict[str, Any] = {}
+    sightings: dict[str, Any] = {}
     for source_id, proxy in proxies.items():
         card = load_card(cards[source_id]) if source_id in cards else None
         if card is not None and not card.get("usable", True):
@@ -1387,6 +1388,43 @@ def command_render(args: argparse.Namespace) -> int:
     from montagewright.planner import _beaten_and_broken
 
     beaten, broken = _beaten_and_broken(direction)
+    # The screen is a filter, not a judge. It reads a 640-pixel proxy at a
+    # frame a second, and when direction -- which watched the same clip --
+    # promises the locked product from a source the screen called absent,
+    # the disagreement belongs to the per-shot check that decodes the master
+    # at 1440 and looks at the actual frames. Refusing it here argued with a
+    # model that was right about a table of three handsets, twice, at the
+    # price of a paid correction each time, and then ended the run.
+    if args.reference_grounding_spec is not None and grounding_target_refs:
+        wanted = {
+            str(option.get("span_id") or "").split(":")[0]
+            for option in (direction.get("candidate_options") or [])
+            if str(option.get("target_id") or "none") in set(grounding_target_refs)
+        }
+        promoted = [
+            item.source_id for item in material
+            if item.source_id in wanted and not item.carries_identity
+        ]
+        if promoted:
+            material = [
+                replace(item, carries_identity=True)
+                if item.source_id in promoted else item
+                for item in material
+            ]
+            print(
+                "  direction says the identity is in "
+                + ", ".join(sorted(promoted))
+                + ", which the screen did not see; the per-shot check will "
+                "settle it",
+                flush=True,
+            )
+            confirmed_identities.update(_confirm_material_identity(
+                [item for item in material if item.source_id in set(promoted)],
+                sightings, args.reference_grounding_spec,
+                masters=originals,
+                client=client, cache=cache, ledger=ledger, library=library,
+                work=work,
+            ))
     def bind_commitments(answer):
         resolved_commitments = resolve_candidate_commitments(
             answer,
