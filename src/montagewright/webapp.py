@@ -2725,12 +2725,24 @@ def create_app() -> FastAPI:
             raise HTTPException(409, "it is still going")
         run.lines.append("— 續跑 —")
         run.state = "running"
-        run.process = subprocess.Popen(
-            run.command,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
+        try:
+            run.process = subprocess.Popen(
+                run.command,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+        except OSError as error:
+            # The recorded command cannot be run any more: a virtualenv that
+            # moved, a python that was upgraded away. That is a sentence, not
+            # a stack trace with an error id in it.
+            run.state = "failed"
+            run.lines.append(f"— 跑不起來：{error}")
+            raise HTTPException(
+                400,
+                f"這一輪記下的指令現在跑不起來（{run.command[0]}）。"
+                "素材與已完成的工作都還在，用「新的一輪」指到同一個素材資料夾就會接上。",
+            ) from error
         run.remember()
         threading.Thread(target=_collect, args=(run,), daemon=True).start()
         return JSONResponse({"state": run.state})

@@ -1144,6 +1144,11 @@
   /* One decision per block, in the order somebody makes them. Sixteen
      fields in one grid read as a settings page for a thing you had already
      decided to run; this reads as three questions. */
+  .notice {
+    padding: 4px 11px; border-radius: 999px; font-size: 12.5px;
+    color: var(--accent); background: var(--wash);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  }
   .group { border-top: 1px solid var(--hair); padding-top: 15px; margin-top: 4px; }
   .group:first-of-type { border-top: 0; padding-top: 0; }
   .group-head { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; }
@@ -1374,6 +1379,7 @@
       <span class="meta" id="crumb-meta"></span>
     </span>
     <span class="grow"></span>
+    <span id="notice" class="notice hide"></span>
     <span id="picked" class="meta"></span>
     <button class="ghost panel-toggle" id="toggle-library" title="開關素材與軌道清單">素材</button>
     <button class="ghost panel-toggle" id="toggle-inspector" title="開關檢查器">檢查器</button>
@@ -2048,7 +2054,7 @@ async function openRun(id, where, how) {
     markRunInUrl(null, how === 'keep' ? 'replace' : 'push');
     showWorkspace(false);
     loadPast();
-    alert(`找不到這一輪：${id}`);
+    sayNotice(`找不到這一輪：${id}`);
     return;
   }
   const data = await res.json();
@@ -4769,7 +4775,10 @@ $('go').addEventListener('click', async () => {
   if ($('go').disabled) return;
   const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
   const path = $('path').value.trim();
-  if (!path && !files.length) { alert('給一個素材路徑，或改用上傳'); return; }
+  if (!path && !files.length) {
+    sayFault('還沒指到素材', '選一個裝著毛片的資料夾，或改用上傳。');
+    return;
+  }
   const body = new FormData();
   files.forEach(f => body.append('rushes', f, f.name));
   body.append('source_path', path);
@@ -4877,7 +4886,7 @@ $('go').addEventListener('click', async () => {
 
 $('resume').addEventListener('click', async () => {
   const res = await fetch(`/api/runs/${runId}/resume`, { method: 'POST' });
-  if (!res.ok) { alert(await res.text()); return; }
+  if (!res.ok) { sayFault('繼續跑不了', await plainError(res)); return; }
   $('resume').classList.add('hide');
   $('fault').classList.add('hide');
   $('fault').innerHTML = '';
@@ -4996,6 +5005,35 @@ const FAULTS = [
 // just been fixed -- the quota banner came back the moment the run restarted,
 // and nothing ever took it down again.
 let faultFrom = 0;
+
+// Server errors arrive as JSON with an error id in them. Nobody watching a
+// cut can do anything with an error id, and putting it in a browser dialog
+// makes them dismiss a modal before they can read the run it came from.
+async function plainError(res) {
+  const text = await res.text();
+  try {
+    const said = JSON.parse(text);
+    return said.detail || said.message || text;
+  } catch (error) {
+    return text;
+  }
+}
+// The cold page has no fault panel to put anything in -- that one lives
+// inside the setup sheet -- so this is the one line it can say.
+let noticeTimer = 0;
+function sayNotice(text) {
+  const bar = $('notice');
+  bar.textContent = text;
+  bar.classList.remove('hide');
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => bar.classList.add('hide'), 6000);
+}
+function sayFault(what, why) {
+  $('fault').innerHTML = `<b>${esc(what)}</b><div>${esc(why)}</div>`;
+  $('fault').classList.remove('hide');
+  $('progress').classList.remove('hide');
+  $('fault').scrollIntoView({block: 'nearest', behavior: 'smooth'});
+}
 function showFault(lines) {
   for (const line of lines.slice(faultFrom).reverse()) {
     for (const [pattern, what, why] of FAULTS) {
