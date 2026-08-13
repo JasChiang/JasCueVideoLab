@@ -1447,9 +1447,28 @@ def command_render(args: argparse.Namespace) -> int:
             option.commitment_id for option in resolved_commitments.options
         })
         if needed is not None and unique < needed:
+            # Say which unit is short and what closes the gap. Told only
+            # that it "supplied 7 per-shot commitments" against a pacing
+            # needing 8, the correction added a second option to a slot it
+            # already had and dropped another slot entirely -- ending with
+            # the same seven options and six distinct commitments. The
+            # array is called candidate_options, so adding an option looks
+            # like adding a commitment unless the difference is spelled
+            # out.
             raise CommitmentError(
-                f"direction supplied {unique} per-shot commitments, but its "
-                f"pacing requires at least {needed} shots"
+                f"the pacing needs at least {needed} shots, so it needs at "
+                f"least {needed} different commitment_id values, and there "
+                f"are {unique}: "
+                + ", ".join(sorted({
+                    option.commitment_id
+                    for option in resolved_commitments.options
+                }))
+                + f". Add {needed - unique} more commitment_id(s) -- new "
+                "shot slots with their own purpose, each with exactly one "
+                "primary. Adding another option to a commitment_id that "
+                "already exists is an alternate for that same shot and does "
+                "not raise this count, and no existing commitment_id may be "
+                "removed to make room."
             )
         return resolved_commitments
 
