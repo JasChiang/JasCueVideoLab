@@ -329,6 +329,50 @@
   /* Only the one holding the take is doubled, and only one of the pair is
      ever visible. The other is loading what the next cut needs. */
   video.waiting { position: absolute; opacity: 0; pointer-events: none; }
+  /* The contact sheet while it cuts: one tile per planned shot, filled in
+     with a real frame as each one is rendered. Sized off the shortest side
+     so a tall 9:16 cut and a wide take both sit in the same grid. */
+  .sheet {
+    position: absolute; inset: 0; z-index: 6; overflow-y: auto;
+    padding: 44px 24px 60px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .sheet-head {
+    color: var(--soft); font-size: 12px; letter-spacing: .02em;
+    display: flex; align-items: baseline; gap: 10px;
+  }
+  .sheet-head b { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .sheet-grid {
+    display: grid; gap: 10px;
+    grid-template-columns: repeat(auto-fill, minmax(122px, 1fr));
+  }
+  .tile {
+    position: relative; aspect-ratio: 4 / 3; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 30%, transparent);
+    border: 1px solid var(--line); overflow: hidden;
+    display: grid; place-items: center;
+  }
+  /* contain, not cover: a 9:16 cut cropped to a landscape tile shows a
+     white band and tells nobody which shot it is. */
+  .tile img {
+    width: 100%; height: 100%; object-fit: contain; display: block;
+    background: #000;
+  }
+  .tile .who {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 3px 6px;
+    font-family: var(--mono); font-size: 10px; color: var(--ink);
+    background: color-mix(in srgb, var(--deep) 78%, transparent);
+    display: flex; justify-content: space-between; gap: 6px;
+  }
+  .tile.waiting { border-style: dashed; }
+  .tile.waiting .who { color: var(--dim); background: none; }
+  .tile.doing { border-color: var(--accent); }
+  .tile.doing::after {
+    content: ''; position: absolute; inset: 0;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    animation: breathe 1.6s ease-in-out infinite;
+  }
+  @keyframes breathe { 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) { .tile.doing::after { animation: none; } }
   .frame { position: relative; display: flex; align-items: center;
            justify-content: center; width: 100%; height: 100%;
            min-width: 0; min-height: 0; }
@@ -1430,6 +1474,13 @@
       <div class="screen">
         <div class="stage-label">預覽工作區</div>
         <div class="over" id="over"></div>
+        <!-- While it cuts. Each shot is a file on disk the moment it is
+             rendered, so there is no reason for this to be a black screen
+             for the whole hour. -->
+        <div class="sheet hide" id="sheet">
+          <div class="sheet-head"><span id="sheet-say">還在決定要用哪幾顆</span></div>
+          <div class="sheet-grid" id="sheet-grid"></div>
+        </div>
         <div class="frame" id="frame">
           <div class="half"><video id="video" playsinline></video></div>
           <div class="half">
@@ -1926,6 +1977,7 @@ async function openRun(id, where, how) {
   markRunInUrl(id, how);
   $('log').textContent = data.lines.join('\n');
   allLines = data.lines;
+  faultFrom = 0;
   openedFrom = {
     source: data.source_path || '',
     music: data.music_path || '',
@@ -1948,6 +2000,7 @@ async function openRun(id, where, how) {
   }
   $('state').textContent = { running:'執行中', done:'完成', failed:'失敗', stopped:'已停止', interrupted:'中斷' }[data.state] || data.state;
   paintSteps(allLines);
+  paintSheet(data.progress, data.state);
   if (data.state !== 'done' && data.state !== 'running') {
     showFault(allLines);
     $('resume').classList.remove('hide');
@@ -4728,7 +4781,7 @@ $('go').addEventListener('click', async () => {
   // into, more than a finished one.
   markRunInUrl(runId, 'push');
   $('state').textContent = '執行中';
-  seen = 0; allLines = []; stepWas = -1; $('log').textContent = '';
+  seen = 0; allLines = []; stepWas = -1; faultFrom = 0; $('log').textContent = '';
   // Whatever is on screen belongs to the last run. Leaving it there while a
   // new one writes cards reads as though the new one already finished.
   for (const id of ['result', 'detail', 'fault']) $(id).classList.add('hide');
@@ -4748,7 +4801,9 @@ $('resume').addEventListener('click', async () => {
   if (!res.ok) { alert(await res.text()); return; }
   $('resume').classList.add('hide');
   $('fault').classList.add('hide');
+  $('fault').innerHTML = '';
   $('state').textContent = '執行中';
+  faultFrom = allLines.length;
   stepWas = -1;
   clearInterval(timer); clearInterval(ticker);
   timer = setInterval(poll, 1200);
@@ -4857,8 +4912,13 @@ const FAULTS = [
    '已經完成的部分還在，把上限調高再跑一次就會接下去。'],
 ];
 
+// Where the current attempt's output starts. A resumed run keeps writing to
+// the same log, so scanning the whole of it re-diagnosed the failure that had
+// just been fixed -- the quota banner came back the moment the run restarted,
+// and nothing ever took it down again.
+let faultFrom = 0;
 function showFault(lines) {
-  for (const line of lines.slice().reverse()) {
+  for (const line of lines.slice(faultFrom).reverse()) {
     for (const [pattern, what, why] of FAULTS) {
       if (pattern.test(line)) {
         $('fault').innerHTML = `<b>${what}</b><div>${why}</div>`;
@@ -4872,6 +4932,49 @@ function showFault(lines) {
     $('fault').innerHTML =
       `<b>這一輪沒有跑完</b><div class="detail">${esc(last.slice(0, 200))}</div>`;
     $('fault').classList.remove('hide');
+  }
+}
+
+// The middle of the screen while it works. Tiles are built once and then
+// only filled in: rebuilding them every poll made every thumbnail blink.
+let sheetFor = -1;
+function paintSheet(progress, state) {
+  const sheet = $('sheet'), frame = $('frame');
+  if (state !== 'running' || !progress) {
+    sheet.classList.add('hide'); frame.classList.remove('hide');
+    sheetFor = -1;
+    return;
+  }
+  sheet.classList.remove('hide'); frame.classList.add('hide');
+  const planned = progress.planned || [], cut = new Set(progress.cut || []);
+  if (!planned.length) {
+    $('sheet-say').textContent = '還在看素材、決定要用哪幾顆——挑完這裡會一顆一顆長出來';
+    $('sheet-grid').innerHTML = '';
+    sheetFor = -1;
+    return;
+  }
+  $('sheet-say').innerHTML =
+    `已經剪好 <b>${cut.size}</b> / <b>${planned.length}</b> 顆`;
+  if (sheetFor !== planned.length) {
+    $('sheet-grid').innerHTML = planned.map(shot => `
+      <div class="tile waiting" data-tile="${shot.index}">
+        <div class="who"><span>${esc(shot.source)}</span>
+          <span>${shot.seconds ? shot.seconds.toFixed(1) + 's' : ''}</span></div>
+      </div>`).join('');
+    sheetFor = planned.length;
+  }
+  const next = planned.find(shot => !cut.has(shot.index));
+  for (const shot of planned) {
+    const tile = $('sheet-grid').querySelector(`[data-tile="${shot.index}"]`);
+    if (!tile) continue;
+    tile.classList.toggle('doing', !!next && next.index === shot.index);
+    if (cut.has(shot.index) && !tile.querySelector('img')) {
+      tile.classList.remove('waiting');
+      const img = new Image();
+      img.src = `/api/runs/${runId}/thumb/${shot.index}`;
+      img.alt = shot.source;
+      tile.prepend(img);
+    }
   }
 }
 
@@ -4898,10 +5001,15 @@ async function poll() {
   $('state').className = 'state' + (data.state === 'done' ? ' done' : '');
   allLines = allLines.concat(data.lines);
   paintSteps(allLines);
+  paintSheet(data.progress, data.state);
   if (data.state === 'failed' || data.state === 'stopped') {
     showFault(allLines);
     $('raw').open = true;
     $('resume').classList.remove('hide');
+  } else {
+    // Running again, or finished. Either way the last failure is history.
+    $('fault').classList.add('hide');
+    $('resume').classList.add('hide');
   }
 
   if (data.state !== 'running') {

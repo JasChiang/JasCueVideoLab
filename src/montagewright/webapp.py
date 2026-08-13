@@ -2654,7 +2654,44 @@ def create_app() -> FastAPI:
             "source_path": _ran_with(run, "render", after=False),
             "music_path": _ran_with(run, "--music"),
             "brief_text": _brief_of(run),
+            # What there is to look at while it works. The panel on the left
+            # said which stage it was on and the whole middle of the screen
+            # stayed black until the last second, so an hour of cutting
+            # showed nobody a single frame of what it was cutting.
+            "progress": _what_is_cut_so_far(run) if run.state == "running" else None,
         })
+
+    def _what_is_cut_so_far(run: Run) -> dict:
+        """The shots it has planned, and which of them are already film.
+
+        Both are on disk long before the report is: the selection as soon as
+        it is chosen, and each shot as a file in segments/ the moment it is
+        rendered.
+        """
+
+        planned: list[dict] = []
+        try:
+            chosen = json.loads(
+                (run.output / "work" / "selection.json").read_text("utf-8")
+            )
+            shots = (chosen.get("value") or chosen).get("shots") or []
+        except (OSError, ValueError, AttributeError):
+            shots = []
+        for index, shot in enumerate(shots):
+            span = str(shot.get("span_id") or "")
+            planned.append({
+                "index": index,
+                "source": str(shot.get("source_id") or span.split(":")[0]),
+                "seconds": shot.get("seconds_needed"),
+                "role": shot.get("picture_role") or shot.get("role") or "",
+                "why": shot.get("why") or shot.get("intent") or "",
+            })
+        cut = sorted(
+            int(path.name[:3])
+            for path in (run.output / "segments").glob("[0-9][0-9][0-9]-*.mp4")
+            if ".handles." not in path.name
+        )
+        return {"planned": planned, "cut": cut}
 
     @app.post("/api/runs/{run_id}/resume")
     def resume(run_id: str) -> JSONResponse:
