@@ -1555,7 +1555,15 @@ def discover_reference_candidates(
     target_ids: Sequence[str] | None = None,
     model_id: str = MODEL_ID,
     reference_resolution: MediaResolution = "high",
-    video_resolution: MediaResolution = "low",
+    # The reference images go at high and the candidate went at low, so a
+    # detailed picture of the product was being compared against a coarse
+    # one of the scene -- and "low" is not a property of the file, it is an
+    # instruction to flatten every frame to about seventy tokens however
+    # good the file is. Improving the proxy could not have helped. Measured
+    # across these rushes the difference is 755k tokens against 937k: about
+    # thirty cents for the whole shoot, to stop asking which of two similar
+    # handsets this is from a picture that cannot hold the answer.
+    video_resolution: MediaResolution = "high",
 ) -> tuple[CandidateDiscoveryResult, Usage] | None:
     """Find coarse identity intervals in one video, or no-op without a client.
 
@@ -1638,6 +1646,7 @@ def remembered_discovery(
     ledger: Any | None = None,
     library: Path | None = None,
     target_ids: Sequence[str] | None = None,
+    video_resolution: MediaResolution = "high",
 ) -> tuple[CandidateDiscoveryResult, Usage | None] | None:
     """Discovery for one source, remembered where the cards are remembered.
 
@@ -1657,10 +1666,15 @@ def remembered_discovery(
     # not, and the first time the wording changed -- to stop "I cannot check
     # this" being reported as "it is not here" -- seventy-four remembered
     # verdicts would have gone on answering the old question forever.
+    # How much of the picture was shown is an input to the answer for the
+    # same reason the wording is: asked at low, a table of three handsets
+    # came back absent three times out of four, and the fourth said the
+    # product was plainly there. Without this in the name, raising the
+    # resolution would have gone on reporting the old answer forever.
     stored = (
         Path(library) / "reference-grounding"
         / f"{digest[:20]}-{spec.definition_sha256()[:16]}"
-          f"-{_sha256_text(_read_prompt())[:8]}.json"
+          f"-{_sha256_text(_read_prompt())[:8]}-{video_resolution}.json"
         if library is not None else None
     )
     if stored is not None and stored.exists():
@@ -1680,7 +1694,7 @@ def remembered_discovery(
                 return remembered, None
     discovered = discover_reference_candidates(
         video_path, spec, client=client, cache=cache, ledger=ledger,
-        target_ids=target_ids,
+        target_ids=target_ids, video_resolution=video_resolution,
     )
     if discovered is None:
         return None
