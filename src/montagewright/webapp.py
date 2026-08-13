@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import re
 from concurrent.futures import ThreadPoolExecutor
 import shutil
@@ -191,9 +192,21 @@ def _state_of_a_foreign_run(out: Path) -> str:
         except (OSError, TypeError, ValueError):
             return "interrupted"
         return "running"
-    if state in {"done", "failed"}:
+    if state in {"done", "failed", "stopped"}:
         return state
     return "done" if (out / "report.json").exists() else "interrupted"
+
+
+def _pid_of_a_foreign_run(out: Path) -> int | None:
+    """The live process behind a run this server did not start."""
+
+    if _state_of_a_foreign_run(out) != "running":
+        return None
+    try:
+        said = json.loads((out / "run-state.json").read_text(encoding="utf-8"))
+        return int(said["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def recall() -> None:
@@ -1820,6 +1833,11 @@ def create_app() -> FastAPI:
         )[:limit]
         out = []
         for run in rows:
+            # A terminal run's state lives on disk, not in this process, so a
+            # row that finished while the list was open kept saying 執行中
+            # until something else happened to reload it.
+            if run.process is None and run.state == "running":
+                run.state = _state_of_a_foreign_run(run.output)
             report = run.report() or {}
             out.append({
                 "run_id": run.run_id,
@@ -2685,6 +2703,17 @@ def create_app() -> FastAPI:
         run = _run(run_id)
         if run.process is not None and run.process.poll() is None:
             run.process.terminate()
+            run.state = "stopped"
+            return JSONResponse({"state": run.state})
+        # Started from a terminal: this server never held the handle, but the
+        # run wrote down its pid so that the button in front of somebody
+        # watching it means the same thing as the button on its own runs.
+        pid = _pid_of_a_foreign_run(run.output)
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError as error:
+                raise HTTPException(409, f"停不下來：{error}") from error
             run.state = "stopped"
         return JSONResponse({"state": run.state})
 

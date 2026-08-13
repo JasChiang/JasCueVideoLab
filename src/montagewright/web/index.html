@@ -1774,6 +1774,7 @@ $('draft-identity').addEventListener('click', async () => {
   }
 });
 
+let pastTimer = 0;
 async function loadPast() {
   const data = await (await fetch('/api/runs?limit=40')).json();
   if (!data.runs.length) {
@@ -1813,6 +1814,13 @@ async function loadPast() {
     '<tr><th>時間</th><th></th><th>片長</th><th>顆數</th><th>逐顆通過</th><th>花費</th><th></th></tr>'
     + rows.join('');
   wirePast($('past-table'));
+  // A run started from the terminal appears here on its own. Without this the
+  // list is only as fresh as the last reload, which is exactly wrong for the
+  // one row you would want to watch.
+  clearTimeout(pastTimer);
+  if (data.runs.some(r => r.state === 'running')) {
+    pastTimer = setTimeout(loadPast, 5000);
+  }
   $('detail').classList.remove('hide');
   // Nothing open yet: the useful thing on a cold page is what was cut
   // before, and the tabs that need a run have nothing in them. The table
@@ -4760,6 +4768,8 @@ const STEPS = [
                  l => /^\s*card \d+\/|^cards:/.test(l)],
   ['speech',     '聽懂在講什麼', 'Apple 辨識器給逐字時間，Gemini 改錯字並標出誰在講',
                  l => /^speech:|transcribed/.test(l)],
+  ['identity',   '認出主角',    '先確定哪幾支素材裡真的有它、在第幾秒最清楚，認不出來的先擱在一邊',
+                 l => /^\s*(screen|identity) \d+\/|^set aside|^kept \d/.test(l)],
   ['direction',  '決定剪成什麼', '調性、長度、比例、音樂怎麼鋪',
                  l => /^direction:/.test(l)],
   ['selection',  '挑鏡頭',     '用哪幾顆、從第幾秒進、多長、什麼運鏡、框住誰',
@@ -4866,7 +4876,7 @@ function showFault(lines) {
 }
 
 function classify(line) {
-  if (/^\s+(card|subject|replan) \d*\/?/.test(line)) return 'faint';
+  if (/^\s+(card|subject|replan|screen|identity) \d*\/?/.test(line)) return 'faint';
   if (/error|Traceback|failed|refused/i.test(line)) return 'bad';
   if (/^(cards|direction|selection|shots|review|replan|cut on action|set aside|no music map)/.test(line)) return 'stage';
   if (/delivered what they planned/.test(line)) return 'good';

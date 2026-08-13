@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+import signal
 import sys
 import time
 from dataclasses import replace
@@ -357,7 +358,8 @@ def _confirm_material_identity(
     target = required[0]
     confirmed: dict[str, tuple[tuple[float, tuple[float, float, float, float]], ...]] = {}
     paid_before = float(getattr(ledger, "spent_usd", 0.0))
-    for item in material:
+    total = len(material)
+    for index, item in enumerate(material, start=1):
         discovery = sightings.get(item.source_id)
         # The master: these frames are decoded at 1440 and their boxes are
         # handed to a tracker that reads the master too.
@@ -383,6 +385,11 @@ def _confirm_material_identity(
             continue
         if found:
             confirmed[item.source_id] = found
+        print(
+            f"  identity {index}/{total}  {item.source_id}  "
+            + (f"{len(found)} confirmed" if found else "none"),
+            flush=True,
+        )
     print(
         f"identity confirmed on {len(confirmed)}/{len(material)} sources "
         f"(${float(getattr(ledger, 'spent_usd', 0.0)) - paid_before:.4f})",
@@ -436,7 +443,8 @@ def _screen_material_identity(
         flush=True,
     )
     paid = 0
-    for item in material:
+    total = len(material)
+    for index, item in enumerate(material, start=1):
         proxy = getattr(item, "proxy", None)
         if proxy is None or not Path(proxy).exists():
             kept.append(item)
@@ -468,6 +476,10 @@ def _screen_material_identity(
         discovery, usage = screened
         paid += 1 if usage is not None else 0
         found[item.source_id] = discovery
+        # Seventy-four of these is minutes of nothing on screen, which reads
+        # as a hang to anyone watching the run rather than the terminal.
+        if usage is not None:
+            print(f"  screen {index}/{total}  {item.source_id}", flush=True)
         absent = [
             summary for summary in discovery.target_summaries
             if summary.target_id in required and summary.verdict == "absent"
@@ -3402,8 +3414,21 @@ def main(argv: list[str] | None = None) -> int:
         return args.handler(args)
     state = Path(where).expanduser() / "run-state.json"
     _write_run_state(state, "running")
+
+    def _stopped(signum: int, frame: object) -> None:
+        # The stop button in the interface reaches a terminal run through this.
+        _write_run_state(state, "stopped")
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _stopped)
+    except (ValueError, OSError):
+        pass  # not the main thread; the pid check still tells the truth
     try:
         outcome = args.handler(args)
+    except KeyboardInterrupt:
+        _write_run_state(state, "stopped")
+        raise
     except BaseException:
         _write_run_state(state, "failed")
         raise
