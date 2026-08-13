@@ -121,6 +121,22 @@ def snap_to_action(
     within: tuple[float, float] | None = None,
     focus: "list[Any] | None" = None,
 ) -> tuple[float, str | None]:
+    """Compatibility wrapper around the contract-producing action snap."""
+
+    start, _contract, note = snap_to_action_contract(
+        card, wanted_start, duration, within=within, focus=focus
+    )
+    return start, note
+
+
+def snap_to_action_contract(
+    card: dict[str, Any],
+    wanted_start: float,
+    duration: float,
+    *,
+    within: tuple[float, float] | None = None,
+    focus: "list[Any] | None" = None,
+) -> "tuple[float, Any | None, str | None]":
     """Move a planned in-point onto the nearest action that contains it.
 
     A cut placed by arithmetic lands wherever the seconds fall, which is
@@ -137,22 +153,30 @@ def snap_to_action(
     boundary, and moved it there on purpose.
     """
 
+    from montagewright.schema import ActionContract
+
     beats = action_beats(card)
     if within is not None:
         first, last = within
         beats = [
             beat for beat in beats
             if beat.starts_seconds >= first - 1e-6
-            and beat.starts_seconds + duration <= last + 1e-6
+            # Both the requested hold and the action's real completion have
+            # to fit.  The old condition checked only start+duration, so a
+            # four-second action could be selected for a two-second shot and
+            # was then cut exactly in half.
+            and max(
+                beat.starts_seconds + duration, beat.ends_seconds
+            ) <= last + 1e-6
         ]
     if not beats:
-        return wanted_start, None
+        return wanted_start, None, None
 
     tolerance = max(0.5, duration / 2.0)
     nearest = min(beats, key=lambda beat: abs(beat.starts_seconds - wanted_start))
     drift = nearest.starts_seconds - wanted_start
     if abs(drift) > tolerance:
-        return wanted_start, None
+        return wanted_start, None, None
     # Landing on the gesture is worth moving for; landing on the gesture
     # while the lens is still hunting is not. A cut that was planned on
     # sharp footage stays where it was planned rather than being dragged
@@ -165,8 +189,19 @@ def snap_to_action(
         if moving_into_softer(
             focus, wanted_start, nearest.starts_seconds, duration
         ):
-            return wanted_start, None
-    return nearest.starts_seconds, (
+            return wanted_start, None, None
+    contract = ActionContract(
+        action_id=nearest.beat_id,
+        what=nearest.what,
+        source_start_seconds=nearest.starts_seconds,
+        source_complete_seconds=nearest.ends_seconds,
+        # Coarse MM:SS cannot prove a sub-second settle.  Keep completion as
+        # the safe boundary until a decoded-PTS refinement supplies one.
+        safe_cut_after_seconds=nearest.ends_seconds,
+        completion_policy="must_complete",
+        timing_basis="coarse_mmss",
+    )
+    return nearest.starts_seconds, contract, (
         f"moved {drift:+.2f}s onto '{nearest.what}'" if abs(drift) > 0.05 else None
     )
 

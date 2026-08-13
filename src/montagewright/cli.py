@@ -29,7 +29,7 @@ from montagewright.clipcard import (
     build_library,
     find_subject,
     load_card,
-    snap_to_action,
+    snap_to_action_contract,
     subjects_from_card,
 )
 from montagewright.cost import BudgetSpent, Ledger
@@ -1722,6 +1722,9 @@ def command_render(args: argparse.Namespace) -> int:
                 for item in material
                 if item.source_id == shot.get("source_id")
             ],
+            source_motion_measurements={
+                item.source_id: item.motion for item in material
+            },
             upload_cache=cache,
         )
 
@@ -2711,6 +2714,7 @@ def _edl_from_selection(
         # the length started from a constant.
         wanted = float(shot.get("seconds_needed") or 0.0) or 4.0
         card = load_card(cards[shot["source_id"]]) if shot["source_id"] in cards else None
+        action_contract = None
         window = _usable_window(shot)
         if window is not None:
             # The card said where this take is worth cutting into and until
@@ -2723,10 +2727,17 @@ def _edl_from_selection(
             wanted = min(wanted, room) if room > 0 else wanted
             start = min(max(start, first), max(first, last - wanted))
         if card is not None:
-            start, note = snap_to_action(
+            start, action_contract, note = snap_to_action_contract(
                 card, start, wanted, within=window,
                 focus=focus_of(str(shot["source_id"])),
             )
+            if action_contract is not None:
+                # Selection names the action; its completion is a local
+                # source-clock floor.  Extend here before rhythm sees the
+                # shot, rather than asking rhythm to rediscover the action.
+                wanted = max(
+                    wanted, action_contract.minimum_duration_from(start)
+                )
             if note:
                 snaps[clip_id] = note
             # Where the card already measured each look. This is what makes
@@ -2761,6 +2772,9 @@ def _edl_from_selection(
                     one.beat_id: one.starts_seconds
                     for one in action_beats(card or {})
                 },
+                action_contracts=(
+                    [action_contract] if action_contract is not None else []
+                ),
                 usable_from_seconds=(window[0] if window else 0.0),
                 usable_to_seconds=(window[1] if window else 0.0),
             )

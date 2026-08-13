@@ -820,9 +820,20 @@ def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
     page = PAGE.read_text(encoding="utf-8")
     for shown in (
         "shotcard", "s.source_id", "b.camera_move", "s.subject", "s.why",
-        "motion.source", "motion.digital", "tellDegradation", "實際做到什麼",
+        "b.motion?.source", "b.motion?.digital", "motion.camera_intent",
+        "motion.composite", "tellDegradation", "實際做到什麼",
+        "剪輯意圖", "原素材語意角色", "數位裁切", "最終組合",
+        "plan_disagreements", "計畫疑點", "全片計畫疑點",
     ):
         assert shown in page, shown
+
+    for role in (
+        "handheld_texture", "setup_reframe", "disturbance", "unknown",
+    ):
+        assert role in page, role
+
+    for relationship in ("source_only", "digital_only", "stacked", "still"):
+        assert relationship in page, relationship
 
 
 def test_a_track_can_be_measured_without_a_reviewed_lock() -> None:
@@ -4799,6 +4810,45 @@ def test_an_action_snap_cannot_land_outside_the_take():
     assert moved == 5.0 and note
 
 
+def test_action_snap_returns_a_completion_contract_for_a_long_action():
+    """An in-point snap must carry the other end of the action with it.
+
+    Previously a four-second gesture could be snapped onto a two-second shot:
+    only the start survived, so rhythm had no fact saying the action ended two
+    seconds after the planned cut.
+    """
+
+    from montagewright.clipcard import snap_to_action_contract
+
+    card = {"action": [{
+        "id": "a01", "what": "the phone unfolds",
+        "from": "0:05", "to": "0:09",
+    }]}
+    start, contract, _ = snap_to_action_contract(
+        card, 5.2, 2.0, within=(4.0, 12.0)
+    )
+
+    assert start == 5.0
+    assert contract is not None
+    assert contract.source_complete_seconds == 9.0
+    assert contract.safe_cut_after_seconds == 9.0
+    assert contract.minimum_duration_from(start) == 4.0
+
+
+def test_action_snap_refuses_a_contract_that_cannot_finish_in_the_span():
+    from montagewright.clipcard import snap_to_action_contract
+
+    card = {"action": [{
+        "id": "a01", "what": "the phone unfolds",
+        "from": "0:05", "to": "0:09",
+    }]}
+    start, contract, note = snap_to_action_contract(
+        card, 5.2, 2.0, within=(4.0, 8.5)
+    )
+
+    assert start == 5.2 and contract is None and note is None
+
+
 def test_a_rejected_stretch_has_no_name_to_be_chosen_by():
     """The whole argument, in one assertion.
 
@@ -5536,6 +5586,26 @@ def test_the_camera_motion_the_model_cannot_see_is_measured():
         assert judgement not in said
 
 
+def test_selected_window_reports_local_source_motion_separately_from_semantics():
+    from montagewright.motion import MotionInterval
+    from montagewright.pipeline import _source_motion_measurement
+
+    found = [
+        MotionInterval("m00", 0.0, 2.0, "moving", 0.3, 0.4, settles=True),
+        MotionInterval("m01", 2.0, 5.0, "still", 0.0, 0.0, settles=False),
+    ]
+    measured = _source_motion_measurement(found, 1.0, 3.0)
+    assert measured == {
+        "available": True,
+        "states": ["moving", "still"],
+        "moving": True,
+        "travel_frame_widths": 0.2,
+        "peak_frame_widths_per_second": 0.3,
+        "settles": True,
+        "event_ids": ["m00", "m01"],
+    }
+
+
 def test_a_setup_reframe_is_not_offered_as_a_span():
     """The camera getting ready is the gap between takes, not a take.
 
@@ -5637,6 +5707,26 @@ def test_overlapping_adjacent_windows_of_one_span_are_reported():
          "seconds_needed": 5},
     ]
     assert "overlapping windows" in sequence_disagreements(shots)[0]
+
+
+def test_resolved_sequence_flags_a_same_subject_punch_in_jump_cut():
+    from montagewright.pipeline import _resolved_sequence_disagreements
+    from montagewright.schema import Clip, EDL, Look, Reframe
+
+    def clip(clip_id, starts, ends, width):
+        return Clip(
+            clip_id=clip_id, source_id="C1",
+            approx_in_seconds=starts, approx_out_seconds=ends,
+            reframe=Reframe(
+                looks=[Look(at="phone")], look_boxes=[(0.5, 0.5, width)],
+                intent="hold",
+            ),
+        )
+
+    notes = _resolved_sequence_disagreements(EDL(
+        project_id="p", clips=[clip("k00", 0.0, 2.0, 0.4), clip("k01", 2.1, 4.0, 0.7)]
+    ))
+    assert any("punch-in jump cut" in note for note in notes)
 
 
 def test_an_explicit_follow_does_not_reuse_one_card_box_as_a_trajectory():
@@ -6983,6 +7073,66 @@ def test_a_beat_may_lengthen_an_authored_move_but_never_shorten_it():
     assert abs(lonely.duration_seconds - 3.0) < 1e-6
     assert lonely.landed_on is None
     assert "left the grid" in (lonely.note or "")
+
+
+def test_a_beat_may_not_cut_a_protected_action_short():
+    """Action completion is content authority; the beat grid gives way."""
+
+    from montagewright.grounding import BeatGrid, Cue, ground_timeline
+    from montagewright.schema import ActionContract, Clip, EDL, MusicSync
+
+    grid = BeatGrid(bpm=120.0, meter=4, duration_seconds=60.0, cues=(
+        Cue(cue_id="b0", time_seconds=0.0, kind="beat"),
+        Cue(cue_id="b1", time_seconds=1.98, kind="beat"),
+        Cue(cue_id="b2", time_seconds=4.25, kind="beat"),
+    ))
+    clip = Clip(
+        clip_id="k00", source_id="C1",
+        approx_in_seconds=5.0, approx_out_seconds=7.0,
+        music_sync=MusicSync(cut_on_beat=True),
+        action_contracts=[ActionContract(
+            action_id="a01", what="the phone unfolds",
+            source_start_seconds=5.0,
+            source_complete_seconds=9.0,
+            safe_cut_after_seconds=9.0,
+        )],
+    )
+
+    grounded = ground_timeline(EDL(project_id="p", clips=[clip]), grid).clips[0]
+    assert grounded.duration_seconds == 4.25
+    assert grounded.landed_on == "b2"
+    assert "selected action needs 4.00s" in (grounded.note or "")
+
+
+def test_release_gate_refuses_a_rhythm_that_still_truncates_an_action():
+    from montagewright.planning_release import rhythm_motion_faults
+    from montagewright.schema import ActionContract, Clip, EDL
+
+    protected = Clip(
+        clip_id="k00", source_id="C1",
+        approx_in_seconds=5.0, approx_out_seconds=9.0,
+        action_contracts=[ActionContract(
+            action_id="a01", what="the phone unfolds",
+            source_start_seconds=5.0,
+            source_complete_seconds=9.0,
+            safe_cut_after_seconds=9.0,
+        )],
+    )
+    shortened = protected.model_copy(update={
+        "approx_out_seconds": 7.0,
+        # Simulate a stale/replaced candidate whose locally available span
+        # can no longer contain the protected action. Grounding cannot heal
+        # this by extending, so the release proof must refuse it.
+        "usable_from_seconds": 5.0,
+        "usable_to_seconds": 7.0,
+    })
+
+    faults = rhythm_motion_faults(
+        EDL(project_id="p", clips=[protected]),
+        EDL(project_id="p", clips=[shortened]),
+        None,
+    )
+    assert any("cannot safely cut before 9.000s" in fault for fault in faults)
 
 
 def test_a_tracker_that_holds_nothing_is_one_shot_not_the_run():

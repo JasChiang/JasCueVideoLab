@@ -82,6 +82,11 @@ TRACK_MINIMUM_OBSERVATIONS = 3
 # the tracker is asked to cross a scene.
 CONFIRMED_REACH_SECONDS = 6.0
 
+# One exact identity seed may replace repeated semantic checkpoints only over
+# a short, uninterrupted local track. Longer shots keep the existing
+# multi-anchor proof even when SAM's masks look geometrically smooth.
+ADAPTIVE_TRACK_MAX_SECONDS = 5.0
+
 
 def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
     """Put every lip-synced picture on the independent audio source clock.
@@ -386,6 +391,35 @@ def _resolved_sequence_disagreements(edl: EDL) -> list[str]:
                 f"{left.clip_id} and {right.clip_id} repeat {overlap:.1f}s "
                 "of the same resolved source window"
             )
+        if left.source_id != right.source_id:
+            continue
+        gap = right.approx_in_seconds - left.approx_out_seconds
+        if -0.25 <= gap <= 0.25:
+            notes.append(
+                f"{left.clip_id} and {right.clip_id} cut nearly continuously "
+                f"inside {left.source_id}; the {gap:+.2f}s source-clock jump "
+                "may read as an accidental cut"
+            )
+        left_reframe, right_reframe = left.reframe, right.reframe
+        if left_reframe is None or right_reframe is None:
+            continue
+        left_labels = [look.at for look in left_reframe.looks]
+        right_labels = [look.at for look in right_reframe.looks]
+        if not left_labels or not right_labels or left_labels[-1] != right_labels[0]:
+            continue
+        if not left_reframe.look_boxes or not right_reframe.look_boxes:
+            continue
+        left_width = float(left_reframe.look_boxes[-1][2])
+        right_width = float(right_reframe.look_boxes[0][2])
+        scale = max(left_width, right_width) / max(
+            min(left_width, right_width), 1e-9
+        )
+        if scale >= 1.35:
+            notes.append(
+                f"{left.clip_id} to {right.clip_id} keeps the same subject in "
+                f"{left.source_id} but changes planned scale {scale:.2f}x; "
+                "review as a possible punch-in jump cut"
+            )
     return notes
 
 
@@ -418,6 +452,41 @@ def _charge(report: "Report", stage: str, usage: Usage) -> None:
     """Keep the report's token tally; ``ask`` settles the stage ledger."""
 
     report.usages.append(usage)
+
+
+def _source_motion_measurement(
+    intervals: Any, starts_seconds: float, ends_seconds: float
+) -> dict[str, Any]:
+    """Summarise local optical-flow facts for the selected source window."""
+
+    selected = []
+    travel = 0.0
+    peak = 0.0
+    for interval in intervals or ():
+        overlap = max(
+            0.0,
+            min(ends_seconds, float(interval.ends_seconds))
+            - max(starts_seconds, float(interval.starts_seconds)),
+        )
+        if overlap <= 0.0:
+            continue
+        seconds = max(
+            1e-9, float(interval.ends_seconds) - float(interval.starts_seconds)
+        )
+        selected.append(interval)
+        if str(interval.state) == "moving":
+            travel += float(interval.travel_vw) * overlap / seconds
+            peak = max(peak, float(interval.peak_vw_s))
+    states = tuple(dict.fromkeys(str(one.state) for one in selected))
+    return {
+        "available": bool(selected),
+        "states": list(states),
+        "moving": "moving" in states,
+        "travel_frame_widths": round(travel, 4),
+        "peak_frame_widths_per_second": round(peak, 4),
+        "settles": any(bool(one.settles) for one in selected),
+        "event_ids": [str(one.event_id) for one in selected],
+    }
 
 
 def _locate_subject(frames, description, *, client, report):
@@ -946,6 +1015,26 @@ def _reaches(one: Any, opens: float, closes: float) -> bool:
     return starts - 1e-6 <= opens and closes <= ends + 1e-6
 
 
+def _single_seed_eligibility(
+    one: Any, opens: float, closes: float,
+) -> tuple[bool, tuple[str, ...]]:
+    """Whether this exact confirmation may start the cheap continuity path."""
+
+    risks: list[str] = list(
+        tuple(getattr(one, "seed_risk_flags", ()) or ())
+    )
+    if not all(getattr(one, field, None) is not None for field in (
+        "video_asset_id", "frame_time_ms", "width", "height",
+    )):
+        risks.append("exact_lineage_unavailable")
+    track_span = max(closes, one.at_seconds + 0.1) - max(
+        0.0, min(opens, one.at_seconds)
+    )
+    if track_span > ADAPTIVE_TRACK_MAX_SECONDS + 1e-6:
+        risks.append("unchecked_span_too_long")
+    return not risks, tuple(dict.fromkeys(risks))
+
+
 def _geometry_from_confirmed(
     source: Source,
     clip: Any,
@@ -956,6 +1045,7 @@ def _geometry_from_confirmed(
     report: Report,
     work: Path,
     checkpoint: Path,
+    validation_mode: str = "multi_anchor",
 ) -> tuple[
     list[dict[str, Any]],
     list[float],
@@ -972,6 +1062,13 @@ def _geometry_from_confirmed(
     pre-roll it does not use.
     """
 
+    if validation_mode == "multi_anchor_fallback" and len(confirmed) < 2:
+        raise ReferenceGeometryUnavailable(
+            clip.clip_id, target_id,
+            f"{clip.clip_id}: multi-anchor fallback requires two confirmed "
+            f"frames; got {len(confirmed)}",
+        )
+
     seed = min(
         inside or confirmed,
         key=lambda one: abs(
@@ -984,6 +1081,24 @@ def _geometry_from_confirmed(
     widened = clip.model_copy(update={
         "approx_in_seconds": reach_in, "approx_out_seconds": reach_out,
     })
+    exact_lineage = None
+    lineage_values = (
+        getattr(seed, "video_asset_id", None),
+        getattr(seed, "frame_time_ms", None),
+        getattr(seed, "width", None),
+        getattr(seed, "height", None),
+    )
+    if all(value is not None for value in lineage_values):
+        from types import SimpleNamespace
+
+        exact_lineage = SimpleNamespace(
+            video_asset_id=seed.video_asset_id,
+            frame_pts=seed.frame_pts,
+            frame_time_ms=seed.frame_time_ms,
+            frame_sha256=seed.frame_sha256,
+            width=seed.width,
+            height=seed.height,
+        )
     tracked, states = _track_subject(
         source, widened, f"the locked identity {target_id}",
         [int(value * 1000) for value in seed.box],
@@ -992,6 +1107,7 @@ def _geometry_from_confirmed(
         track_name=f"confirmed-{target_id.replace(':', '_')}",
         semantic_anchors=tuple((one.at_seconds, one.box) for one in confirmed),
         require_identity_validation=True,
+        seed_lineage=exact_lineage,
     )
     boxes: list[dict[str, Any]] = []
     times: list[float] = []
@@ -1028,6 +1144,17 @@ def _geometry_from_confirmed(
         ),
     )
     kept = len(boxes)
+    continuity_risks = sorted(
+        name.split(":", 1)[1]
+        for name in states
+        if name.startswith("_continuity_risk:")
+    )
+    segment_id = hashlib.sha256(
+        json.dumps([
+            source.source_id, target_id, getattr(seed, "sighting", ""),
+            seed.frame_pts,
+        ], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
     report.reference_grounding[clip.clip_id].update({
         "matched_anchors": len(confirmed),
         "tracked_frames": kept,
@@ -1036,6 +1163,11 @@ def _geometry_from_confirmed(
         "sam_seed_pts": seed.frame_pts,
         "sam_seed_sha256": seed.frame_sha256,
         "identity_by_continuity": bool(states.get("_identity_by_continuity")),
+        "validation_mode": validation_mode,
+        "continuity_segment_id": segment_id,
+        "risk_flags": continuity_risks,
+        "checkpoint_count": len(confirmed),
+        "paid_checkpoint_count": 0,
     })
     if kept < TRACK_MINIMUM_OBSERVATIONS or kept / analysed < TRACK_QUORUM:
         report.reference_grounding[clip.clip_id]["status"] = (
@@ -1045,7 +1177,11 @@ def _geometry_from_confirmed(
             clip.clip_id, target_id,
             f"{clip.clip_id}: tracking from the confirmed frame at "
             f"{seed.at_seconds:.2f}s covered {kept}/{analysed} of the cut; "
-            "refusing Gemini-box fallback",
+            + (
+                f"continuity risks: {', '.join(continuity_risks)}; "
+                if continuity_risks else ""
+            )
+            + "refusing Gemini-box fallback",
         )
     report.reference_grounding[clip.clip_id]["status"] = "sam_geometry_validated"
     return (
@@ -1135,16 +1271,77 @@ def _reference_subject_samples(
         # seconds the cut actually uses. Two confirmations, or one inside.
         usable = near if (inside or len(near) >= 2) else []
         if usable:
+            # Try one exact, low-risk seed before requiring a second semantic
+            # checkpoint. This is safe only while the seed and every second
+            # being delivered fit inside one short continuous tracking span.
+            # The strict SAM continuity audit is the second half of this
+            # proof; on any doubt we fall through to the old multi-anchor
+            # route rather than blessing the track.
+            centre = (clip_start_ms + clip_end_ms) / 2000.0
+            eligibility = {
+                id(one): _single_seed_eligibility(
+                    one, clip_start_ms / 1000.0, clip_end_ms / 1000.0
+                )
+                for one in usable
+            }
+            single_candidates = [
+                one for one in usable if eligibility[id(one)][0]
+            ]
+            if single_candidates:
+                single = min(
+                    single_candidates, key=lambda one: abs(one.at_seconds - centre)
+                )
+                report.reference_grounding[clip.clip_id] = {
+                    "target_id": target_id,
+                    "status": "identity_from_source",
+                    "confirmed_at": [round(single.at_seconds, 3)],
+                    "seeded_inside_cut": single in inside,
+                    "validation_mode": "single_seed_continuity",
+                }
+                try:
+                    return _geometry_from_confirmed(
+                        source, clip, target_id, [single],
+                        [single] if single in inside else [],
+                        report=report, work=work, checkpoint=checkpoint,
+                        validation_mode="single_seed_continuity",
+                    )
+                except ReferenceShotUnusable as unusable:
+                    report.reference_grounding[clip.clip_id][
+                        "fallback_reason"
+                    ] = str(unusable)[:200]
+                    report.subject_notes[clip.clip_id] = str(unusable)[:200]
+                except Exception as error:  # noqa: BLE001 -- fallback is safe
+                    reason = (
+                        f"single-seed tracking failed: "
+                        f"{type(error).__name__}: {error}"
+                    )[:200]
+                    report.reference_grounding[clip.clip_id][
+                        "fallback_reason"
+                    ] = reason
+                    report.subject_notes[clip.clip_id] = reason
+
+            fallback_reason = report.subject_notes.get(clip.clip_id)
+            if not single_candidates:
+                risks = sorted({
+                    risk for one in usable for risk in eligibility[id(one)][1]
+                })
+                fallback_reason = (
+                    "single seed ineligible"
+                    + (f": {', '.join(risks)}" if risks else "")
+                )
             report.reference_grounding[clip.clip_id] = {
                 "target_id": target_id,
                 "status": "identity_from_source",
                 "confirmed_at": [round(one.at_seconds, 3) for one in usable],
                 "seeded_inside_cut": bool(inside),
+                "validation_mode": "multi_anchor_fallback",
+                "fallback_reason": fallback_reason,
             }
             try:
                 return _geometry_from_confirmed(
                     source, clip, target_id, usable, inside,
                     report=report, work=work, checkpoint=checkpoint,
+                    validation_mode="multi_anchor_fallback",
                 )
             except ReferenceShotUnusable as unusable:
                 # Fall through and ask inside the cut's own window, which is
@@ -2432,6 +2629,7 @@ def run(
     confirmed_identities: "dict[str, Any] | None" = None,
     rhythm_shots: "list[Any] | None" = None,
     upload_cache: Any | None = None,
+    source_motion_measurements: Mapping[str, Any] | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
     """Take an EDL to a finished file.
 
@@ -2604,7 +2802,20 @@ def run(
                 round(clip.approx_in_seconds, 3),
                 round(clip.approx_out_seconds, 3),
             ],
+            "measurement": _source_motion_measurement(
+                (source_motion_measurements or {}).get(clip.source_id, ()),
+                clip.approx_in_seconds,
+                clip.approx_out_seconds,
+            ),
         }
+        measured = report.source_motion_details[clip.clip_id]["measurement"]
+        semantic_moves = reframe.source_motion_role != "locked"
+        if measured["available"] and bool(measured["moving"]) != semantic_moves:
+            report.plan_disagreements.append(
+                f"{clip.clip_id} source motion differs: local measurement says "
+                f"{'moving' if measured['moving'] else 'still'} but semantic role "
+                f"is {reframe.source_motion_role}"
+            )
         path = paths.get(clip.clip_id)
         report.digital_motion[clip.clip_id] = _digital_motion_of(path)
 

@@ -480,6 +480,18 @@ def _floor_for(clip: Clip) -> float:
     return seconds_needed_for(stops, reframe.camera_energy)
 
 
+def _action_floor_for(clip: Clip) -> float:
+    """The hard content floor imposed by selected action contracts."""
+
+    return max(
+        (
+            contract.minimum_duration_from(clip.approx_in_seconds)
+            for contract in clip.action_contracts
+        ),
+        default=0.0,
+    )
+
+
 def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
     """Lay the clips out in time.
 
@@ -599,6 +611,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 wanted_point = None
 
         if wanted_point is not None:
+            assert grid is not None
             end = wanted_point
             landed = clip.music_sync.sync_to
             found = grid.cue(landed) if grid is not None else None
@@ -640,7 +653,9 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         # ending a whole film over hundredths of a second. A rule that has
         # to be remembered in four places is a rule that will be forgotten
         # in a fifth.
+        action_floor = _action_floor_for(clip)
         floor_seconds = wanted if keeps_source_move else 0.0
+        floor_seconds = max(floor_seconds, action_floor)
         # Landing on a beat may lengthen a shot that exists to let the
         # source's own move play; it may not shorten one. `nearest_cue`
         # takes the closest event in either direction, so a cue thirteen
@@ -669,8 +684,13 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 )
             else:
                 end, landed, landed_kind = floor_end, None, None
+            obligation = (
+                f"the source move needs {wanted:.2f}s"
+                if keeps_source_move and wanted >= action_floor
+                else f"the selected action needs {action_floor:.2f}s"
+            )
             held = (
-                f"the source move needs {wanted:.2f}s, past "
+                obligation + ", past "
                 + (f"cue {missed}" if missed else "the nearest cue")
                 + "; "
                 + (
@@ -748,7 +768,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                     f"usable source ends after {available:.2f}s; could not "
                     + (f"reach cue {missed}" if missed else "hold the requested length")
                     + (
-                        " -- and it ends before this shot's own move does"
+                        " -- and it ends before this shot's protected content does"
                         if floor_seconds > 0.0
                         and end < cursor + floor_seconds - 1e-6
                         else ""

@@ -9,7 +9,7 @@ valid answer merely because it lands on a beat.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Sequence, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -28,6 +28,10 @@ PresentationIntent = Literal[
     "partial_reveal", "transition_pass",
 ]
 MotionPreference = Literal["native_first", "virtual_allowed", "hold"]
+CameraTreatment = Literal[
+    "hold", "use_source_motion", "follow_subject", "reveal", "compare",
+    "push_in", "pull_out", "multi_stop",
+]
 Tier = Literal["primary", "alternate"]
 
 
@@ -51,6 +55,57 @@ class CandidateOption(StrictFrozen):
     motion_preference: MotionPreference
     target_id: str = Field(min_length=1, max_length=256)
     why: str = Field(min_length=1, max_length=1200)
+    # Local feasibility, derived from the selected source/span rather than
+    # invented by the provider.  Selection and replan see the menu in ranked
+    # order, so "hold" is no longer the only obviously safe answer when the
+    # take has measured room for a useful treatment.
+    feasible_treatments: tuple[CameraTreatment, ...] = ("hold",)
+    preferred_treatment: CameraTreatment = "hold"
+    minimum_camera_seconds: float = Field(default=0.0, ge=0.0)
+    feasibility_reason: str = "local fallback: hold"
+
+
+def _camera_treatments(
+    item: Any,
+    span: Any,
+    *,
+    preference: MotionPreference,
+    target_id: str,
+) -> tuple[tuple[CameraTreatment, ...], CameraTreatment, float, str]:
+    """Rank treatments using facts that exist before the camera is planned."""
+
+    seconds = max(0.0, float(span.ends_seconds) - float(span.starts_seconds))
+    role = str(getattr(span, "motion_role", "") or "locked")
+    pan_room = float(getattr(item, "pan_room", 0.0) or 0.0)
+    tilt_room = float(getattr(item, "tilt_room", 0.0) or 0.0)
+    push_room = float(getattr(item, "push_room", 1.0) or 1.0)
+    treatments: list[CameraTreatment] = []
+    reasons: list[str] = []
+    minimum = 0.0
+
+    if preference == "native_first" and role in {"authored", "subject_follow"}:
+        treatments.append("use_source_motion")
+        reasons.append(f"span has {role} source motion")
+    if preference != "hold":
+        if target_id != "none":
+            treatments.append("follow_subject")
+            reasons.append("named subject can be tracked locally")
+        travel_room = max(pan_room, tilt_room)
+        if travel_room > 0.02 and seconds >= 1.0:
+            treatments.extend(("reveal", "compare"))
+            minimum = max(minimum, 1.0)
+            reasons.append(f"crop has {travel_room:.0%} measured travel room")
+        if push_room > 1.02 and seconds >= 1.0:
+            treatments.extend(("push_in", "pull_out"))
+            minimum = max(minimum, 1.0)
+            reasons.append(f"resolution permits up to {push_room:.2f}x push")
+        if travel_room > 0.02 and seconds >= 1.8:
+            treatments.append("multi_stop")
+            minimum = max(minimum, 1.8)
+    treatments.append("hold")
+    ranked = tuple(dict.fromkeys(treatments))
+    preferred = ranked[0]
+    return ranked, preferred, minimum, "; ".join(reasons) or "hold requested or no measured move room"
 
 
 class CandidateCommitments(StrictFrozen):
@@ -225,7 +280,9 @@ def resolve_candidate_commitments(
                 f"{available:.3f}s"
             )
             continue
-        preference = str(raw.get("motion_preference") or "")
+        preference = cast(
+            MotionPreference, str(raw.get("motion_preference") or "")
+        )
         from montagewright.coverage import visual_supported_max
 
         supported = visual_supported_max(
@@ -263,6 +320,14 @@ def resolve_candidate_commitments(
         # caller; what is left here catches a source that was never offered
         # for promotion at all.
         try:
+            treatments, preferred, camera_floor, feasibility_reason = (
+                _camera_treatments(
+                    item_index.get(str(span.source_id)),
+                    span,
+                    preference=preference,
+                    target_id=target_id,
+                )
+            )
             options.append(CandidateOption(
                 commitment_id=raw.get("commitment_id"),
                 purpose=raw.get("purpose"),
@@ -275,6 +340,10 @@ def resolve_candidate_commitments(
                 motion_preference=preference,
                 target_id=target_id,
                 why=raw.get("why"),
+                feasible_treatments=treatments,
+                preferred_treatment=preferred,
+                minimum_camera_seconds=camera_floor,
+                feasibility_reason=feasibility_reason,
             ))
         except Exception as error:
             faults.append(f"option {index} is invalid: {error}")
@@ -318,6 +387,10 @@ def describe_commitments(commitments: CandidateCommitments) -> str:
             f"role={option.picture_role}; minimum={option.min_supported_seconds:g}s; "
             f"presentation={option.presentation_intent}; motion="
             f"{option.motion_preference}; target={option.target_id}; "
+            f"local camera menu={','.join(option.feasible_treatments)}; "
+            f"preferred={option.preferred_treatment}; camera floor="
+            f"{option.minimum_camera_seconds:g}s; feasibility="
+            f"{option.feasibility_reason}; "
             f"purpose={option.purpose}"
         )
     return "\n".join(lines)
@@ -355,6 +428,23 @@ def validate_selection_commitments(
             faults.append(
                 f"shot {index} gives {commitment_id} {seconds:.3f}s but its "
                 f"content needs {option.min_supported_seconds:.3f}s"
+            )
+        from montagewright.schema import camera_intent_of
+
+        treatment = camera_intent_of(shot)
+        if treatment not in option.feasible_treatments:
+            faults.append(
+                f"shot {index} chooses locally infeasible camera treatment "
+                f"{treatment!r}; {option.span_id} offers "
+                f"{', '.join(option.feasible_treatments)}"
+            )
+        if (
+            treatment != "hold"
+            and seconds + 1e-6 < option.minimum_camera_seconds
+        ):
+            faults.append(
+                f"shot {index} gives {treatment} {seconds:.3f}s but local "
+                f"camera geometry needs {option.minimum_camera_seconds:.3f}s"
             )
         # Motion is an editorial preference, not a content invariant. A
         # locked source can fulfil `native_first` with a safe virtual move or

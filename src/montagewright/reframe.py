@@ -1619,38 +1619,73 @@ def ffmpeg_crop_filters(
     ]
 
 
-def _track_holds_together(samples: list) -> bool:
-    """Whether this track ever let go of what it was following.
+def _track_continuity_risks(samples: list, analysis_fps: float) -> tuple[str, ...]:
+    """Return reasons one semantic seed may not speak for the whole track.
 
-    A tracker that switches to a neighbouring object leaves a trace: the
-    box jumps, or its area changes by a factor no real subject does between
-    two samples a quarter of a second apart. A track that does neither is
-    still on the thing it was seeded with, which a verified frame has
-    already named.
+    Missing geometry used to reset the comparison and then disappear from
+    the verdict.  A mask could therefore vanish behind an occluder, return on
+    a lookalike, and still be called continuous because neither half jumped
+    internally.  Single-seed identity is deliberately stricter than ordinary
+    crop tracking: every analysed sample must remain a clean tracked mask.
     """
 
     from math import hypot
 
+    risks: list[str] = []
+    if len(samples) < 3:
+        risks.append("too_few_samples")
     last: tuple[float, float, float, float] | None = None
+    edge_run = 0
+    max_gap = max(0.5, 1.5 / max(float(analysis_fps), 0.1))
     for sample in samples:
         box = getattr(sample, "derived_tracking_box", None)
         at = getattr(sample, "analysis_sample_time_ms", 0) / 1000.0
+        state = getattr(
+            getattr(sample, "tracking_state", ""),
+            "value",
+            str(getattr(sample, "tracking_state", "")),
+        )
+        if state != "tracked":
+            risks.append(f"state_{state or 'unknown'}")
+        if bool(getattr(sample, "shot_boundary", False)):
+            risks.append("shot_boundary")
         if not box or len(box) != 4:
-            # A gap is not a jump; it is simply nothing to compare across.
+            risks.append("missing_mask")
             last = None
+            edge_run = 0
             continue
         x0, y0, x1, y1 = (value / 1000.0 for value in box)
         centre = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
         area = max(1e-6, abs(x1 - x0) * abs(y1 - y0))
+        at_edge = x0 <= 0.02 or y0 <= 0.02 or x1 >= 0.98 or y1 >= 0.98
+        edge_run = edge_run + 1 if at_edge else 0
+        if edge_run >= 2:
+            risks.append("edge_exit")
+        if int(getattr(sample, "connected_components", 1) or 0) > 4:
+            risks.append("fragmented_mask")
+        probability = getattr(sample, "mean_positive_probability", None)
+        if probability is not None and float(probability) < 0.6:
+            risks.append("weak_mask")
         if last is not None:
             was_x, was_y, was_area, was_at = last
-            gap = max(1e-3, at - was_at)
+            gap = at - was_at
+            if gap <= 0:
+                risks.append("non_monotonic_time")
+                gap = 1e-3
+            elif gap > max_gap:
+                risks.append("sample_gap")
             if hypot(centre[0] - was_x, centre[1] - was_y) / gap > 0.6:
-                return False
+                risks.append("center_jump")
             if not 0.4 <= area / was_area <= 2.5:
-                return False
+                risks.append("area_jump")
         last = (centre[0], centre[1], area, at)
-    return True
+    return tuple(dict.fromkeys(risks))
+
+
+def _track_holds_together(samples: list, analysis_fps: float = 1.0) -> bool:
+    """Compatibility predicate backed by the strict continuity assessment."""
+
+    return not _track_continuity_risks(samples, analysis_fps)
 
 
 def observations_from_sam(
@@ -1741,7 +1776,14 @@ def observations_from_sam(
         # every one of them with its identity confirmed on three frames,
         # because the second anchor's moment happened to be one the tracker
         # had no mask for. Sixty seconds came out twenty-seven.
-        if len(matched_times) == 1 and _track_holds_together(samples):
+        continuity_risks: tuple[str, ...] = ()
+        if len(matched_times) == 1:
+            continuity_risks = _track_continuity_risks(
+                samples, float(getattr(track, "analysis_fps", 1.0))
+            )
+            for risk in continuity_risks:
+                states[f"_continuity_risk:{risk}"] = 1
+        if len(matched_times) == 1 and not continuity_risks:
             tracked = [
                 sample.analysis_sample_time_ms / 1000.0
                 for sample in samples

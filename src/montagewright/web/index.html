@@ -2167,6 +2167,8 @@ function inspect(i) {
   const said = (lastReport.shots || {})[`k${String(b.index).padStart(2, '0')}`] || {};
   const deg = (lastReport.degradations || []).filter(
     d => d.clip_id === `k${String(b.index).padStart(2, '0')}`);
+  const disagreements = disagreementsForShot(lastReport, b.index, b.source_id);
+  const allDisagreements = lastReport.plan_disagreements || [];
   const moved = Math.abs(b.in_seconds - (plan.start_seconds ?? b.in_seconds)) > 0.01
     || Math.abs(b.seconds - (rhythm.seconds ?? b.seconds)) > 0.01;
 
@@ -2196,20 +2198,28 @@ function inspect(i) {
     <section class="ins-part result ${said.delivered === false ? 'off' : ''}">
       <h4>驗收結果 <small>實際做到什麼</small></h4>
       <div class="pairs">
-        <span>原素材</span><span>${esc(motionLabel(b.motion?.source, 'source'))}</span>
+        <span>原素材本機實測</span><span>${esc(sourceMeasurementLabel(
+          b.source_motion_details?.measurement
+        ))}</span>
+        <span>原素材語意角色</span><span>${esc(motionLabel(b.motion?.source, 'source'))}</span>
         <span>數位裁切</span><span>${esc(motionLabel(b.motion?.digital, 'digital'))}</span>
-        <span>兩層關係</span><span>${esc(COMPOSITES[b.motion?.composite] || b.motion?.composite || '—')}</span>
+        <span>最終組合</span><span>${esc(compositeLabel(b.motion?.composite))}</span>
         ${b.source_motion_details?.description
           ? `<span>素材運鏡說明</span><span>${esc(b.source_motion_details.description)}</span>` : ''}
       </div>
       ${said.note ? `<p class="why">${esc(said.note)}</p>`
         : '<p class="why">逐顆驗收沒有單獨看這一顆。</p>'}
       ${deg.length ? `<div class="degs">${deg.map(tellDegradation).join('')}</div>` : ''}
+      ${disagreements.length ? `<div class="degs">${disagreements.map(
+        note => `<div class="warn">計畫疑點：${esc(note)}</div>`).join('')}</div>` : ''}
     </section>
 
     <section class="ins-part plan">
       <h4>原計畫</h4>
       <div class="pairs">
+        <span>剪輯意圖</span><span>${esc(intentLabel(
+          b.motion?.camera_intent || plan.camera_intent
+        ))}</span>
         <span>運鏡</span><span>${esc(MOVES[b.camera_move] || b.camera_move || '—')}${
           plan.frame ? `<i class="why">　宣告${plan.frame === 'travels' ? '會動' : '不動'}</i>` : ''}</span>
         <span>畫面停在</span><span>${
@@ -2227,6 +2237,9 @@ function inspect(i) {
       </div>
       <p class="why">${esc(plan.why || '—')}</p>
       ${rhythm.why ? `<p class="why"><i>為什麼這個長度：</i>${esc(rhythm.why)}</p>` : ''}
+      ${allDisagreements.length ? `<details class="deeper"><summary>全片計畫疑點 ${allDisagreements.length}</summary>
+        <div class="degs">${allDisagreements.map(
+          note => `<div class="warn">${esc(note)}</div>`).join('')}</div></details>` : ''}
     </section>
 
     <section class="ins-part adjust">
@@ -5393,6 +5406,7 @@ function render(report) {
     const r = rhythm[k] || {}, v = verdicts[k] || {};
     const degs = degByClip[k] || [];
     const motion = report.motion?.[k] || {};
+    const disagreements = disagreementsForShot(report, i, s.source_id);
     const ok = v.delivered === undefined ? '' :
       `<span class="tag ${v.delivered ? 'ok' : 'no'}">${
         v.delivered ? '做到' : '沒做到'}</span>`;
@@ -5403,13 +5417,14 @@ function render(report) {
         <div class="said">
           <div class="titleline">
             <span class="subject">${esc(s.subject)}</span>
-            ${ok}${degs.length ? `<span class="tag warn">${degs.length}</span>` : ''}
+            ${ok}${degs.length ? `<span class="tag warn">${degs.length}</span>` : ''}${
+              disagreements.length ? `<span class="tag warn">疑點 ${disagreements.length}</span>` : ''}
           </div>
           <div class="meta">
             <span class="mono no">${i}</span>
             <a class="mono shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a>
             <span class="mono">${Number(s.start_seconds ?? 0).toFixed(1)}s ＋${Number(r.seconds ?? 0).toFixed(1)}s</span>
-            <span class="move">${esc(motionLabel(motion.source, 'source'))} ＋ ${esc(motionLabel(motion.digital, 'digital'))}</span>
+            <span class="move">${esc(intentLabel(motion.camera_intent || s.camera_intent))} · ${esc(compositeLabel(motion.composite))}</span>
           </div>
         </div>
       </div>
@@ -6061,10 +6076,19 @@ const MOVES = {
 const SOURCE_MOTIONS = {
   locked: '原素材固定', authored: '原素材有設計運鏡',
   subject_follow: '原素材跟拍主體',
+  handheld_texture: '原素材是手持質感',
+  setup_reframe: '原素材正在重新構圖',
+  disturbance: '原素材有突發擾動',
+  unknown: '原素材運動角色不確定',
 };
 const COMPOSITES = {
   source_only: '只用原生運鏡', digital_only: '只用數位運鏡',
   stacked: '原生＋數位疊加', still: '兩層都固定',
+};
+const INTENTS = {
+  hold: '定住', use_source_motion: '沿用原生運鏡',
+  follow_subject: '跟隨主體', reveal: '揭示', compare: '比較',
+  push_in: '推近', pull_out: '拉遠', multi_stop: '多落點',
 };
 const AUDIO_ROLES = {
   auto: '沿用舊設定', discard: '不使用原音', narrative: '敘事／訪談',
@@ -6081,6 +6105,36 @@ function motionLabel(value, layer) {
   if (!value) return '—';
   if (layer === 'source') return SOURCE_MOTIONS[value] || value;
   return String(value).split('+').map(v => MOVES[v] || v).join('＋');
+}
+
+function intentLabel(value) {
+  if (!value) return '—';
+  return INTENTS[value] || MOVES[value] || value;
+}
+
+function compositeLabel(value) {
+  if (!value) return '—';
+  return COMPOSITES[value] || value;
+}
+
+function sourceMeasurementLabel(value) {
+  if (!value?.available) return '沒有本機量測資料';
+  if (!value.moving) return value.states?.includes('not_a_shift')
+    ? '畫面有變化，但不是可解釋的整體平移' : '本機量到固定';
+  const travel = Number(value.travel_frame_widths || 0).toFixed(2);
+  const peak = Number(value.peak_frame_widths_per_second || 0).toFixed(2);
+  return `本機量到位移 ${travel} 畫面寬（峰值 ${peak}/秒）${
+    value.settles ? '，最後落定' : ''}`;
+}
+
+function disagreementsForShot(report, index, sourceId) {
+  const key = `k${String(index).padStart(2, '0')}`;
+  const source = String(sourceId || '');
+  return (report?.plan_disagreements || []).filter(note => {
+    const said = String(note || '');
+    return new RegExp(`(^|[^A-Za-z0-9_])${key}([^A-Za-z0-9_]|$)`).test(said)
+      || (source && said.includes(source));
+  });
 }
 
 // Where across the frame the box sits. The width is fixed by the delivery

@@ -987,6 +987,21 @@ class ExactFrameBBoxBatchResult(FrozenStrictModel):
             for evaluation in self.evaluations
         )
 
+    def matched_evaluations(self) -> tuple[ExactFrameBBoxEvaluation, ...]:
+        """Return matched, lineage-bound decisions without declaring readiness.
+
+        A single exact-frame decision can safely *seed* an adaptive local
+        tracking attempt.  It is not, by itself, the old two-anchor proof of
+        a track.  Keeping that distinction in the API prevents callers from
+        weakening ``sam_seed_evaluations`` merely to try the cheaper path.
+        """
+
+        return tuple(
+            evaluation
+            for evaluation in self.evaluations
+            if evaluation.decision.verdict == "matched_target"
+        )
+
     @property
     def sam_ready(self) -> bool:
         return self.matched_anchor_count >= self.minimum_matched_anchors
@@ -994,11 +1009,7 @@ class ExactFrameBBoxBatchResult(FrozenStrictModel):
     def sam_seed_evaluations(self) -> tuple[ExactFrameBBoxEvaluation, ...]:
         """Return lineage-bound seeds only after the local two-anchor gate."""
 
-        matched = tuple(
-            evaluation
-            for evaluation in self.evaluations
-            if evaluation.decision.verdict == "matched_target"
-        )
+        matched = self.matched_evaluations()
         if len(matched) < self.minimum_matched_anchors:
             raise ReferenceGroundingError(
                 "SAM handoff requires at least "
@@ -1722,6 +1733,46 @@ class ConfirmedFrame(FrozenStrictModel):
     sighting_window: tuple[float, float]
     frame_pts: int
     frame_sha256: str = Field(pattern=SHA256_PATTERN)
+    # Old on-disk confirmations omit these fields and remain valid, but are
+    # conservatively ineligible for the exact-lineage single-seed shortcut.
+    video_asset_id: str | None = Field(
+        default=None, pattern=r"^sha256:[0-9a-f]{64}$"
+    )
+    frame_time_ms: int | None = Field(default=None, ge=0)
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    seed_risk_flags: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_optional_lineage(self) -> "ConfirmedFrame":
+        lineage = (
+            self.video_asset_id, self.frame_time_ms, self.width, self.height,
+        )
+        if any(value is not None for value in lineage) and not all(
+            value is not None for value in lineage
+        ):
+            raise ValueError("confirmed frame lineage fields must be all-or-none")
+        if self.frame_time_ms is not None and abs(
+            self.frame_time_ms / 1000.0 - self.at_seconds
+        ) > 0.001:
+            raise ValueError("confirmed frame seconds and exact lineage disagree")
+        _unique_non_empty(self.seed_risk_flags, "seed_risk_flags")
+        return self
+
+
+def exact_seed_risk_flags(decision: ExactFrameBBoxDecision) -> tuple[str, ...]:
+    """Facts that make one semantic seed insufficient for identity continuity."""
+
+    risks: list[str] = []
+    if decision.excluded_instances:
+        risks.append("excluded_instance_in_seed_frame")
+    if decision.visibility_state != "full":
+        risks.append(f"visibility_{decision.visibility_state}")
+    if decision.occlusion_state != "none":
+        risks.append(f"occlusion_{decision.occlusion_state}")
+    if decision.touches_frame_edges:
+        risks.append("target_touches_frame_edge")
+    return tuple(risks)
 
 
 def confirm_source_identity(
@@ -1840,6 +1891,63 @@ def confirm_source_identity(
             continue
         seen_pts.add(frame.lineage.frame_pts)
         prepared.append(frame)
+    if not prepared:
+        return ()
+
+    # The common clean case pays for one semantic seed.  Its identity is
+    # proved by Gemini here; SAM still has to prove uninterrupted local
+    # continuity for the exact cut before the box is usable.  Multiple
+    # sightings retain the old multi-anchor path because a seed from one
+    # appearance cannot say anything about a later re-entry.
+    source_sightings = [
+        candidate for candidate in discovery.candidates
+        if candidate.target_id == target_id
+        and candidate.identity_status != "hard_negative"
+    ]
+    if len(source_sightings) == 1:
+        try:
+            seeded = decide_exact_frame_bbox(
+                spec, local, "sighting", prepared[0],
+                client=client, cache=cache, ledger=ledger,
+            )
+        except ReferenceGroundingError:
+            seeded = None
+        if seeded is not None:
+            decision, _usage = seeded
+            native = decision.tracking_box_xyxy_1000
+            risks = exact_seed_risk_flags(decision)
+            if native is not None and not risks:
+                x0, y0, x1, y1 = native
+                lineage = prepared[0].lineage
+                confirmed_at_ms = int(lineage.frame_time_ms)
+                nearest = min(times, key=lambda one: abs(one - confirmed_at_ms))
+                name = sighting_of.get(nearest, "sighting")
+                confirmed = [ConfirmedFrame(
+                    at_seconds=confirmed_at_ms / 1000.0,
+                    box=(x0 / 1000.0, y0 / 1000.0, x1 / 1000.0, y1 / 1000.0),
+                    sighting=name,
+                    sighting_window=windows.get(
+                        name, (0.0, float(video.duration_ms) / 1000.0)
+                    ),
+                    frame_pts=int(lineage.frame_pts),
+                    frame_sha256=str(lineage.frame_sha256),
+                    video_asset_id=str(lineage.video_asset_id),
+                    frame_time_ms=confirmed_at_ms,
+                    width=int(lineage.width),
+                    height=int(lineage.height),
+                    seed_risk_flags=(),
+                )]
+                if stored is not None:
+                    stored.parent.mkdir(parents=True, exist_ok=True)
+                    stored.write_text(json.dumps({
+                        "target": target_id,
+                        "video_sha256": digest,
+                        "confirmed": [
+                            one.model_dump(mode="json") for one in confirmed
+                        ],
+                    }), encoding="utf-8")
+                return tuple(confirmed)
+
     if len(prepared) < 2:
         return ()
 
@@ -1861,16 +1969,22 @@ def confirm_source_identity(
         native = evaluation.decision.tracking_box_xyxy_1000
         if native is None:
             continue
-        at_ms = int(evaluation.lineage.frame_time_ms)
-        nearest = min(times, key=lambda one: abs(one - at_ms))
+        x0, y0, x1, y1 = native
+        confirmed_at_ms = int(evaluation.lineage.frame_time_ms)
+        nearest = min(times, key=lambda one: abs(one - confirmed_at_ms))
         name = sighting_of.get(nearest, "sighting")
         confirmed.append(ConfirmedFrame(
-            at_seconds=at_ms / 1000.0,
-            box=tuple(float(value) / 1000.0 for value in native),
+            at_seconds=confirmed_at_ms / 1000.0,
+            box=(x0 / 1000.0, y0 / 1000.0, x1 / 1000.0, y1 / 1000.0),
             sighting=name,
             sighting_window=windows.get(name, (0.0, float(video.duration_ms) / 1000.0)),
             frame_pts=int(evaluation.lineage.frame_pts),
             frame_sha256=str(evaluation.lineage.frame_sha256),
+            video_asset_id=str(evaluation.lineage.video_asset_id),
+            frame_time_ms=int(evaluation.lineage.frame_time_ms),
+            width=int(evaluation.lineage.width),
+            height=int(evaluation.lineage.height),
+            seed_risk_flags=exact_seed_risk_flags(evaluation.decision),
         ))
     if stored is not None:
         stored.parent.mkdir(parents=True, exist_ok=True)
@@ -1884,7 +1998,7 @@ def confirm_source_identity(
 
 def sampling_times_for(
     discovery: CandidateDiscoveryResult, target_id: str
-) -> list[int]:
+) -> list[tuple[int, str]]:
     """When to look, to find out whether this source holds the identity.
 
     Per sighting, not per source and not per cut. The screen already says

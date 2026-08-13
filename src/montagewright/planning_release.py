@@ -30,6 +30,25 @@ def rhythm_motion_faults(
                 f"land ({entry.note or 'no matching local cue'})"
             )
         before = original.get(clip.clip_id)
+        if before is not None:
+            source_out = clip.approx_in_seconds + entry.duration_seconds
+            for contract in before.action_contracts:
+                if contract.completion_policy in {"may_cut_on_action", "loopable"}:
+                    continue
+                if clip.approx_in_seconds > contract.source_start_seconds + 1e-6:
+                    faults.append(
+                        f"{clip.clip_id}: source in-point "
+                        f"{clip.approx_in_seconds:.3f}s starts after protected "
+                        f"action {contract.action_id} began at "
+                        f"{contract.source_start_seconds:.3f}s"
+                    )
+                if source_out < contract.safe_cut_after_seconds - 1e-6:
+                    faults.append(
+                        f"{clip.clip_id}: protected action {contract.action_id} "
+                        f"cannot safely cut before "
+                        f"{contract.safe_cut_after_seconds:.3f}s source time; "
+                        f"rhythm ends it at {source_out:.3f}s"
+                    )
         before_move = (
             before.reframe.editorial_intent
             if before is not None and before.reframe is not None else "hold"

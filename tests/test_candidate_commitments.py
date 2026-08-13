@@ -8,6 +8,7 @@ import pytest
 
 from montagewright.candidate_commitments import (
     CommitmentError,
+    describe_commitments,
     resolve_candidate_commitments,
     validate_replacement_commitments,
     validate_selection_commitments,
@@ -80,6 +81,44 @@ def test_local_resolver_keeps_the_full_pool_and_marks_unoffered_spans_deferred()
     assert resolved.options[0].min_supported_seconds == 3.5
     assert resolved.deferred_span_ids == ("C1:s01",)
     assert "single point of failure" in resolved.warnings[0]
+    option = resolved.options[0]
+    assert option.preferred_treatment == "use_source_motion"
+    assert option.feasible_treatments[:2] == (
+        "use_source_motion", "follow_subject"
+    )
+    assert "local camera menu=" in describe_commitments(resolved)
+
+
+def test_local_camera_catalog_exposes_measured_virtual_room_before_hold():
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="foldable detail",
+        spans=_material()[0].spans, pan_room=0.24, tilt_room=0.0,
+        push_room=1.4,
+    )]
+    resolved = resolve_candidate_commitments(
+        _direction(
+            motion_preference="virtual_allowed", min_supported_seconds="0:03"
+        ), material,
+        material_digest="a" * 64, aspect="9:16", target_seconds=20.0,
+        grounding_target_ids=("device.fold",), grounding_sha256="b" * 64,
+    )
+    option = resolved.options[0]
+    assert option.preferred_treatment == "follow_subject"
+    assert {"reveal", "compare", "push_in", "pull_out", "multi_stop"} <= set(
+        option.feasible_treatments
+    )
+    assert option.feasible_treatments[-1] == "hold"
+    assert option.minimum_camera_seconds == 1.8
+
+    faults = validate_selection_commitments([{
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 1.0, "camera_intent": "multi_stop",
+        "looks": [{
+            "presentation_intent": "reveal_endpoint",
+            "entity_id": "device.fold",
+        }],
+    }], resolved)
+    assert any("camera geometry needs 1.800s" in fault for fault in faults)
 
 
 @pytest.mark.parametrize("change, message", [

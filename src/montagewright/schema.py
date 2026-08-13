@@ -40,6 +40,9 @@ PictureRole = Literal[
 AudioCompletion = Literal[
     "none", "complete_thought", "complete_action_sound", "intentional_cut"
 ]
+ActionCompletionPolicy = Literal[
+    "must_complete", "may_cut_on_action", "loopable", "hold_after_result",
+]
 
 
 class ModelFacing(BaseModel):
@@ -459,6 +462,43 @@ class MusicSync(ModelFacing):
     )
 
 
+class ActionContract(Local):
+    """A locally resolved obligation carried by one selected source action.
+
+    Gemini names a coarse action with MM:SS clock readings on the Clip Card.
+    Those strings stop at the model boundary.  The card reader resolves them
+    onto the source clock, and later exact-frame refinement may replace the
+    values without changing the contract consumed by rhythm.
+
+    ``safe_cut_after_seconds`` is deliberately separate from completion.  In
+    the coarse path they are equal; a dense local pass can move the safe cut
+    to the first settled decoded frame while preserving the semantic action.
+    """
+
+    action_id: str = Field(min_length=1)
+    what: str = ""
+    source_start_seconds: float = Field(ge=0.0)
+    source_complete_seconds: float = Field(gt=0.0)
+    safe_cut_after_seconds: float = Field(gt=0.0)
+    completion_policy: ActionCompletionPolicy = "must_complete"
+    timing_basis: Literal["coarse_mmss", "decoded_source_pts"] = "coarse_mmss"
+
+    @model_validator(mode="after")
+    def ordered_source_clock(self) -> "ActionContract":
+        if self.source_complete_seconds <= self.source_start_seconds:
+            raise ValueError("action completion must follow action start")
+        if self.safe_cut_after_seconds < self.source_complete_seconds:
+            raise ValueError("safe cut cannot precede action completion")
+        return self
+
+    def minimum_duration_from(self, source_in_seconds: float) -> float:
+        """Minimum screen time required from this concrete source in-point."""
+
+        if self.completion_policy in {"may_cut_on_action", "loopable"}:
+            return 0.0
+        return max(0.0, self.safe_cut_after_seconds - source_in_seconds)
+
+
 class Clip(ModelFacing):
     """One shot. Times are approximate; grounding snaps them."""
 
@@ -546,6 +586,13 @@ class Clip(ModelFacing):
     # it. Carried because grounding is what puts one on a beat, and the card
     # is read three layers earlier.
     moments: dict[str, float] = Field(default_factory=dict)
+    action_contracts: list[ActionContract] = Field(
+        default_factory=list,
+        description=(
+            "Local action-completion obligations for this selected source "
+            "window. Gemini never authors these resolved seconds."
+        ),
+    )
     usable_from_seconds: float = Field(default=0.0, ge=0.0)
     usable_to_seconds: float = Field(default=0.0, ge=0.0)
 
