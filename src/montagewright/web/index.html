@@ -913,6 +913,8 @@
     border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--line));
     font-size: 11px;
   }
+  button.danger { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+  button.danger:hover { background: var(--wash); }
   .graphic-block.draft { border-style: dashed; opacity: .72; }
   .graphic-block.on { box-shadow: inset 0 0 0 1px var(--accent); }
   /* Every other lane draws a waveform behind its name. This one draws
@@ -2851,6 +2853,13 @@ function inspectGraphic() {
       <span>狀態</span><select id="graphic-status" class="wide">${graphicOptions([
         ['draft','草稿，不輸出'],['approved','核准並輸出']
       ], one.status)}</select>
+    </div>
+    <!-- Deleting was only ever offered from the 字卡 tab's header, which is
+         not on screen when a card is picked off the timeline -- where
+         somebody who has just read a card they never asked for is standing. -->
+    <div class="row" style="margin-top:11px;gap:9px;align-items:center">
+      <button type="button" class="ghost danger" id="graphic-drop">刪掉這張字卡</button>
+      <span class="why">可以用「復原上一步」救回來。</span>
     </div></section>
     <details class="graphic-advanced graphic-editor-panel" data-panel="content"><summary>進階內容與來源</summary>
       <section class="ins-part"><div class="pairs">
@@ -3002,6 +3011,7 @@ function inspectGraphic() {
     control.onkeydown = (e) => e.stopPropagation();
   }
   $('graphic-undo').onclick = undoGraphicEdit;
+  $('graphic-drop').onclick = dropPickedGraphic;
   const showGraphicEditorPanel = (wanted) => {
     activeGraphicPanel = wanted;
     for (const button of box.querySelectorAll('.graphic-editor-nav button')) {
@@ -4216,7 +4226,7 @@ function addBriefCandidate(candidateId, variantIndex = -1) {
 
 $('graphic-add').onclick = () => addGraphicAtPlayhead();
 
-$('graphic-del').onclick = () => {
+function dropPickedGraphic() {
   if (!(graphicPicked >= 0 && graphicPicked < graphicsPlan.cues.length)) return;
   rememberGraphicsUndo('delete-graphic');
   graphicsPlan.cues.splice(graphicPicked, 1);
@@ -4225,7 +4235,9 @@ $('graphic-del').onclick = () => {
   graphicsPlan.facts = graphicsPlan.facts.filter(f => f.source_kind !== 'user' || used.has(f.fact_id));
   graphicPicked = -1; refreshGraphicsFromPlan(); saveGraphics();
   $('graphic-inspector').classList.add('hide'); $('inspector').classList.remove('hide');
-};
+  $('ins-head').querySelector('.who').textContent = '這一顆';
+}
+$('graphic-del').onclick = dropPickedGraphic;
 
 // Which cue the editor is working on. Separate from which one is being
 // spoken: you scrub away to look at something and come back, and the line
