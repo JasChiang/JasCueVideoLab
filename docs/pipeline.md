@@ -203,6 +203,19 @@ commitment-first planning 買到的東西：替代品一次買齊，換上去免
 追蹤的時間權威。這個改善應用 `$ / 正確交付的身分鏡頭` 驗收，不能只比較
 呼叫次數。
 
+Exact confirmation 不再對 screen-positive 的整個素材池逐支呼叫。Direction
+先把素材縮成帶 target 的 primary／alternate commitment sources；本機只替這個
+池準備一張 master-frame seed，再以同一 identity reference pack 每批最多六個
+不同 asset 一起判定。每項都用 asset SHA、candidate、PTS、frame SHA 與尺寸產生
+獨立 item id 並逐項驗證；缺失／重複／lineage 錯配只 singleton retry 該項，
+成功鄰居不重送。Matched 但遮擋／相似物／貼邊仍回退單來源多錨點，semantic
+negative／uncertain 則記錄為有效答案，不為了追求 matched 反覆付費。
+
+以 `artifacts/identity-full` 的既有 direction 回放，36 個 options 中 33 個帶
+identity，共 29 個 distinct sources；新版初始 seed 是最多 5 個 cross-source
+calls（每批 6），舊版則是逐 source。實際總 calls 仍取決於高風險 fallback 與
+repair，必須由下一次全量 ledger 驗收。
+
 節奏現在攜帶本機 `ActionContract`：動作開始、完成與安全切出點會進 EDL；
 拍點只能選在動作完成之後，找不到合適拍時寧可離拍，也不截斷動作。每顆仍
 可各自使用一小節或兩小節，沒有全片固定 bar mode。

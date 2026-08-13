@@ -1776,6 +1776,54 @@ def exact_seed_risk_flags(decision: ExactFrameBBoxDecision) -> tuple[str, ...]:
     return tuple(risks)
 
 
+def source_confirmation_cache_path(
+    video_path: Path,
+    spec: ReferenceGroundingSpec,
+    target_id: str,
+    library: Path,
+) -> Path:
+    """Content-addressed location shared by singleton and cross-asset paths."""
+
+    digest = sha256_file(Path(video_path).expanduser().resolve(strict=True))
+    target_key = _sha256_text(target_id)[:10]
+    return (
+        Path(library) / "reference-grounding"
+        / f"identity-{digest[:20]}-{spec.definition_sha256()[:16]}"
+          f"-{_sha256_text(_read_prompt())[:8]}-{target_key}"
+          f"-{SOURCE_CONFIRMATION_VERSION}.json"
+    )
+
+
+def read_source_confirmation_cache(
+    path: Path, target_id: str,
+) -> tuple[ConfirmedFrame, ...] | None:
+    try:
+        remembered = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(remembered, dict) or remembered.get("target") != target_id:
+            return None
+        return tuple(
+            ConfirmedFrame.model_validate(one)
+            for one in remembered.get("confirmed") or ()
+        )
+    except (OSError, ValueError, ValidationError):
+        return None
+
+
+def write_source_confirmation_cache(
+    path: Path,
+    target_id: str,
+    video_sha256: str,
+    confirmed: Sequence[ConfirmedFrame],
+) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps({
+        "target": target_id,
+        "video_sha256": video_sha256,
+        "confirmed": [one.model_dump(mode="json") for one in confirmed],
+    }), encoding="utf-8")
+
+
 def confirm_source_identity(
     video_path: Path,
     spec: ReferenceGroundingSpec,
@@ -1807,25 +1855,13 @@ def confirm_source_identity(
     video_path = Path(video_path).expanduser().resolve(strict=True)
     digest = sha256_file(video_path)
     stored = (
-        Path(library) / "reference-grounding"
-        / f"identity-{digest[:20]}-{spec.definition_sha256()[:16]}"
-          f"-{_sha256_text(_read_prompt())[:8]}"
-          f"-{SOURCE_CONFIRMATION_VERSION}.json"
+        source_confirmation_cache_path(video_path, spec, target_id, library)
         if library is not None else None
     )
     if stored is not None and stored.exists():
-        try:
-            remembered = json.loads(stored.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            remembered = None
-        if isinstance(remembered, dict) and remembered.get("target") == target_id:
-            try:
-                return tuple(
-                    ConfirmedFrame.model_validate(one)
-                    for one in remembered.get("confirmed") or ()
-                )
-            except ValidationError:
-                pass
+        remembered = read_source_confirmation_cache(stored, target_id)
+        if remembered is not None:
+            return remembered
 
     sampled = sampling_times_for(discovery, target_id)
     if not sampled and at_ms:
@@ -1989,12 +2025,9 @@ def confirm_source_identity(
             seed_risk_flags=exact_seed_risk_flags(evaluation.decision),
         ))
     if stored is not None:
-        stored.parent.mkdir(parents=True, exist_ok=True)
-        stored.write_text(json.dumps({
-            "target": target_id,
-            "video_sha256": digest,
-            "confirmed": [one.model_dump(mode="json") for one in confirmed],
-        }), encoding="utf-8")
+        write_source_confirmation_cache(
+            stored, target_id, digest, confirmed
+        )
     return tuple(confirmed)
 
 
@@ -2621,3 +2654,733 @@ def decide_exact_frame_bboxes(
         thought_tokens=sum(item.thought_tokens for item in usages),
     )
     return result, usage
+
+
+# Cross-asset batching is deliberately a parallel v2 contract.  The v1
+# batch above remains one-video-only: downstream code relies on its two
+# anchors necessarily belonging to the same source.  V2 shares one reference
+# pack across sources, but validates and returns every source independently.
+CrossAssetFailureCode = Literal[
+    "missing_decision",
+    "duplicate_decision",
+    "unknown_item_id",
+    "malformed_result",
+    "lineage_mismatch",
+    "item_validation_failed",
+    "batch_protocol_failure",
+    "retry_failed",
+]
+
+
+@dataclass(frozen=True)
+class CrossAssetExactFrameItem:
+    """One independently lineage-bound request inside a cross-source call."""
+
+    discovery: CandidateDiscoveryResult
+    candidate_id: str
+    frame: ExactFrameMaterial
+
+    def candidate(self) -> CandidateInterval:
+        return self.discovery.candidate(self.candidate_id)
+
+    def item_id(
+        self, spec: ReferenceGroundingSpec, target_id: str,
+    ) -> str:
+        """Stable routing key that cannot collide across video assets."""
+
+        identity = {
+            "contract_version": "reference-exact-frame-cross-asset-item-v2",
+            "query_lock_sha256": spec.identity_lock.definition_sha256(),
+            "grounding_spec_sha256": spec.definition_sha256(),
+            "target_id": target_id,
+            "candidate": self.candidate().model_dump(
+                mode="json", exclude_none=True
+            ),
+            "lineage": self.frame.lineage.model_dump(
+                mode="json", exclude_none=True
+            ),
+        }
+        return "xf_" + _sha256_text(_canonical_json(identity))
+
+
+@dataclass(frozen=True)
+class PreparedSourceIdentitySeed:
+    """A local exact frame ready to join a cross-source identity call."""
+
+    item: CrossAssetExactFrameItem
+    target_id: str
+    sighting: str
+    sighting_window: tuple[float, float]
+
+
+def prepare_source_identity_seed(
+    video_path: Path,
+    spec: ReferenceGroundingSpec,
+    discovery: CandidateDiscoveryResult,
+    target_id: str,
+    frames_dir: Path,
+    *,
+    at_ms: tuple[int, ...] = (),
+) -> PreparedSourceIdentitySeed | None:
+    """Materialize one source seed without asking a provider.
+
+    Candidate times may come from a proxy, so the returned item carries a
+    new discovery bound to the master that was actually decoded. The coarse
+    sighting window remains a hard boundary; an exact frame decoded outside
+    it is refused rather than silently broadening what the screen observed.
+    """
+
+    _validate_discovery_for_spec(spec, discovery)
+    _selected_target_ids(spec, (target_id,))
+    source = Path(video_path).expanduser().resolve(strict=True)
+    sampled = sampling_times_for(discovery, target_id)
+    promoted = False
+    if not sampled and at_ms:
+        promoted = True
+        ordered = tuple(sorted(dict.fromkeys(int(value) for value in at_ms)))
+        if ordered:
+            sampled = [(ordered[len(ordered) // 2], "promoted")]
+    if not sampled:
+        return None
+
+    requested_ms, sighting = sampled[0]
+    video = inspect_video_lineage(source)
+    original = next(
+        (
+            candidate for candidate in discovery.candidates
+            if candidate.candidate_id == sighting
+            and candidate.target_id == target_id
+        ),
+        None,
+    )
+    if original is None:
+        if not promoted:
+            raise ReferenceGroundingError(
+                "source seed sighting is absent from candidate discovery"
+            )
+        start_ms, end_ms = 0, int(video.duration_ms)
+    else:
+        start_ms = max(0, int(original.start_ms))
+        end_ms = min(int(video.duration_ms), int(original.end_ms))
+    if end_ms <= start_ms:
+        raise ReferenceGroundingError(
+            "source seed sighting is empty on the master timeline"
+        )
+    requested_ms = max(start_ms, min(end_ms - 1, int(requested_ms)))
+    frames_dir = Path(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    frame = materialize_frame_at_time(
+        source,
+        requested_ms,
+        frames_dir / f"identity-seed-{target_id.replace(':', '_')}.jpg",
+        max_width=1440,
+    )
+    if not start_ms <= frame.lineage.frame_time_ms < end_ms:
+        raise ReferenceGroundingError(
+            "decoded source seed lies outside its coarse sighting window"
+        )
+    local = CandidateDiscoveryResult.model_validate({
+        "contract_version": "reference-candidate-discovery-v1",
+        "query_id": spec.identity_lock.query_id,
+        "query_lock_sha256": spec.identity_lock.definition_sha256(),
+        "grounding_spec_sha256": spec.definition_sha256(),
+        "video_asset_id": video.asset_id,
+        "video_sha256": video.content_sha256,
+        "duration_ms": int(video.duration_ms),
+        "candidates": [{
+            "candidate_id": "sighting",
+            "target_id": target_id,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "recommended_seed_ms": int(frame.lineage.frame_time_ms),
+            "identity_status": "uncertain",
+            "confidence": 0.5,
+            "visible_state": "unjudged exact seed from the coarse sighting",
+            "visibility_state": "unknown",
+            "occlusion_state": "unknown",
+            "identity_evidence": [],
+            "exclusion_evidence": [],
+        }],
+        "target_summaries": [{
+            "target_id": target_id,
+            "verdict": "uncertain",
+            "reason": "the exact master frame decides this source seed",
+        }],
+        "warnings": [],
+    })
+    return PreparedSourceIdentitySeed(
+        item=CrossAssetExactFrameItem(
+            discovery=local, candidate_id="sighting", frame=frame
+        ),
+        target_id=target_id,
+        sighting=sighting,
+        sighting_window=(start_ms / 1000.0, end_ms / 1000.0),
+    )
+
+
+def confirmed_frame_from_validated_seed(
+    prepared: PreparedSourceIdentitySeed,
+    evaluation: ExactFrameBBoxEvaluation,
+) -> ConfirmedFrame:
+    """Turn one validated v2 evaluation into a reusable source confirmation."""
+
+    expected = prepared.item.frame.lineage
+    if evaluation.lineage != expected:
+        raise ReferenceGroundingError(
+            "validated source seed evaluation belongs to a different exact frame"
+        )
+    decision = evaluation.decision
+    if (
+        decision.target_id != prepared.target_id
+        or decision.candidate_id != prepared.item.candidate_id
+    ):
+        raise ReferenceGroundingError(
+            "validated source seed decision belongs to a different request"
+        )
+    native = decision.tracking_box_xyxy_1000
+    if native is None:
+        raise ReferenceGroundingError(
+            "only a matched exact-frame decision can confirm a source seed"
+        )
+    x0, y0, x1, y1 = native
+    return ConfirmedFrame(
+        at_seconds=expected.frame_time_ms / 1000.0,
+        box=(x0 / 1000.0, y0 / 1000.0, x1 / 1000.0, y1 / 1000.0),
+        sighting=prepared.sighting,
+        sighting_window=prepared.sighting_window,
+        frame_pts=expected.frame_pts,
+        frame_sha256=expected.frame_sha256,
+        video_asset_id=expected.video_asset_id,
+        frame_time_ms=expected.frame_time_ms,
+        width=expected.width,
+        height=expected.height,
+        seed_risk_flags=exact_seed_risk_flags(decision),
+    )
+
+
+class CrossAssetItemFailure(FrozenStrictModel):
+    code: CrossAssetFailureCode
+    detail: str = Field(min_length=1)
+    fields: tuple[str, ...] = ()
+
+
+class CrossAssetExactFrameOutcome(FrozenStrictModel):
+    item_id: str = Field(pattern=r"^xf_[0-9a-f]{64}$")
+    request_index: int = Field(ge=0)
+    status: Literal["validated", "retry_required", "retry_exhausted"]
+    evaluation: ExactFrameBBoxEvaluation | None = None
+    attempts: int = Field(ge=1, le=2)
+    failures: tuple[CrossAssetItemFailure, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "CrossAssetExactFrameOutcome":
+        if self.status == "validated":
+            if self.evaluation is None:
+                raise ValueError("validated cross-asset outcome needs an evaluation")
+        elif self.evaluation is not None:
+            raise ValueError("failed cross-asset outcome cannot carry an evaluation")
+        if self.status != "validated" and not self.failures:
+            raise ValueError("failed cross-asset outcome needs a failure reason")
+        return self
+
+
+class CrossAssetExactFrameBatchResult(FrozenStrictModel):
+    contract_version: Literal["reference-exact-frame-cross-asset-result-v2"] = (
+        "reference-exact-frame-cross-asset-result-v2"
+    )
+    query_id: str = Field(min_length=1, pattern=TARGET_ID_PATTERN)
+    query_lock_sha256: str = Field(pattern=SHA256_PATTERN)
+    grounding_spec_sha256: str = Field(pattern=SHA256_PATTERN)
+    target_id: str = Field(min_length=1, pattern=TARGET_ID_PATTERN)
+    outcomes: tuple[CrossAssetExactFrameOutcome, ...] = Field(min_length=1)
+    protocol_failures: tuple[CrossAssetItemFailure, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_result(self) -> "CrossAssetExactFrameBatchResult":
+        indexes = [outcome.request_index for outcome in self.outcomes]
+        if indexes != list(range(len(self.outcomes))):
+            raise ValueError("cross-asset outcomes must preserve request order")
+        item_ids = [outcome.item_id for outcome in self.outcomes]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("cross-asset outcomes must have unique item ids")
+        return self
+
+    @property
+    def failures(self) -> tuple[CrossAssetExactFrameOutcome, ...]:
+        return tuple(
+            outcome for outcome in self.outcomes
+            if outcome.status != "validated"
+        )
+
+    def evaluations_for_asset(
+        self, video_asset_id: str,
+    ) -> tuple[ExactFrameBBoxEvaluation, ...]:
+        return tuple(
+            outcome.evaluation
+            for outcome in self.outcomes
+            if outcome.evaluation is not None
+            and outcome.evaluation.lineage.video_asset_id == video_asset_id
+        )
+
+    def to_single_asset_batch(
+        self,
+        video_asset_id: str,
+        *,
+        minimum_matched_anchors: int = 2,
+    ) -> ExactFrameBBoxBatchResult:
+        """Recover the old SAM gate without ever combining two sources."""
+
+        evaluations = self.evaluations_for_asset(video_asset_id)
+        if not evaluations:
+            raise ReferenceGroundingError(
+                f"cross-asset result has no validated frames for {video_asset_id}"
+            )
+        hashes = {evaluation.lineage.video_sha256 for evaluation in evaluations}
+        if len(hashes) != 1:
+            raise ReferenceGroundingError(
+                "one video asset id resolved to multiple video hashes"
+            )
+        return ExactFrameBBoxBatchResult(
+            query_id=self.query_id,
+            query_lock_sha256=self.query_lock_sha256,
+            grounding_spec_sha256=self.grounding_spec_sha256,
+            video_asset_id=video_asset_id,
+            video_sha256=next(iter(hashes)),
+            target_id=self.target_id,
+            evaluations=evaluations,
+            minimum_matched_anchors=minimum_matched_anchors,
+        )
+
+
+def _cross_asset_exact_frame_batch_schema(
+    target_id: str,
+    item_ids: Sequence[str],
+    candidate_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Provider schema permits omission so local code can retry it explicitly."""
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["contract_version", "results"],
+        "properties": {
+            "contract_version": {
+                "type": "string",
+                "enum": ["reference-exact-frame-cross-asset-response-v2"],
+            },
+            "results": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": len(item_ids),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_id", "decision"],
+                    "properties": {
+                        "item_id": {"type": "string", "enum": list(item_ids)},
+                        "decision": _exact_frame_schema_for_candidates(
+                            target_id, tuple(dict.fromkeys(candidate_ids))
+                        ),
+                    },
+                },
+            },
+        },
+    }
+
+
+def _cross_failure(
+    code: CrossAssetFailureCode,
+    detail: str,
+    *,
+    fields: Sequence[str] = (),
+) -> CrossAssetItemFailure:
+    return CrossAssetItemFailure(
+        code=code, detail=detail[:500], fields=tuple(fields)
+    )
+
+
+def _validation_failure(error: Exception) -> CrossAssetItemFailure:
+    message = str(error)
+    prefix = "exact-frame response lineage mismatch: "
+    if message.startswith(prefix):
+        fields = tuple(
+            field.strip() for field in message[len(prefix):].split(",")
+            if field.strip()
+        )
+        return _cross_failure("lineage_mismatch", message, fields=fields)
+    return _cross_failure("item_validation_failed", message or type(error).__name__)
+
+
+def validate_cross_asset_exact_frame_payload(
+    payload: dict[str, Any],
+    *,
+    spec: ReferenceGroundingSpec,
+    target_id: str,
+    items: Sequence[CrossAssetExactFrameItem],
+    attempts: int = 1,
+) -> tuple[
+    tuple[CrossAssetExactFrameOutcome, ...],
+    tuple[CrossAssetItemFailure, ...],
+]:
+    """Validate every v2 result independently and retain valid neighbours."""
+
+    materialized = tuple(items)
+    item_ids = tuple(item.item_id(spec, target_id) for item in materialized)
+    protocol: list[CrossAssetItemFailure] = []
+    if set(payload) != {"contract_version", "results"} or payload.get(
+        "contract_version"
+    ) != "reference-exact-frame-cross-asset-response-v2":
+        fault = _cross_failure(
+            "batch_protocol_failure", "cross-asset response contract mismatch"
+        )
+        return tuple(
+            CrossAssetExactFrameOutcome(
+                item_id=item_id,
+                request_index=index,
+                status="retry_required",
+                attempts=attempts,
+                failures=(fault,),
+            )
+            for index, item_id in enumerate(item_ids)
+        ), (fault,)
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        fault = _cross_failure(
+            "batch_protocol_failure", "cross-asset results must be an array"
+        )
+        return tuple(
+            CrossAssetExactFrameOutcome(
+                item_id=item_id,
+                request_index=index,
+                status="retry_required",
+                attempts=attempts,
+                failures=(fault,),
+            )
+            for index, item_id in enumerate(item_ids)
+        ), (fault,)
+
+    expected = {item_id: index for index, item_id in enumerate(item_ids)}
+    by_id: dict[str, list[Any]] = {}
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            protocol.append(_cross_failure(
+                "malformed_result", "cross-asset result item must be an object"
+            ))
+            continue
+        item_id = raw.get("item_id")
+        if not isinstance(item_id, str):
+            protocol.append(_cross_failure(
+                "malformed_result", "cross-asset result item has no item_id"
+            ))
+            continue
+        if item_id not in expected:
+            protocol.append(_cross_failure(
+                "unknown_item_id", f"provider returned unknown item_id {item_id!r}"
+            ))
+            continue
+        by_id.setdefault(item_id, []).append(raw)
+
+    outcomes: list[CrossAssetExactFrameOutcome] = []
+    for index, (item, item_id) in enumerate(zip(materialized, item_ids, strict=True)):
+        offered = by_id.get(item_id, [])
+        if not offered:
+            outcomes.append(CrossAssetExactFrameOutcome(
+                item_id=item_id,
+                request_index=index,
+                status="retry_required",
+                attempts=attempts,
+                failures=(_cross_failure(
+                    "missing_decision", "provider omitted this exact-frame item"
+                ),),
+            ))
+            continue
+        if len(offered) != 1:
+            outcomes.append(CrossAssetExactFrameOutcome(
+                item_id=item_id,
+                request_index=index,
+                status="retry_required",
+                attempts=attempts,
+                failures=(_cross_failure(
+                    "duplicate_decision",
+                    f"provider returned {len(offered)} decisions for one item",
+                ),),
+            ))
+            continue
+        raw = offered[0]
+        if set(raw) != {"item_id", "decision"} or not isinstance(
+            raw.get("decision"), dict
+        ):
+            outcomes.append(CrossAssetExactFrameOutcome(
+                item_id=item_id,
+                request_index=index,
+                status="retry_required",
+                attempts=attempts,
+                failures=(_cross_failure(
+                    "malformed_result", "item decision must be one structured object"
+                ),),
+            ))
+            continue
+        try:
+            decision = validate_exact_frame_payload(
+                raw["decision"],
+                spec=spec,
+                discovery=item.discovery,
+                candidate=item.candidate(),
+                frame=item.frame.lineage,
+            )
+            evaluation = ExactFrameBBoxEvaluation(
+                lineage=item.frame.lineage, decision=decision
+            )
+        except (ReferenceGroundingError, ValidationError, ValueError) as error:
+            outcomes.append(CrossAssetExactFrameOutcome(
+                item_id=item_id,
+                request_index=index,
+                status="retry_required",
+                attempts=attempts,
+                failures=(_validation_failure(error),),
+            ))
+            continue
+        outcomes.append(CrossAssetExactFrameOutcome(
+            item_id=item_id,
+            request_index=index,
+            status="validated",
+            evaluation=evaluation,
+            attempts=attempts,
+        ))
+    return tuple(outcomes), tuple(protocol)
+
+
+def decide_cross_asset_exact_frame_bboxes(
+    spec: ReferenceGroundingSpec,
+    target_id: str,
+    items: Sequence[CrossAssetExactFrameItem],
+    *,
+    client: Any | None,
+    cache: UploadCache | Any | None = None,
+    ledger: Any | None = None,
+    model_id: str = MODEL_ID,
+    max_frames_per_call: int = 6,
+    reference_resolution: MediaResolution = "high",
+    frame_resolution: MediaResolution = "high",
+) -> tuple[CrossAssetExactFrameBatchResult, Usage] | None:
+    """Judge frames from several videos while preserving per-asset lineage.
+
+    Structural provider failures are retried once through the established
+    singleton v1 API. Valid semantic answers -- including uncertain and hard
+    negative -- are final and are never retried merely to seek a match.
+    """
+
+    if client is None:
+        return None
+    if not 1 <= max_frames_per_call <= MAX_EXACT_FRAMES_PER_CALL:
+        raise ValueError(
+            f"max_frames_per_call must be in [1, {MAX_EXACT_FRAMES_PER_CALL}]"
+        )
+    materialized = tuple(items)
+    if not materialized:
+        raise ValueError("cross-asset exact-frame batch requires at least one item")
+    try:
+        _selected_target_ids(spec, (target_id,))
+    except ValueError as error:
+        raise ReferenceGroundingError(str(error)) from error
+
+    prepared: list[CrossAssetExactFrameItem] = []
+    for item in materialized:
+        _validate_discovery_for_spec(spec, item.discovery)
+        try:
+            candidate = item.candidate()
+        except ValueError as error:
+            raise ReferenceGroundingError(str(error)) from error
+        _preflight_exact_frame(
+            spec, item.discovery, candidate, item.frame, target_id=target_id
+        )
+        _media_mime_type(item.frame.path, FRAME_MIME_BY_SUFFIX, "exact frame")
+        prepared.append(item)
+    item_ids = tuple(item.item_id(spec, target_id) for item in prepared)
+    if len(item_ids) != len(set(item_ids)):
+        raise ValueError("cross-asset batch items must be unique")
+    frame_keys = tuple(
+        (item.frame.lineage.video_asset_id, item.frame.lineage.frame_pts)
+        for item in prepared
+    )
+    if len(frame_keys) != len(set(frame_keys)):
+        raise ValueError("cross-asset batch requires distinct asset/PTS frames")
+
+    common_parts = reference_prompt_parts(
+        spec,
+        client=client,
+        cache=cache,
+        target_ids=(target_id,),
+        resolution=reference_resolution,
+    )
+    all_outcomes: list[CrossAssetExactFrameOutcome] = []
+    protocol_failures: list[CrossAssetItemFailure] = []
+    usages: list[Usage] = []
+    for chunk_start in range(0, len(prepared), max_frames_per_call):
+        chunk = prepared[chunk_start:chunk_start + max_frames_per_call]
+        chunk_ids = item_ids[chunk_start:chunk_start + max_frames_per_call]
+        parts = list(common_parts)
+        requests: list[dict[str, Any]] = []
+        for offset, (item, item_id) in enumerate(
+            zip(chunk, chunk_ids, strict=True), start=1
+        ):
+            candidate = item.candidate()
+            requests.append({
+                "request_number": chunk_start + offset,
+                "item_id": item_id,
+                "candidate": candidate.model_dump(mode="json", exclude_none=True),
+                "lineage": item.frame.lineage.model_dump(
+                    mode="json", exclude_none=True
+                ),
+            })
+            parts.append({
+                "type": "text",
+                "text": (
+                    f"EXACT ITEM {item_id}: target_id={target_id}; "
+                    f"candidate={candidate.candidate_id}; "
+                    f"lineage={_canonical_json(item.frame.lineage)}."
+                ),
+            })
+            frame_path = item.frame.path.expanduser().resolve(strict=True)
+            mime = _media_mime_type(
+                frame_path, FRAME_MIME_BY_SUFFIX, "exact frame"
+            )
+            parts.append({
+                "type": "image",
+                "mime_type": mime,
+                "uri": _media_uri(
+                    frame_path,
+                    client=client,
+                    cache=cache,
+                    mime_type=mime,
+                    expected_sha256=item.frame.lineage.frame_sha256,
+                    immutable_snapshot=True,
+                ),
+                "resolution": frame_resolution,
+            })
+        parts.append({
+            "type": "text",
+            "text": (
+                f"{_read_prompt()}\n\n"
+                "TASK=exact_frame_cross_asset_batch_v2\n"
+                f"ITEM_REQUESTS={_canonical_json(requests)}\n"
+                "Return exactly one result for every supplied item_id. "
+                "Never transfer a lineage echo between items. Coordinates "
+                "are Gemini-native [ymin,xmin,ymax,xmax] integers in 0..1000. "
+                "Return only the requested structured object."
+            ),
+        })
+        try:
+            interaction = ask(
+                client,
+                model=model_id,
+                store=False,
+                input=parts,
+                patience_seconds=180.0,
+                generation_config={
+                    "thinking_level": "low",
+                    "max_output_tokens": min(
+                        8_192, max(MAX_OUTPUT_TOKENS, 640 + 832 * len(chunk))
+                    ),
+                },
+                response_format=structured_json(
+                    _cross_asset_exact_frame_batch_schema(
+                        target_id,
+                        chunk_ids,
+                        [item.candidate_id for item in chunk],
+                    )
+                ),
+                ledger=ledger,
+                budget_stage="reference_exact_frame_cross_asset_batch_v2",
+            )
+            usages.append(Usage.from_interaction(interaction))
+            payload = _parse_payload(interaction, "cross-asset exact-frame batch")
+            outcomes, protocol = validate_cross_asset_exact_frame_payload(
+                payload,
+                spec=spec,
+                target_id=target_id,
+                items=chunk,
+            )
+        except ReferenceGroundingError as error:
+            fault = _cross_failure(
+                "batch_protocol_failure", str(error) or type(error).__name__
+            )
+            outcomes = tuple(
+                CrossAssetExactFrameOutcome(
+                    item_id=item_id,
+                    request_index=index,
+                    status="retry_required",
+                    attempts=1,
+                    failures=(fault,),
+                )
+                for index, item_id in enumerate(chunk_ids)
+            )
+            protocol = (fault,)
+        # Validator indexes are chunk-local; normalize once into request order.
+        for local, outcome in enumerate(outcomes):
+            all_outcomes.append(outcome.model_copy(update={
+                "request_index": chunk_start + local,
+            }))
+        protocol_failures.extend(protocol)
+
+    # Retry only structural failures. The singleton v1 path performs the same
+    # immutable echo validation and cannot be poisoned by a neighbour.
+    final: list[CrossAssetExactFrameOutcome] = list(all_outcomes)
+    for index, outcome in enumerate(tuple(final)):
+        if outcome.status != "retry_required":
+            continue
+        item = prepared[outcome.request_index]
+        try:
+            retried = decide_exact_frame_bbox(
+                spec,
+                item.discovery,
+                item.candidate_id,
+                item.frame,
+                client=client,
+                cache=cache,
+                ledger=ledger,
+                model_id=model_id,
+                reference_resolution=reference_resolution,
+                frame_resolution=frame_resolution,
+            )
+            if retried is None:
+                raise ReferenceGroundingError("singleton retry returned no result")
+            decision, retry_usage = retried
+            usages.append(retry_usage)
+            evaluation = ExactFrameBBoxEvaluation(
+                lineage=item.frame.lineage, decision=decision
+            )
+            final[index] = CrossAssetExactFrameOutcome(
+                item_id=outcome.item_id,
+                request_index=outcome.request_index,
+                status="validated",
+                evaluation=evaluation,
+                attempts=2,
+                failures=outcome.failures,
+            )
+        except (ReferenceGroundingError, ValidationError, ValueError) as error:
+            final[index] = CrossAssetExactFrameOutcome(
+                item_id=outcome.item_id,
+                request_index=outcome.request_index,
+                status="retry_exhausted",
+                attempts=2,
+                failures=outcome.failures + (
+                    _cross_failure(
+                        "retry_failed", str(error) or type(error).__name__
+                    ),
+                ),
+            )
+
+    result = CrossAssetExactFrameBatchResult(
+        query_id=spec.identity_lock.query_id,
+        query_lock_sha256=spec.identity_lock.definition_sha256(),
+        grounding_spec_sha256=spec.definition_sha256(),
+        target_id=target_id,
+        outcomes=tuple(final),
+        protocol_failures=tuple(protocol_failures),
+    )
+    return result, Usage(
+        input_tokens=sum(usage.input_tokens for usage in usages),
+        output_tokens=sum(usage.output_tokens for usage in usages),
+        thought_tokens=sum(usage.thought_tokens for usage in usages),
+    )

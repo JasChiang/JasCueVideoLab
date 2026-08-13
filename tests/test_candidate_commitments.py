@@ -89,6 +89,28 @@ def test_local_resolver_keeps_the_full_pool_and_marks_unoffered_spans_deferred()
     assert "local camera menu=" in describe_commitments(resolved)
 
 
+def test_only_identity_primary_and_alternate_sources_are_exact_confirmed():
+    from montagewright.cli import _identity_commitment_sources
+
+    direction = _direction()
+    alternate = dict(direction["candidate_options"][0])
+    alternate.update({
+        "span_id": "C1:s01", "tier": "alternate",
+        "min_supported_seconds": "0:03",
+    })
+    direction["candidate_options"].append(alternate)
+    resolved = _resolved(direction)
+    assert _identity_commitment_sources(resolved) == {"C1"}
+
+    context = resolved.model_copy(update={
+        "options": tuple(
+            option.model_copy(update={"target_id": "none"})
+            for option in resolved.options
+        )
+    })
+    assert _identity_commitment_sources(context) == set()
+
+
 def test_local_camera_catalog_exposes_measured_virtual_room_before_hold():
     material = [MaterialItem(
         source_id="C1", duration_seconds=8.0, summary="foldable detail",

@@ -348,7 +348,15 @@ def _confirm_material_identity(
 ) -> dict[str, tuple[tuple[float, tuple[float, float, float, float]], ...]]:
     """Where each source's identity was proved, on the master's clock."""
 
-    from montagewright.reference_grounding import confirm_source_identity
+    from montagewright.reference_grounding import (
+        confirm_source_identity,
+        confirmed_frame_from_validated_seed,
+        decide_cross_asset_exact_frame_bboxes,
+        prepare_source_identity_seed,
+        read_source_confirmation_cache,
+        source_confirmation_cache_path,
+        write_source_confirmation_cache,
+    )
 
     required = tuple(
         spec.identity_lock.framing.required_target_ids
@@ -360,7 +368,10 @@ def _confirm_material_identity(
     confirmed: dict[str, tuple[tuple[float, tuple[float, float, float, float]], ...]] = {}
     paid_before = float(getattr(ledger, "spent_usd", 0.0))
     total = len(material)
-    for index, item in enumerate(material, start=1):
+    prepared = []
+    prepared_sources: list[tuple[Any, Any, Path, Path]] = []
+    fallback: list[Any] = []
+    for item in material:
         if not getattr(item, "carries_identity", True):
             # The screen already answered this one. Asking again costs money
             # to be told the same thing.
@@ -371,6 +382,105 @@ def _confirm_material_identity(
         source = masters.get(item.source_id)
         if discovery is None or source is None:
             continue
+        cache_path = source_confirmation_cache_path(
+            Path(source), spec, target, library
+        )
+        remembered = read_source_confirmation_cache(cache_path, target)
+        if remembered is not None:
+            if remembered:
+                confirmed[item.source_id] = remembered
+            continue
+        try:
+            one = prepare_source_identity_seed(
+                Path(source), spec, discovery, target,
+                work / "identity-frames" / item.source_id,
+                at_ms=(
+                    tuple(
+                        int(item.duration_seconds * 1000 * share)
+                        for share in (0.1, 0.3, 0.5, 0.7, 0.9)
+                    ) if spread else ()
+                ),
+            )
+        except Exception as error:  # local preparation; singleton path reports it
+            print(
+                f"  {item.source_id} — seed preparation failed: "
+                f"{type(error).__name__}: {error}"[:150],
+                flush=True,
+            )
+            fallback.append(item)
+            continue
+        if one is None:
+            fallback.append(item)
+            continue
+        prepared.append(one.item)
+        prepared_sources.append((item, one, cache_path, Path(source)))
+
+    if prepared:
+        ledger.check()
+        try:
+            judged = decide_cross_asset_exact_frame_bboxes(
+                spec, target, prepared,
+                client=client, cache=cache, ledger=ledger,
+            )
+        except BudgetSpent:
+            raise
+        except Exception as error:  # noqa: BLE001 -- reported, not swallowed
+            print(
+                "  cross-source identity batch failed: "
+                f"{type(error).__name__}: {error}"[:150],
+                flush=True,
+            )
+            fallback.extend(item for item, _, _, _ in prepared_sources)
+        else:
+            outcomes = judged[0].outcomes if judged is not None else ()
+            for index, (item, seed, cache_path, source) in enumerate(
+                prepared_sources
+            ):
+                outcome = outcomes[index] if index < len(outcomes) else None
+                found = ()
+                video_sha256 = ""
+                semantic_answer = False
+                decision = None
+                if outcome is not None and outcome.evaluation is not None:
+                    video_sha256 = outcome.evaluation.lineage.video_sha256
+                    semantic_answer = True
+                    decision = outcome.evaluation.decision
+                    try:
+                        frame = confirmed_frame_from_validated_seed(
+                            seed, outcome.evaluation
+                        )
+                    except Exception:
+                        frame = None
+                    if frame is not None and not frame.seed_risk_flags:
+                        found = (frame,)
+                if found:
+                    confirmed[item.source_id] = found
+                    write_source_confirmation_cache(
+                        cache_path,
+                        target,
+                        video_sha256,
+                        found,
+                    )
+                else:
+                    if semantic_answer and decision is not None:
+                        if decision.verdict != "matched_target":
+                            # A negative/uncertain decision is a valid
+                            # semantic answer, not a protocol failure. Record
+                            # it and do not pay repeatedly in search of a more
+                            # convenient verdict.
+                            write_source_confirmation_cache(
+                                cache_path, target, video_sha256, ()
+                            )
+                            continue
+                    # A matched but risky seed needs independent anchors; a
+                    # structural failure needs the mature singleton path.
+                    fallback.append(item)
+
+    for item in fallback:
+        discovery = sightings.get(item.source_id)
+        source = masters.get(item.source_id)
+        if discovery is None or source is None:
+            continue
         ledger.check()
         try:
             found = confirm_source_identity(
@@ -378,9 +488,6 @@ def _confirm_material_identity(
                 client=client,
                 frames_dir=work / "identity-frames" / item.source_id,
                 cache=cache, ledger=ledger, library=library,
-                # A promoted source has no sightings to sample -- the screen
-                # recorded none because it decided against it. Five moments
-                # across the take, and the master decides.
                 at_ms=(
                     tuple(
                         int(item.duration_seconds * 1000 * share)
@@ -396,9 +503,12 @@ def _confirm_material_identity(
                 f"{type(error).__name__}: {error}"[:150],
                 flush=True,
             )
-            continue
+            found = ()
         if found:
             confirmed[item.source_id] = found
+
+    for index, item in enumerate(material, start=1):
+        found = confirmed.get(item.source_id, ())
         print(
             f"  identity {index}/{total}  {item.source_id}  "
             + (f"{len(found)} confirmed" if found else "none"),
@@ -410,6 +520,16 @@ def _confirm_material_identity(
         flush=True,
     )
     return confirmed
+
+
+def _identity_commitment_sources(commitments: Any) -> set[str]:
+    """Sources whose primary/alternate picture promises the locked target."""
+
+    return {
+        option.span_id.split(":", 1)[0]
+        for option in commitments.options
+        if option.target_id != "none"
+    }
 
 
 def _screen_material_identity(
@@ -1203,18 +1323,10 @@ def command_render(args: argparse.Namespace) -> int:
             library=library,
         )
         set_aside.update(identity_aside)
-        # Prove the identity now, at the moments the screen says are
-        # clearest, once per source and remembered for good. Doing it later
-        # meant doing it inside whichever seconds an edit wanted -- three
-        # views of a folded handset's edge, or the moment a camera had
-        # pulled back off a close-up -- and paying for it again on every
-        # repair round.
-        confirmed_identities = _confirm_material_identity(
-            material, sightings, args.reference_grounding_spec,
-            masters=originals,
-            client=client, cache=cache, ledger=ledger, library=library,
-            work=work,
-        )
+        # Exact boxes are deliberately deferred until direction has bought a
+        # bounded primary/alternate pool.  Screening protects recall; paying
+        # to locate every positive source before knowing whether the edit can
+        # use it was the largest avoidable identity cost.
 
     if set_aside:
         print(
@@ -1405,6 +1517,7 @@ def command_render(args: argparse.Namespace) -> int:
     # at 1440 and looks at the actual frames. Refusing it here argued with a
     # model that was right about a table of three handsets, twice, at the
     # price of a paid correction each time, and then ended the run.
+    promoted: list[str] = []
     if args.reference_grounding_spec is not None and grounding_target_refs:
         wanted = {
             str(option.get("span_id") or "").split(":")[0]
@@ -1428,13 +1541,6 @@ def command_render(args: argparse.Namespace) -> int:
                 "settle it",
                 flush=True,
             )
-            confirmed_identities.update(_confirm_material_identity(
-                [item for item in material if item.source_id in set(promoted)],
-                sightings, args.reference_grounding_spec,
-                masters=originals,
-                client=client, cache=cache, ledger=ledger, library=library,
-                work=work, spread=True,
-            ))
     def bind_commitments(answer):
         resolved_commitments = resolve_candidate_commitments(
             answer,
@@ -1528,6 +1634,34 @@ def command_render(args: argparse.Namespace) -> int:
             beaten, broken = _beaten_and_broken(direction)
     else:  # pragma: no cover - the bounded loop either binds or raises.
         raise correction_fault or CommitmentError("commitment correction failed")
+
+    # Direction has now reduced the screen-positive pool to the sources that
+    # can actually serve a primary or alternate commitment. Prove only that
+    # pool. Context-only options name target=none and never buy an identity
+    # box; a failed primary can still fall through to its already-confirmed
+    # alternate without starting another planning call.
+    if args.reference_grounding_spec is not None:
+        identity_sources = _identity_commitment_sources(commitments)
+        normal = [
+            item for item in material
+            if item.source_id in identity_sources
+            and item.source_id not in set(promoted)
+        ]
+        promoted_material = [
+            item for item in material if item.source_id in set(promoted)
+        ]
+        confirmed_identities.update(_confirm_material_identity(
+            normal, sightings, args.reference_grounding_spec,
+            masters=originals,
+            client=client, cache=cache, ledger=ledger, library=library,
+            work=work,
+        ))
+        confirmed_identities.update(_confirm_material_identity(
+            promoted_material, sightings, args.reference_grounding_spec,
+            masters=originals,
+            client=client, cache=cache, ledger=ledger, library=library,
+            work=work, spread=True,
+        ))
     # Keep the paid full Direction immutable. Candidate corrections have
     # their own content-addressed artifacts above and are never allowed to
     # overwrite the decision that watched all rushes and heard the music.
