@@ -1139,6 +1139,20 @@
   }
   .source-field { order: -2; }
   .brief-field textarea { min-height: 150px; }
+  /* One decision per block, in the order somebody makes them. Sixteen
+     fields in one grid read as a settings page for a thing you had already
+     decided to run; this reads as three questions. */
+  .group { border-top: 1px solid var(--hair); padding-top: 15px; margin-top: 4px; }
+  .group:first-of-type { border-top: 0; padding-top: 0; }
+  .group-head { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; }
+  .group-head h3 { margin: 0; font-size: 13.5px; font-weight: 600; }
+  .group-say { margin: 0 0 11px; color: var(--dim); font-size: 12.5px; }
+  .tag.need { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .source-field .hint { display: flex; justify-content: space-between; gap: 12px; }
+  .source-field .hint b { color: var(--ok); font-weight: 550; }
+  .brief-field textarea { min-height: 92px; }
+  .brief-field .check { margin-top: 9px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
   .setup-advanced { grid-column: 1 / -1; border-top: 1px solid var(--line); padding-top: 8px; }
   .setup-advanced summary { cursor: pointer; color: var(--soft); font-weight: 600; }
   .setup-advanced .fields { margin-top: 10px; }
@@ -1558,46 +1572,89 @@
   <div class="sheet" id="sheet">
     <div id="setup">
       <h2>新的一輪</h2>
-      <p class="sub">指到素材，其餘留空也能跑。</p>
-      <div class="fields">
-        <div class="field wide source-field">
-          <label>素材</label>
-          <div class="row" style="gap:8px;flex-wrap:nowrap">
-            <input type="text" id="path" placeholder="點「瀏覽」選一個資料夾，或直接貼路徑">
-            <button type="button" class="ghost" id="browse" style="white-space:nowrap">瀏覽…</button>
-          </div>
-          <div class="picker hide" id="picker">
-            <div class="crumb" id="crumb"></div>
-            <div class="listing" id="listing"></div>
-            <div class="foot">
-              <button type="button" id="use-here">用這個資料夾</button>
-              <button type="button" class="ghost" id="close-picker">關閉</button>
-              <span class="why" id="picker-note"></span>
+      <p class="sub">只有素材是一定要給的。其他留空，它會自己決定。</p>
+
+      <!-- The order somebody decides things in, not the order the command
+           line takes them. What the film is about used to sit below two
+           collapsed advanced panels, under the heading 創作 Brief. -->
+      <section class="group">
+        <div class="group-head"><h3>素材</h3><span class="tag need">一定要</span></div>
+        <p class="group-say">選一個裝著毛片的資料夾。它會自己看完每一支。</p>
+        <div class="fields">
+          <div class="field wide source-field">
+            <div class="row" style="gap:8px;flex-wrap:nowrap">
+              <input type="text" id="path" placeholder="還沒選資料夾">
+              <button type="button" class="ghost" id="browse" style="white-space:nowrap">選資料夾…</button>
             </div>
+            <div class="picker hide" id="picker">
+              <div class="crumb" id="crumb"></div>
+              <div class="listing" id="listing"></div>
+              <div class="foot">
+                <button type="button" id="use-here">用這個資料夾</button>
+                <button type="button" class="ghost" id="close-picker">關閉</button>
+                <span class="why" id="picker-note"></span>
+              </div>
+            </div>
+            <div class="hint"><span id="source-say"></span>
+              <a href="#" id="show-upload">素材不在這台電腦上？改用上傳</a></div>
           </div>
-          <div class="hint">本機素材用路徑就好——上傳等於把硬碟上的檔案搬進瀏覽器再寫回去。
-            <a href="#" id="show-upload">還是要用上傳</a></div>
-        </div>
-        <div class="field wide hide" id="upload-row">
-          <label>上傳素材資料夾</label>
-          <input type="file" id="rushes" webkitdirectory directory multiple>
-        </div>
-        <div class="field">
-          <label>音樂</label>
-          <div class="row" style="gap:8px;flex-wrap:nowrap">
-            <input type="text" id="music-path" placeholder="留空＝不配樂">
-            <button type="button" class="ghost" id="browse-music" style="white-space:nowrap">瀏覽…</button>
+          <div class="field wide hide" id="upload-row">
+            <label>上傳素材資料夾</label>
+            <input type="file" id="rushes" webkitdirectory directory multiple>
           </div>
         </div>
-        <div class="field"><label>片長（秒）</label>
-          <input type="number" id="seconds" min="0" step="1" placeholder="讓它自己決定">
-          <select id="duration-mode"><option value="preferred">偏好長度，可自然縮短</option><option value="exact">精確交付長度</option></select>
-          <div class="why">偏好長度不會用空停留補滿；精確長度適合廣告版位等硬規格。留空則由定調決定。</div></div>
-        <div class="field"><label>輸出比例</label>
-          <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select></div>
-        <div class="field"><label>語音</label>
-          <select id="speech"><option value="auto">自動判斷</option><option value="never">不要轉錄</option></select></div>
-        <details class="setup-advanced"><summary>參考影像（讓它認得同一台）</summary>
+      </section>
+
+      <section class="group">
+        <div class="group-head"><h3>想剪成什麼樣</h3><span class="tag">可留空</span></div>
+        <p class="group-say">給誰看、要記得什麼、非講不可的是哪些。寫得越具體，挑片越像你要的。</p>
+        <div class="fields">
+          <div class="field wide brief-field">
+            <textarea id="brief" placeholder="例如：給沒到現場的人看。要有會場氛圍與人物，主角是那台摺疊機，最後收在一顆穩定的產品畫面。"></textarea>
+            <label class="check"><input type="checkbox" id="inherit-brief"> 沿用目前這一輪的 Brief</label>
+            <details class="deeper"><summary>已經寫成檔案了</summary>
+              <div class="row" style="gap:8px;flex-wrap:nowrap;margin-top:8px">
+                <input type="text" id="brief-path" placeholder="Brief 檔案路徑（.md／.txt）">
+                <button type="button" class="ghost" id="browse-brief" style="white-space:nowrap">選檔案…</button>
+              </div>
+              <div class="why">上面的文字會當成補充，一起存起來。</div>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <section class="group">
+        <div class="group-head"><h3>成品規格</h3><span class="tag">有預設值</span></div>
+        <div class="fields">
+          <div class="field">
+            <label>配樂</label>
+            <div class="row" style="gap:8px;flex-wrap:nowrap">
+              <input type="text" id="music-path" placeholder="不配樂">
+              <button type="button" class="ghost" id="browse-music" style="white-space:nowrap">選…</button>
+            </div>
+            <div class="why">剪點會跟著它的拍子走。</div>
+          </div>
+          <div class="field"><label>片長</label>
+            <div class="row" style="gap:8px;flex-wrap:nowrap">
+              <input type="number" id="seconds" min="0" step="1" placeholder="自動"
+                     style="flex:0 0 84px">
+              <select id="duration-mode">
+                <option value="preferred">大約就好</option>
+                <option value="exact">要剛剛好</option>
+              </select>
+            </div>
+            <div class="why">「大約」不會用空停留硬補滿。</div></div>
+          <div class="field"><label>畫面比例</label>
+            <select id="aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select>
+            <div class="why">9:16 直式，給手機看。</div></div>
+          <div class="field"><label>現場說話</label>
+            <select id="speech"><option value="auto">有人講話就聽寫</option><option value="never">不用聽寫</option></select>
+            <div class="why">沒有旁白的活動片可以關掉，省時間。</div></div>
+        </div>
+      </section>
+
+      <div class="fields">
+        <details class="setup-advanced"><summary>指定主角，讓它認得是同一台（選填）</summary>
         <div class="fields">
         <div class="field wide"><label>這是什麼</label>
           <input type="text" id="grounding-target-description" placeholder="例如：參考圖中這一台摺疊手機">
@@ -1634,7 +1691,7 @@
           <div class="why">上傳的 spec 宣告的圖不在這台機器上時才需要，檔名須對應 reference_images[].path。spec 用路徑給的話，圖就在 spec 旁邊，這裡留空。</div></div>
         </div></details>
         </div></details>
-        <details class="setup-advanced"><summary>字幕、可編輯時間軸與預算</summary>
+        <details class="setup-advanced"><summary>字幕、剪輯軟體時間軸與花費上限</summary>
         <div class="fields">
         <div class="field"><label>語言</label><input type="text" id="locale" value="zh-TW"></div>
         <div class="field"><label>字幕</label>
@@ -1659,21 +1716,14 @@
             <option value="finalcut">Final Cut</option>
             <option value="both">兩種都要</option>
           </select></div>
-        <div class="field"><label>預算上限（美元）</label>
-          <input type="number" id="budget" value="6" min="0.5" step="0.5"></div>
+        <div class="field"><label>最多花多少（美元）</label>
+          <input type="number" id="budget" value="6" min="0.5" step="0.5">
+          <div class="why">花到這個數字就停下來，已經做完的不會重付。</div></div>
         </div></details>
-        <div class="field wide brief-field"><label>創作 Brief（可留空）</label>
-          <div class="row" style="gap:8px;flex-wrap:nowrap">
-            <input type="text" id="brief-path" placeholder="Brief 檔案路徑（.md／.txt，可留空）">
-            <button type="button" class="ghost" id="browse-brief" style="white-space:nowrap">瀏覽…</button>
-          </div>
-          <textarea id="brief" placeholder="這支片要給誰看？希望觀眾記得什麼？哪些內容非講不可？也可以直接貼現有文件。"></textarea>
-          <label class="check"><input type="checkbox" id="inherit-brief"> 從目前開啟的 run 繼承 Brief（重新整理後也有效）</label>
-          <div class="why">可直接指定本機 Brief 檔；下方文字會作為補充需求一起保存。Gemini 會用它決定敘事、挑片與哪些文字值得做成字卡；一般文字只會先成為可檢查的字卡草稿，不會自行變成已核准文案。</div></div>
       </div>
       <div class="actions">
-        <button id="go">開始剪</button>
-        <label class="check"><input type="checkbox" id="review"> 開啟自審與重新規劃（會多花錢與時間）</label>
+        <button id="go" disabled>開始剪</button>
+        <label class="check"><input type="checkbox" id="review"> 剪完讓它自己審一遍再改（比較慢，也比較貴）</label>
         <span class="grow"></span>
         <button class="ghost" id="close-sheet">關閉</button>
       </div>
@@ -1765,7 +1815,33 @@ $('close-picker').addEventListener('click', () => $('picker').classList.add('hid
 $('use-here').addEventListener('click', () => {
   $(pickTarget).value = picking;
   $('picker').classList.add('hide');
+  if (pickTarget === 'path') sourceChosen();
 });
+
+// A path in a box is not an answer to "did I pick the right folder". Say
+// what is in it, and only let the run start once there is something to cut.
+let sayingAbout = '';
+async function sourceChosen() {
+  const where = $('path').value.trim();
+  $('go').disabled = !where && ![...($('rushes').files || [])].length;
+  if (!where || where === sayingAbout) return;
+  sayingAbout = where;
+  $('source-say').textContent = '看看裡面有什麼…';
+  try {
+    const data = await (await fetch(
+      `/api/browse?path=${encodeURIComponent(where)}`)).json();
+    const clips = (data.videos || []).length;
+    $('source-say').innerHTML = clips
+      ? `<b>${where.split('/').pop()}</b>　找到 ${clips} 支影片`
+      : `<b>${where.split('/').pop()}</b>　這個資料夾裡沒有影片`;
+    $('go').disabled = !clips;
+  } catch (error) {
+    $('source-say').textContent = '找不到這個資料夾';
+    $('go').disabled = true;
+  }
+}
+$('path').addEventListener('input', sourceChosen);
+$('path').addEventListener('change', sourceChosen);
 
 $('show-upload').addEventListener('click', (e) => {
   e.preventDefault(); $('upload-row').classList.remove('hide');
@@ -4682,6 +4758,7 @@ window.addEventListener('popstate', () => {
 });
 
 $('rushes').addEventListener('change', () => {
+  $('go').disabled = ![...$('rushes').files].length;
   const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
   $('picked').textContent = files.length ? `${files.length} 支影片` : '沒有找到影片檔';
 });
@@ -5354,6 +5431,7 @@ $('new-run').addEventListener('click', () => {
   // whoever was filling it.
   if (openedFrom.source && !$('path').value.trim()) {
     $('path').value = openedFrom.source;
+    sourceChosen();
   }
   if (openedFrom.music && !$('music-path').value.trim()) {
     $('music-path').value = openedFrom.music;
