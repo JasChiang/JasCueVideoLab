@@ -1097,6 +1097,12 @@ class MaterialItem:
     # frame of every clip". Kept and marked instead: usable as context,
     # never as the subject.
     carries_identity: bool = True
+    # Which seconds of this take the lens was actually on, as a share of the
+    # take's own sharpest frame. Not a verdict -- soft is a choice an edit
+    # gets to make -- but the planner was choosing in-points with no way to
+    # know, off a proxy at a frame a second where soft looks like a picture
+    # of something soft. See `focus.py`.
+    focus_note: str = ""
     # Which stretch is worth cutting into, what happens where, and what the
     # material was judged to need. Selection picks a start second, and it was
     # picking one blind: a shot whose first second is the camera still
@@ -1414,6 +1420,8 @@ def _describe_material(material: list[MaterialItem]) -> str:
             facts.append("、".join(room))
         else:
             facts.append("這個交付比例下橫向縱向都沒有空間，鏡頭移不了")
+        if item.focus_note:
+            facts.append(item.focus_note)
         if not item.carries_identity:
             # Said first, in the fact list, because it changes what the whole
             # line is for: this source is where the event was, not where the

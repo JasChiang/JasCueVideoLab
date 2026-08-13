@@ -119,6 +119,7 @@ def snap_to_action(
     duration: float,
     *,
     within: tuple[float, float] | None = None,
+    focus: "list[Any] | None" = None,
 ) -> tuple[float, str | None]:
     """Move a planned in-point onto the nearest action that contains it.
 
@@ -152,6 +153,19 @@ def snap_to_action(
     drift = nearest.starts_seconds - wanted_start
     if abs(drift) > tolerance:
         return wanted_start, None
+    # Landing on the gesture is worth moving for; landing on the gesture
+    # while the lens is still hunting is not. A cut that was planned on
+    # sharp footage stays where it was planned rather than being dragged
+    # into the soft part -- the take that prompted this had its in-point
+    # pushed a second earlier onto a heart gesture, from 80% of its own
+    # best focus down to 33%, with the sharp half inside the same span.
+    if focus:
+        from montagewright.focus import moving_into_softer
+
+        if moving_into_softer(
+            focus, wanted_start, nearest.starts_seconds, duration
+        ):
+            return wanted_start, None
     return nearest.starts_seconds, (
         f"moved {drift:+.2f}s onto '{nearest.what}'" if abs(drift) > 0.05 else None
     )

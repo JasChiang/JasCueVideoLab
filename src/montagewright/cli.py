@@ -564,6 +564,22 @@ def _screen_material_identity(
     return kept, aside, found
 
 
+def _focus_note(source: Path, library: Path, duration: float) -> str:
+    """One line about this take's focus, or nothing if it holds.
+
+    Measured locally off the original, cached by content hash, and never
+    sent as a verdict: the planner is told which seconds the lens was on and
+    decides what to do about it, exactly as it does with camera motion.
+    """
+
+    try:
+        from montagewright.focus import cached as focus_for, describe
+
+        return describe(focus_for(source, library), 0.0, duration)
+    except Exception:
+        return ""
+
+
 def _travel(source: Path, target_aspect: float) -> tuple[float, float]:
     """Horizontal and vertical room to move, as fractions of the frame.
 
@@ -1104,6 +1120,9 @@ def command_render(args: argparse.Namespace) -> int:
                 camera_motion=str((card or {}).get("camera_motion", "") or ""),
                 shot_size=str((card or {}).get("shot_size", "") or ""),
                 facing=str((card or {}).get("facing", "") or ""),
+                focus_note=_focus_note(
+                    originals.get(source_id, proxy), library, _duration(proxy)
+                ),
                 spans=tuple(
                     spans_of(card, source_id, _duration(proxy))
                 ),
@@ -1569,7 +1588,7 @@ def command_render(args: argparse.Namespace) -> int:
         print(f"  {note}", flush=True)
 
     edl, snaps = _edl_from_selection(
-        selection, rushes, cards, transcripts=transcripts
+        selection, rushes, cards, transcripts=transcripts, library=library
     )
     if snaps:
         print(f"cut on action: {len(snaps)} in-points moved", flush=True)
@@ -1703,7 +1722,7 @@ def command_render(args: argparse.Namespace) -> int:
             if not repaired:
                 raise
             edl, snaps = _edl_from_selection(
-                selection, rushes, cards, transcripts=transcripts
+                selection, rushes, cards, transcripts=transcripts, library=library
             )
             sources = {
                 one["source_id"]: probe(one["source_id"], found[one["source_id"]])
@@ -1865,7 +1884,7 @@ def command_render(args: argparse.Namespace) -> int:
                           commitments=commitments,
                       )
                       edl, snaps = _edl_from_selection(
-                          selection, rushes, cards, transcripts=transcripts
+                          selection, rushes, cards, transcripts=transcripts, library=library
                       )
                       sources = {
                           shot["source_id"]: probe(
@@ -2073,7 +2092,7 @@ def command_render(args: argparse.Namespace) -> int:
               # the next round renders a different film rather than re-reading
               # the same one.
               edl, snaps = _edl_from_selection(
-                  selection, rushes, cards, transcripts=transcripts
+                  selection, rushes, cards, transcripts=transcripts, library=library
               )
               sources = {
                   shot["source_id"]: probe(
@@ -2586,9 +2605,30 @@ def _look_boxes(card: dict, reframe) -> list[tuple[float, float, float]]:
 def _edl_from_selection(
     selection: dict, rushes: Path, cards: dict[str, Path], *,
     transcripts: dict[str, dict] | None = None,
+    library: Path | None = None,
 ) -> tuple[EDL, dict[str, str]]:
     clips = []
     snaps: dict[str, str] = {}
+
+    def focus_of(source_id: str) -> list:
+        """How this take's focus behaves, measured once per file ever."""
+
+        if library is None:
+            return []
+        original = rushes / f"{source_id}.MP4"
+        if not original.exists():
+            found = next(rushes.glob(f"{source_id}.*"), None)
+            if found is None:
+                return []
+            original = found
+        try:
+            from montagewright.focus import cached as focus_for
+
+            return focus_for(original, library)
+        except Exception:
+            # A reading nobody could take is not a reason to refuse the cut.
+            return []
+
     for index, shot in enumerate(selection["shots"]):
         # Text and UI have to survive whole or they say nothing. The first
         # run cropped a Galaxy Unpacked wordmark down to "y Unpacked", which
@@ -2616,7 +2656,10 @@ def _edl_from_selection(
             wanted = min(wanted, room) if room > 0 else wanted
             start = min(max(start, first), max(first, last - wanted))
         if card is not None:
-            start, note = snap_to_action(card, start, wanted, within=window)
+            start, note = snap_to_action(
+                card, start, wanted, within=window,
+                focus=focus_of(str(shot["source_id"])),
+            )
             if note:
                 snaps[clip_id] = note
             # Where the card already measured each look. This is what makes
