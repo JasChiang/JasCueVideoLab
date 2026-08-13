@@ -251,6 +251,23 @@ def resolve_candidate_commitments(
         if target_id not in known_targets:
             faults.append(f"option {index} names unknown target {target_id!r}")
             continue
+        # Sources the screen found the identity absent from are offered as
+        # context, so a commitment may be cut from one -- but not one that
+        # promises the identity. Caught here rather than at selection: the
+        # same round that proposed it can fix it, and a promise nothing can
+        # keep costs a repair round every stage it survives.
+        carrier = item_index.get(str(span.source_id))
+        if (
+            target_id != "none"
+            and carrier is not None
+            and not getattr(carrier, "carries_identity", True)
+        ):
+            faults.append(
+                f"option {index} promises {target_id} from {span_id}, whose "
+                "source the identity screen found it absent from; use this "
+                "span for context with target_id none"
+            )
+            continue
         try:
             options.append(CandidateOption(
                 commitment_id=raw.get("commitment_id"),
