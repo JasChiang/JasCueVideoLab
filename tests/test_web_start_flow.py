@@ -93,7 +93,11 @@ def test_web_duration_contract_is_explicit_and_reaches_the_cli(
     assert run.command[at + 1] == "preferred"
     page = (Path(__file__).parents[1] / "src/montagewright/web/index.html").read_text()
     assert 'id="duration-mode"' in page
-    assert "偏好長度，可自然縮短" in page
+    # The wording is the interface's to choose; what this test defends is that
+    # both modes are offered and named for what they do, so the difference is
+    # a decision somebody makes rather than a flag they inherit.
+    assert 'value="preferred"' in page and 'value="exact"' in page
+    assert "不會用空停留硬補滿" in page
 
 
 def test_new_round_inherits_parent_brief_on_the_server(
