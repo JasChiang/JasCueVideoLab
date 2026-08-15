@@ -1717,6 +1717,30 @@ def _framable_window(
     return first, last
 
 
+def _actions_for_span(item: MaterialItem, span: Any) -> tuple[str, ...]:
+    """Action ids whose source-clock interval actually reaches this span."""
+
+    first = float(span.starts_seconds)
+    last = float(span.ends_seconds)
+    return tuple(
+        action_id
+        for action_id, action_start, action_end in item.action_windows
+        if float(action_start) <= last + 1e-3
+        and float(action_end) >= first - 1e-3
+    )
+
+
+def _action_ids_for_material(material: list[MaterialItem]) -> list[str]:
+    """Schema menu containing only actions reachable from offered spans."""
+
+    return list(dict.fromkeys(
+        action_id
+        for item in material
+        for span in item.spans
+        for action_id in _actions_for_span(item, span)
+    ))
+
+
 def _describe_material(material: list[MaterialItem]) -> str:
     """The card's measurements alongside the description.
 
@@ -1886,6 +1910,11 @@ def _describe_material(material: list[MaterialItem]) -> str:
                     "，兩者都在此段內，可以在它們之間運鏡"
                     if len(inside.get(span.span_id, ())) >= 2
                     else ""
+                )
+                + (
+                    "，此段可用動作=" + "、".join(_actions_for_span(item, span))
+                    if _actions_for_span(item, span)
+                    else "，此段沒有可綁定的命名動作"
                 )
                 + "）"
                 for span in item.spans
@@ -3157,9 +3186,7 @@ def select_shots(
                     for option in selection_commitments.options
                 )) if selection_commitments is not None else None
             ),
-            action_ids=list(dict.fromkeys(
-                action_id for item in usable for action_id in item.action_ids
-            )),
+            action_ids=_action_ids_for_material(usable),
         ))
 
     schema = response_schema([one.span_id for one in offered])
@@ -3225,9 +3252,7 @@ def select_shots(
                     option.commitment_id
                     for option in selection_commitments.options
                 )) if selection_commitments is not None else None,
-                action_ids=list(dict.fromkeys(
-                    action_id for item in usable for action_id in item.action_ids
-                )),
+                action_ids=_action_ids_for_material(scoped_material),
             ))
             patch_input = [selection_input[0], {
                 "type": "text",
@@ -3601,10 +3626,7 @@ def select_shots(
                         option.commitment_id
                         for option in selection_commitments.options
                     )) if selection_commitments is not None else None,
-                    action_ids=list(dict.fromkeys(
-                        action_id for item in usable
-                        for action_id in item.action_ids
-                    )),
+                    action_ids=_action_ids_for_material(scoped_material),
                 ))
                 attempt_input = [selection_input[0], {
                     "type": "text",
@@ -3909,10 +3931,6 @@ def action_contract_disagreements(
     Selection can still choose fewer shots or a different treatment.
     """
 
-    allowed = {
-        item.source_id: set(item.action_ids)
-        for item in material
-    }
     faults: list[str] = []
     for index, shot in enumerate(shots):
         selected = str(shot.get("action_id") or "none")
@@ -3923,7 +3941,15 @@ def action_contract_disagreements(
         }:
             faults.append(f"k{index:02d} has no valid action_treatment")
             continue
-        offered_actions = allowed.get(source, set())
+        source_item = next(
+            (item for item in material if item.source_id == source), None
+        )
+        named_span = resolve_named_span(shot, material)
+        offered_actions = set(
+            _actions_for_span(source_item, named_span)
+            if source_item is not None and named_span is not None
+            else (source_item.action_ids if source_item is not None else ())
+        )
         if (
             str(shot.get("picture_role") or "") == "primary_action"
             and offered_actions
@@ -3948,10 +3974,10 @@ def action_contract_disagreements(
                 f"k{index:02d} uses {treatment} but selects no action_id"
             )
             continue
-        if selected not in allowed.get(source, set()):
+        if selected not in offered_actions:
             faults.append(
                 f"k{index:02d} selects action {selected!r}, which is not an "
-                f"action offered by source {source}"
+                f"action offered inside span {shot.get('span_id') or source}"
             )
             continue
         resolved = resolve_action_boundary(shot, material)
@@ -4789,9 +4815,7 @@ def replan_shots(
         [one.span_id for one in offered],
         replace_clip_ids=[f"k{index:02d}" for index, _, _ in failing],
         grounding_target_ids=grounding_target_ids,
-        action_ids=list(dict.fromkeys(
-            action_id for item in usable for action_id in item.action_ids
-        )),
+        action_ids=_action_ids_for_material(usable),
         commitment_ids=list(dict.fromkeys(
             option.commitment_id for option in commitments.options
         )) if commitments is not None else None,

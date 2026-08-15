@@ -183,7 +183,7 @@ def test_action_id_is_validated_against_the_selected_source():
         "action_treatment": "complete_here",
     }], material)
 
-    assert "not an action offered by source C1" in faults[0]
+    assert "not an action offered inside span C1" in faults[0]
 
 
 def test_primary_action_cannot_silently_drop_an_offered_action_contract():
@@ -204,6 +204,27 @@ def test_primary_action_cannot_silently_drop_an_offered_action_contract():
 
     assert len(faults) == 1
     assert "must choose complete_here" in faults[0]
+
+
+def test_primary_action_does_not_inherit_actions_from_another_span():
+    from montagewright.planner import MaterialItem, action_contract_disagreements
+    from montagewright.spans import Span
+
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=60.0, summary="action then later result",
+        action_ids=("a01",), action_windows=(("a01", 2.0, 6.0),),
+        spans=(
+            Span("C1:s00", "C1", 0.0, 8.0),
+            Span("C1:s02", "C1", 40.0, 50.0),
+        ),
+    )]
+    later_result = {
+        "source_id": "C1", "span_id": "C1:s02",
+        "picture_role": "primary_action",
+        "action_id": "none", "action_treatment": "none",
+    }
+
+    assert action_contract_disagreements([later_result], material) == []
 
 
 def test_intentional_action_cut_must_really_end_before_completion():
@@ -374,7 +395,7 @@ def test_after_completion_must_begin_inside_the_selected_span():
     faults = action_contract_disagreements([shot], material)
 
     assert len(faults) == 1
-    assert "before the selected span opens" in faults[0]
+    assert "not an action offered inside span C1:s02" in faults[0]
 
 
 def test_normalized_selection_cannot_keep_stale_span_clock_echoes():
