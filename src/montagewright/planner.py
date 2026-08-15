@@ -3975,11 +3975,18 @@ def action_contract_disagreements(
                     f"but complete_here needs at least {needed:.2f}s; choose "
                     "fewer shots, after_completion, or a different action"
                 )
-        elif treatment == "after_completion" and action_end + seconds > usable_to + 1e-3:
-            faults.append(
-                f"k{index:02d} cannot hold {seconds:.2f}s after action "
-                f"{selected!r} completes at {action_end:.2f}s inside this window"
-            )
+        elif treatment == "after_completion":
+            if action_end < usable_from - 1e-3:
+                faults.append(
+                    f"k{index:02d} cannot enter after action {selected!r}: "
+                    f"it completes at {action_end:.2f}s before the selected "
+                    f"span opens at {usable_from:.2f}s"
+                )
+            elif action_end + seconds > usable_to + 1e-3:
+                faults.append(
+                    f"k{index:02d} cannot hold {seconds:.2f}s after action "
+                    f"{selected!r} completes at {action_end:.2f}s inside this window"
+                )
         elif treatment == "intentional_cut":
             why = str(shot.get("why") or "").strip()
             source_start = float(shot.get("start_seconds") or usable_from)

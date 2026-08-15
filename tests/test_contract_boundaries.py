@@ -355,6 +355,28 @@ def test_action_validation_uses_the_named_span_not_selection_echoes():
     assert "cannot hold 3.00s" in faults[0]
 
 
+def test_after_completion_must_begin_inside_the_selected_span():
+    from montagewright.planner import MaterialItem, action_contract_disagreements
+    from montagewright.spans import Span
+
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=70.0, summary="later result island",
+        action_ids=("a03",), action_windows=(("a03", 20.0, 30.0),),
+        spans=(Span("C1:s02", "C1", 41.0, 61.0),),
+    )]
+    shot = {
+        "source_id": "C1", "span_id": "C1:s02",
+        "action_id": "a03", "action_treatment": "after_completion",
+        "seconds_needed": 3.0,
+        "usable_from_seconds": 41.0, "usable_to_seconds": 61.0,
+    }
+
+    faults = action_contract_disagreements([shot], material)
+
+    assert len(faults) == 1
+    assert "before the selected span opens" in faults[0]
+
+
 def test_normalized_selection_cannot_keep_stale_span_clock_echoes():
     from montagewright.planner import MaterialItem, span_contract_disagreements
     from montagewright.spans import Span
