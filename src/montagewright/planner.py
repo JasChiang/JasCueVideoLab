@@ -13,11 +13,12 @@ happening in it and what the track is doing underneath.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -49,11 +50,23 @@ def _http_options(types):
         timeout=REQUEST_TIMEOUT_MS,
         retry_options=types.HttpRetryOptions(attempts=1),
     )
-MODEL_ID = "gemini-3.6-flash"
+MODEL_ID = "gemini-3.7-flash"
+# Gemini 3.7 currently accepts text-only interactions for this project but
+# rejects interactions that attach File API video.  A scoped Selection repair
+# is the only planning call that needs those clips after the first answer, so
+# keep the rest of the pipeline and its caches on 3.7 while using the proven
+# multimodal 3.6 endpoint for this bounded patch.
+SELECTION_PATCH_MODEL_ID = os.environ.get(
+    "MONTAGEWRIGHT_SELECTION_PATCH_MODEL", "gemini-3.6-flash"
+)
 
-# 3.6 Flash deprecated the sampling knobs, so consistency comes from the
+# 3.7 Flash does not use custom sampling knobs, so consistency comes from the
 # response schema and the instructions rather than from temperature.
 THINKING_HIGH = "high"
+SERVER_ERROR_ATTEMPTS = 2
+SERVER_ERROR_BACKOFF_SECONDS = float(
+    os.environ.get("MONTAGEWRIGHT_5XX_BACKOFF_SECONDS", "1.0")
+)
 
 # Room to answer, everywhere. Billing is on tokens produced, not on the
 # ceiling, so a high one costs nothing and a low one costs the whole pass:
@@ -70,6 +83,22 @@ MAX_OUTPUT_TOKENS = 65536
 
 class PlannerError(RuntimeError):
     pass
+
+
+class SelectionUnrenderable(PlannerError):
+    """The paid Selection answer is reviewable but not executable.
+
+    Carry the final normalized answer across the exception boundary so the
+    CLI can persist a clearly labelled draft before the run stops.  The draft
+    is never treated as a valid Selection cache entry.
+    """
+
+    def __init__(
+        self, message: str, *, draft: dict[str, Any], faults: list[str]
+    ) -> None:
+        super().__init__(message)
+        self.draft = copy.deepcopy(draft)
+        self.faults = tuple(faults)
 
 
 @dataclass(frozen=True)
@@ -280,20 +309,14 @@ def _describe_music(grid: BeatGrid) -> str:
 
 
 def _needs_at_least(clip) -> float:
-    """The least this clip's own move can happen in, or zero if unknown."""
+    """The canonical local floor Rhythm will later be released against."""
 
-    from montagewright.reframe import seconds_needed_for
+    # Do not maintain a prompt-only approximation here.  It previously
+    # omitted single-look rests, unknown-box fallback and transition passes, so
+    # Rhythm was shown a smaller floor than the executable release gate used.
+    from montagewright.grounding import _floor_for
 
-    reframe = getattr(clip, "reframe", None)
-    if reframe is None or len(reframe.looks) < 2 or not reframe.look_boxes:
-        return 0.0
-    if len(reframe.look_boxes) < len(reframe.looks):
-        return 0.0
-    stops = [
-        (one.seconds, box[0], box[1], box[2])
-        for one, box in zip(reframe.looks, reframe.look_boxes)
-    ]
-    return seconds_needed_for(stops, reframe.camera_energy)
+    return _floor_for(clip)
 
 
 def _describe_clips(edl: EDL, context: dict[str, dict] | None = None) -> str:
@@ -406,6 +429,20 @@ def _is_spend_cap(error: Exception) -> bool:
     """
 
     return _provider_budget_message(error) is not None
+
+
+def _provider_status_code(error: Exception) -> int | None:
+    """Read an HTTP status across SDK ClientError/ServerError variants."""
+
+    for name in ("status_code", "code"):
+        value = getattr(error, name, None)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"(?<!\d)([45]\d\d)(?!\d)", str(error))
+    return int(match.group(1)) if match else None
 
 
 def _provider_budget_message(error: Exception) -> str | None:
@@ -521,16 +558,40 @@ def ask(
             max_output_tokens=int(
                 generation.get("max_output_tokens") or MAX_OUTPUT_TOKENS
             ),
+            model_id=str(request["model"]),
         )
-    try:
-        interaction = _asked(client).interactions.create(**request)
-    except Exception as error:
-        if reservation_id is not None and ledger is not None:
-            ledger.cancel(reservation_id)
-        provider_budget = _provider_budget_message(error)
-        if provider_budget is not None:
-            raise BudgetSpent(provider_budget) from error
-        raise
+    interaction = None
+    for attempt in range(SERVER_ERROR_ATTEMPTS):
+        try:
+            interaction = _asked(client).interactions.create(**request)
+            break
+        except Exception as error:
+            provider_budget = _provider_budget_message(error)
+            if provider_budget is not None:
+                if reservation_id is not None and ledger is not None:
+                    ledger.cancel(reservation_id)
+                raise BudgetSpent(provider_budget) from error
+            status = _provider_status_code(error)
+            retryable = status in {500, 502, 503, 504}
+            if retryable and attempt + 1 < SERVER_ERROR_ATTEMPTS:
+                if ledger is not None and budget_stage is not None:
+                    ledger.note_uncertain_attempt(
+                        budget_stage, status=int(status)
+                    )
+                delay = SERVER_ERROR_BACKOFF_SECONDS * (2**attempt)
+                print(
+                    f"Gemini {status}: retrying the same request "
+                    f"{attempt + 1}/{SERVER_ERROR_ATTEMPTS - 1} after "
+                    f"{delay:g}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            if reservation_id is not None and ledger is not None:
+                ledger.cancel(reservation_id)
+            raise
+    if interaction is None:  # pragma: no cover - loop returns or raises.
+        raise RuntimeError("Gemini interaction retry loop did not return")
     if reservation_id is not None and ledger is not None:
         usage = Usage.from_interaction(interaction)
         raw_usage = getattr(interaction, "usage", None) or {}
@@ -580,6 +641,7 @@ def decide_rhythm(
     duration_mode: str = "exact",
     client: Any | None = None,
     ledger: Any | None = None,
+    artifact_dir: Path | None = None,
 ) -> tuple[EDL, Usage]:
     """Return the EDL with each clip's rhythm decided by the model.
 
@@ -603,11 +665,35 @@ def decide_rhythm(
     changes what the model asks for, not where local code puts it.
     """
 
-    if client is None:
-        client = _default_client()
-
     clip_ids = [clip.clip_id for clip in edl.clips]
     prompt = (PROMPTS / "rhythm_zh-TW.txt").read_text(encoding="utf-8")
+    cache_key = _rhythm_artifact_key(
+        edl,
+        grid,
+        intent=intent,
+        brief=brief,
+        context=context or {},
+        music=music,
+        shots=shots,
+        target_seconds=target_seconds,
+        duration_mode=duration_mode,
+        prompt=prompt,
+        clip_ids=clip_ids,
+    )
+    if artifact_dir is not None:
+        from montagewright.planning_artifacts import decided
+
+        remembered = decided(Path(artifact_dir), "rhythm", cache_key)
+        if remembered is not None:
+            try:
+                return EDL.model_validate(remembered["edl"]), Usage(0, 0, 0)
+            except (KeyError, TypeError, ValueError):
+                # A stale or manually edited artifact is not executable.
+                # Keep it for audit and ask again under the current contract.
+                pass
+
+    if client is None:
+        client = _default_client()
 
     if grid is None:
         about_music = (
@@ -647,7 +733,8 @@ def decide_rhythm(
                     + (
                         "這是精確交付規格，必須在內容證據允許下達成。"
                         if duration_mode == "exact" else
-                        "這是偏好上限，不可用停格或無證據停留補滿；"
+                        "這是偏好中心，不是精確交付秒數；可在一個小節內"
+                        "自然收尾，不可用停格或無證據停留補滿。"
                         "素材不足時應回傳自然且較短的版本。"
                     )
                     + "素材裡有動作起訖的，動作做完需要多久就是那顆的下限。\n\n"
@@ -722,18 +809,68 @@ def decide_rhythm(
             payload.get("music_from_seconds"),
             payload.get("music_spans"),
         )
+        # Give the editor the executable result before applying a local
+        # fallback. The first answer must be allowed to fail honestly: that
+        # is how Gemini learns that its symbolic 59.5-second plan becomes a
+        # 72.85-second film after the measured grid and content floors. Only
+        # the bounded second answer may shed ordinary beat snaps, and only to
+        # honour a preferred upper bound.
+        if attempt > 0:
+            candidate = _protect_preferred_camera_floors(
+                candidate, duration_mode=duration_mode
+            )
+            candidate = _fit_preferred_rhythm_to_target(
+                candidate,
+                grid,
+                target_seconds=target_seconds,
+                duration_mode=duration_mode,
+            )
         from montagewright.coverage import edl_coverage_audit
+        from montagewright.grounding import apply_to_edl, ground_timeline
         from montagewright.planning_release import rhythm_motion_faults
 
+        # Validate the timeline that the renderer will actually execute.
+        # Validating the model's pre-grounding holds let a 59.5-second answer
+        # expand to 72.85 seconds after beat/action floors, then fail only
+        # after two paid Rhythm calls.  Grounding is deterministic and belongs
+        # inside the paid answer's acceptance boundary.
+        grounded = ground_timeline(candidate, grid)
+        executable = apply_to_edl(candidate, grounded)
+        preferred_tolerance = _preferred_rhythm_tolerance(
+            grid, duration_mode=duration_mode
+        )
         coverage = edl_coverage_audit(
-            candidate, target_seconds, hard_target=duration_mode == "exact"
+            executable,
+            target_seconds,
+            hard_target=duration_mode == "exact",
+            duration_tolerance_seconds=preferred_tolerance,
         )
         coverage_faults = coverage.faults
         release_faults = rhythm_motion_faults(edl, candidate, grid)
         all_faults = (*coverage_faults, *release_faults)
         if (target_seconds <= 0 or not coverage_faults) and not release_faults:
+            if artifact_dir is not None:
+                from montagewright.planning_artifacts import decide
+
+                decide(
+                    Path(artifact_dir),
+                    "rhythm",
+                    cache_key,
+                    {"edl": candidate.model_dump(mode="json")},
+                )
             return candidate, usage_total
         if attempt == 0:
+            grounding_details = [
+                (
+                    f"{entry.clip.clip_id}: requested "
+                    f"{entry.clip.approx_out_seconds - entry.clip.approx_in_seconds:.2f}s, "
+                    f"executes as {entry.duration_seconds:.2f}s"
+                    + (f" ({entry.note})" if entry.note else "")
+                )
+                for entry in grounded.clips
+                if entry.duration_seconds
+                > entry.clip.approx_out_seconds - entry.clip.approx_in_seconds + 0.01
+            ]
             attempt_input = request_input + [{
                 "type": "text",
                 "text": (
@@ -743,7 +880,7 @@ def decide_rhythm(
                     " speaker、B-roll 或靜態畫面一起拉長來湊總秒數。"
                     "若這組 shots 本身不足，仍請給最自然、無死空氣的"
                     "版本，本機會把它交回結構選片重規劃。\n\n- "
-                    + "\n- ".join(all_faults)
+                    + "\n- ".join((*all_faults, *grounding_details))
                     + "\n\n上一版答案：\n"
                     + json.dumps(payload, ensure_ascii=False)
                 ),
@@ -753,6 +890,214 @@ def decide_rhythm(
         "shots; structural selection must add content or shorten the target: "
         + "; ".join((*coverage_faults, *release_faults))
     )
+
+
+def _rhythm_artifact_key(
+    edl: EDL,
+    grid: BeatGrid | None,
+    *,
+    intent: str,
+    brief: str,
+    context: dict[str, dict],
+    music: Path | None,
+    shots: "list[MaterialItem] | None",
+    target_seconds: float,
+    duration_mode: str,
+    prompt: str,
+    clip_ids: list[str],
+) -> str:
+    """Everything that changes one paid Rhythm answer, in canonical form."""
+
+    from dataclasses import asdict, is_dataclass
+
+    from montagewright.grounding import beat_grid_payload
+    from montagewright.planning_artifacts import asked
+
+    def plain(value: Any) -> Any:
+        if isinstance(value, Path):
+            try:
+                stat = value.expanduser().resolve().stat()
+                return {
+                    "path": str(value.expanduser().resolve()),
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            except OSError:
+                return {"path": str(value)}
+        if hasattr(value, "model_dump"):
+            return plain(value.model_dump(mode="json"))
+        if is_dataclass(value) and not isinstance(value, type):
+            return plain(asdict(value))
+        if isinstance(value, dict):
+            return {str(key): plain(one) for key, one in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [plain(one) for one in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return repr(value)
+
+    contract = {
+        "version": "rhythm-executable-grounding-v1",
+        "model": MODEL_ID,
+        "thinking": THINKING_HIGH,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "prompt": prompt,
+        "schema": _rhythm_schema(clip_ids),
+        "edl": edl.model_dump(mode="json"),
+        "grid": beat_grid_payload(grid) if grid is not None else None,
+        "intent": intent,
+        "brief": brief,
+        "context": context,
+        "music": plain(music),
+        "shots": plain(shots or []),
+        "target_seconds": target_seconds,
+        "duration_mode": duration_mode,
+    }
+    return asked(json.dumps(contract, ensure_ascii=False, sort_keys=True))
+
+
+def _fit_preferred_rhythm_to_target(
+    edl: EDL,
+    grid: BeatGrid | None,
+    *,
+    target_seconds: float,
+    duration_mode: str,
+) -> EDL:
+    """Sacrifice optional beat snaps before exceeding a preferred ceiling.
+
+    Gemini owns the pacing request.  The measured grid owns exact cue times.
+    When their combination runs beyond a *preferred* delivery ceiling, an
+    editor leaves the least useful cuts off-grid before inventing extra time.
+    This greedy pass removes only symbolic out-point snaps; action, source
+    motion, readable rests and usable-window floors remain enforced by
+    ``ground_timeline``.  Exact deliveries still require structural replanning.
+    """
+
+    if grid is None or target_seconds <= 0 or duration_mode == "exact":
+        return edl
+
+    from montagewright.grounding import ground_timeline
+
+    chosen = edl
+    ceiling = target_seconds + _preferred_rhythm_tolerance(
+        grid, duration_mode=duration_mode
+    )
+    duration = ground_timeline(chosen, grid).duration_seconds
+    while duration > ceiling + 1e-6:
+        best: tuple[float, EDL, float] | None = None
+        for index, clip in enumerate(chosen.clips):
+            sync = clip.music_sync
+            # A named section boundary is a creative structural decision,
+            # not an optional quantisation. The fallback may only let an
+            # ordinary cut leave the beat grid.
+            if not sync.cut_on_beat or sync.sync_to is not None:
+                continue
+            unsnapped = sync.model_copy(update={
+                "cut_on_beat": False,
+                "sync_to": None,
+                "rhythm_reason": (
+                    sync.rhythm_reason
+                    + "；本機為遵守片長上限，讓此切點離開拍點"
+                ).strip("；"),
+            })
+            clips = list(chosen.clips)
+            clips[index] = clip.model_copy(update={"music_sync": unsnapped})
+            trial = chosen.model_copy(update={"clips": clips})
+            grounded_trial = ground_timeline(trial, grid)
+            # Leaving a cut off-grid is allowed; making the planned camera
+            # move physically unreadable is not.  The old fitter selected the
+            # largest arithmetic saving first and could turn a valid 3.0s pan
+            # into 2.56s, after which the release gate quite correctly stopped
+            # the whole film.  Only consider reductions that preserve every
+            # measured camera floor.
+            if any(entry.move_too_short for entry in grounded_trial.clips):
+                continue
+            trial_duration = grounded_trial.duration_seconds
+            saved = duration - trial_duration
+            if saved > 1e-6 and (best is None or saved > best[0]):
+                best = (saved, trial, trial_duration)
+        if best is None:
+            break
+        _, chosen, duration = best
+    return chosen
+
+
+def _preferred_rhythm_tolerance(
+    grid: BeatGrid | None, *, duration_mode: str
+) -> float:
+    """Natural delivery tolerance for a music-led preferred duration.
+
+    ``preferred`` means approximately the requested length, not an exact
+    broadcast clock.  One bar is the smallest musically coherent amount of
+    slack: it lets an action or camera move complete without making a cut
+    feel accidentally late.  Exact deliveries and films without a measured
+    music grid keep the existing strict tolerance.
+    """
+
+    if duration_mode != "preferred" or grid is None:
+        return 0.0
+    return grid.phrase_seconds(bars=1)
+
+
+def _protect_preferred_camera_floors(
+    edl: EDL, *, duration_mode: str
+) -> EDL:
+    """Let selected camera treatments finish before fitting total duration.
+
+    Gemini chooses the editorial duration, but the measured look geometry is
+    the authority on whether that duration can physically deliver the move.
+    On the bounded second Rhythm answer, extend only undersized camera moves
+    that the source window can actually supply.  The cut deliberately leaves
+    the beat grid: completing a pan/push cleanly outranks an early beat.
+
+    This is not a generic duration stretcher.  Action and native source-motion
+    contracts have their own clocks, ordinary holds are untouched, and exact
+    deliveries still require structural replanning.
+    """
+
+    if duration_mode != "preferred":
+        return edl
+
+    from montagewright.grounding import _floor_for
+
+    rewritten: list[Clip] = []
+    for clip in edl.clips:
+        floor = _floor_for(clip)
+        duration = clip.approx_out_seconds - clip.approx_in_seconds
+        if floor <= duration + 1e-6:
+            rewritten.append(clip)
+            continue
+
+        window = clip.usable_window
+        available = (
+            max(0.0, window[1] - clip.approx_in_seconds)
+            if window is not None else float("inf")
+        )
+        if available < floor - 1e-6:
+            # The chosen take cannot carry this treatment.  Preserve the
+            # honest fault so Selection can replace it; do not fabricate time.
+            rewritten.append(clip)
+            continue
+
+        sync = clip.music_sync.model_copy(update={
+            "cut_on_beat": False,
+            "beats": None,
+            "sync_to": None,
+            "rhythm_reason": (
+                clip.music_sync.rhythm_reason
+                + "；本機保留完成運鏡所需時間，切點離開拍點"
+            ).strip("；"),
+        })
+        claim = clip.coverage_claim_seconds
+        rewritten.append(clip.model_copy(update={
+            "approx_out_seconds": clip.approx_in_seconds + floor,
+            # A measured move completing between declared looks is itself
+            # visual development.  Preserve evidence accounting while still
+            # letting the ordinary coverage gate reject any further padding.
+            "coverage_claim_seconds": max(float(claim or 0.0), floor),
+            "music_sync": sync,
+        }))
+    return edl.model_copy(update={"clips": rewritten})
 
 
 def _apply(
@@ -1064,6 +1409,13 @@ class MaterialItem:
     # camera across it rather than crop the middle out and call it framing.
     composition: str = ""
     subjects: tuple[str, ...] = ()
+    # Raw card geometry is local evidence used to prove that Selection's
+    # requested move fits its requested seconds before the answer is saved.
+    # Prompt copy remains in ``subjects``; these numbers are never model
+    # authority and never confirm identity.
+    subject_geometry: tuple[
+        tuple[str, str | None, float, float, float, float], ...
+    ] = ()
     # When each named subject was actually seen, and what the frame did over
     # the take. Separately these are two facts already on record; together
     # they say whether a subject is in a given window at all. See
@@ -1097,6 +1449,14 @@ class MaterialItem:
     # frame of every clip". Kept and marked instead: usable as context,
     # never as the subject.
     carries_identity: bool = True
+    # Per-target source-screen authority.  A source may contain target B even
+    # when target A is absent, and their appearances need not occupy the same
+    # seconds.  Tuple form keeps the frozen material record deterministic and
+    # JSON-friendly while avoiding a mutable dict inside it.
+    identity_windows_by_target: tuple[
+        tuple[str, tuple[tuple[float, float], ...]], ...
+    ] = ()
+    identity_absent_targets: tuple[str, ...] = ()
     # Which seconds of this take the lens was actually on, as a share of the
     # take's own sharpest frame. Not a verdict -- soft is a choice an edit
     # gets to make -- but the planner was choosing in-points with no way to
@@ -1135,6 +1495,13 @@ class MaterialItem:
     pan_room: float = 0.0
     tilt_room: float = 0.0
     action: tuple[str, ...] = ()
+    # Card action ids scoped by this source. Selection may use one to turn
+    # descriptive action evidence into an explicit completion obligation.
+    action_ids: tuple[str, ...] = ()
+    # Source-clock action boundaries from the card.  Prompt prose is for the
+    # editor; these numbers are the local contract that proves a requested
+    # treatment fits before Rhythm is allowed to spend anything.
+    action_windows: tuple[tuple[str, float, float], ...] = ()
     needs: tuple[str, ...] = ()
     # What is said, when, and by whom. A shot chosen out of an interview is
     # chosen because of a sentence; without the lines the planner is picking
@@ -1427,6 +1794,27 @@ def _describe_material(material: list[MaterialItem]) -> str:
             # line is for: this source is where the event was, not where the
             # product is.
             facts.insert(1, "鎖定的主角不在這支裡：只能當環境／氣氛，不能當主體")
+        else:
+            absent_targets = tuple(
+                getattr(item, "identity_absent_targets", ()) or ()
+            )
+            if absent_targets:
+                facts.insert(
+                    1,
+                    "以下鎖定主角不在這支裡：" + "、".join(absent_targets),
+                )
+            for target_id, windows in (
+                getattr(item, "identity_windows_by_target", ()) or ()
+            ):
+                if windows:
+                    facts.append(
+                        f"{target_id}只在"
+                        + "、".join(
+                            f"{starts:.1f}–{ends:.1f}s"
+                            for starts, ends in windows
+                        )
+                        + "可見"
+                    )
         head = f"- {item.source_id}（{'、'.join(facts)}）：{item.summary}"
         # The ids a plan may name, with what is in each. Everything else on
         # this line describes the take; this is the part that is choosable,
@@ -1790,7 +2178,9 @@ def correct_candidate_options(
                 "不可改故事方向、片長、節奏、音樂判斷或淘汰清單。"
                 "回傳完整 replacement candidate_options，不要回 patch。"
                 "同一 commitment_id 的 purpose 與 required 必須一致，"
-                "且恰好一個 primary；motion_preference 是偏好，不是硬需求。\n\n"
+                "且恰好一個 primary。recommended_treatment、suggested_move、"
+                "camera_route 與 motion_reason 是導演建議，不是本機能力宣告；"
+                "仍要提出有意義的運鏡與 fallback，不要因為不確定就一律 hold。\n\n"
                 "## 不可修改的既有定調\n"
                 + json.dumps(immutable, ensure_ascii=False, sort_keys=True)
                 + "\n\n## 上一版 candidate_options\n"
@@ -1823,6 +2213,7 @@ def _selection_schema(
     audio_span_ids: list[str] | None = None,
     grounding_target_ids: list[str] | None = None,
     commitment_ids: list[str] | None = None,
+    action_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Flat shots plus flat coverage. Nothing nests more than one level.
 
@@ -1864,6 +2255,8 @@ def _selection_schema(
                         *(["replace_clip_id"] if replace_clip_ids else []),
                         "span_id",
                         "start_offset_seconds",
+                        "action_id",
+                        "action_treatment",
                         "camera_intent",
                         "pacing_exception",
                         "pacing_exception_reason",
@@ -1902,6 +2295,7 @@ def _selection_schema(
                         "span_id": {"type": "string", "enum": span_ids},
                         "start_offset_seconds": {
                             "type": "string",
+                            "pattern": r"^\d{1,3}:[0-5]\d(?:\.\d+)?$",
                             "description": (
                                 "從這個片段的**開頭**算起第幾秒進。0 就是"
                                 "從片段開頭進，那通常是對的——片段的邊界"
@@ -1913,6 +2307,7 @@ def _selection_schema(
                         },
                         "seconds_needed": {
                             "type": "string",
+                            "pattern": r"^\d{1,3}:[0-5]\d(?:\.\d+)?$",
                             "description": (
                                 "How many seconds this shot needs to do the "
                                 "job you picked it for: the gesture playing "
@@ -1923,6 +2318,25 @@ def _selection_schema(
                                 "that leaves each shot less than it needs is "
                                 "a count with too many shots in it。\n"
                                 "寫成 MM:SS（`0:03`）。"
+                            ),
+                        },
+                        "action_id": {
+                            "type": "string",
+                            "enum": ["none", *(action_ids or [])],
+                            "description": (
+                                "只有這顆必須讓素材清單中的具名動作完整做完時，"
+                                "才逐字填其 action id；其他一律填 none。"
+                                "附近剛好有動作不代表這顆選了它。"
+                            ),
+                        },
+                        "action_treatment": {
+                            "type": "string",
+                            "enum": ["none", "complete_here", "after_completion"],
+                            "description": (
+                                "none：這顆不以具名動作為切點，action_id 也必須是 none。"
+                                "complete_here：從動作開始看到動作完整結束，seconds_needed "
+                                "必須容得下整段，系統不會事後偷偷延長。after_completion："
+                                "動作已完成後才進鏡，保留結果／停頓，不重播動作。"
                             ),
                         },
                         "audio_role": {
@@ -2063,6 +2477,7 @@ def _selection_schema(
                                     },
                                     "seconds": {
                                         "type": "string",
+                                        "pattern": r"^\d{1,3}:[0-5]\d(?:\.\d+)?$",
                                         "description": (
                                             "在這個落點停多久再走。填 0 讓本機"
                                             "用一個「還算停頓」的下限；要人讀懂"
@@ -2089,6 +2504,8 @@ def _selection_schema(
                                             "為它把畫面縮小塞進去。要它成真得"
                                             "靠規劃——兩個落點帶過去、換一顆更"
                                             "窄的素材、或填 false 接受局部。"
+                                            "partial_reveal 或 transition_pass "
+                                            "明確允許局部，因此只能填 false。"
                                         ),
                                     },
                                     "presentation_intent": {
@@ -2102,7 +2519,9 @@ def _selection_schema(
                                         ],
                                         "description": (
                                             "宣告這個落點對觀眾承諾什麼。"
-                                            "complete_hold 要完整看見；"
+                                            "complete_hold 是完整到達並穩定停住，"
+                                            "不代表必須看見整個物件；是否可裁掉"
+                                            "邊緣由 must_be_whole 另外回答。"
                                             "centered_hold 要有穩定可辨識落點；"
                                             "reveal_endpoint 是運鏡最後真的要到達的主體；"
                                             "partial_reveal 明確允許主體只進出一部分；"
@@ -2283,6 +2702,100 @@ def _selection_schema(
     return result
 
 
+def _selection_patch_schema(
+    span_ids: list[str], shot_indices: list[int], *,
+    grounding_target_ids: list[str] | None = None,
+    commitment_ids: list[str] | None = None,
+    action_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """A shallow provider contract that cannot rewrite the whole edit."""
+
+    full = _selection_schema(
+        span_ids,
+        grounding_target_ids=grounding_target_ids,
+        commitment_ids=commitment_ids,
+        action_ids=action_ids,
+    )
+    shot = copy.deepcopy(full["properties"]["shots"]["items"])
+    shot["required"] = ["shot_index", *shot["required"]]
+    shot["properties"] = {
+        "shot_index": {"type": "integer", "enum": shot_indices},
+        **shot["properties"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["replacements", "repair_summary"],
+        "properties": {
+            "replacements": {
+                "type": "array",
+                "minItems": len(shot_indices),
+                "maxItems": len(shot_indices),
+                "items": shot,
+            },
+            "repair_summary": {"type": "string"},
+        },
+    }
+
+
+def _merge_selection_patch(
+    base: dict[str, Any], patch: dict[str, Any], *,
+    allowed_indices: set[int], offered: list[Any],
+    source_motion: dict[str, str],
+    commitment_spans: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
+    """Normalize authorized replacements and preserve every other byte."""
+
+    raw = list(patch.get("replacements") or [])
+    indices = [int(one.get("shot_index", -1)) for one in raw]
+    if len(indices) != len(set(indices)) or set(indices) != allowed_indices:
+        raise PlannerError(
+            "selection patch must replace exactly "
+            + ", ".join(f"k{one:02d}" for one in sorted(allowed_indices))
+        )
+    original_shots = list(base.get("shots") or [])
+    replacements: list[dict[str, Any]] = []
+    for one in raw:
+        index = int(one["shot_index"])
+        if not 0 <= index < len(original_shots):
+            raise PlannerError(f"selection patch index {index} is out of range")
+        replacement = {key: value for key, value in one.items()
+                       if key != "shot_index"}
+        expected_commitment = str(
+            original_shots[index].get("commitment_id") or ""
+        )
+        if str(replacement.get("commitment_id") or "") != expected_commitment:
+            raise PlannerError(
+                f"k{index:02d} patch changed commitment "
+                f"{expected_commitment!r}"
+            )
+        allowed_for_commitment = (
+            commitment_spans.get(expected_commitment)
+            if commitment_spans is not None else None
+        )
+        if (
+            allowed_for_commitment is not None
+            and str(replacement.get("span_id") or "")
+            not in allowed_for_commitment
+        ):
+            raise PlannerError(
+                f"k{index:02d} patch chose span "
+                f"{replacement.get('span_id')!r} outside commitment "
+                f"{expected_commitment!r}"
+            )
+        replacements.append(replacement)
+    normalized = {"shots": replacements}
+    expand_spans(normalized, offered, source_motion=source_motion)
+    merged = copy.deepcopy(base)
+    for raw_one, replacement in zip(raw, normalized["shots"]):
+        merged["shots"][int(raw_one["shot_index"])] = replacement
+    merged.setdefault("duration_repairs", []).append(
+        "Selection patch changed only "
+        + ", ".join(f"k{one:02d}" for one in sorted(allowed_indices))
+    )
+    return merged
+
+
 def _beaten_and_broken(
     direction: dict[str, Any]
 ) -> tuple[dict[str, str], set[str]]:
@@ -2308,6 +2821,190 @@ def _beaten_and_broken(
     return beaten, broken
 
 
+def camera_duration_disagreements(
+    shots: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    material: list[MaterialItem] | tuple[MaterialItem, ...],
+) -> list[str]:
+    """Price Selection's move from this source's measured card geometry.
+
+    Gemini owns the editorial duration and desired rests. Local code owns
+    whether the crop can travel between those named looks at the selected
+    energy in that time. Running this inside Selection's bounded repair loop
+    prevents an impossible answer from becoming the cached EDL.
+    """
+
+    from montagewright.clipcard import find_subject
+    from montagewright.grounding import camera_floor_for
+    from montagewright.schema import reframe_of
+
+    by_source = {item.source_id: item for item in material}
+    faults: list[str] = []
+    for index, shot in enumerate(shots):
+        item = by_source.get(str(shot.get("source_id") or ""))
+        if item is None:
+            continue
+        reframe = reframe_of(shot)
+        if not reframe.looks:
+            continue
+        card = {
+            "subjects": [
+                {
+                    "label": label,
+                    "entity_id": entity_id,
+                    "centre_x": centre_x,
+                    "centre_y": centre_y,
+                    "width": width,
+                    "height": height,
+                    "moves": False,
+                }
+                for (
+                    label, entity_id, centre_x, centre_y, width, height
+                ) in item.subject_geometry
+            ]
+        }
+        measured: list[tuple[float, float, float]] = []
+        for look in reframe.looks:
+            box = find_subject(card, look.at, entity_id=look.entity_id)
+            if box is None:
+                measured = []
+                break
+            crop_width = (
+                min(1.0, max(0.2, box.height / 0.66))
+                if look.framing == "fill" else 1.0
+            )
+            measured.append((box.centre_x, box.centre_y, crop_width))
+        priced = reframe.model_copy(update={"look_boxes": measured})
+        floor = camera_floor_for(priced)
+        seconds = float(shot.get("seconds_needed") or 0.0)
+        if seconds + 1e-6 >= floor:
+            continue
+        evidence = (
+            "measured card positions"
+            if measured and len(measured) == len(reframe.looks)
+            else "conservative estimate because one or more look positions are unknown"
+        )
+        faults.append(
+            f"k{index:02d}: {reframe.camera_move} needs at least "
+            f"{floor:.3f}s from {evidence}, but Selection gave "
+            f"{seconds:.3f}s; lengthen this shot, reduce declared dwell, "
+            "choose a faster justified energy, or choose another feasible treatment"
+        )
+    return faults
+
+
+def repair_camera_rests_to_duration(
+    chosen: dict[str, Any],
+    material: list[MaterialItem] | tuple[MaterialItem, ...],
+) -> list[str]:
+    """Fit preferred look rests inside an otherwise feasible shot.
+
+    Selection owns the edit length and preferred dwell at each landing. The
+    local geometry solver owns travel time. When only preferred dwell is too
+    generous, shorten it while preserving source, commitment, move, energy
+    and total shot length. If travel plus a readable settle at every real
+    stop still cannot fit, leave the answer for bounded Selection repair.
+    """
+
+    from montagewright.capabilities import SETTLE_SECONDS
+    from montagewright.clipcard import find_subject
+    from montagewright.grounding import camera_floor_for
+    from montagewright.schema import looks_of, reframe_of
+
+    by_source = {item.source_id: item for item in material}
+    repairs: list[str] = []
+    for index, shot in enumerate(chosen.get("shots") or []):
+        item = by_source.get(str(shot.get("source_id") or ""))
+        if item is None:
+            continue
+        reframe = reframe_of(shot)
+        if len(reframe.looks) < 2:
+            continue
+        raw_looks = list(shot.get("looks") or [])
+        stop_indices = [
+            at for at, look in enumerate(raw_looks)
+            if str(look.get("presentation_intent") or "")
+            != "transition_pass"
+        ]
+        if len(stop_indices) < 2:
+            continue
+
+        card = {
+            "subjects": [
+                {
+                    "label": label,
+                    "entity_id": entity_id,
+                    "centre_x": centre_x,
+                    "centre_y": centre_y,
+                    "width": width,
+                    "height": height,
+                    "moves": False,
+                }
+                for (
+                    label, entity_id, centre_x, centre_y, width, height
+                ) in item.subject_geometry
+            ]
+        }
+        measured: list[tuple[float, float, float]] = []
+        for look in reframe.looks:
+            box = find_subject(card, look.at, entity_id=look.entity_id)
+            if box is None:
+                measured = []
+                break
+            crop_width = (
+                min(1.0, max(0.2, box.height / 0.66))
+                if look.framing == "fill" else 1.0
+            )
+            measured.append((box.centre_x, box.centre_y, crop_width))
+        priced = reframe.model_copy(update={"look_boxes": measured})
+        floor = camera_floor_for(priced)
+        duration = max(0.0, float(shot.get("seconds_needed") or 0.0))
+        if floor <= duration + 1e-6:
+            continue
+
+        declared = sum(
+            max(0.0, float(raw_looks[at].get("seconds") or 0.0))
+            for at in stop_indices
+        )
+        travel = max(0.0, floor - declared)
+        available_rests = duration - travel
+        minimum_rests = SETTLE_SECONDS * len(stop_indices)
+        if available_rests < minimum_rests - 1e-6:
+            continue
+
+        flexible = [
+            max(
+                0.0,
+                float(raw_looks[at].get("seconds") or 0.0) - SETTLE_SECONDS,
+            )
+            for at in stop_indices
+        ]
+        extra = max(0.0, available_rests - minimum_rests)
+        weight = sum(flexible)
+        before = [
+            float(raw_looks[at].get("seconds") or 0.0)
+            for at in stop_indices
+        ]
+        for position, at in enumerate(stop_indices):
+            share = (
+                extra * flexible[position] / weight
+                if weight > 1e-9 else extra / len(stop_indices)
+            )
+            raw_looks[at]["seconds"] = SETTLE_SECONDS + share
+
+        trial = priced.model_copy(update={"looks": looks_of(shot)})
+        if camera_floor_for(trial) > duration + 1e-5:
+            for at, seconds in zip(stop_indices, before):
+                raw_looks[at]["seconds"] = seconds
+            continue
+        repairs.append(
+            f"k{index:02d}: kept {reframe.camera_move} and the "
+            f"{duration:.2f}s edit, fitting preferred look rests from "
+            f"{sum(before):.2f}s to {available_rests:.2f}s after measured "
+            "travel time"
+        )
+    return repairs
+
+
 def select_shots(
     material: list[MaterialItem],
     direction: dict[str, Any],
@@ -2321,8 +3018,16 @@ def select_shots(
     music_grid: BeatGrid | None = None,
     commitments: Any | None = None,
     duration_mode: str = "exact",
+    initial_selection: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Usage]:
-    """Stage two: which shots, in what order, and why each one."""
+    """Stage two: which shots, in what order, and why each one.
+
+    ``initial_selection`` is a previously paid answer which a newer local
+    executable audit rejected. It is validated without a model call, then
+    enters the same bounded repair loop with only the failing commitments'
+    material attached. This is how a resume upgrades contracts without
+    paying to rethink the entire cut.
+    """
 
     if client is None:
         client = _default_client()
@@ -2360,6 +3065,18 @@ def select_shots(
         list(grounding_spec.identity_lock.framing.required_target_ids)
         if grounding_spec is not None else []
     )
+    # A coarse screen is allowed to keep identity-negative sources as useful
+    # context.  Once that verdict is still present here, however, a candidate
+    # option may not promise the locked identity from the same source.  Keep
+    # the context source in the material vocabulary, but remove that
+    # impossible source/target pairing from the executable commitment menu.
+    # This also gives a surviving alternate primary status in Selection so a
+    # repair is not nudged back toward the locally disproved original primary.
+    # The screen is a coarse recall pass, not final authority.  Keep its
+    # disagreement visible but do not remove a story option or stop the paid
+    # edit before the exact final-window check can run.  A failed exact check
+    # becomes a needs_review draft shot in the caller.
+    selection_commitments = commitments
     audio_span_sources = {
         line.split("`", 2)[1]: item.source_id
         for item in usable for line in item.speech
@@ -2413,10 +3130,10 @@ def select_shots(
                     )
                     + (
                         "## 已驗證的內容承諾候選\n\n"
-                        + describe_commitments(commitments)
+                        + describe_commitments(selection_commitments)
                         + "\n\n每顆必須引用 commitment_id，且只能選該承諾列出的"
                         " span。先履約，再用音樂與原生／虛擬運鏡安排節奏。\n\n"
-                        if commitments is not None else ""
+                        if selection_commitments is not None else ""
                     )
                     + graphic_copy
                     +
@@ -2438,9 +3155,9 @@ def select_shots(
         )
     selection_input += _attach_material(usable, cache, client, beaten)
 
-    schema = structured_json(
-        _selection_schema(
-            [one.span_id for one in offered],
+    def response_schema(span_ids: list[str]) -> dict[str, Any]:
+        return structured_json(_selection_schema(
+            span_ids,
             min_shots=min_shots,
             max_shots=max_shots,
             graphic_candidate_ids=graphic_candidate_ids,
@@ -2448,38 +3165,207 @@ def select_shots(
             grounding_target_ids=grounding_target_ids,
             commitment_ids=(
                 list(dict.fromkeys(
-                    option.commitment_id for option in commitments.options
-                )) if commitments is not None else None
+                    option.commitment_id
+                    for option in selection_commitments.options
+                )) if selection_commitments is not None else None
             ),
-        )
-    )
+            action_ids=list(dict.fromkeys(
+                action_id for item in usable for action_id in item.action_ids
+            )),
+        ))
+
+    schema = response_schema([one.span_id for one in offered])
     usage_total = Usage(0, 0, 0)
+    commitment_span_ids: dict[str, set[str]] = {}
+    if selection_commitments is not None:
+        for option in selection_commitments.options:
+            commitment_span_ids.setdefault(
+                option.commitment_id, set()
+            ).add(option.span_id)
+
+    if initial_selection is not None:
+        # A paid, normalized Selection already exists. Give the model the
+        # complete editorial context, but make the provider grammar capable
+        # of returning only the named failing shots. Local merge is the sole
+        # writer of the complete answer, so prompt drift cannot alter a good
+        # neighbour, duplicate a commitment, or drop a required beat.
+        base = copy.deepcopy(initial_selection)
+        patch_faults = audit_cached_selection(
+            base, material, direction,
+            commitments=selection_commitments,
+            grounding_spec=grounding_spec,
+            duration_mode=duration_mode,
+        )
+        for _patch_attempt in range(2):
+            if not patch_faults:
+                return base, usage_total
+            failing_indices = {
+                int(found.group(1))
+                for fault in patch_faults
+                for found in [re.search(r"(?:^k|^shot )(\d+)", fault)]
+                if found is not None
+            }
+            if not failing_indices:
+                raise SelectionUnrenderable(
+                    "selection needs a global structural decision rather "
+                    "than a shot patch: " + "; ".join(patch_faults),
+                    draft=base, faults=patch_faults,
+                )
+            failing_commitments = {
+                str(base["shots"][index].get("commitment_id") or "")
+                for index in failing_indices
+                if 0 <= index < len(base.get("shots") or [])
+            }
+            allowed_span_ids = {
+                option.span_id for option in selection_commitments.options
+                if option.commitment_id in failing_commitments
+            } if selection_commitments is not None else {
+                span.span_id for span in offered
+            }
+            scoped_material = [
+                replace(item, spans=tuple(
+                    span for span in item.spans
+                    if span.span_id in allowed_span_ids
+                ))
+                for item in usable
+                if any(span.span_id in allowed_span_ids for span in item.spans)
+            ]
+            patch_schema = structured_json(_selection_patch_schema(
+                sorted(allowed_span_ids), sorted(failing_indices),
+                grounding_target_ids=grounding_target_ids,
+                commitment_ids=list(dict.fromkeys(
+                    option.commitment_id
+                    for option in selection_commitments.options
+                )) if selection_commitments is not None else None,
+                action_ids=list(dict.fromkeys(
+                    action_id for item in usable for action_id in item.action_ids
+                )),
+            ))
+            patch_input = [selection_input[0], {
+                "type": "text",
+                "text": (
+                    "你看得到完整方向、音樂與上一版完整時間軸，但 response "
+                    "schema 只允許回傳指定鏡頭的 replacements。不要回傳完整 "
+                    "Selection。每個 replacement 必須維持該 shot 原本的 "
+                    "commitment_id；優先同長替換，讓完整影片總長、順序與其他 "
+                    "shots 完全不變。\n\n## 本機執行錯誤\n- "
+                    + "\n- ".join(patch_faults)
+                    + "\n\n## 不可修改的完整 Selection\n"
+                    + json.dumps(base, ensure_ascii=False, sort_keys=True)
+                    + "\n\n## 這次可用候選\n"
+                    + _describe_material(scoped_material)
+                ),
+            }] + _attach_material(scoped_material, cache, client, beaten)
+            interaction = ask(
+                client,
+                model=SELECTION_PATCH_MODEL_ID,
+                store=False,
+                input=patch_input,
+                generation_config={
+                    "thinking_level": THINKING_HIGH,
+                    "max_output_tokens": MAX_OUTPUT_TOKENS,
+                },
+                response_format=patch_schema,
+                ledger=ledger,
+                budget_stage="selection",
+            )
+            used = Usage.from_interaction(interaction)
+            usage_total = Usage(
+                usage_total.input_tokens + used.input_tokens,
+                usage_total.output_tokens + used.output_tokens,
+                usage_total.thought_tokens + used.thought_tokens,
+            )
+            try:
+                base = _merge_selection_patch(
+                    base, _parse(interaction, what="selection shot patch"),
+                    allowed_indices=failing_indices,
+                    offered=offered,
+                    source_motion={
+                        item.source_id: item.camera_motion for item in usable
+                    },
+                    commitment_spans=commitment_span_ids,
+                )
+            except PlannerError as error:
+                patch_faults = [str(error)]
+                continue
+            base.setdefault("duration_repairs", []).extend(
+                repair_single_look_hold_overflow(base)
+            )
+            base.setdefault("duration_repairs", []).extend(
+                repair_camera_rests_to_duration(base, usable)
+            )
+            patch_faults = audit_cached_selection(
+                base, material, direction,
+                commitments=selection_commitments,
+                grounding_spec=grounding_spec,
+                duration_mode=duration_mode,
+            )
+        raise SelectionUnrenderable(
+            "selection shot patch remained structurally unrenderable: "
+            + "; ".join(patch_faults),
+            draft=base, faults=patch_faults,
+        )
+
     chosen: dict[str, Any] = {}
     faults: list[str] = []
+    identity_advisories: list[str] = []
     attempt_input = selection_input
+    attempt_schema = schema
+    repair_excluded_sources: set[str] = set()
+    pending_initial = copy.deepcopy(initial_selection)
+    pending_patch_base: dict[str, Any] | None = None
+    pending_patch_indices: set[int] = set()
     for attempt in range(3):
-        interaction = ask(
-            client,
-            model=MODEL_ID,
-            store=False,
-            input=attempt_input,
-            generation_config={
-                "thinking_level": THINKING_HIGH,
-                "max_output_tokens": MAX_OUTPUT_TOKENS,
-            },
-            response_format=schema,
-            ledger=ledger,
-            budget_stage="selection",
-        )
-        used = Usage.from_interaction(interaction)
-        usage_total = Usage(
-            usage_total.input_tokens + used.input_tokens,
-            usage_total.output_tokens + used.output_tokens,
-            usage_total.thought_tokens + used.thought_tokens,
-        )
-        chosen = _parse(interaction, what="selection pass")
+        validating_previous = pending_initial is not None
+        if validating_previous:
+            assert pending_initial is not None
+            chosen = pending_initial
+            pending_initial = None
+        else:
+            interaction = ask(
+                client,
+                model=MODEL_ID,
+                store=False,
+                input=attempt_input,
+                generation_config={
+                    "thinking_level": THINKING_HIGH,
+                    "max_output_tokens": MAX_OUTPUT_TOKENS,
+                },
+                response_format=attempt_schema,
+                ledger=ledger,
+                budget_stage="selection",
+            )
+            used = Usage.from_interaction(interaction)
+            usage_total = Usage(
+                usage_total.input_tokens + used.input_tokens,
+                usage_total.output_tokens + used.output_tokens,
+                usage_total.thought_tokens + used.thought_tokens,
+            )
+            parsed = _parse(
+                interaction,
+                what=(
+                    "selection shot patch"
+                    if pending_patch_base is not None
+                    else "selection pass"
+                ),
+            )
+            if pending_patch_base is not None:
+                chosen = _merge_selection_patch(
+                    pending_patch_base, parsed,
+                    allowed_indices=pending_patch_indices,
+                    offered=offered,
+                    source_motion={
+                        item.source_id: item.camera_motion for item in usable
+                    },
+                    commitment_spans=commitment_span_ids,
+                )
+                pending_patch_base = None
+                pending_patch_indices = set()
+            else:
+                chosen = parsed
         shot_count = len(chosen.get("shots") or [])
         faults = []
+        identity_advisories = []
         if (
             (min_shots is not None and shot_count < min_shots)
             or (max_shots is not None and shot_count > max_shots)
@@ -2487,11 +3373,24 @@ def select_shots(
             faults.append(
                 f"shot count {shot_count} is outside {min_shots}–{max_shots}"
             )
-        expand_spans(
-            chosen, offered,
-            source_motion={item.source_id: item.camera_motion for item in usable},
+        faults.extend(selection_clock_disagreements(chosen.get("shots") or []))
+        if not validating_previous:
+            expand_spans(
+                chosen, offered,
+                source_motion={
+                    item.source_id: item.camera_motion for item in usable
+                },
+            )
+        chosen.setdefault("duration_repairs", []).extend(
+            repair_single_look_hold_overflow(chosen)
+        )
+        chosen.setdefault("duration_repairs", []).extend(
+            repair_camera_rests_to_duration(chosen, usable)
         )
         faults.extend(look_contract_disagreements(chosen.get("shots") or []))
+        faults.extend(action_contract_disagreements(
+            chosen.get("shots") or [], usable
+        ))
         # Material cards already retain the source moment at which a named
         # subject was actually seen.  Treat a look that the chosen source
         # window cannot reach as a structural selection fault, not a warning
@@ -2500,13 +3399,16 @@ def select_shots(
         # the window and mark it partial_reveal/transition_pass.  It only
         # rejects promising a different moment of the take.
         faults.extend(frame_disagreements(chosen.get("shots") or [], material))
-        if commitments is not None:
+        faults.extend(camera_duration_disagreements(
+            chosen.get("shots") or [], usable
+        ))
+        if selection_commitments is not None:
             from montagewright.candidate_commitments import (
                 validate_selection_commitments,
             )
 
             faults.extend(validate_selection_commitments(
-                chosen.get("shots") or [], commitments
+                chosen.get("shots") or [], selection_commitments
             ))
         if grounding_target_ids:
             known_grounding_targets = set(grounding_target_ids)
@@ -2521,13 +3423,14 @@ def select_shots(
                             f"k{shot_index:02d} look {look_index + 1} names "
                             f"unknown grounding entity_id {entity_id!r}"
                         )
-            faults.extend(grounding_target_disagreements(
+            identity_advisories.extend(grounding_target_disagreements(
                 chosen.get("shots") or [], grounding_required_target_ids
             ))
-            faults.extend(context_only_disagreements(
+            identity_advisories.extend(context_only_disagreements(
                 chosen.get("shots") or [], usable, known_grounding_targets
             ))
-        expand_audio_assignments(chosen, audio_span_ids)
+        if not validating_previous:
+            expand_audio_assignments(chosen, audio_span_ids)
         faults.extend(audio_assignment_disagreements(
             chosen.get("shots") or [], usable
         ))
@@ -2586,8 +3489,8 @@ def select_shots(
             selection_coverage_audit,
         )
 
-        chosen["duration_repairs"] = list(
-            repair_bounded_visual_holds(chosen, commitments, usable)
+        chosen.setdefault("duration_repairs", []).extend(
+            repair_bounded_visual_holds(chosen, selection_commitments, usable)
         )
         coverage = selection_coverage_audit(
             chosen, usable, float(direction.get("target_seconds") or 0.0),
@@ -2595,7 +3498,7 @@ def select_shots(
         )
         if duration_mode == "preferred":
             preferred_repairs = repair_preferred_unsupported_time(
-                chosen, coverage, commitments
+                chosen, coverage, selection_commitments
             )
             if preferred_repairs:
                 chosen["duration_repairs"].extend(preferred_repairs)
@@ -2608,7 +3511,38 @@ def select_shots(
         faults.extend(sequence_disagreements(chosen.get("shots") or []))
         if not faults:
             break
-        if attempt == 0:
+        # A text warning cannot remove a span from a structured answer.  The
+        # failed v3 run proved that twice: both repairs chose C8388 again even
+        # after the local identity gate named it.  Once a source has made an
+        # impossible identity claim, remove all of its spans from the repair
+        # grammar.  It remains available to the initial creative pass as
+        # context; only this bounded correction forfeits it.  Excluding the
+        # whole source is intentionally stronger than excluding one look,
+        # because the flat provider schema cannot encode a span/entity pair.
+        repair_excluded_sources.update(_context_claiming_source_ids(
+            chosen.get("shots") or [], usable, set(grounding_target_ids)
+        ))
+        if repair_excluded_sources:
+            repair_span_ids = [
+                span.span_id for item in usable
+                if item.source_id not in repair_excluded_sources
+                for span in item.spans
+            ]
+            if not repair_span_ids:
+                raise PlannerError(
+                    "selection exhausted every span while excluding sources "
+                    "that the identity screen found absent: "
+                    + ", ".join(sorted(repair_excluded_sources))
+                )
+            attempt_schema = response_schema(repair_span_ids)
+        exclusion_note = (
+            "\n\n## 本機已從 repair grammar 移除的來源\n"
+            + ", ".join(sorted(repair_excluded_sources))
+            + "。這些來源仍可作環境 context，但這次完整重選不可再引用；"
+            "請改用同 commitment 的可用 alternate。"
+            if repair_excluded_sources else ""
+        )
+        if attempt == 0 and not validating_previous:
             attempt_input = selection_input + [{
                 "type": "text",
                 "text": (
@@ -2618,9 +3552,10 @@ def select_shots(
                     + "\n- ".join(faults)
                     + "\n\n上一版答案：\n"
                     + json.dumps(chosen, ensure_ascii=False)
+                    + exclusion_note
                 ),
             }]
-        elif attempt == 1:
+        else:
             # The first repair has already watched the same full pool. If it
             # is still structurally wrong, replaying every proxy, reference
             # image and the music a third time is expensive and has twice
@@ -2635,19 +3570,23 @@ def select_shots(
                 for found in [re.search(r"(?:^k|^shot )(\d+)", fault)]
                 if found is not None
             }
+            unscoped_faults = [
+                fault for fault in faults
+                if re.search(r"(?:^k|^shot )(\d+)", fault) is None
+            ]
             allowed_span_ids: set[str] = set()
-            if commitments is not None:
+            if selection_commitments is not None:
                 failing_commitments = {
                     str(chosen["shots"][index].get("commitment_id") or "")
                     for index in failing_indices
                     if 0 <= index < len(chosen.get("shots") or [])
                 }
                 allowed_span_ids = {
-                    option.span_id for option in commitments.options
+                    option.span_id for option in selection_commitments.options
                     if option.commitment_id in failing_commitments
+                    and option.span_id.split(":", 1)[0]
+                    not in repair_excluded_sources
                 }
-            from dataclasses import replace
-
             scoped_material = [
                 replace(item, spans=tuple(
                     span for span in item.spans
@@ -2656,28 +3595,74 @@ def select_shots(
                 for item in usable
                 if any(span.span_id in allowed_span_ids for span in item.spans)
             ]
-            attempt_input = [{
-                "type": "text",
-                "text": (
-                    "你只在修正上一版 Selection 的本機執行錯誤。"
-                    "回傳完整 shots/audio_assignments 答案；不可只改理由，"
-                    "不可新增 span 或 commitment。\n\n"
-                    "## 已定方向\n"
-                    + json.dumps(direction, ensure_ascii=False, sort_keys=True)
-                    + (
-                        "\n\n## 已驗證的 commitment 候選\n"
-                        + describe_commitments(commitments)
-                        if commitments is not None else ""
-                    )
-                    + "\n\n## 本機仍無法執行的原因\n- "
-                    + "\n- ".join(faults)
-                    + "\n\n## 上一版完整答案\n"
-                    + json.dumps(chosen, ensure_ascii=False, sort_keys=True)
-                    + "\n\n## 素材文字目錄\n"
-                    + _describe_material(usable)
-                    + "\n\n只有上述錯誤鏡頭可改；其他 shots 必須原樣保留。"
-                ),
-            }] + _attach_material(scoped_material, cache, client, beaten)
+            if failing_indices and not unscoped_faults and allowed_span_ids:
+                # The final repair is a patch, not another complete timeline.
+                # A complete response constrained to only the failing spans
+                # made every healthy shot choose one of those spans, which is
+                # how a single C8953 window was duplicated across unrelated
+                # commitments. Local merge is the only writer of neighbours.
+                pending_patch_base = copy.deepcopy(chosen)
+                pending_patch_indices = set(failing_indices)
+                attempt_schema = structured_json(_selection_patch_schema(
+                    sorted(allowed_span_ids), sorted(failing_indices),
+                    grounding_target_ids=grounding_target_ids,
+                    commitment_ids=list(dict.fromkeys(
+                        option.commitment_id
+                        for option in selection_commitments.options
+                    )) if selection_commitments is not None else None,
+                    action_ids=list(dict.fromkeys(
+                        action_id for item in usable
+                        for action_id in item.action_ids
+                    )),
+                ))
+                attempt_input = [selection_input[0], {
+                    "type": "text",
+                    "text": (
+                        "你只在修正上一版 Selection 的本機執行錯誤。"
+                        "response schema 只允許回傳指定鏡頭的 replacements；"
+                        "不要回傳完整 Selection。每個 replacement 必須維持"
+                        "原本的 shot_index 與 commitment_id，只能使用該 "
+                        "commitment 的候選 span。其他 shots 由本機原樣保留。"
+                        "\n\n## 本機仍無法執行的原因\n- "
+                        + "\n- ".join(faults)
+                        + "\n\n## 不可修改的完整 Selection\n"
+                        + json.dumps(chosen, ensure_ascii=False, sort_keys=True)
+                        + "\n\n## 這次可用候選\n"
+                        + _describe_material(scoped_material)
+                        + exclusion_note
+                    ),
+                }] + _attach_material(
+                    scoped_material, cache, client, beaten
+                )
+            else:
+                # Global faults (for example audio assignment structure) need
+                # a complete answer. Keep the full original span grammar;
+                # narrowing a full response to failing spans is contradictory.
+                attempt_schema = schema
+                attempt_input = [{
+                    "type": "text",
+                    "text": (
+                        "你只在修正上一版 Selection 的本機執行錯誤。"
+                        "回傳完整 shots/audio_assignments 答案；不可只改理由，"
+                        "不可新增 span 或 commitment。\n\n"
+                        "## 已定方向\n"
+                        + json.dumps(
+                            direction, ensure_ascii=False, sort_keys=True
+                        )
+                        + (
+                            "\n\n## 已驗證的 commitment 候選\n"
+                            + describe_commitments(selection_commitments)
+                            if selection_commitments is not None else ""
+                        )
+                        + "\n\n## 本機仍無法執行的原因\n- "
+                        + "\n- ".join(faults)
+                        + "\n\n## 上一版完整答案\n"
+                        + json.dumps(
+                            chosen, ensure_ascii=False, sort_keys=True
+                        )
+                        + exclusion_note
+                    ),
+                }] + _attach_material(usable, cache, client, beaten)
     if faults:
         # A look nobody can reach is one look, not the film. Two repairs
         # have already been spent asking for a different plan; dropping the
@@ -2710,23 +3695,178 @@ def select_shots(
             faults = frame_disagreements(chosen.get("shots") or [], material)
             chosen.setdefault("plan_disagreements", []).extend(salvaged)
     if faults:
-        raise PlannerError(
+        raise SelectionUnrenderable(
             "selection remained structurally unrenderable after two repairs: "
-            + "; ".join(faults)
+            + "; ".join(faults),
+            draft=chosen,
+            faults=faults,
         )
     chosen["frame_disagreements"] = frame_disagreements(
         chosen.get("shots") or [], material
     )
+    # Identity evidence is checked exactly on the final source window later.
+    # A coarse-screen disagreement must be visible, but it must not consume
+    # two Selection repairs or prevent a reviewable draft from rendering.
+    chosen.setdefault("plan_disagreements", []).extend(identity_advisories)
     return chosen, usage_total
+
+
+def audit_cached_selection(
+    chosen: dict[str, Any],
+    material: list[MaterialItem],
+    direction: dict[str, Any],
+    *,
+    commitments: Any | None = None,
+    grounding_spec: Any | None = None,
+    duration_mode: str = "exact",
+) -> list[str]:
+    """Run fresh Selection's executable gates on an already-normalized cache.
+
+    A fresh answer reaches disk only after ``expand_spans`` and
+    ``expand_audio_assignments``.  Repeating either transform on resume can
+    erase the original clock or subtly change an accepted answer, so this
+    audit is deliberately read-only.  Validators that calculate derived
+    coverage receive a private copy because that calculation annotates its
+    input with ``coverage_claim_seconds``.
+    """
+
+    _, broken = _beaten_and_broken(direction)
+    usable = [item for item in material if item.source_id not in broken]
+    offered = [span for item in usable for span in item.spans]
+    min_shots, max_shots = _shot_count_bounds(direction, len(offered))
+    shots = chosen.get("shots") or []
+    faults: list[str] = []
+
+    def check(label: str, read: Any) -> None:
+        try:
+            faults.extend(read())
+        except (KeyError, TypeError, ValueError) as error:
+            faults.append(
+                f"cached selection {label} validator could not read the "
+                f"answer: {error}"
+            )
+
+    if (
+        (min_shots is not None and len(shots) < min_shots)
+        or (max_shots is not None and len(shots) > max_shots)
+    ):
+        faults.append(
+            f"shot count {len(shots)} is outside {min_shots}–{max_shots}"
+        )
+    check("clock", lambda: selection_clock_disagreements(shots))
+    check("look", lambda: look_contract_disagreements(shots))
+    check("action", lambda: action_contract_disagreements(shots, usable))
+    check("frame", lambda: frame_disagreements(shots, material))
+    check(
+        "camera duration",
+        lambda: camera_duration_disagreements(shots, usable),
+    )
+    if commitments is not None:
+        from montagewright.candidate_commitments import (
+            validate_selection_commitments,
+        )
+
+        check(
+            "commitment",
+            lambda: validate_selection_commitments(shots, commitments),
+        )
+
+    grounding_target_ids = (
+        [
+            target.target_id
+            for target in grounding_spec.identity_lock.identity.targets
+        ]
+        if grounding_spec is not None else []
+    )
+    if grounding_target_ids:
+        known = set(grounding_target_ids)
+        for shot_index, shot in enumerate(shots):
+            for look_index, look in enumerate(shot.get("looks") or []):
+                entity_id = look.get("entity_id")
+                if (
+                    entity_id not in {None, "", "none"}
+                    and entity_id not in known
+                ):
+                    faults.append(
+                        f"k{shot_index:02d} look {look_index + 1} names "
+                        f"unknown grounding entity_id {entity_id!r}"
+                    )
+
+    audio_span_sources = {
+        line.split("`", 2)[1]: item.source_id
+        for item in usable for line in item.speech
+        if line.startswith("`") and "`" in line[1:]
+    }
+    check(
+        "audio structure",
+        lambda: audio_assignment_structure_disagreements(
+            chosen, list(audio_span_sources)
+        ),
+    )
+    check("audio", lambda: audio_assignment_disagreements(shots, usable))
+    if (
+        audio_span_sources
+        and not (chosen.get("audio_assignments") or [])
+        and any(str(shot.get("picture_role") or "") == "speaker" for shot in shots)
+    ):
+        faults.append(
+            "speaker-led pictures use transcribed content but "
+            "audio_assignments is empty; choose canonical transcript "
+            "span IDs and set picture source audio to discard"
+        )
+    assignments_at: dict[int, list[dict[str, Any]]] = {}
+    for assignment in chosen.get("audio_assignments") or []:
+        try:
+            shot_index = int(assignment.get("starts_at_shot_index", -1))
+        except (TypeError, ValueError):
+            continue
+        assignments_at.setdefault(shot_index, []).append(assignment)
+    for shot_index, shot in enumerate(shots):
+        if str(shot.get("picture_role") or "") != "speaker":
+            continue
+        starts = assignments_at.get(shot_index) or []
+        if len(starts) > 1:
+            faults.append(
+                f"k{shot_index:02d}: speaker picture has multiple "
+                "narrative assignments starting on this shot"
+            )
+            continue
+        if not starts:
+            continue
+        span_id = str(starts[0].get("audio_span_id") or "")
+        voice_source = audio_span_sources.get(span_id)
+        if voice_source != str(shot.get("source_id") or ""):
+            faults.append(
+                f"k{shot_index:02d}: speaker picture source "
+                f"{shot.get('source_id')} cannot lip-sync narrative "
+                f"{span_id} from {voice_source}; use the same source or "
+                "change picture_role to reaction/illustrative_broll"
+            )
+
+    from montagewright.coverage import selection_coverage_audit
+
+    coverage_copy = copy.deepcopy(chosen)
+    check(
+        "coverage",
+        lambda: list(selection_coverage_audit(
+            coverage_copy,
+            usable,
+            float(direction.get("target_seconds") or 0.0),
+            hard_target=duration_mode == "exact",
+        ).faults),
+    )
+    check("sequence", lambda: sequence_disagreements(shots))
+    return list(dict.fromkeys(faults))
 
 
 def look_contract_disagreements(shots: list[dict[str, Any]]) -> list[str]:
     """Run the executable Look contract while Selection can still repair it.
 
     JSON Schema can require every field but cannot express relationships such
-    as ``complete_hold`` requiring ``must_be_whole``. Delaying the canonical
-    Pydantic validation until EDL construction turns a repairable provider
-    answer into a local crash after the paid selection call.
+    as a deliberately partial pass also promising that the whole subject must
+    remain visible. Delaying the canonical Pydantic validation until EDL
+    construction turns a repairable provider answer into a local crash after
+    the paid selection call.
     """
 
     faults: list[str] = []
@@ -2735,6 +3875,115 @@ def look_contract_disagreements(shots: list[dict[str, Any]]) -> list[str]:
             looks_of(shot)
         except (TypeError, ValueError) as error:
             faults.append(f"k{index:02d} has an invalid look contract: {error}")
+    return faults
+
+
+def selection_clock_disagreements(
+    shots: list[dict[str, Any]],
+) -> list[str]:
+    """Reject malformed model clocks before normalization can erase the cause."""
+
+    from montagewright.spans import seconds_of
+
+    faults: list[str] = []
+
+    def read(value: Any, *, positive: bool) -> bool:
+        if isinstance(value, str) and ":" not in value:
+            return False
+        parsed = seconds_of(value)
+        return parsed is not None and (parsed > 0.0 if positive else parsed >= 0.0)
+
+    for index, shot in enumerate(shots):
+        if not read(shot.get("start_offset_seconds"), positive=False):
+            faults.append(f"k{index:02d} has invalid MM:SS start_offset_seconds")
+        if not read(shot.get("seconds_needed"), positive=True):
+            faults.append(f"k{index:02d} has invalid or zero MM:SS seconds_needed")
+        for look_index, look in enumerate(shot.get("looks") or []):
+            if not read(look.get("seconds"), positive=False):
+                faults.append(
+                    f"k{index:02d} look {look_index + 1} has invalid MM:SS seconds"
+                )
+    return faults
+
+
+def action_contract_disagreements(
+    shots: list[dict[str, Any]], material: "list[MaterialItem]",
+) -> list[str]:
+    """Validate the selected action treatment before paid Rhythm.
+
+    A Selection duration is a promise, not a hint.  EDL used to silently
+    expand a two-second choice to a fourteen-second card action, leaving
+    Rhythm with an impossible total.  Resolve that contradiction here while
+    Selection can still choose fewer shots or a different treatment.
+    """
+
+    allowed = {
+        item.source_id: set(item.action_ids)
+        for item in material
+    }
+    windows = {
+        item.source_id: {
+            action_id: (float(start), float(end))
+            for action_id, start, end in item.action_windows
+        }
+        for item in material
+    }
+    faults: list[str] = []
+    for index, shot in enumerate(shots):
+        selected = str(shot.get("action_id") or "none")
+        treatment = str(shot.get("action_treatment") or "")
+        source = str(shot.get("source_id") or "")
+        if treatment not in {"none", "complete_here", "after_completion"}:
+            faults.append(f"k{index:02d} has no valid action_treatment")
+            continue
+        if treatment == "none":
+            if selected != "none":
+                faults.append(
+                    f"k{index:02d} selects action {selected!r} but its "
+                    "action_treatment is none"
+                )
+            continue
+        if selected == "none":
+            faults.append(
+                f"k{index:02d} uses {treatment} but selects no action_id"
+            )
+            continue
+        if selected not in allowed.get(source, set()):
+            faults.append(
+                f"k{index:02d} selects action {selected!r}, which is not an "
+                f"action offered by source {source}"
+            )
+            continue
+        boundary = windows.get(source, {}).get(selected)
+        if boundary is None:
+            faults.append(
+                f"k{index:02d} action {selected!r} has no local source-clock boundary"
+            )
+            continue
+        action_start, action_end = boundary
+        seconds = float(shot.get("seconds_needed") or 0.0)
+        usable_from = float(shot.get("usable_from_seconds", 0.0) or 0.0)
+        usable_to = float(
+            shot.get("usable_to_seconds", action_end) or action_end
+        )
+        if treatment == "complete_here":
+            needed = max(0.0, action_end - action_start)
+            if action_start < usable_from - 1e-3 or action_end > usable_to + 1e-3:
+                faults.append(
+                    f"k{index:02d} action {selected!r} cannot complete inside "
+                    "the selected source window"
+                )
+            elif seconds + 1e-3 < needed:
+                faults.append(
+                    f"k{index:02d} gives {seconds:.2f}s to action {selected!r}, "
+                    f"but complete_here needs at least {needed:.2f}s; choose "
+                    "fewer shots, after_completion, or a different action"
+                )
+        elif action_end + seconds > usable_to + 1e-3:
+            faults.append(
+                f"k{index:02d} cannot hold {seconds:.2f}s after action "
+                f"{selected!r} completes at {action_end:.2f}s inside this window"
+            )
     return faults
 
 
@@ -2752,6 +4001,120 @@ def _shot_count_bounds(
     return lower, upper
 
 
+def _identity_windows_for(
+    item: "MaterialItem", target_id: str
+) -> tuple[tuple[float, float], ...] | None:
+    indexed = dict(getattr(item, "identity_windows_by_target", ()) or ())
+    return indexed.get(target_id) if target_id in indexed else None
+
+
+def _material_can_claim_target(
+    item: "MaterialItem", target_id: str, span: Any | None = None
+) -> bool:
+    """Whether this exact target is available throughout an offered span."""
+
+    if target_id in set(getattr(item, "identity_absent_targets", ()) or ()):
+        return False
+    windows = _identity_windows_for(item, target_id)
+    if windows is None or not windows:
+        # No target-specific answer means unscreened/uncertain, which retains
+        # the established fail-open behaviour until exact grounding.
+        return bool(getattr(item, "carries_identity", True))
+    if span is None:
+        return True
+    return any(
+        starts - 1e-6 <= span.starts_seconds
+        and span.ends_seconds <= ends + 1e-6
+        for starts, ends in windows
+    )
+
+
+def _context_claiming_source_ids(
+    shots: list[dict[str, Any]],
+    material: "list[MaterialItem]",
+    grounding_target_ids: set[str],
+) -> set[str]:
+    """Return identity-negative sources currently asked to depict a lock."""
+
+    by_source = {item.source_id: item for item in material}
+    by_span = {span.span_id: span for item in material for span in item.spans}
+    claimed: set[str] = set()
+    for shot in shots:
+        source = str(
+            shot.get("source_id")
+            or str(shot.get("span_id") or "").split(":", 1)[0]
+        )
+        item = by_source.get(source)
+        if item is None:
+            continue
+        span = by_span.get(str(shot.get("span_id") or ""))
+        for look in shot.get("looks") or []:
+            target_id = str(look.get("entity_id") or "").strip()
+            if target_id in grounding_target_ids and not _material_can_claim_target(
+                item, target_id, span
+            ):
+                claimed.add(source)
+                break
+    return claimed
+
+
+def _commitments_without_context_claims(
+    commitments: Any | None,
+    material: "list[MaterialItem]",
+    grounding_target_ids: set[str],
+) -> Any | None:
+    """Prune locally impossible identity options before paid Selection.
+
+    A context-only source remains useful material.  Only an option that binds
+    a locked target to that source is impossible.  If its primary is removed,
+    promote the first surviving alternate so the textual menu does not steer
+    a repair back toward the rejected source.  A required commitment with no
+    surviving option is exhausted locally and must not spend a Selection call.
+    """
+
+    if commitments is None or not grounding_target_ids:
+        return commitments
+    item_by_source = {item.source_id: item for item in material}
+    span_by_id = {span.span_id: span for item in material for span in item.spans}
+    grouped: dict[str, list[Any]] = {}
+    order: list[str] = []
+    for option in commitments.options:
+        if option.commitment_id not in grouped:
+            order.append(option.commitment_id)
+            grouped[option.commitment_id] = []
+        span = span_by_id.get(option.span_id)
+        source = span.source_id if span is not None else option.span_id.split(":", 1)[0]
+        item = item_by_source.get(source)
+        if (
+            option.target_id in grounding_target_ids
+            and item is not None
+            and not _material_can_claim_target(item, option.target_id, span)
+        ):
+            continue
+        grouped[option.commitment_id].append(option)
+
+    required = set(commitments.required_ids)
+    exhausted = [one for one in order if one in required and not grouped[one]]
+    if exhausted:
+        raise PlannerError(
+            "required commitments have no identity-capable primary or "
+            "alternate after the local screen: " + ", ".join(exhausted)
+        )
+
+    options: list[Any] = []
+    for commitment_id in order:
+        surviving = grouped[commitment_id]
+        if not surviving:
+            continue
+        if not any(one.tier == "primary" for one in surviving):
+            surviving = [
+                surviving[0].model_copy(update={"tier": "primary"}),
+                *surviving[1:],
+            ]
+        options.extend(surviving)
+    return commitments.model_copy(update={"options": tuple(options)})
+
+
 def context_only_disagreements(
     shots: list[dict[str, Any]],
     material: "list[MaterialItem]",
@@ -2767,23 +4130,23 @@ def context_only_disagreements(
     with the frames judged and nothing in them.
     """
 
-    context = {
-        item.source_id for item in material
-        if not getattr(item, "carries_identity", True)
-    }
-    if not context:
-        return []
+    by_source = {item.source_id: item for item in material}
+    by_span = {span.span_id: span for item in material for span in item.spans}
     notes: list[str] = []
     for index, shot in enumerate(shots):
         source = str(
             shot.get("source_id")
             or str(shot.get("span_id") or "").split(":")[0]
         )
-        if source not in context:
+        item = by_source.get(source)
+        if item is None:
             continue
+        span = by_span.get(str(shot.get("span_id") or ""))
         for look in shot.get("looks") or []:
             entity = str(look.get("entity_id") or "").strip()
-            if entity in grounding_target_ids:
+            if entity in grounding_target_ids and not _material_can_claim_target(
+                item, entity, span
+            ):
                 notes.append(
                     f"k{index:02d} looks at {entity} in {source}, which the "
                     "identity screen found it absent from; use this source "
@@ -2865,33 +4228,50 @@ def expand_audio_assignments(
 
     from montagewright.spans import seconds_of
 
-    offered = set(offered_ids)
-    shots = chosen.get("shots") or []
+    faults = audio_assignment_structure_disagreements(chosen, offered_ids)
+    if faults:
+        raise PlannerError(faults[0])
     assignments = chosen.get("audio_assignments") or []
-    seen: set[str] = set()
     for index, assignment in enumerate(assignments):
-        span_id = str(assignment.get("audio_span_id") or "")
-        if span_id not in offered:
-            raise PlannerError(f"audio assignment names unknown span {span_id!r}")
-        if span_id in seen:
-            raise PlannerError(f"audio span {span_id} was assigned more than once")
-        seen.add(span_id)
-        shot_index = int(assignment.get("starts_at_shot_index", -1))
-        if not 0 <= shot_index < len(shots):
-            raise PlannerError(
-                f"audio assignment {span_id} starts at missing shot {shot_index}"
-            )
         assignment["offset_seconds"] = seconds_of(
             assignment.get("offset_seconds")
         ) or 0.0
         assignment["audio_id"] = f"a{index:02d}"
+
+
+def audio_assignment_structure_disagreements(
+    chosen: dict[str, Any], offered_ids: list[str]
+) -> list[str]:
+    """Read-only half of audio expansion, shared with cache validation."""
+
+    offered = set(offered_ids)
+    shots = chosen.get("shots") or []
+    assignments = chosen.get("audio_assignments") or []
+    seen: set[str] = set()
+    faults: list[str] = []
+    for assignment in assignments:
+        span_id = str(assignment.get("audio_span_id") or "")
+        if span_id not in offered:
+            faults.append(f"audio assignment names unknown span {span_id!r}")
+        if span_id in seen:
+            faults.append(f"audio span {span_id} was assigned more than once")
+        seen.add(span_id)
+        try:
+            shot_index = int(assignment.get("starts_at_shot_index", -1))
+        except (TypeError, ValueError):
+            shot_index = -1
+        if not 0 <= shot_index < len(shots):
+            faults.append(
+                f"audio assignment {span_id} starts at missing shot {shot_index}"
+            )
     if assignments and any(
         str(shot.get("audio_role")) == "narrative" for shot in shots
     ):
-        raise PlannerError(
+        faults.append(
             "narrative audio is duplicated: use top-level audio_assignments "
             "and set picture-shot source audio to discard"
         )
+    return faults
 
 
 def expand_spans(
@@ -3002,11 +4382,16 @@ def frame_disagreements(
         legacy = "camera_intent" not in shot
         intent = camera_intent_of(shot)
         travels = str(shot.get("frame", "")) == "travels"
-        stops = len(shot.get("looks") or [])
-        labels = [str(one.get("at", "")) for one in shot.get("looks") or []]
+        all_looks = list(shot.get("looks") or [])
+        stable_looks = [
+            one for one in all_looks
+            if str(one.get("presentation_intent") or "") != "transition_pass"
+        ]
+        stops = len(stable_looks)
+        labels = [str(one.get("at", "")) for one in stable_looks]
         framings = [
             str(one.get("framing", "thirds"))
-            for one in shot.get("looks") or []
+            for one in stable_looks
         ]
         if legacy:
             if travels and stops < 2:
@@ -3016,6 +4401,14 @@ def frame_disagreements(
         elif intent in {"hold", "use_source_motion", "follow_subject"} and stops != 1:
             off.append(
                 f"k{index:02d} chose {intent} and gave {stops} looks; it needs one"
+            )
+        elif intent == "hold" and any(
+            str(one.get("presentation_intent") or "") == "reveal_endpoint"
+            for one in stable_looks
+        ):
+            off.append(
+                f"k{index:02d} chose hold for a reveal_endpoint; a static "
+                "crop cannot perform the promised reveal"
             )
         elif intent in {"reveal", "compare"} and (
             stops < 2 or len(set(labels)) < 2
@@ -3057,6 +4450,25 @@ def frame_disagreements(
         ).strip():
             off.append(f"k{index:02d} claimed a pacing exception without a reason")
 
+        # A look's seconds are screen time promised to that stop, not a note
+        # for Rhythm to reinterpret.  Selection used to be able to ask for a
+        # three-second shot whose only complete hold lasted 3.5 seconds.  The
+        # contradiction then survived until the rhythm release gate, after
+        # every paid planning decision had already happened.  Transition
+        # passes are deliberately excluded: they are waypoints, not rests.
+        declared_rest = sum(
+            max(0.0, float(one.get("seconds") or 0.0))
+            for one in all_looks
+            if str(one.get("presentation_intent") or "")
+            != "transition_pass"
+        )
+        shot_seconds = max(0.0, float(shot.get("seconds_needed") or 0.0))
+        if declared_rest > shot_seconds + 1e-6:
+            off.append(
+                f"k{index:02d} promises {declared_rest:.2f}s of look holds "
+                f"inside a {shot_seconds:.2f}s shot"
+            )
+
         # A subject named from the whole take, used in a window the take's
         # own camera has travelled away from. Both halves were on record and
         # nothing compared them: a shot asked to sweep across a row of
@@ -3091,6 +4503,42 @@ def frame_disagreements(
                     "is not in this window"
                 )
     return off
+
+
+def repair_single_look_hold_overflow(
+    chosen: dict[str, Any],
+) -> tuple[str, ...]:
+    """Fit one declared hold inside its shot without changing the edit.
+
+    A single look has no allocation decision to make: if Selection asks to
+    hold it longer than the shot exists, the only executable interpretation
+    that preserves the chosen source, commitment and total rhythm is to hold
+    it for the whole shot.  Multi-look shots remain structural repairs because
+    redistributing time between their stops is an editorial decision.
+    """
+
+    repaired: list[str] = []
+    for index, shot in enumerate(chosen.get("shots") or []):
+        stable = [
+            look for look in (shot.get("looks") or [])
+            if str(look.get("presentation_intent") or "")
+            != "transition_pass"
+        ]
+        if len(stable) != 1:
+            continue
+        shot_seconds = max(
+            0.0, float(shot.get("seconds_needed") or 0.0)
+        )
+        declared = max(0.0, float(stable[0].get("seconds") or 0.0))
+        if declared <= shot_seconds + 1e-6:
+            continue
+        stable[0]["seconds"] = round(shot_seconds, 3)
+        repaired.append(
+            f"k{index:02d}: fitted the only look hold from {declared:.2f}s "
+            f"to the shot's {shot_seconds:.2f}s; source, commitment and "
+            "total edit length are unchanged"
+        )
+    return tuple(repaired)
 
 
 def sequence_disagreements(shots: list[dict[str, Any]]) -> list[str]:
@@ -3219,6 +4667,9 @@ def replan_shots(
         [one.span_id for one in offered],
         replace_clip_ids=[f"k{index:02d}" for index, _, _ in failing],
         grounding_target_ids=grounding_target_ids,
+        action_ids=list(dict.fromkeys(
+            action_id for item in usable for action_id in item.action_ids
+        )),
         commitment_ids=list(dict.fromkeys(
             option.commitment_id for option in commitments.options
         )) if commitments is not None else None,
@@ -3247,20 +4698,28 @@ def replan_shots(
             usage_total.thought_tokens + used.thought_tokens,
         )
         again = _parse(interaction, what="replan pass")
+        local_contract_faults = selection_clock_disagreements(
+            again.get("shots") or []
+        )
         expand_spans(
             again, offered,
             source_motion={item.source_id: item.camera_motion for item in usable},
         )
         replacement_shots = again.get("shots") or []
-        if commitments is None:
+        local_contract_faults.extend(action_contract_disagreements(
+            replacement_shots, usable
+        ))
+        if commitments is None and not local_contract_faults:
             break
         from montagewright.candidate_commitments import (
             validate_replacement_commitments,
         )
 
-        commitment_faults = list(validate_replacement_commitments(
-            failing, replacement_shots, commitments
-        ))
+        commitment_faults = list(local_contract_faults)
+        if commitments is not None:
+            commitment_faults.extend(validate_replacement_commitments(
+                failing, replacement_shots, commitments
+            ))
         # The shapes a Look may take are enforced when one is built, which
         # happens long after this call returns -- so a replan that promised
         # a complete hold without asking for the whole subject came back

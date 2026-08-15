@@ -47,12 +47,22 @@ def _two_assets(tmp_path):
 
 
 def _v2_result(item, item_id, spec, video, frame, *, verdict="matched_target"):
+    full = _exact_decision_payload(
+        spec, video, frame, verdict=verdict,
+        candidate_id=item.candidate_id,
+    )
+    semantic = {
+        name: full.get(name, [] if name == "excluded_instances" else None)
+        for name in (
+            "verdict", "confidence", "native_box_yxyx_1000",
+            "visibility_state", "occlusion_state", "touches_frame_edges",
+            "identity_evidence", "exclusion_evidence", "excluded_instances",
+            "reason",
+        )
+    }
     return {
         "item_id": item_id,
-        "decision": _exact_decision_payload(
-            spec, video, frame, verdict=verdict,
-            candidate_id=item.candidate_id,
-        ),
+        **semantic,
     }
 
 
@@ -65,10 +75,44 @@ def test_item_id_disambiguates_same_candidate_and_pts_across_assets(tmp_path):
     assert all(item_id.startswith("xf_") and len(item_id) == 67 for item_id in item_ids)
 
 
-def test_swapped_asset_decisions_are_rejected_per_item(tmp_path):
+def test_v2_provider_schema_stays_at_v1_decision_depth(tmp_path):
+    from montagewright.reference_grounding import (
+        _cross_asset_exact_frame_batch_schema,
+    )
+
+    spec, items, _, _ = _two_assets(tmp_path)
+    item_ids = [item.item_id(spec, "target.primary") for item in items]
+    schema = _cross_asset_exact_frame_batch_schema(
+        "target.primary", item_ids, [item.candidate_id for item in items]
+    )
+    result_item = schema["properties"]["results"]["items"]
+
+    assert "decision" not in result_item["properties"], (
+        "nesting a full decision object caused Interactions to reject the "
+        "response schema before reading any frames"
+    )
+    assert result_item["properties"]["item_id"] == {"type": "string"}, (
+        "long content hashes are locally validated routing keys, not a "
+        "provider enum that spends schema complexity"
+    )
+    assert schema["properties"]["results"]["minItems"] == 1
+    for redundant_echo in (
+        "contract_version", "query_id", "query_lock_sha256",
+        "grounding_spec_sha256", "video_asset_id", "video_sha256",
+        "target_id", "candidate_id", "frame_pts", "frame_time_ms",
+        "frame_sha256", "width", "height",
+    ):
+        assert redundant_echo not in result_item["properties"]
+    assert "excluded_instances" in result_item["required"], (
+        "schema reduction must not hide lookalikes from the local safety gate"
+    )
+
+
+def test_item_id_restores_local_asset_lineage_without_provider_echo(tmp_path):
     spec, items, videos, frames = _two_assets(tmp_path)
     item_ids = [item.item_id(spec, "target.primary") for item in items]
-    # Keep routing ids in place but swap the full immutable decision echoes.
+    # Semantic answers carry no asset echo. item_id routes each answer and
+    # local expected requests restore the immutable source lineage.
     payload = {
         "contract_version": "reference-exact-frame-cross-asset-response-v2",
         "results": [
@@ -82,14 +126,29 @@ def test_swapped_asset_decisions_are_rejected_per_item(tmp_path):
     )
 
     assert protocol == ()
-    assert [outcome.status for outcome in outcomes] == [
-        "retry_required", "retry_required"
+    assert [outcome.status for outcome in outcomes] == ["validated", "validated"]
+    assert [outcome.evaluation.lineage.video_asset_id for outcome in outcomes] == [
+        item.frame.lineage.video_asset_id for item in items
     ]
-    assert all(
-        outcome.failures[0].code == "lineage_mismatch"
-        and "video_asset_id" in outcome.failures[0].fields
-        for outcome in outcomes
+
+
+def test_provider_cannot_add_a_forged_lineage_echo(tmp_path):
+    spec, items, videos, frames = _two_assets(tmp_path)
+    item_id = items[0].item_id(spec, "target.primary")
+    raw = _v2_result(items[0], item_id, spec, videos[0], frames[0])
+    raw["video_asset_id"] = videos[1].asset_id
+    outcomes, _ = validate_cross_asset_exact_frame_payload(
+        {
+            "contract_version": "reference-exact-frame-cross-asset-response-v2",
+            "results": [raw],
+        },
+        spec=spec,
+        target_id="target.primary",
+        items=(items[0],),
     )
+
+    assert outcomes[0].status == "retry_required"
+    assert outcomes[0].failures[0].code == "malformed_result"
 
 
 def test_missing_item_retries_only_that_singleton(tmp_path):

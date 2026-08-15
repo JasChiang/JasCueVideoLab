@@ -258,9 +258,9 @@ class Look(ModelFacing):
             "text, a UI state, a readout. A subject wider than any crop of "
             "its source cannot be whole and still, so this and a single look "
             "is a contradiction local code will report rather than resolve. "
-            "`presentation_intent=complete_hold` promises the whole subject, "
-            "so it requires this to be true; if you do not want to promise "
-            "that, choose another intent rather than leaving this false."
+            "This is independent of whether the camera completes and holds "
+            "on the intended visual beat: a complete hold on a face or phone "
+            "detail may still allow non-essential edges to be cropped."
         ),
     )
     presentation_intent: Literal[
@@ -272,10 +272,11 @@ class Look(ModelFacing):
     ] = Field(
         default="centered_hold",
         description=(
-            "What this look promises to the viewer. complete_hold requires "
-            "the whole subject and therefore `must_be_whole=true` -- pick "
-            "centered_hold instead when the subject need not be complete; "
-            "centered_hold requires a stable recognizable "
+            "What this look promises to the viewer. complete_hold means the "
+            "camera fully arrives and rests long enough to read the intended "
+            "visual beat; it does not by itself require every edge of the "
+            "physical subject to remain visible. `must_be_whole` separately "
+            "answers that spatial constraint. centered_hold requires a stable recognizable "
             "landing; reveal_endpoint is the destination of a move; "
             "partial_reveal and transition_pass explicitly allow an object "
             "to enter, leave, or remain partly outside the frame. This is an "
@@ -285,8 +286,6 @@ class Look(ModelFacing):
 
     @model_validator(mode="after")
     def presentation_matches_whole_promise(self) -> "Look":
-        if self.presentation_intent == "complete_hold" and not self.must_be_whole:
-            raise ValueError("complete_hold requires must_be_whole=true")
         if self.presentation_intent in {"partial_reveal", "transition_pass"} and self.must_be_whole:
             raise ValueError(
                 f"{self.presentation_intent} cannot also promise must_be_whole"
@@ -499,6 +498,33 @@ class ActionContract(Local):
         return max(0.0, self.safe_cut_after_seconds - source_in_seconds)
 
 
+class SourceMotionContract(Local):
+    """A locally measured source move that this shot explicitly keeps whole.
+
+    The editorial choice ``use_source_motion`` says *which treatment* to use;
+    it does not prove how long the move lasts.  This contract carries the
+    measured source-clock interval separately so a nominal shot duration never
+    becomes a motion floor merely because Selection asked for it.
+    """
+
+    motion_role: Literal["authored", "subject_follow"]
+    source_start_seconds: float = Field(ge=0.0)
+    source_complete_seconds: float = Field(gt=0.0)
+    safe_cut_after_seconds: float = Field(gt=0.0)
+    timing_basis: Literal["local_motion_interval"] = "local_motion_interval"
+
+    @model_validator(mode="after")
+    def ordered_source_clock(self) -> "SourceMotionContract":
+        if self.source_complete_seconds <= self.source_start_seconds:
+            raise ValueError("source motion completion must follow its start")
+        if self.safe_cut_after_seconds < self.source_complete_seconds:
+            raise ValueError("source motion safe cut cannot precede completion")
+        return self
+
+    def minimum_duration_from(self, source_in_seconds: float) -> float:
+        return max(0.0, self.safe_cut_after_seconds - source_in_seconds)
+
+
 class Clip(ModelFacing):
     """One shot. Times are approximate; grounding snaps them."""
 
@@ -591,6 +617,13 @@ class Clip(ModelFacing):
         description=(
             "Local action-completion obligations for this selected source "
             "window. Gemini never authors these resolved seconds."
+        ),
+    )
+    source_motion_contracts: list[SourceMotionContract] = Field(
+        default_factory=list,
+        description=(
+            "Locally measured authored/follow motion intervals selected for "
+            "completion. The model never authors these source-clock values."
         ),
     )
     usable_from_seconds: float = Field(default=0.0, ge=0.0)

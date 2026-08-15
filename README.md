@@ -71,13 +71,14 @@ Montagewright 分開保存：
 
 `--budget` 是整輪工作的美元上限。每次付費呼叫送出前，Montagewright 會用最大輸出 token 先保留最壞情況預算；餘額不夠就不送出，留下當下最好的成片，而不是偷偷換成較差的判斷。
 
-目前 production model 固定為 `gemini-3.6-flash`，程式中的估價表為：
+目前 production model 固定為 `gemini-3.7-flash`。費率依 Google 公告，
+以 UTC 日期在每次預算保留與實際結算時自動選擇：
 
-| Token 類型 | 每百萬 token |
-| --- | ---: |
-| 新 input | US$1.50 |
-| cached input | US$0.15 |
-| output／thinking | US$7.50 |
+| Token 類型 | 至 2026-12-31（含） | 2027-01-01 起 |
+| --- | ---: | ---: |
+| 新 input | US$0.75 | US$1.50 |
+| cached input | US$0.075 | US$0.15 |
+| output／thinking | US$3.75 | US$7.50 |
 
 這是 Montagewright 用來做預算保留與報表的固定費率，不是 Google 帳戶的 quota。API 的 429 仍可能來自 rate limit、billing、shared project quota 或帳戶層級限制。
 

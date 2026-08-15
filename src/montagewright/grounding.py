@@ -413,8 +413,9 @@ class GroundedClip:
     # cues by strength fixed the cutting; nothing made the claim checkable.
     landed_kind: str | None = None
     note: str | None = None
-    # Set when a camera move lengthened this shot past what the rhythm asked
-    # for, so the report can say why the cut runs where it does.
+    # Set only when the usable source window is too short to satisfy the
+    # measured camera floor. A preference safely lengthened by grounding is
+    # recorded in ``note`` and is not a release fault.
     move_too_short: str | None = None
 
     @property
@@ -441,12 +442,10 @@ class GroundedTimeline:
 def _requested_duration(clip: Clip, grid: BeatGrid | None) -> float:
     """How long this clip wants to be, in seconds.
 
-    The length is the planner's, whole. A flat per-move floor used to raise it
-    here, which reads as safety and is a length decision made by a constant:
-    how long a sweep needs depends on how far it travels and how much is on
-    the way, and the planner is the one who watched the shot. What the floor
-    is good for is saying afterwards that the move could not happen in the
-    time it was given -- reported, not corrected.
+    The preference is the planner's, whole. A flat per-move constant must not
+    rewrite it here: how long a sweep needs depends on measured travel and
+    declared rests. ``ground_timeline`` combines that geometry-derived floor
+    with this preference, completing the move off-grid when necessary.
     """
 
     if grid is not None and clip.music_sync.beats:
@@ -454,30 +453,62 @@ def _requested_duration(clip: Clip, grid: BeatGrid | None) -> float:
     return clip.approx_out_seconds - clip.approx_in_seconds
 
 
-def _floor_for(clip: Clip) -> float:
-    """The least time this clip's own move can happen in.
+def camera_floor_for(reframe: object | None) -> float:
+    """The least time a measured reframe can physically complete.
 
-    Estimated from the card's subject positions, which are what is known
-    before grounding runs. A clip whose looks cannot be located falls back to
-    the move's declared floor, because an unknown distance is not a zero one.
+    This is shared by Selection validation and execution.  Keeping a second
+    table of simplified floors in the planner let a 1.5-second push pass the
+    paid Selection and fail against this calculation immediately afterwards.
+    Measured card positions win; a move whose looks cannot be located is
+    explicitly a conservative estimate, not content-derived geometry.
     """
 
     from montagewright.capabilities import MOVE_FLOORS
     from montagewright.reframe import seconds_needed_for
 
-    reframe = clip.reframe
-    if reframe is None or len(reframe.looks) < 2:
+    if reframe is None or not getattr(reframe, "looks", None):
         return 0.0
+
+    declared_stops = [
+        (
+            -1.0 if one.presentation_intent == "transition_pass"
+            else one.seconds
+        )
+        for one in reframe.looks
+    ]
+    if len(reframe.looks) < 2:
+        # With one look there is no camera journey whose declared dwell times
+        # must add up.  `look.seconds` is then the Selection pass's preferred
+        # shot length, and Rhythm exists precisely to reconsider that length
+        # in sequence.  Treating the whole preference as a hard floor made a
+        # 3.00s hold reject a musically chosen 2.90s hold and left Rhythm no
+        # authority at all.  Preserve only the physical/readable landing; real
+        # action, speech and source-motion completion have their own explicit
+        # contracts below this layer.
+        if reframe.looks[0].presentation_intent == "transition_pass":
+            return 0.0
+        from montagewright.capabilities import SETTLE_SECONDS
+
+        return SETTLE_SECONDS
 
     seen = reframe.look_boxes
     if not seen or len(seen) < len(reframe.looks):
-        return MOVE_FLOORS.get(reframe.camera_move, 0.0)
+        readable_rests = sum(max(0.0, one) for one in declared_stops)
+        return max(
+            MOVE_FLOORS.get(reframe.camera_move, 0.0), readable_rests
+        )
 
     stops = [
-        (one.seconds, where[0], where[1], where[2])
-        for one, where in zip(reframe.looks, seen)
+        (rest, where[0], where[1], where[2])
+        for rest, where in zip(declared_stops, seen)
     ]
     return seconds_needed_for(stops, reframe.camera_energy)
+
+
+def _floor_for(clip: Clip) -> float:
+    """The least time this clip's own move can happen in."""
+
+    return camera_floor_for(clip.reframe)
 
 
 def _action_floor_for(clip: Clip) -> float:
@@ -487,6 +518,18 @@ def _action_floor_for(clip: Clip) -> float:
         (
             contract.minimum_duration_from(clip.approx_in_seconds)
             for contract in clip.action_contracts
+        ),
+        default=0.0,
+    )
+
+
+def _source_motion_floor_for(clip: Clip) -> float:
+    """The measured remainder of explicitly selected authored source motion."""
+
+    return max(
+        (
+            contract.minimum_duration_from(clip.approx_in_seconds)
+            for contract in clip.source_motion_contracts
         ),
         default=0.0,
     )
@@ -552,15 +595,6 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         # is the estimate available before anything is grounded. The executor
         # measures again and reports against what it finds.
         floor = _floor_for(clip)
-        # Not a correction. The move stays as asked and runs in the time it
-        # was given; this says it will not read, so the report and the review
-        # round see it instead of a shot that quietly arrives too fast.
-        too_short = (
-            f"{move} across this shot needs about {floor:.1f}s and has "
-            f"{wanted:.2f}s"
-            if floor > 0.0 and wanted < floor - 1e-6
-            else None
-        )
         end = cursor + wanted
         landed: str | None = None
         landed_kind: str | None = None
@@ -654,8 +688,31 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         # to be remembered in four places is a rule that will be forgotten
         # in a fifth.
         action_floor = _action_floor_for(clip)
-        floor_seconds = wanted if keeps_source_move else 0.0
-        floor_seconds = max(floor_seconds, action_floor)
+        # The Selection duration is a pacing request, not proof that source
+        # motion lasts that long. Only locally measured motion intervals are a
+        # completion floor.
+        source_motion_floor = _source_motion_floor_for(clip)
+        if (
+            keeps_source_move
+            and source_motion_floor <= 0.0
+            and clip.reframe is not None
+            and clip.reframe.source_motion_role == "locked"
+        ):
+            # Compatibility for old EDLs that encoded source motion only in
+            # editorial_intent. New plans always carry the semantic role and a
+            # measured SourceMotionContract, so nominal duration is never used
+            # as their motion proof.
+            source_motion_floor = wanted
+        source_floor = source_motion_floor if keeps_source_move else 0.0
+        # One canonical completion floor for every kind of temporal promise.
+        # Digital camera motion used to be diagnostic-only while action and
+        # authored source motion were hard floors.  Rhythm could therefore
+        # return a 2.56s pan that Selection had proved needed 3.0s, and the
+        # release gate stopped the whole film after two paid answers.  A
+        # physically selected move is the same kind of obligation: finish it
+        # cleanly, or leave the musical grid.  No-music timelines use this
+        # exact path too, so content rhythm and music rhythm cannot drift.
+        floor_seconds = max(floor, source_floor, action_floor)
         # Landing on a beat may lengthen a shot that exists to let the
         # source's own move play; it may not shorten one. `nearest_cue`
         # takes the closest event in either direction, so a cue thirteen
@@ -684,11 +741,12 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 )
             else:
                 end, landed, landed_kind = floor_end, None, None
-            obligation = (
-                f"the source move needs {wanted:.2f}s"
-                if keeps_source_move and wanted >= action_floor
-                else f"the selected action needs {action_floor:.2f}s"
-            )
+            if floor >= source_floor and floor >= action_floor:
+                obligation = f"the planned {move} needs {floor:.2f}s"
+            elif source_floor >= action_floor:
+                obligation = f"the source move needs {source_floor:.2f}s"
+            else:
+                obligation = f"the selected action needs {action_floor:.2f}s"
             held = (
                 obligation + ", past "
                 + (f"cue {missed}" if missed else "the nearest cue")
@@ -776,6 +834,17 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 )
                 note = f"{note}; {feasibility_note}" if note else feasibility_note
 
+        final_duration = end - cursor
+        # Only report a structural camera fault when the *source itself*
+        # cannot supply the canonical floor (normally a usable-window clamp).
+        # A short model preference that local grounding safely lengthened is
+        # an ordinary compiled decision, not a reason to reject the film.
+        too_short = (
+            f"{move} across this shot needs about {floor:.1f}s and has "
+            f"{final_duration:.2f}s"
+            if floor > 0.0 and final_duration < floor - 1e-6
+            else None
+        )
         grounded.append(
             GroundedClip(
                 clip=clip,
@@ -869,6 +938,33 @@ def _put_anchor_on_the_music(
     }.get(clip.music_sync.anchor_relation, 0.0)
 
     begins = at - (aimed - cursor)
+    # A musical anchor may add pre-roll before protected source content, but
+    # it may not move the in-point through the beginning of that content.
+    # Doing so made a perfectly valid complete action fail only in the final
+    # release proof (for example 2.000s becoming 2.082s to meet a beat).
+    # Content completion outranks sub-second beat alignment; keep the authored
+    # in-point and report why the requested anchor could not move instead.
+    protected_starts = [
+        (contract.source_start_seconds, f"action {contract.action_id}")
+        for contract in clip.action_contracts
+        if contract.completion_policy not in {"may_cut_on_action", "loopable"}
+    ]
+    protected_starts.extend(
+        (contract.source_start_seconds, f"{contract.motion_role} source motion")
+        for contract in clip.source_motion_contracts
+    )
+    crossed = [
+        (start, label)
+        for start, label in protected_starts
+        if begins > start + 1e-6
+    ]
+    if crossed:
+        start, label = min(crossed)
+        return None, (
+            f"putting '{wanted}' on the {kind} needs this shot to start at "
+            f"{begins:.3f}s, after protected {label} begins at {start:.3f}s; "
+            "kept the complete source action instead"
+        )
     window = clip.usable_window
     if window is not None and not (
         window[0] - 1e-6 <= begins and begins + length <= window[1] + 1e-6

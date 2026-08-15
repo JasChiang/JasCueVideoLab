@@ -53,8 +53,10 @@ DRAFT_PROMPT_PATH = (
 # its own evidence, and a truncated structured answer is a refused call --
 # paid for, and worth nothing.
 MAX_OUTPUT_TOKENS = 4_096
+EXACT_OUTPUT_POLICY_VERSION = "exact-output-v2-1024+1280n-cap12288"
 MAX_EXACT_FRAMES_PER_CALL = 8
 SOURCE_CONFIRMATION_VERSION = "adaptive-seed-v1"
+SOURCE_CONFIRMATION_OUTCOME_VERSION = "source-confirmation-outcome-v1"
 TARGET_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 ReferencePolarity = Literal["positive", "negative"]
@@ -65,6 +67,20 @@ TargetVerdict = Literal["present", "absent", "uncertain"]
 ExactFrameVerdict = Literal[
     "matched_target", "hard_negative", "uncertain", "not_visible"
 ]
+
+
+def exact_frame_output_budget(frame_count: int) -> int:
+    """Budget structured exact-frame answers without charging for padding.
+
+    Gemini's thinking tokens share the output ceiling.  The old 768-token
+    allowance per frame truncated a five-frame Fold8 answer at 4,352 tokens,
+    throwing away a paid semantic result.  This is only a ceiling/reservation;
+    settlement still uses the provider's actual output and thought tokens.
+    """
+
+    if frame_count < 1:
+        raise ValueError("frame_count must be positive")
+    return min(12_288, max(MAX_OUTPUT_TOKENS, 1_024 + 1_280 * frame_count))
 VisibilityState = Literal[
     "full", "partial", "occluded", "entering", "exiting", "unknown"
 ]
@@ -1728,6 +1744,13 @@ class ConfirmedFrame(FrozenStrictModel):
     nearest analysis sample to it.
     """
 
+    # Older cache entries kept this fact only in their outer ``target``
+    # wrapper.  In memory that wrapper disappears, so an unlabelled frame can
+    # otherwise be re-used while grounding another target in the same source.
+    # It remains optional only so the cache reader can migrate those entries.
+    target_id: str | None = Field(
+        default=None, min_length=1, pattern=TARGET_ID_PATTERN
+    )
     at_seconds: float = Field(ge=0.0)
     box: tuple[float, float, float, float]
     sighting: str = Field(min_length=1)
@@ -1801,9 +1824,21 @@ def read_source_confirmation_cache(
         remembered = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(remembered, dict) or remembered.get("target") != target_id:
             return None
-        return tuple(
+        confirmed = tuple(
             ConfirmedFrame.model_validate(one)
             for one in remembered.get("confirmed") or ()
+        )
+        # Old empty files erased whether Gemini said hard-negative,
+        # uncertain, or the provider failed.  They are not authoritative
+        # negatives and must be judged once under the typed outcome contract.
+        if not confirmed and not remembered.get("status"):
+            return None
+        if any(one.target_id not in {None, target_id} for one in confirmed):
+            return None
+        return tuple(
+            one if one.target_id is not None
+            else one.model_copy(update={"target_id": target_id})
+            for one in confirmed
         )
     except (OSError, ValueError, ValidationError):
         return None
@@ -1814,14 +1849,38 @@ def write_source_confirmation_cache(
     target_id: str,
     video_sha256: str,
     confirmed: Sequence[ConfirmedFrame],
+    *,
+    status: str | None = None,
+    reason: str = "",
 ) -> None:
+    if any(one.target_id != target_id for one in confirmed):
+        raise ValueError("source confirmation target and frame target disagree")
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps({
+        "contract_version": SOURCE_CONFIRMATION_OUTCOME_VERSION,
         "target": target_id,
         "video_sha256": video_sha256,
+        "status": status or ("confirmed" if confirmed else "uncertain"),
+        "reason": reason,
         "confirmed": [one.model_dump(mode="json") for one in confirmed],
     }), encoding="utf-8")
+
+
+def read_source_confirmation_status(path: Path, target_id: str) -> str | None:
+    """Read a typed semantic outcome; legacy empty caches are unknown."""
+
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("target") != target_id:
+        return None
+    status = payload.get("status")
+    if status in {"confirmed", "hard_negative", "uncertain"}:
+        return str(status)
+    confirmed = payload.get("confirmed") or ()
+    return "confirmed" if confirmed else None
 
 
 def confirm_source_identity(
@@ -1836,6 +1895,7 @@ def confirm_source_identity(
     ledger: Any | None = None,
     library: Path | None = None,
     at_ms: "tuple[int, ...]" = (),
+    outcome: dict[str, str] | None = None,
 ) -> tuple["ConfirmedFrame", ...]:
     """Prove the identity once per source, where it is clearest.
 
@@ -1850,7 +1910,12 @@ def confirm_source_identity(
     one cut, is free.
     """
 
+    def report(status: str, reason: str = "") -> None:
+        if outcome is not None:
+            outcome.update({"status": status, "reason": reason})
+
     if client is None:
+        report("provider_failure", "no Gemini client")
         return ()
     video_path = Path(video_path).expanduser().resolve(strict=True)
     digest = sha256_file(video_path)
@@ -1861,6 +1926,11 @@ def confirm_source_identity(
     if stored is not None and stored.exists():
         remembered = read_source_confirmation_cache(stored, target_id)
         if remembered is not None:
+            report(
+                read_source_confirmation_status(stored, target_id)
+                or ("confirmed" if remembered else "uncertain"),
+                "source confirmation cache",
+            )
             return remembered
 
     sampled = sampling_times_for(discovery, target_id)
@@ -1882,6 +1952,7 @@ def confirm_source_identity(
         for candidate in discovery.candidates
     }
     if len(times) < 2:
+        report("uncertain", "fewer than two independent source times")
         return ()
     video = inspect_video_lineage(video_path)
     local = CandidateDiscoveryResult.model_validate({
@@ -1930,6 +2001,7 @@ def confirm_source_identity(
         seen_pts.add(frame.lineage.frame_pts)
         prepared.append(frame)
     if not prepared:
+        report("provider_failure", "no exact frame could be materialized")
         return ()
 
     # The common clean case pays for one semantic seed.  Its identity is
@@ -1961,6 +2033,7 @@ def confirm_source_identity(
                 nearest = min(times, key=lambda one: abs(one - confirmed_at_ms))
                 name = sighting_of.get(nearest, "sighting")
                 confirmed = [ConfirmedFrame(
+                    target_id=target_id,
                     at_seconds=confirmed_at_ms / 1000.0,
                     box=(x0 / 1000.0, y0 / 1000.0, x1 / 1000.0, y1 / 1000.0),
                     sighting=name,
@@ -1977,16 +2050,15 @@ def confirm_source_identity(
                 )]
                 if stored is not None:
                     stored.parent.mkdir(parents=True, exist_ok=True)
-                    stored.write_text(json.dumps({
-                        "target": target_id,
-                        "video_sha256": digest,
-                        "confirmed": [
-                            one.model_dump(mode="json") for one in confirmed
-                        ],
-                    }), encoding="utf-8")
+                    write_source_confirmation_cache(
+                        stored, target_id, digest, confirmed,
+                        status="confirmed", reason="clean exact seed",
+                    )
+                report("confirmed", "clean exact seed")
                 return tuple(confirmed)
 
     if len(prepared) < 2:
+        report("uncertain", "fewer than two distinct exact frames")
         return ()
 
     decided = decide_exact_frame_bboxes(
@@ -1996,6 +2068,7 @@ def confirm_source_identity(
         minimum_matched_anchors=2,
     )
     if decided is None:
+        report("provider_failure", "exact-frame batch returned no result")
         return ()
     batch, _usage = decided
     try:
@@ -2012,6 +2085,7 @@ def confirm_source_identity(
         nearest = min(times, key=lambda one: abs(one - confirmed_at_ms))
         name = sighting_of.get(nearest, "sighting")
         confirmed.append(ConfirmedFrame(
+            target_id=target_id,
             at_seconds=confirmed_at_ms / 1000.0,
             box=(x0 / 1000.0, y0 / 1000.0, x1 / 1000.0, y1 / 1000.0),
             sighting=name,
@@ -2024,10 +2098,20 @@ def confirm_source_identity(
             height=int(evaluation.lineage.height),
             seed_risk_flags=exact_seed_risk_flags(evaluation.decision),
         ))
+    verdicts = [one.decision.verdict for one in batch.evaluations]
+    status = (
+        "confirmed" if confirmed
+        else "hard_negative" if verdicts and all(
+            verdict == "hard_negative" for verdict in verdicts
+        )
+        else "uncertain"
+    )
+    reason = ", ".join(verdicts) or "no validated exact decisions"
     if stored is not None:
         write_source_confirmation_cache(
-            stored, target_id, digest, confirmed
+            stored, target_id, digest, confirmed, status=status, reason=reason,
         )
+    report(status, reason)
     return tuple(confirmed)
 
 
@@ -2602,10 +2686,7 @@ def decide_exact_frame_bboxes(
         candidate_enum = tuple(
             dict.fromkeys(candidate.candidate_id for candidate, _ in chunk)
         )
-        max_output_tokens = min(
-            8_192,
-            max(MAX_OUTPUT_TOKENS, 512 + 768 * len(chunk)),
-        )
+        max_output_tokens = exact_frame_output_budget(len(chunk))
         interaction = ask(
             client,
             model=model_id,
@@ -2844,6 +2925,7 @@ def confirmed_frame_from_validated_seed(
         )
     x0, y0, x1, y1 = native
     return ConfirmedFrame(
+        target_id=prepared.target_id,
         at_seconds=expected.frame_time_ms / 1000.0,
         box=(x0 / 1000.0, y0 / 1000.0, x1 / 1000.0, y1 / 1000.0),
         sighting=prepared.sighting,
@@ -2957,7 +3039,89 @@ def _cross_asset_exact_frame_batch_schema(
     item_ids: Sequence[str],
     candidate_ids: Sequence[str],
 ) -> dict[str, Any]:
-    """Provider schema permits omission so local code can retry it explicitly."""
+    """A shallow provider schema; local code remains the routing authority.
+
+    The first v2 shape nested the complete exact-frame decision under
+    ``results[].decision`` and enumerated six 67-character item hashes.  The
+    Interactions endpoint rejected that response schema with HTTP 400 before
+    reading any pixels.  Flattening the decision restores the already-proven
+    v1 nesting depth.  ``item_id`` deliberately stays an ordinary string:
+    unknown IDs are rejected locally and therefore need not inflate provider
+    schema complexity.
+    """
+
+    del target_id, candidate_ids  # immutable routing facts live in item_id
+    string_array = {"type": "array", "items": {"type": "string"}}
+    # Only facts the model must actually judge. Query/spec/asset/frame echoes
+    # were redundant -- item_id already hashes the complete expected request,
+    # and local code restores those fields before running the established v1
+    # validator. Removing them sharply reduces provider schema complexity and
+    # prevents a generated echo from ever becoming a routing authority.
+    semantic_fields = {
+        "verdict": {
+            "type": "string",
+            "enum": [
+                "matched_target", "hard_negative", "uncertain", "not_visible",
+            ],
+        },
+        "confidence": {"type": "number"},
+        "native_box_yxyx_1000": {
+            "anyOf": [
+                {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                },
+                {"type": "null"},
+            ]
+        },
+        "visibility_state": {
+            "type": "string",
+            "enum": [
+                "full", "partial", "occluded", "entering", "exiting", "unknown",
+            ],
+        },
+        "occlusion_state": {
+            "type": "string",
+            "enum": ["none", "minor", "major", "unknown"],
+        },
+        "touches_frame_edges": {
+            "type": "array",
+            "items": {
+                "type": "string", "enum": ["top", "right", "bottom", "left"],
+            },
+        },
+        "identity_evidence": string_array,
+        "exclusion_evidence": string_array,
+        # Lookalike geometry remains mandatory. Dropping it would make a
+        # smaller schema by weakening the composition/instance safety gate.
+        "excluded_instances": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["native_box_yxyx_1000", "reason"],
+                "properties": {
+                    "native_box_yxyx_1000": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                    },
+                    "reason": {"type": "string"},
+                },
+            },
+        },
+        "reason": {"type": "string"},
+    }
+    item_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["item_id", *semantic_fields],
+        "properties": {"item_id": {"type": "string"}, **semantic_fields},
+    }
 
     return {
         "type": "object",
@@ -2970,19 +3134,13 @@ def _cross_asset_exact_frame_batch_schema(
             },
             "results": {
                 "type": "array",
-                "minItems": 0,
+                # A completely missing answer is handled as a parse/protocol
+                # failure and retried one item at a time. Asking the provider
+                # to support an explicitly empty successful response served no
+                # useful path and was outside the proven v1 array contract.
+                "minItems": 1,
                 "maxItems": len(item_ids),
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["item_id", "decision"],
-                    "properties": {
-                        "item_id": {"type": "string", "enum": list(item_ids)},
-                        "decision": _exact_frame_schema_for_candidates(
-                            target_id, tuple(dict.fromkeys(candidate_ids))
-                        ),
-                    },
-                },
+                "items": item_schema,
             },
         },
     }
@@ -3107,22 +3265,47 @@ def validate_cross_asset_exact_frame_payload(
             ))
             continue
         raw = offered[0]
-        if set(raw) != {"item_id", "decision"} or not isinstance(
-            raw.get("decision"), dict
-        ):
+        semantic_names = {
+            "verdict", "confidence", "native_box_yxyx_1000",
+            "visibility_state", "occlusion_state", "touches_frame_edges",
+            "identity_evidence", "exclusion_evidence", "excluded_instances",
+            "reason",
+        }
+        if set(raw) != {"item_id", *semantic_names}:
             outcomes.append(CrossAssetExactFrameOutcome(
                 item_id=item_id,
                 request_index=index,
                 status="retry_required",
                 attempts=attempts,
                 failures=(_cross_failure(
-                    "malformed_result", "item decision must be one structured object"
+                    "malformed_result",
+                    "item must contain only item_id and the exact semantic fields",
                 ),),
             ))
             continue
+        expected = item.frame.lineage
+        # Restore immutable facts from the locally selected request. They are
+        # not asked of the provider and therefore cannot be swapped or forged
+        # in a cross-source response.
+        decision_payload = {
+            "contract_version": "reference-exact-frame-bbox-v1",
+            "query_id": spec.identity_lock.query_id,
+            "query_lock_sha256": spec.identity_lock.definition_sha256(),
+            "grounding_spec_sha256": spec.definition_sha256(),
+            "video_asset_id": expected.video_asset_id,
+            "video_sha256": expected.video_sha256,
+            "target_id": target_id,
+            "candidate_id": item.candidate_id,
+            "frame_pts": expected.frame_pts,
+            "frame_time_ms": expected.frame_time_ms,
+            "frame_sha256": expected.frame_sha256,
+            "width": expected.width,
+            "height": expected.height,
+            **{name: raw[name] for name in semantic_names},
+        }
         try:
             decision = validate_exact_frame_payload(
-                raw["decision"],
+                decision_payload,
                 spec=spec,
                 discovery=item.discovery,
                 candidate=item.candidate(),
@@ -3279,9 +3462,7 @@ def decide_cross_asset_exact_frame_bboxes(
                 patience_seconds=180.0,
                 generation_config={
                     "thinking_level": "low",
-                    "max_output_tokens": min(
-                        8_192, max(MAX_OUTPUT_TOKENS, 640 + 832 * len(chunk))
-                    ),
+                    "max_output_tokens": exact_frame_output_budget(len(chunk)),
                 },
                 response_format=structured_json(
                     _cross_asset_exact_frame_batch_schema(

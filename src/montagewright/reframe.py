@@ -358,6 +358,19 @@ def _with_rest(
     return CropPath(limited)
 
 
+def _rest_for_stop(seconds: float) -> float:
+    """Resolve a declared rest without turning a pass-through into a stop.
+
+    Zero means the planner left the readable settle to local policy. A
+    negative value is an internal sentinel for ``transition_pass``: the path
+    must cross that waypoint without manufacturing the usual settle.
+    """
+
+    if float(seconds) < 0.0:
+        return 0.0
+    return max(0.0, float(seconds)) or SETTLE_SECONDS
+
+
 def seconds_needed_for(
     stops: list[tuple[float, float, float, float]],
     energy: CameraEnergy = "calm",
@@ -382,7 +395,7 @@ def seconds_needed_for(
         # not a geometric question -- the planner answers it.
         return stops[0][0] if stops else 0.0
 
-    resting = sum(max(0.0, one[0]) or SETTLE_SECONDS for one in stops)
+    resting = sum(_rest_for_stop(one[0]) for one in stops)
     ceiling = ENERGY_LIMITS[energy]["max_speed"]
     travelling = 0.0
     for before, after in zip(stops, stops[1:]):
@@ -520,7 +533,7 @@ def build_look_path(
             )
         )
 
-    rests = [max(0.0, one[0]) or SETTLE_SECONDS for one in stops]
+    rests = [_rest_for_stop(one[0]) for one in stops]
     # Never let resting eat the whole shot; leave at least as much for
     # travelling as for standing still.
     if sum(rests) > duration_seconds * (1.0 - SETTLE_SHARE * 2):
@@ -1457,12 +1470,19 @@ def _eased(
 
 
 def interpolate_crop_keyframes(
-    keys: list[dict], seconds: float, *, ease: bool = True
+    keys: list[dict], seconds: float, *, ease: bool | None = None
 ) -> dict | None:
     """Numeric twin of the ffmpeg crop path used by evidence consumers."""
 
     if not keys:
         return None
+    # A short path describes authored camera stops, so easing into and out of
+    # each leg is intentional.  A dense path is sampled tracking geometry:
+    # easing every sample would make the virtual camera brake to zero and
+    # accelerate again dozens of times inside one move.  Render and evidence
+    # consumers must make the same distinction.
+    if ease is None:
+        ease = len(keys) <= 4
     before, after = keys[0], keys[-1]
     for left, right in zip(keys, keys[1:]):
         if float(left["at"]) <= seconds <= float(right["at"]):
@@ -1551,12 +1571,16 @@ def ffmpeg_crop_expression(
         x, y, crop_w, crop_h = first.to_pixels(width, height)
         return str(crop_w), str(crop_h), str(x), str(y)
 
+    # Semantic paths contain a few authored stops; dense paths contain SAM
+    # samples.  Re-easing every dense sample produces a visible stop/start
+    # cadence, so only the former ease each leg.
+    ease = len(path.keyframes) <= 4
     # Crop extents must stay even for chroma subsampling, and must not run off
     # the frame at any point in the ramp.
-    w_expr = f"floor(min({_axis_expression(path, lambda c: c.width, width, clock=clock)},{width})/2)*2"
-    h_expr = f"floor(min({_axis_expression(path, lambda c: c.height, height, clock=clock)},{height})/2)*2"
-    x_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.x, width, clock=clock)},{width}-out_w))/2)*2"
-    y_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.y, height, clock=clock)},{height}-out_h))/2)*2"
+    w_expr = f"floor(min({_axis_expression(path, lambda c: c.width, width, ease=ease, clock=clock)},{width})/2)*2"
+    h_expr = f"floor(min({_axis_expression(path, lambda c: c.height, height, ease=ease, clock=clock)},{height})/2)*2"
+    x_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.x, width, ease=ease, clock=clock)},{width}-out_w))/2)*2"
+    y_expr = f"floor(max(0,min({_axis_expression(path, lambda c: c.y, height, ease=ease, clock=clock)},{height}-out_h))/2)*2"
     return w_expr, h_expr, x_expr, y_expr
 
 
@@ -1596,13 +1620,14 @@ def ffmpeg_crop_filters(
         ]
 
     clock = f"(on/{output_fps}-{clock_offset_seconds:.6f})"
-    left = _axis_expression(path, lambda crop: crop.x, 1, clock=clock)
-    top = _axis_expression(path, lambda crop: crop.y, 1, clock=clock)
+    ease = len(path.keyframes) <= 4
+    left = _axis_expression(path, lambda crop: crop.x, 1, ease=ease, clock=clock)
+    top = _axis_expression(path, lambda crop: crop.y, 1, ease=ease, clock=clock)
     right = _axis_expression(
-        path, lambda crop: crop.x + crop.width, 1, clock=clock
+        path, lambda crop: crop.x + crop.width, 1, ease=ease, clock=clock
     )
     bottom = _axis_expression(
-        path, lambda crop: crop.y + crop.height, 1, clock=clock
+        path, lambda crop: crop.y + crop.height, 1, ease=ease, clock=clock
     )
     # perspective(source) maps the authored rectangle to the four corners of
     # a fixed-size source canvas and supports per-frame corner expressions.

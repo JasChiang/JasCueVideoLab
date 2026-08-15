@@ -211,13 +211,39 @@
   .grip:hover, .grip.holding { background: var(--accent); }
   .grip:hover::before, .grip.holding::before { background: #fff; opacity: 1; }
 
-  .grip.flat { cursor: row-resize; height: 5px; width: auto; }
+  /* This divider resizes the timeline; it is not playback progress.  Making
+     its entire width orange on hover put a second progress-looking line
+     above the real red playhead, and the centred resize nub looked like a
+     scrubber parked at 50%. Keep the rail neutral and highlight only the
+     handle somebody can actually drag. */
+  .grip.flat {
+    cursor: row-resize; height: 5px; width: auto;
+    background: transparent; border-top: 1px solid var(--line);
+  }
+  .grip.flat:hover, .grip.flat.holding { background: transparent; }
   .grip.flat::after { inset: -5px 0; }
   .grip.flat::before {
-    width: 30px; height: 3px; margin: -1.5px 0 0 -15px;
+    width: 38px; height: 3px; margin: -2px 0 0 -19px;
+  }
+  .grip.flat:hover::before, .grip.flat.holding::before {
+    background: var(--accent); opacity: 1;
   }
   .work > * { min-width: 0; min-height: 0; }
-  .stage { display: grid; min-height: 0; min-width: 0; }
+  .stage {
+    display: grid; grid-template-rows: auto minmax(0, 1fr);
+    min-height: 0; min-width: 0;
+  }
+  .stage-notices {
+    display: flex; flex-direction: column; gap: 4px;
+    background: var(--panel);
+  }
+  .stage-notices > div {
+    position: static; max-width: none; z-index: auto;
+    margin: 0; padding: 7px 12px; border-radius: 0;
+    border: 0; border-bottom: 1px solid var(--line);
+    box-shadow: none; backdrop-filter: none; pointer-events: auto;
+    font-size: 11.5px; line-height: 1.4;
+  }
   @media (max-width: 1100px) {
     .work { grid-template-columns: 1fr 5px minmax(260px, 30vw); }
     .browser, #grip-left { display: none; }
@@ -365,6 +391,11 @@
     background: color-mix(in srgb, var(--deep) 78%, transparent);
     display: flex; justify-content: space-between; gap: 6px;
   }
+  .tile .tile-state {
+    position: absolute; top: 5px; left: 5px; z-index: 2;
+    padding: 2px 5px; border-radius: 999px; font-size: 9px;
+    color: #fff; background: rgba(24, 24, 22, .72);
+  }
   .tile.waiting { border-style: dashed; }
   .tile.waiting .who { color: var(--dim); background: none; }
   .tile.doing { border-color: var(--accent); }
@@ -432,14 +463,15 @@
     text-align: inherit; white-space: pre-wrap; touch-action: manipulation;
   }
   .graphic-preview-status {
-    position: absolute; right: 12px; top: 12px; z-index: 9;
-    padding: 5px 9px; border-radius: 999px; background: rgba(23,25,29,.88);
-    box-shadow: 0 3px 12px rgba(0,0,0,.18); backdrop-filter: blur(8px);
-    color: #fff; font-size: 11px; font-weight: 620; pointer-events: none;
+    color: var(--soft); background: var(--sunk); font-weight: 620;
   }
-  .graphic-preview-status.validation { background: rgba(126,38,38,.94); }
+  .graphic-preview-status.validation {
+    color: #9d2929; background: color-mix(in srgb, #c43c3c 10%, var(--panel));
+  }
   .graphic-preview-status.transient,
-  .graphic-preview-status.stale { background: rgba(91,67,25,.94); }
+  .graphic-preview-status.stale {
+    color: #8a6118; background: color-mix(in srgb, #b77a16 10%, var(--panel));
+  }
   .graphic-preview-stale-badge {
     position: absolute; right: 0; top: -27px; z-index: 8;
     max-width: min(250px, 90vw); padding: 4px 7px; border-radius: 5px;
@@ -508,11 +540,10 @@
     font-size: 10px; font-family: var(--mono); color: #fff;
     background: var(--accent); padding: 1px 5px; border-radius: 3px; white-space: nowrap;
   }
-  .warn {
-    position: absolute; right: 18px; bottom: 16px; max-width: 52%; z-index: 5;
-    font-size: 11.5px; color: #f4d9a8; background: rgba(70,48,16,.9);
-    border: 1px solid rgba(196,142,52,.5); border-radius: 6px;
-    padding: 6px 10px; pointer-events: none;
+  /* Persistent warnings belong in the stage notice rail, never over the
+     picture somebody is trying to judge. */
+  .crop-warning {
+    color: #8a6118; background: color-mix(in srgb, #b77a16 10%, var(--panel));
   }
   .peek { position: absolute; left: 18px; bottom: 16px; display: flex; gap: 2px; }
   .peek button { font-size: 11.5px; border-radius: 6px; }
@@ -733,6 +764,14 @@
     border-radius: 7px;
   }
   .degs { margin-top: 6px; }
+  .degs > .warn {
+    position: static; max-width: none; margin-top: 5px;
+    padding: 7px 9px; border-radius: 5px;
+    color: color-mix(in srgb, var(--ink) 82%, #b77a16);
+    background: color-mix(in srgb, #b77a16 10%, var(--sunk));
+    border-left: 3px solid color-mix(in srgb, #b77a16 72%, var(--line));
+    font-size: 11.5px; line-height: 1.45;
+  }
   .deg { padding: 3px 0; }
   .deg .why { display: block; }
   .figures summary {
@@ -1495,6 +1534,10 @@
     <div class="grip" id="grip-left" title="拖動調整寬度"></div>
 
     <div class="stage">
+      <div class="stage-notices" aria-live="polite">
+        <div class="graphic-preview-status hide" id="graphic-preview-status">正在產生精準預覽…</div>
+        <div class="crop-warning hide" id="crop-warn">這一輪沒有留下裁切紀錄，框是事後從素材卡重算的，不等於實際裁切</div>
+      </div>
       <div class="screen">
         <div class="stage-label">預覽工作區</div>
         <div class="over" id="over"></div>
@@ -1516,10 +1559,8 @@
           </div>
           <div class="cropbox hide" id="cropbox"></div>
           <div class="graphic-preview-layer hide" id="graphic-preview"></div>
-          <div class="graphic-preview-status hide" id="graphic-preview-status">正在產生精準預覽…</div>
           <div class="burnt hide" id="burnt"></div>
         </div>
-        <div class="warn hide" id="crop-warn">這一輪沒有留下裁切紀錄，框是事後從素材卡重算的，不等於實際裁切</div>
         <div class="peek">
           <button class="bare on" id="see-cut">成片</button>
           <button class="bare" id="see-raw">原素材＋裁切框</button>
@@ -1685,7 +1726,7 @@
           <input type="file" id="grounding-negatives" accept="image/*" multiple>
           <div class="why">文字說得出「另一個型號更寬」，說不出它實際長什麼樣。給一張，判定就能直接比對兩張圖，不必靠描述。</div></div>
         </div></details>
-        <details class="deeper"><summary>我已經有 grounding spec</summary>
+        <details class="deeper" id="grounding-spec-details"><summary id="grounding-spec-summary">我已經有 grounding spec</summary>
         <div class="fields">
         <div class="field wide"><label>spec 路徑</label>
           <div class="row" style="gap:8px;flex-wrap:nowrap">
@@ -1765,7 +1806,21 @@
 
 const $ = (id) => document.getElementById(id);
 let runId = null, seen = 0, timer = null, ticker = null, allLines = [], lastSource = '';
-let openedFrom = { source: '', music: '', brief: '' };
+let openedFrom = { source: '', music: '', brief: '', grounding: '', groundingRefs: 0 };
+
+function updateGroundingSpecSummary(inherited = false) {
+  const path = $('grounding-spec-path').value.trim();
+  const uploaded = $('grounding-spec-file').files.length > 0;
+  if (!path && !uploaded) {
+    $('grounding-spec-summary').textContent = '我已經有 grounding spec';
+    return;
+  }
+  const refs = inherited && openedFrom.groundingRefs
+    ? `（${openedFrom.groundingRefs} 張參考圖）` : '';
+  $('grounding-spec-summary').textContent = inherited
+    ? `已沿用上一輪 grounding spec${refs}`
+    : `已指定 grounding spec${refs}`;
+}
 let baseRunId = '';
 let inheritOpenedBrief = false;
 
@@ -1821,6 +1876,8 @@ $('browse').addEventListener('click', () => openPicker('path', 'video'));
 $('browse-music').addEventListener('click', () => openPicker('music-path', 'audio'));
 $('browse-brief').addEventListener('click', () => openPicker('brief-path', 'file'));
 $('browse-spec').addEventListener('click', () => openPicker('grounding-spec-path', 'spec'));
+$('grounding-spec-path').addEventListener('input', () => updateGroundingSpecSummary(false));
+$('grounding-spec-file').addEventListener('change', () => updateGroundingSpecSummary(false));
 $('close-picker').addEventListener('click', () => $('picker').classList.add('hide'));
 $('use-here').addEventListener('click', () => {
   $(pickTarget).value = picking;
@@ -1918,6 +1975,11 @@ async function loadPast() {
     $('past-table').innerHTML = emptyRow(7, '還沒有跑過任何一輪。');
     $('detail').classList.remove('hide');
     showTab('pane-past');
+    // The CLI may create the first run after this page was opened.  Keep the
+    // empty home screen live too; otherwise automatic discovery only began
+    // after at least one run already existed.
+    clearTimeout(pastTimer);
+    if (!runId) pastTimer = setTimeout(loadPast, 5000);
     return;
   }
   // Grouped by the material, because that is the unit of this work: one
@@ -1938,7 +2000,9 @@ async function loadPast() {
     </td></tr>`);
     for (const r of runs) rows.push(`<tr>
       <td class="mono">${new Date(r.started_at * 1000).toLocaleString('zh-TW', {month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})}</td>
-      <td>${r.state === 'done' ? '' : `<span class="tag ${r.state === 'failed' ? 'no' : ''}">${
+      <td>${r.state === 'done' && r.delivery_status === 'needs_review'
+        ? '<span class="tag no">待確認</span>'
+        : r.state === 'done' ? '' : `<span class="tag ${r.state === 'failed' ? 'no' : ''}">${
         ({running:'執行中',failed:'失敗',stopped:'已停止',interrupted:'中斷'})[r.state] || r.state}</span>`}</td>
       <td class="mono">${r.seconds ? r.seconds.toFixed(1) + 's' : '—'}</td>
       <td class="mono">${r.shots || '—'}</td>
@@ -1955,7 +2019,7 @@ async function loadPast() {
   // list is only as fresh as the last reload, which is exactly wrong for the
   // one row you would want to watch.
   clearTimeout(pastTimer);
-  if (data.runs.some(r => r.state === 'running')) {
+  if (!runId || data.runs.some(r => r.state === 'running')) {
     pastTimer = setTimeout(loadPast, 5000);
   }
   $('detail').classList.remove('hide');
@@ -2068,6 +2132,8 @@ async function openRun(id, where, how) {
     source: data.source_path || '',
     music: data.music_path || '',
     brief: data.brief_text || '',
+    grounding: data.grounding_spec_path || '',
+    groundingRefs: data.grounding_reference_count || 0,
   };
   baseRunId = id;
   // Opening a run shows the workspace, whether or not it finished. This
@@ -2085,7 +2151,8 @@ async function openRun(id, where, how) {
     $('result').classList.remove('hide');
   }
   $('state').textContent = { running:'執行中', done:'完成', failed:'失敗', stopped:'已停止', interrupted:'中斷' }[data.state] || data.state;
-  paintSteps(allLines);
+  lastProgress = data.progress;
+  paintSteps(lastProgress, data.state);
   paintSheet(data.progress, data.state);
   if (data.state !== 'done' && data.state !== 'running') {
     showFault(allLines);
@@ -2094,6 +2161,18 @@ async function openRun(id, where, how) {
   if (data.report) {
     for (const t of document.querySelectorAll('.tab')) t.classList.remove('hide');
     render(data.report); showExtras(); showTab('pane-shots');
+    // A failed draft has useful Selection data, but it also still has a
+    // failure the viewer needs to see.  render() used to strand the progress
+    // and fault panel inside the now-closed setup sheet, so the timeline came
+    // back while the reason it stopped disappeared.  Keep both together at
+    // the top of the shot list until a real report replaces the draft.
+    if (data.report.draft_only && data.state !== 'done') {
+      const shots = $('pane-shots');
+      if (shots && !shots.contains($('progress'))) {
+        shots.insertBefore($('progress'), shots.firstChild);
+        $('progress').style.marginTop = '0';
+      }
+    }
   } else {
     // The progress panel lives inside the setup sheet, because that is where
     // it appears when this tab is the one that pressed start -- and the
@@ -2125,7 +2204,7 @@ async function openRun(id, where, how) {
   if (data.state === 'running') {
     seen = data.total_lines ?? data.lines.length;
     timer = setInterval(poll, 1200);
-    ticker = setInterval(() => { if (allLines.length) paintSteps(allLines); }, 1000);
+    ticker = setInterval(() => { paintSteps(lastProgress, 'running'); }, 1000);
   }
   window.scrollTo({ top: $('progress').offsetTop - 20, behavior: 'smooth' });
 }
@@ -2162,7 +2241,7 @@ function inspect(i) {
   $('ins-head').querySelector('.who').textContent = '這一顆';
   const b = blocks[i];
   if (!b || !lastReport) { $('inspector').innerHTML = ''; return; }
-  const plan = (lastReport.selection?.shots || [])[b.index] || {};
+  const plan = b.manual_plan || (lastReport.selection?.shots || [])[b.index] || {};
   const rhythm = (lastReport.rhythm || {})[`k${String(b.index).padStart(2, '0')}`] || {};
   const said = (lastReport.shots || {})[`k${String(b.index).padStart(2, '0')}`] || {};
   const deg = (lastReport.degradations || []).filter(
@@ -2176,7 +2255,7 @@ function inspect(i) {
   // hold in your head which shot it is talking about while you read.
   $('inspector').innerHTML = `
     <div class="ins-card">
-      <img class="ins-thumb" alt="" src="/api/runs/${runId}/thumb/${b.index}">
+      <img class="ins-thumb" alt="" src="${esc(b.thumb_url || `/api/runs/${runId}/thumb/${b.index}`)}">
       <div class="ins-said">
         <div class="ins-subject">${esc(plan.subject || b.source_id)}</div>
         <div class="ins-row">
@@ -2184,6 +2263,16 @@ function inspect(i) {
           ${said.delivered === undefined ? '' :
             `<span class="tag ${said.delivered ? 'ok' : 'no'}">${
               said.delivered ? '做到' : '沒做到'}</span>`}
+          ${b.identity_status === 'needs_review'
+            ? '<span class="tag no">主體待確認</span>' : ''}
+          ${b.identity_status === 'unverified'
+            ? '<span class="tag no">主體尚未證明</span>' : ''}
+          ${b.identity_status === 'source_confirmed'
+            ? '<span class="tag">來源格已確認</span>' : ''}
+          ${b.identity_status === 'track_validated'
+            ? '<span class="tag ok">最終追蹤已驗證</span>' : ''}
+          ${b.identity_status === 'human_verified'
+            ? '<span class="tag ok">使用者已確認</span>' : ''}
         </div>
         <a class="link" href="/api/runs/${runId}/shot/${b.index}" target="_blank">單獨看這一顆 ↗</a>
       </div>
@@ -2210,8 +2299,10 @@ function inspect(i) {
       ${said.note ? `<p class="why">${esc(said.note)}</p>`
         : '<p class="why">逐顆驗收沒有單獨看這一顆。</p>'}
       ${deg.length ? `<div class="degs">${deg.map(tellDegradation).join('')}</div>` : ''}
-      ${disagreements.length ? `<div class="degs">${disagreements.map(
-        note => `<div class="warn">計畫疑點：${esc(note)}</div>`).join('')}</div>` : ''}
+      ${disagreements.length ? `<details class="deeper shot-doubts">
+        <summary>這顆的計畫疑點 ${disagreements.length}</summary>
+        <div class="degs">${disagreements.map(
+          note => `<div class="warn">${esc(note)}</div>`).join('')}</div></details>` : ''}
     </section>
 
     <section class="ins-part plan">
@@ -2220,6 +2311,17 @@ function inspect(i) {
         <span>剪輯意圖</span><span>${esc(intentLabel(
           b.motion?.camera_intent || plan.camera_intent
         ))}</span>
+        ${plan.direction_motion_advice ? `
+          <span>Direction 建議</span><span>${esc(
+            intentLabel(plan.direction_motion_advice.treatment)
+          )}・${esc(MOVES[plan.direction_motion_advice.move]
+            || plan.direction_motion_advice.move || '—')}<br>
+            <i class="why">${esc(plan.direction_motion_advice.route || '')}</i></span>
+          <span>建議理由</span><span>${esc(
+            plan.direction_motion_advice.reason || '—'
+          )}<br><i class="why">不可行時：${esc(intentLabel(
+            plan.direction_motion_advice.fallback
+          ))}</i></span>` : ''}
         <span>運鏡</span><span>${esc(MOVES[b.camera_move] || b.camera_move || '—')}${
           plan.frame ? `<i class="why">　宣告${plan.frame === 'travels' ? '會動' : '不動'}</i>` : ''}</span>
         <span>畫面停在</span><span>${
@@ -2227,7 +2329,10 @@ function inspect(i) {
             ? plan.looks.map(one =>
                 `${esc(one.at)}<i class="why"> ${esc(one.framing)}${
                   one.seconds ? `・停 ${one.seconds}s` : ''}${
-                  one.whole ? '・必須完整' : ''}</i>`
+                  (one.whole ?? one.must_be_whole)
+                    ? '・同一畫面必須看全' : ''}${
+                  one.presentation_intent
+                    ? `・${presentationLabel(one.presentation_intent)}` : ''}</i>`
               ).join('<br>↓ ')
             : esc(plan.subject || '—')
         }</span>
@@ -2255,8 +2360,58 @@ function inspect(i) {
         <span class="mono" id="gain-said">${(b.gain_db || 0) > 0 ? '+' : ''}${(b.gain_db || 0).toFixed(1)} dB</span>
         <button class="bare" id="gain-off">歸零</button>
       </div>
+      ${b.identity_issue ? `<p class="why">主體疑點：${esc(b.identity_issue)}</p>` : ''}
+      <button id="replace-shot">換這一顆（保留節奏）</button>
     </section>`;
   wireGain(i);
+  $('replace-shot').onclick = () => chooseReplacement(i);
+}
+
+async function chooseReplacement(i) {
+  const b = blocks[i];
+  const got = await fetch(`/api/runs/${runId}/replacement-candidates?needed_seconds=${b.seconds}`);
+  if (!got.ok) { alert('讀不到可替換片段'); return; }
+  const candidates = (await got.json()).candidates || [];
+  if (!candidates.length) { alert('沒有足以容納這個節奏格的可用片段'); return; }
+  let dialog = $('replacement-dialog');
+  if (!dialog) {
+    dialog = document.createElement('dialog'); dialog.id = 'replacement-dialog';
+    dialog.style.cssText = 'max-width:720px;width:calc(100% - 32px);border:1px solid #777;border-radius:12px;padding:18px;background:var(--panel);color:var(--ink)';
+    document.body.appendChild(dialog);
+  }
+  dialog.innerHTML = `
+    <h3>替換這一顆</h3>
+    <p class="why">原本 ${b.seconds.toFixed(2)} 秒不變，因此後面所有拍點都不會移動。</p>
+    <select id="replacement-choice" style="width:100%;margin:10px 0"></select>
+    <video id="replacement-preview" controls muted style="width:100%;max-height:340px;background:#000"></video>
+    <label style="display:block;margin:12px 0"><input id="replacement-confirm" type="checkbox"> 我已確認這段包含指定主體</label>
+    <div style="display:flex;gap:8px;justify-content:flex-end"><button id="replacement-cancel" class="bare">取消</button><button id="replacement-apply">套用片段</button></div>`;
+  const choice = $('replacement-choice');
+  choice.innerHTML = candidates.map((one, at) =>
+    `<option value="${at}">${esc(one.source_id)} · ${one.in_seconds.toFixed(1)}–${one.out_seconds.toFixed(1)}s · ${esc(one.summary)}</option>`
+  ).join('');
+  const preview = $('replacement-preview');
+  const show = () => {
+    const one = candidates[+choice.value || 0];
+    preview.src = `/api/runs/${runId}/source/${encodeURIComponent(one.source_id)}#t=${one.in_seconds},${Math.min(one.out_seconds, one.in_seconds + b.seconds)}`;
+  };
+  choice.onchange = show; show();
+  $('replacement-cancel').onclick = () => dialog.close();
+  $('replacement-apply').onclick = () => {
+    const one = candidates[+choice.value || 0];
+    b.replacement = {
+      source_id: one.source_id, span_id: one.span_id,
+      confirms_identity: $('replacement-confirm').checked,
+    };
+    b.source_id = one.source_id;
+    b.in_seconds = one.in_seconds;
+    b.subject = one.summary;
+    b.identity_status = b.replacement.confirms_identity ? 'human_verified' : 'needs_review';
+    b.identity_issue = b.replacement.confirms_identity ? '' : '使用者尚未確認這個替換片段包含指定主體';
+    b.thumb_url = `/api/runs/${runId}/source-thumb/${encodeURIComponent(one.source_id)}?at=${(one.in_seconds + b.seconds / 2).toFixed(3)}`;
+    dialog.close(); paintStrip(); inspect(i);
+  };
+  dialog.showModal();
 }
 
 async function showStrip() {
@@ -2267,6 +2422,7 @@ async function showStrip() {
   // reordered or dropped anything, after which every panel read out another
   // shot's reasoning and the recut asked to re-cut the wrong take.
   blocks = data.blocks;
+  refreshShotMotionFacts();
   timelineRevision = data.revision || 0;
   audioAssignments = data.audio_assignments || [];
   timelineFps = data.output_fps || 30;
@@ -2306,8 +2462,12 @@ async function showStrip() {
   $('reel').onclick = (e) => {
     if (e.target.closest('.blk')) return;
     const box = $('reel').getBoundingClientRect();
-    const total = blocks.reduce((a, b) => a + b.seconds, 0) || 1;
-    $('video').currentTime = ((e.clientX - box.left) / box.width) * total;
+    // Blocks, ruler and playhead all use pixels-per-second. Converting a
+    // click by the element's proportional width was a second time scale;
+    // it diverged as soon as min-width or zoom made the DOM width differ
+    // from `duration * scale`.
+    $('video').currentTime = Math.max(0, Math.min(
+      (e.clientX - box.left) / scale, reelSeconds()));
   };
 }
 
@@ -4528,7 +4688,7 @@ function paintStrip() {
     return `
     <div class="blk ${b.delivered === false ? 'no' : ''} ${i === picked ? 'on' : ''}"
          style="left:${left}px;width:${b.seconds * scale}px;
-                background-image:url(/api/runs/${runId}/thumb/${b.index})"
+                background-image:url('${b.thumb_url || `/api/runs/${runId}/thumb/${b.index}`}')"
          data-i="${i}" draggable="true"
          title="${esc(b.source_id)}　${esc(b.subject)}">
       <div class="grip l" data-edge="l" data-i="${i}"></div>
@@ -4563,10 +4723,10 @@ function wireStrip() {
     const i = +el.dataset.i;
     el.onclick = (e) => {
       if (e.target.dataset.kill !== undefined || e.target.classList.contains('grip')) return;
-      picked = i; paintStrip(); inspect(i);
-      if (peeking) peek(true);
       const at = blocks.slice(0, i).reduce((a, b) => a + b.seconds, 0);
       $('video').currentTime = at + 0.05;
+      picked = i; paintStrip(); inspect(i); movePlayhead(at + 0.05);
+      if (peeking) peek(true);
     };
     el.ondragstart = () => { from = i; };
     el.ondragover = (e) => e.preventDefault();
@@ -4652,7 +4812,8 @@ $('recut').addEventListener('click', async () => {
         index: b.index, in_seconds: b.in_seconds, seconds: b.seconds,
         gain_db: b.gain_db || 0, audio_role: b.audio_role || 'auto',
         audio_completion: b.audio_completion || 'none',
-        picture_role: b.picture_role || 'primary_action' }))
+        picture_role: b.picture_role || 'primary_action',
+        replacement: b.replacement || null }))
     }),
   });
   $('recut').disabled = false;
@@ -4689,6 +4850,10 @@ document.addEventListener('DOMContentLoaded', () => {
       if (peeking) peek(peeking, beside);
     }
     mirrorRaw();
+    // Playback's animation-frame loop updates this while playing. A paused
+    // seek (clicking a shot, the ruler, or using fastSeek) still emits
+    // timeupdate/seeked and must move the same red line as well.
+    movePlayhead();
   });
   addEventListener('resize', () => {
   if (!blocks.length) return;
@@ -4894,7 +5059,7 @@ $('go').addEventListener('click', async () => {
   // into, more than a finished one.
   markRunInUrl(runId, 'push');
   $('state').textContent = '執行中';
-  seen = 0; allLines = []; stepWas = -1; faultFrom = 0; $('log').textContent = '';
+  seen = 0; allLines = []; lastProgress = null; stepWas = -1; faultFrom = 0; $('log').textContent = '';
   // Whatever is on screen belongs to the last run. Leaving it there while a
   // new one writes cards reads as though the new one already finished.
   for (const id of ['result', 'detail', 'fault']) $(id).classList.add('hide');
@@ -4905,7 +5070,7 @@ $('go').addEventListener('click', async () => {
   $('export').parentElement.classList.add('hide');
   $('video').removeAttribute('src');
   timer = setInterval(poll, 1200);
-  ticker = setInterval(() => { if (allLines.length) paintSteps(allLines); }, 1000);
+  ticker = setInterval(() => { paintSteps(lastProgress, 'running'); }, 1000);
   poll();
 });
 
@@ -4917,67 +5082,57 @@ $('resume').addEventListener('click', async () => {
   $('fault').innerHTML = '';
   $('state').textContent = '執行中';
   faultFrom = allLines.length;
+  lastProgress = null;
   stepWas = -1;
   clearInterval(timer); clearInterval(ticker);
   timer = setInterval(poll, 1200);
-  ticker = setInterval(() => { if (allLines.length) paintSteps(allLines); }, 1000);
+  ticker = setInterval(() => { paintSteps(lastProgress, 'running'); }, 1000);
 });
 
 $('stop').addEventListener('click', async () => {
   if (runId) await fetch(`/api/runs/${runId}/stop`, { method: 'POST' });
 });
 
-// What each stage is for, in the order it happens. The raw output says
-// "cards: 74 written"; this says what that was and why it took four minutes.
+// What each durable stage is for, in the order it happens.  The server sends
+// the current structured phase; stdout remains useful evidence in 原始輸出,
+// but a phrase such as "no music map" must never advance this state machine.
 const STEPS = [
-  ['proxy',      '準備素材',   '每支壓一份小檔給模型看，順便把已經剪過的長片照場景切點拆開',
-                 l => /clips (from|in) /.test(l)],
-  ['cards',      '看每一支素材', 'Gemini 連聲音一起看完，記下內容、可框住的東西在哪、動作在第幾秒、聲音是不是內容',
-                 l => /^\s*card \d+\/|^cards:/.test(l)],
-  ['speech',     '聽懂在講什麼', 'Apple 辨識器給逐字時間，Gemini 改錯字並標出誰在講',
-                 l => /^speech:|transcribed/.test(l)],
-  ['identity',   '認出主角',    '先確定哪幾支素材裡真的有它、在第幾秒最清楚，認不出來的先擱在一邊',
-                 l => /^\s*(screen|identity) \d+\/|^set aside|^kept \d/.test(l)],
-  ['direction',  '決定剪成什麼', '調性、長度、比例、音樂怎麼鋪',
-                 l => /^direction:/.test(l)],
-  ['selection',  '挑鏡頭',     '用哪幾顆、從第幾秒進、多長、什麼運鏡、框住誰',
-                 l => /^selection:|^cut on action/.test(l)],
-  ['subject',    '找主體與裁切', 'Gemini 指出是哪一個，SAM 逐幀追出在哪裡，算出裁切路徑',
-                 l => /^no music map|^\s*subject \d+\/|frame loading|propagate/.test(l)],
-  ['review',     '驗收',       '先逐顆對照它自己的計畫，再看整支',
-                 l => /^shots:|^review \d/.test(l)],
-  ['replan',     '重新規劃',    '沒做到的那幾顆換個做法，其他不動',
-                 l => /^\s*replan /.test(l)],
-  ['done',       '完成',       '影片、報表、以及你要的時間軸',
-                 l => /^deliverable/.test(l)],
+  ['proxy',      '準備素材',     '每支壓一份小檔給模型看，順便把已經剪過的長片照場景切點拆開'],
+  ['cards',      '看每一支素材',   'Gemini 連聲音一起看完，記下內容、可框住的東西在哪、動作在第幾秒、聲音是不是內容'],
+  ['speech',     '聽懂在講什麼',   'Apple 辨識器給逐字時間，Gemini 改錯字並標出誰在講'],
+  ['identity_screen', '初篩主體',   '先粗篩哪幾支素材可能有主角，不能確定的先保留'],
+  ['direction',  '決定剪成什麼',   '調性、長度、比例、音樂怎麼鋪'],
+  ['identity_confirmation', '核驗候選主體', 'Direction 選出候選後，在原始畫格精確確認主體'],
+  ['selection',  '挑鏡頭',       '用哪幾顆、從第幾秒進、多長、什麼運鏡、框住誰'],
+  ['rhythm',     '安排節奏',     '在內容、動作與運鏡做得完的範圍內，把切點排到音樂上'],
+  ['subject',    '找主體與裁切',   'Gemini 指出是哪一個，SAM 逐幀追出在哪裡，算出裁切路徑'],
+  ['review',     '驗收',         '先逐顆對照它自己的計畫，再看整支'],
+  ['replan',     '重新規劃',      '沒做到的那幾顆換個做法，其他不動'],
+  ['done',       '完成',         '影片、報表、以及你要的時間軸'],
 ];
 
 let stepSince = 0, stepWas = -1;
+let lastProgress = null;
 
 function since(seconds) {
   if (seconds < 60) return `${seconds | 0} 秒`;
   return `${(seconds / 60) | 0} 分 ${(seconds % 60) | 0} 秒`;
 }
 
-function paintSteps(lines) {
-  let reached = -1;
-  const notes = {};
-  lines.forEach(line => {
-    STEPS.forEach(([key, , , matches], i) => {
-      if (!matches(line)) return;
-      if (i > reached) reached = i;
-      notes[key] = line.trim();
-    });
-  });
-  const label = $('state').textContent;
-  const running = label === '執行中';
-  const broke = label === '失敗' || label === '中斷';
+function paintSteps(progress, runState) {
+  const completed = new Set(progress?.completed || []);
+  const current = progress?.phase || '';
+  const running = runState === 'running';
+  const broke = ['failed', 'stopped', 'interrupted'].includes(runState);
+  const identity = progress?.identity || {};
   $('steps').innerHTML = STEPS.map(([key, name, said], i) => {
-    const state = i < reached ? 'done'
-      : i === reached ? (running ? 'now' : broke ? 'broke' : 'done')
+    const state = completed.has(key) ? 'done'
+      : key === current ? (running ? 'now' : broke ? 'broke' : 'done')
       : 'todo';
-    let note = notes[key] && state !== 'todo'
-      ? `<div class="said mono" style="color:var(--dim)">${esc(notes[key])}</div>` : '';
+    let note = '';
+    if (key === 'identity_confirmation' && identity.total && state !== 'todo') {
+      note = `<div class="said mono" style="color:var(--dim)">核驗 ${identity.current}/${identity.total}</div>`;
+    }
     if (state === 'now') {
       if (i !== stepWas) { stepWas = i; stepSince = Date.now(); }
       note += `<div class="why">已經 ${since((Date.now() - stepSince) / 1000)}`
@@ -4993,6 +5148,18 @@ function paintSteps(lines) {
 // A failure buried in a collapsed panel is a failure nobody sees. Pull out
 // the line that says what went wrong and put it where the eye already is.
 const FAULTS = [
+  [/selection has unresolved source-clock contracts before Rhythm:.*(?:push_in|pull_out|pan|tilt|reveal|compare|multi_stop).*needs about/i,
+   '選片的運鏡停留與鏡長互相衝突',
+   'Selection 已保存，尚未呼叫 Rhythm。新版會保留原本的運鏡、鏡頭與總長，只在仍保有最低落定時間時縮短各落點停留；連最低落定都放不下才要求重選。可以繼續目前這一輪。'],
+  [/source in-point .*starts after protected action/i,
+   '音樂對位碰到必須完整保留的動作',
+   'Rhythm 想把來源入點往後移來貼拍點，會切掉動作開頭，所以本機拒絕。新版會保留完整動作、讓精確拍點退讓；可以按「繼續跑」，不必重做素材卡或主體辨識。'],
+  [/hold across this shot needs about .* and has /i,
+   '單一畫面的建議長度被誤當成硬下限',
+   '單一 look 沒有運鏡路程，Selection 的停留秒數只是節奏建議。新版只保護落定所需時間；完整動作、對白與多落點運鏡仍由各自契約保護。可以繼續目前這一輪。'],
+  [/TimelineCoverageError:/,
+   '節奏超過畫面真正有內容的長度',
+   '選片已保存成可檢視草稿；有鏡頭被拉得比動作／內容證據更長，或總長超出目標。時間軸顯示選片原本的安全長度，不代表已完成裁切或渲染。'],
   [/ACCESS_TOKEN_TYPE_UNSUPPORTED|credential type cannot call the Gemini Developer Files API/i,
    '這把 Google Cloud key 不能呼叫 Gemini Files API',
    '目前 MontageWright 走 Gemini Developer API。請改用一般 Gemini API key（不要選「透過 service account 驗證」）；service-account-backed Cloud key 要等媒體層遷移到 GCS／Enterprise backend 才能使用。'],
@@ -5061,6 +5228,16 @@ function sayFault(what, why) {
 }
 function showFault(lines) {
   for (const line of lines.slice(faultFrom).reverse()) {
+    if (/SelectionUnrenderable:|selection remained structurally unrenderable/i.test(line)) {
+      const saved = Boolean(lastReport?.draft_only);
+      $('fault').innerHTML = saved
+        ? '<b>選片已保存，但本機契約驗證未通過</b>'
+          + '<div>這份付費 Selection 結果是不可發佈草稿，可在時間軸檢視。</div>'
+        : '<b>選片未通過本機契約驗證</b>'
+          + '<div>這個舊 run 失敗時尚未保存最後的 Selection 回覆，所以無法還原時間軸。現在已修正，之後同類失敗會保留可檢視草稿。</div>';
+      $('fault').classList.remove('hide');
+      return;
+    }
     for (const [pattern, what, why] of FAULTS) {
       if (pattern.test(line)) {
         $('fault').innerHTML = `<b>${what}</b><div>${why}</div>`;
@@ -5069,7 +5246,11 @@ function showFault(lines) {
       }
     }
   }
-  const last = lines.filter(l => /Error|Traceback|refused/i.test(l)).pop();
+  const candidates = lines.filter(
+    l => !/For further information/i.test(l)
+      && /SelectionUnrenderable:|PlannerError:|[A-Za-z]+Error:|refused/i.test(l)
+  );
+  const last = candidates.pop();
   if (last) {
     $('fault').innerHTML =
       `<b>這一輪沒有跑完</b><div class="detail">${esc(last.slice(0, 200))}</div>`;
@@ -5079,43 +5260,86 @@ function showFault(lines) {
 
 // The middle of the screen while it works. Tiles are built once and then
 // only filled in: rebuilding them every poll made every thumbnail blink.
-let sheetFor = -1;
+let sheetFor = '';
 function paintSheet(progress, state) {
   const sheet = $('cutting'), frame = $('frame');
   if (state !== 'running' || !progress) {
     sheet.classList.add('hide'); frame.classList.remove('hide');
-    sheetFor = -1;
+    sheetFor = '';
     return;
   }
   sheet.classList.remove('hide'); frame.classList.add('hide');
   const planned = progress.planned || [], cut = new Set(progress.cut || []);
   if (!planned.length) {
-    $('cutting-say').textContent = '還在看素材、決定要用哪幾顆——挑完這裡會一顆一顆長出來';
-    $('cutting-grid').innerHTML = '';
-    sheetFor = -1;
+    const identity = progress.identity || {};
+    const candidates = progress.identity_candidates || [];
+    if (progress.phase === 'identity_confirmation') {
+      $('cutting-say').innerHTML = identity.total
+        ? `正在精確核驗候選主體　<b>${identity.current}</b> / <b>${identity.total}</b> 支`
+        : '正在整理要精確核驗的候選主體';
+      const candidateKey = `${runId}:identity:${identity.current}/${identity.total}:`
+        + candidates.map(item => item.source).join(',');
+      if (sheetFor !== candidateKey) {
+        $('cutting-grid').innerHTML = candidates.map(item => `
+          <div class="tile waiting" data-tile="identity-${esc(item.source)}">
+            <img data-kind="identity" alt="${esc(item.source)}"
+              src="/api/runs/${runId}/identity-thumb/${encodeURIComponent(item.source)}">
+            <span class="tile-state">候選畫格・尚未選片</span>
+            <div class="who"><span>${esc(item.source)}</span><span>精確核驗</span></div>
+          </div>`).join('');
+        sheetFor = candidateKey;
+      }
+    } else {
+      $('cutting-say').textContent = '還在看素材、決定要用哪幾顆——挑完這裡會一顆一顆長出來';
+      $('cutting-grid').innerHTML = '';
+      sheetFor = '';
+    }
     return;
   }
-  $('cutting-say').innerHTML =
-    `已經剪好 <b>${cut.size}</b> / <b>${planned.length}</b> 顆`;
-  if (sheetFor !== planned.length) {
+  const trackingTotal = Number(progress.tracking_total || 0);
+  const trackingDone = Number(progress.tracking_done || 0);
+  $('cutting-say').innerHTML = cut.size
+    ? `已經渲染 <b>${cut.size}</b> / <b>${planned.length}</b> 顆`
+    : trackingTotal
+      ? `正在找主體與計算裁切　<b>${trackingDone}</b> / <b>${trackingTotal}</b> 顆`
+      : `已選好 <b>${planned.length}</b> 顆，正在準備追蹤與裁切`;
+  const sheetKey = `${runId}:${planned.length}`;
+  if (sheetFor !== sheetKey) {
     $('cutting-grid').innerHTML = planned.map(shot => `
       <div class="tile waiting" data-tile="${shot.index}">
+        <img data-kind="source" alt="${esc(shot.source)}"
+          src="/api/runs/${runId}/source-thumb/${encodeURIComponent(shot.source)}?at=${
+            Math.max(0, Number(shot.at || 0) + Number(shot.seconds || 0) / 2).toFixed(3)}">
+        <span class="tile-state">素材預覽・尚未裁切</span>
         <div class="who"><span>${esc(shot.source)}</span>
           <span>${shot.seconds ? shot.seconds.toFixed(1) + 's' : ''}</span></div>
       </div>`).join('');
-    sheetFor = planned.length;
+    sheetFor = sheetKey;
   }
-  const next = planned.find(shot => !cut.has(shot.index));
+  const trackingIndex = Number.isInteger(progress.tracking_index)
+    ? progress.tracking_index : null;
+  const next = trackingIndex == null
+    ? planned.find(shot => !cut.has(shot.index))
+    : planned.find(shot => shot.index === trackingIndex);
   for (const shot of planned) {
     const tile = $('cutting-grid').querySelector(`[data-tile="${shot.index}"]`);
     if (!tile) continue;
     tile.classList.toggle('doing', !!next && next.index === shot.index);
-    if (cut.has(shot.index) && !tile.querySelector('img')) {
+    const state = tile.querySelector('.tile-state');
+    if (state) state.textContent = cut.has(shot.index)
+      ? '已渲染'
+      : (!!next && next.index === shot.index
+        ? '正在追蹤與裁切'
+        : (shot.index < trackingDone
+          ? '追蹤完成・等待渲染'
+          : '素材預覽・尚未裁切'));
+    if (cut.has(shot.index) && tile.querySelector('img')?.dataset.kind !== 'cut') {
       tile.classList.remove('waiting');
-      const img = new Image();
+      const old = tile.querySelector('img');
+      const img = new Image(); img.dataset.kind = 'cut';
       img.src = `/api/runs/${runId}/thumb/${shot.index}`;
       img.alt = shot.source;
-      tile.prepend(img);
+      if (old) old.replaceWith(img); else tile.prepend(img);
     }
   }
 }
@@ -5139,10 +5363,11 @@ async function poll() {
   }
   seen = data.total_lines;
   $('log').scrollTop = $('log').scrollHeight;
-  $('state').textContent = { running: '執行中', done: '完成', failed: '失敗', stopped: '已停止' }[data.state];
+  $('state').textContent = { running: '執行中', done: '完成', failed: '失敗', stopped: '已停止', interrupted: '中斷' }[data.state] || data.state;
   $('state').className = 'state' + (data.state === 'done' ? ' done' : '');
   allLines = allLines.concat(data.lines);
-  paintSteps(allLines);
+  lastProgress = data.progress;
+  paintSteps(lastProgress, data.state);
   paintSheet(data.progress, data.state);
   if (data.state === 'failed' || data.state === 'stopped') {
     showFault(allLines);
@@ -5356,25 +5581,32 @@ function render(report) {
   wireExports(report);
   const where = (report.selection?.shots || []).length;
   $('crumb-what').textContent = lastSource || '這一輪';
+  const currentSpend = Object.values(report.spend?.by_stage || {})
+    .reduce((a, b) => a + b, 0);
+  const cumulativeSpend = Object.values(
+    report.spend_all_attempts?.by_stage || report.spend?.by_stage || {}
+  ).reduce((a, b) => a + b, 0);
   $('crumb-meta').textContent =
-    `${(report.duration_seconds ?? 0).toFixed(1)}s · ${where} 顆 · $`
-    + Object.values(report.spend?.by_stage || {}).reduce((a, b) => a + b, 0).toFixed(2);
+    `${report.draft_only ? '未渲染草稿 · ' : ''}${(report.duration_seconds ?? 0).toFixed(1)}s · ${where} 顆 · $`
+    + `${cumulativeSpend.toFixed(2)} 累計`;
   const howMany = (report.selection?.shots || []).length;
   const [landed, wanted] = String(report.cuts_on_music ?? '0/0').split('/').map(Number);
   const degraded = (report.degradations || []).length;
-  const spent = Object.values(report.spend?.by_stage || {}).reduce((a, b) => a + b, 0);
+  const spent = currentSpend;
   const target = report.target_seconds;
   const off = target ? (report.duration_seconds ?? 0) - target : 0;
 
   const stats = [
     [`${(report.duration_seconds ?? 0).toFixed(1)}s`,
-     target ? `目標 ${target}s，${off < 0 ? '短' : '長'} ${Math.abs(off).toFixed(1)}s` : '片長'],
+     report.draft_only ? '選片保存的安全長度，尚未渲染'
+       : target ? `目標 ${target}s，${off < 0 ? '短' : '長'} ${Math.abs(off).toFixed(1)}s` : '片長'],
     [howMany, '顆鏡頭'],
     // "0/13" read as though every cut had missed. A film where nothing asked
     // for a beat is not a film that missed every beat.
     wanted ? [`${landed}/${wanted}`, '刀切在音樂事件上']
            : [howMany, '刀的長度由內容決定'],
     [degraded, degraded ? '處做不到原本的計畫，都記了原因' : '處沒做到計畫'],
+    ['$' + cumulativeSpend.toFixed(2), '所有嘗試累計花費'],
     ['$' + spent.toFixed(2), '本輪花費'],
   ];
   $('stats').innerHTML = stats.map(([v, s]) =>
@@ -5385,10 +5617,25 @@ function render(report) {
   const spend = Object.entries(report.spend?.by_stage || {})
     .sort((a, b) => b[1] - a[1]);
   const total = spend.reduce((a, [, v]) => a + v, 0);
+  const uncertainAttempts = Number(
+    report.spend_all_attempts?.uncertain_attempts
+      ?? report.spend?.uncertain_attempts ?? 0
+  );
   $('spend').innerHTML = '<tr><th>階段</th><th style="text-align:right">花費</th></tr>' +
     spend.map(([k, v]) =>
       `<tr><td>${esc(k)}</td><td class="mono" style="text-align:right">$${v.toFixed(4)}</td></tr>`).join('') +
-    `<tr><td class="why">合計</td><td class="mono" style="text-align:right">$${total.toFixed(4)}</td></tr>`;
+    `<tr><td class="why">本輪合計</td><td class="mono" style="text-align:right">$${total.toFixed(4)}</td></tr>` +
+    `<tr><td class="why">所有嘗試累計</td><td class="mono" style="text-align:right">$${cumulativeSpend.toFixed(4)}</td></tr>` +
+    (uncertainAttempts
+      ? `<tr><td colspan="2"><span class="tag no">另有 ${uncertainAttempts} 次供應商重試可能已計費，但沒有 usage，未包含在金額內</span></td></tr>`
+      : '');
+
+  const reviewBlocked = report.delivery_status === 'needs_review';
+  $('notice').classList.toggle('hide', !reviewBlocked);
+  $('notice').textContent = reviewBlocked
+    ? '有鏡頭的主體仍待確認；匯出前請先檢查標記鏡頭。' : '';
+  $('export').title = reviewBlocked
+    ? '這支片仍可輸出預覽，但尚未通過主體確認' : '';
 
   const shots = report.selection?.shots || [];
   const rhythm = report.rhythm || {}, verdicts = report.shots || {};
@@ -5406,6 +5653,7 @@ function render(report) {
     const r = rhythm[k] || {}, v = verdicts[k] || {};
     const degs = degByClip[k] || [];
     const motion = report.motion?.[k] || {};
+    const sourceFact = sourceMovementFact(i);
     const disagreements = disagreementsForShot(report, i, s.source_id);
     const ok = v.delivered === undefined ? '' :
       `<span class="tag ${v.delivered ? 'ok' : 'no'}">${
@@ -5424,7 +5672,9 @@ function render(report) {
             <span class="mono no">${i}</span>
             <a class="mono shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a>
             <span class="mono">${Number(s.start_seconds ?? 0).toFixed(1)}s ＋${Number(r.seconds ?? 0).toFixed(1)}s</span>
-            <span class="move">${esc(intentLabel(motion.camera_intent || s.camera_intent))} · ${esc(compositeLabel(motion.composite))}</span>
+            <span class="move"><span data-source-motion="${i}">${esc(sourceFact)}</span> · ${esc(
+              intentLabel(motion.camera_intent || s.camera_intent)
+            )} · ${esc(compositeLabel(motion.composite))}</span>
           </div>
         </div>
       </div>
@@ -5506,6 +5756,16 @@ $('new-run').addEventListener('click', () => {
   if (openedFrom.brief && !$('brief').value.trim()) {
     $('brief').value = openedFrom.brief;
   }
+  if (openedFrom.grounding
+      && !$('grounding-spec-path').value.trim()
+      && !$('grounding-target-description').value.trim()
+      && !$('grounding-spec-file').files.length) {
+    $('grounding-spec-path').value = openedFrom.grounding;
+  }
+  updateGroundingSpecSummary(Boolean(
+    openedFrom.grounding
+    && $('grounding-spec-path').value.trim() === openedFrom.grounding
+  ));
   inheritOpenedBrief = Boolean(baseRunId && openedFrom.brief);
   $('inherit-brief').checked = inheritOpenedBrief;
   $('veil').classList.remove('hide');
@@ -5514,8 +5774,8 @@ $('new-run').addEventListener('click', () => {
 
 
 let clockSaid = '';
-function movePlayhead() {
-  const at = $('video').currentTime || 0;
+function movePlayhead(atOverride = null) {
+  const at = atOverride == null ? ($('video').currentTime || 0) : atOverride;
   const x = at * scale;
   const box = $('scroller');
 
@@ -5662,13 +5922,17 @@ $('playhead').addEventListener('mousedown', (e) => {
   const move = (ev) => {
     wanted = Math.max(0, Math.min(
       (ev.clientX - box.left) / scale, reelSeconds()));
-    movePlayhead();
+    // currentTime is deliberately throttled below because seeking decodes
+    // video. The lightweight red line should still follow every pointer
+    // event instead of trailing the cursor by one decode.
+    movePlayhead(wanted);
     if (!pending) { pending = true; requestAnimationFrame(apply); }
   };
   const up = () => {
     document.removeEventListener('mousemove', move);
     document.removeEventListener('mouseup', up);
     cut.currentTime = wanted;
+    movePlayhead(wanted);
   };
   document.addEventListener('mousemove', move);
   document.addEventListener('mouseup', up);
@@ -6028,11 +6292,11 @@ function cropAt(block, seconds) {
     if (t <= keys[i].at) {
       const a = keys[i - 1], b = keys[i];
       const span = (b.at - a.at) || 1;
-      // Smoothstep, the same 3u^2-2u^3 the render's crop expression uses.
-      // A straight line here put the box in the wrong place through the
-      // middle of every move, which is the part of a move worth checking.
+      // A few keys are authored stops and ease like the render. Many keys
+      // are dense SAM samples and stay continuous; easing each sample would
+      // make the virtual camera brake and restart throughout the shot.
       const u = Math.max(0, Math.min((t - a.at) / span, 1));
-      const p = u * u * (3 - 2 * u);
+      const p = keys.length <= 4 ? u * u * (3 - 2 * u) : u;
       return {
         x: a.x + (b.x - a.x) * p, y: a.y + (b.y - a.y) * p,
         w: a.w + (b.w - a.w) * p, h: a.h + (b.h - a.h) * p,
@@ -6101,6 +6365,13 @@ const PICTURE_ROLES = {
   punchline_hold: '笑點停留', end_hold: '結尾停留',
   title_read: '讀字時間', music_montage: '音樂蒙太奇'
 };
+const PRESENTATIONS = {
+  complete_hold: '完整到達並停穩',
+  centered_hold: '穩定可辨識落點',
+  reveal_endpoint: '揭示運鏡的最終落點',
+  partial_reveal: '允許局部入／出畫',
+  transition_pass: '經過畫面，不停住',
+};
 function motionLabel(value, layer) {
   if (!value) return '—';
   if (layer === 'source') return SOURCE_MOTIONS[value] || value;
@@ -6110,6 +6381,11 @@ function motionLabel(value, layer) {
 function intentLabel(value) {
   if (!value) return '—';
   return INTENTS[value] || MOVES[value] || value;
+}
+
+function presentationLabel(value) {
+  if (!value) return '—';
+  return PRESENTATIONS[value] || value;
 }
 
 function compositeLabel(value) {
@@ -6125,6 +6401,21 @@ function sourceMeasurementLabel(value) {
   const peak = Number(value.peak_frame_widths_per_second || 0).toFixed(2);
   return `本機量到位移 ${travel} 畫面寬（峰值 ${peak}/秒）${
     value.settles ? '，最後落定' : ''}`;
+}
+
+function sourceMovementFact(index) {
+  const measured = blocks.find(block => Number(block.index) === Number(index))
+    ?.source_motion_details?.measurement;
+  if (!measured?.available) return '素材運動未量測';
+  return measured.moving
+    ? `素材位移 ${Number(measured.travel_frame_widths || 0).toFixed(2)} 畫面寬`
+    : '素材固定';
+}
+
+function refreshShotMotionFacts() {
+  for (const node of document.querySelectorAll('[data-source-motion]')) {
+    node.textContent = sourceMovementFact(node.dataset.sourceMotion);
+  }
 }
 
 function disagreementsForShot(report, index, sourceId) {
@@ -6309,6 +6600,8 @@ new ResizeObserver(() => {
 }).observe($('frame'));
 $('video').addEventListener('loadedmetadata', showBurnt);
 $('video').addEventListener('timeupdate', showBurnt);
+for (const eventName of ['seeked', 'loadedmetadata', 'durationchange', 'pause'])
+  $('video').addEventListener(eventName, () => movePlayhead());
 for (const eventName of ['timeupdate','seeked','loadedmetadata','pause'])
   $('video').addEventListener(eventName, showGraphicPreview);
 $('video').addEventListener('play', () => scheduleGraphicPreviewPrewarm(0));

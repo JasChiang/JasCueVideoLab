@@ -116,7 +116,10 @@ def repair_bounded_visual_holds(
         if (
             has_independent_audio
             or str(shot.get("audio_role") or "discard") != "discard"
-            or bool(shot.get("audio_completion"))
+            # ``none`` is the required schema value for no completion duty;
+            # treating the non-empty string as truthy disabled this local
+            # repair for every new Selection answer.
+            or str(shot.get("audio_completion") or "none") != "none"
         ):
             continue
         limit = VISUAL_ONLY_LIMITS[role]
@@ -263,14 +266,19 @@ def visual_supported_max(
                 intervals.append((
                     float(found["start"]), float(found["end"]), "action",
                 ))
-    for measured in getattr(item, "motion", ()):
-        if str(getattr(measured, "state", "still")) == "still":
-            continue
-        intervals.append((
-            float(getattr(measured, "starts_seconds", 0.0)),
-            float(getattr(measured, "ends_seconds", 0.0)),
-            "motion",
-        ))
+    # Pixel displacement is not automatically editorial development. Setup,
+    # disturbance and handheld texture all move, but none completes the source
+    # treatment promised by ``use_source_motion``. The semantic span role and
+    # the explicit treatment must agree before local motion can buy coverage.
+    if str(motion_role) in {"authored", "subject_follow"}:
+        for measured in getattr(item, "motion", ()):
+            if str(getattr(measured, "state", "still")) == "still":
+                continue
+            intervals.append((
+                float(getattr(measured, "starts_seconds", 0.0)),
+                float(getattr(measured, "ends_seconds", 0.0)),
+                "motion",
+            ))
     measured_seconds = _overlap(
         float(source_start), source_end, intervals
     )
@@ -287,6 +295,53 @@ def visual_supported_max(
     # contract.  It cannot extend beyond source evidence or invent more time.
     evidenced = measured_seconds + 0.60 if measured_seconds > 0.0 else 0.0
     return min(available, max(float(base), evidenced))
+
+
+def source_motion_contract_for(
+    item: Any,
+    *,
+    source_start: float,
+    source_end: float,
+    motion_role: str,
+) -> Any | None:
+    """Protect a measured source move only when Selection kept it whole.
+
+    ``use_source_motion`` means the edit uses the motion visible inside the
+    chosen excerpt.  It does not, by itself, promise to play an arbitrarily
+    long camera-motion interval from its beginning to its end.  A completion
+    contract is therefore valid only when the selected source window already
+    contains the complete measured interval.  Partial overlaps remain usable
+    native-motion excerpts, but carry no false whole-move obligation.
+    """
+
+    role = str(motion_role or "")
+    if role not in {"authored", "subject_follow"} or item is None:
+        return None
+    pieces: list[tuple[float, float]] = []
+    for measured in getattr(item, "motion", ()):
+        if str(getattr(measured, "state", "still")) == "still":
+            continue
+        measured_start = float(getattr(measured, "starts_seconds", 0.0))
+        measured_end = float(getattr(measured, "ends_seconds", 0.0))
+        contains_whole_interval = (
+            float(source_start) <= measured_start + 1e-6
+            and float(source_end) >= measured_end - 1e-6
+        )
+        if contains_whole_interval:
+            # Preserve the measurement's real boundary.  We deliberately do
+            # not intersect it with the selection: that would let a later
+            # shortened edit redefine its own endpoint as successful.
+            pieces.append((measured_start, measured_end))
+    if not pieces:
+        return None
+    from montagewright.schema import SourceMotionContract
+
+    return SourceMotionContract(
+        motion_role=role,
+        source_start_seconds=min(left for left, _ in pieces),
+        source_complete_seconds=max(right for _, right in pieces),
+        safe_cut_after_seconds=max(right for _, right in pieces),
+    )
 
 
 def _entry(
@@ -360,20 +415,33 @@ def _entry(
 
 
 def _target_faults(
-    duration: float, supported: float, target: float, *, hard: bool = False,
+    duration: float,
+    supported: float,
+    target: float,
+    *,
+    hard: bool = False,
+    duration_tolerance_seconds: float | None = None,
 ) -> list[str]:
     if target <= 0:
         return []
-    tolerance = max(
+    evidence_tolerance = max(
         TARGET_TOLERANCE_SECONDS, target * TARGET_TOLERANCE_FRACTION
     )
+    # A preferred music-led duration may legitimately finish on the end of
+    # the current bar instead of cutting a protected action or camera move a
+    # fraction early.  Keep that delivery tolerance separate from evidence
+    # tolerance: allowing one more bar never licenses one more bar of empty
+    # or unsupported picture.
+    duration_tolerance = max(
+        evidence_tolerance, float(duration_tolerance_seconds or 0.0)
+    )
     faults = []
-    if hard and duration < target - tolerance:
+    if hard and duration < target - duration_tolerance:
         faults.append(
             f"timeline is only {duration:.2f}s against the {target:.2f}s "
             f"target; structural selection is short by {target - duration:.2f}s"
         )
-    if duration > target + tolerance:
+    if duration > target + duration_tolerance:
         faults.append(
             f"timeline is {duration:.2f}s against the {target:.2f}s target; "
             f"it is over by {duration - target:.2f}s and must remove or "
@@ -382,14 +450,14 @@ def _target_faults(
     # Soft targets may be shorter, but a timeline that already reaches its
     # requested duration by adding unsupported seconds is still invalid.
     # Compare evidence with the actual edit here, not with the optional goal.
-    if supported < duration - tolerance:
+    if supported < duration - evidence_tolerance:
         faults.append(
             f"evidence covers {supported:.2f}s of the {duration:.2f}s edit; "
             f"{duration - supported:.2f}s needs additional narrative, visible "
             "action/reaction, readable graphics, montage or an explicit "
             "shorter delivery—not longer holds"
         )
-    elif hard and supported < target - tolerance:
+    elif hard and supported < target - evidence_tolerance:
         faults.append(
             f"evidence covers {supported:.2f}s of the {target:.2f}s target; "
             f"{target - supported:.2f}s needs additional narrative, visible "
@@ -404,6 +472,12 @@ def _visual_claim(item: Any, shot: dict[str, Any], role: str) -> float:
 
     seconds = max(0.0, float(shot.get("seconds_needed") or 0.0))
     source_start = float(shot.get("start_seconds") or 0.0)
+    looks = list(shot.get("looks") or [])
+    grounded_look = next((
+        look for look in looks
+        if str(look.get("entity_id") or "none") not in {"", "none"}
+    ), None)
+    evidence_look = grounded_look or (looks[0] if looks else {})
     return visual_supported_max(
         item,
         role=role,
@@ -414,16 +488,10 @@ def _visual_claim(item: Any, shot: dict[str, Any], role: str) -> float:
             if str(shot.get("camera_intent") or "") == "use_source_motion"
             else ""
         ),
-        presentation_intent=next((
-            str(look.get("presentation_intent") or "")
-            for look in shot.get("looks") or []
-            if look.get("presentation_intent")
-        ), ""),
-        target_id=next((
-            str(look.get("entity_id") or "none")
-            for look in shot.get("looks") or []
-            if str(look.get("entity_id") or "none") != "none"
-        ), "none"),
+        presentation_intent=str(
+            evidence_look.get("presentation_intent") or ""
+        ),
+        target_id=str(evidence_look.get("entity_id") or "none"),
     )
 
 
@@ -503,7 +571,11 @@ def selection_coverage_audit(
 
 
 def edl_coverage_audit(
-    edl: EDL, target_seconds: float, *, hard_target: bool = False,
+    edl: EDL,
+    target_seconds: float,
+    *,
+    hard_target: bool = False,
+    duration_tolerance_seconds: float | None = None,
 ) -> CoverageAudit:
     """Audit the resolved picture/audio clock shared by CLI, Web and render."""
 
@@ -543,7 +615,11 @@ def edl_coverage_audit(
         faults.extend(found)
     supported = sum(one.supported_seconds for one in entries)
     faults.extend(_target_faults(
-        cursor, supported, float(target_seconds or 0), hard=hard_target
+        cursor,
+        supported,
+        float(target_seconds or 0),
+        hard=hard_target,
+        duration_tolerance_seconds=duration_tolerance_seconds,
     ))
     return CoverageAudit(
         cursor, supported, float(target_seconds or 0), tuple(entries),

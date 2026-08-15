@@ -84,6 +84,9 @@ class Beat:
     ends_seconds: float
 
 
+_NEAREST_ACTION = object()
+
+
 def action_beats(card: dict[str, Any]) -> list[Beat]:
     beats: list[Beat] = []
     for entry in card.get("action", []) or []:
@@ -118,13 +121,15 @@ def snap_to_action(
     wanted_start: float,
     duration: float,
     *,
+    action_id: object = _NEAREST_ACTION,
     within: tuple[float, float] | None = None,
     focus: "list[Any] | None" = None,
 ) -> tuple[float, str | None]:
     """Compatibility wrapper around the contract-producing action snap."""
 
     start, _contract, note = snap_to_action_contract(
-        card, wanted_start, duration, within=within, focus=focus
+        card, wanted_start, duration, action_id=action_id,
+        within=within, focus=focus
     )
     return start, note
 
@@ -134,16 +139,16 @@ def snap_to_action_contract(
     wanted_start: float,
     duration: float,
     *,
+    action_id: object = _NEAREST_ACTION,
     within: tuple[float, float] | None = None,
     focus: "list[Any] | None" = None,
 ) -> "tuple[float, Any | None, str | None]":
-    """Move a planned in-point onto the nearest action that contains it.
+    """Resolve one explicitly selected action into a completion contract.
 
-    A cut placed by arithmetic lands wherever the seconds fall, which is
-    usually the middle of a gesture. An editor entering a shot goes in as the
-    movement starts. This only moves the in-point when there is an action
-    close enough to be the one meant -- half the shot's length -- so a static
-    shot keeps the timing it was given.
+    A nearby action is descriptive card evidence, not an instruction to show
+    it. New planning callers pass ``action_id`` explicitly; ``none`` leaves a
+    static/detail shot untouched. Omitting the keyword retains only the legacy
+    helper behaviour for old callers and cached tests.
 
     `within` is the stretch the card said was worth cutting into. Actions are
     recorded across the whole take, including the parts nobody should use --
@@ -155,27 +160,54 @@ def snap_to_action_contract(
 
     from montagewright.schema import ActionContract
 
+    legacy_nearest = action_id is _NEAREST_ACTION
+    selected = str(action_id or "none").strip()
+    if not legacy_nearest and selected in {"", "none"}:
+        return wanted_start, None, None
+    # The id is scoped by the shot's selected source; the caller validates that
+    # pairing before this card resolves it.
+    local_id = selected.rsplit(":", 1)[-1]
     beats = action_beats(card)
+    if not legacy_nearest:
+        beats = [beat for beat in beats if beat.beat_id == local_id]
     if within is not None:
         first, last = within
         beats = [
             beat for beat in beats
             if beat.starts_seconds >= first - 1e-6
-            # Both the requested hold and the action's real completion have
-            # to fit.  The old condition checked only start+duration, so a
-            # four-second action could be selected for a two-second shot and
-            # was then cut exactly in half.
-            and max(
-                beat.starts_seconds + duration, beat.ends_seconds
-            ) <= last + 1e-6
+            and beat.ends_seconds <= last + 1e-6
+            and (
+                # The requested window may already contain the whole action.
+                # In that case keep its earlier context instead of snapping
+                # to the action start and pushing the out-point past the span.
+                (
+                    wanted_start >= first - 1e-6
+                    and wanted_start + duration <= last + 1e-6
+                    and beat.starts_seconds >= wanted_start - 1e-6
+                    and beat.ends_seconds <= wanted_start + duration + 1e-6
+                )
+                # Otherwise snapping to the action start is safe only when
+                # both the requested hold and real completion still fit.
+                or max(
+                    beat.starts_seconds + duration, beat.ends_seconds
+                ) <= last + 1e-6
+            )
         ]
     if not beats:
         return wanted_start, None, None
 
-    tolerance = max(0.5, duration / 2.0)
-    nearest = min(beats, key=lambda beat: abs(beat.starts_seconds - wanted_start))
-    drift = nearest.starts_seconds - wanted_start
-    if abs(drift) > tolerance:
+    nearest = (
+        min(beats, key=lambda beat: abs(beat.starts_seconds - wanted_start))
+        if legacy_nearest else beats[0]
+    )
+    already_contained = (
+        not legacy_nearest
+        and nearest.starts_seconds >= wanted_start - 1e-6
+        and nearest.ends_seconds <= wanted_start + duration + 1e-6
+    )
+    resolved_start = wanted_start if already_contained else nearest.starts_seconds
+    drift = resolved_start - wanted_start
+    if legacy_nearest and abs(drift) > max(0.5, duration / 2.0):
         return wanted_start, None, None
     # Landing on the gesture is worth moving for; landing on the gesture
     # while the lens is still hunting is not. A cut that was planned on
@@ -187,7 +219,7 @@ def snap_to_action_contract(
         from montagewright.focus import moving_into_softer
 
         if moving_into_softer(
-            focus, wanted_start, nearest.starts_seconds, duration
+            focus, wanted_start, resolved_start, duration
         ):
             return wanted_start, None, None
     contract = ActionContract(
@@ -201,7 +233,7 @@ def snap_to_action_contract(
         completion_policy="must_complete",
         timing_basis="coarse_mmss",
     )
-    return nearest.starts_seconds, contract, (
+    return resolved_start, contract, (
         f"moved {drift:+.2f}s onto '{nearest.what}'" if abs(drift) > 0.05 else None
     )
 
@@ -614,7 +646,14 @@ def find_subject(
     boxes = subjects_from_card(card)
     if entity_id is not None:
         matched = [box for box in boxes if box.entity_id == entity_id]
-        return matched[0] if len(matched) == 1 else None
+        if len(matched) == 1:
+            return matched[0]
+        if matched:
+            boxes = matched
+        # Legacy cards predate grounding identities and therefore have no
+        # entity_id on otherwise useful measured boxes.  Falling through to
+        # the description keeps those local coordinates available; identity
+        # authority still comes from exact grounding, never from this match.
     lowered = description.lower()
     exactish = []
     for box in boxes:
@@ -625,6 +664,41 @@ def find_subject(
         return exactish[0]
     if exactish:
         return None
+    # Selection may describe a measured box in the brief's language while a
+    # reusable card was written in another one. Relative composition remains
+    # unambiguous across languages, and is geometry rather than identity.
+    positional = {
+        "left": ("left", "左"),
+        "centre": ("middle", "center", "centre", "中間", "中央"),
+        "right": ("right", "右"),
+    }
+    requested = [
+        name for name, words in positional.items()
+        if any(word in lowered for word in words)
+    ]
+    if len(requested) == 1 and boxes:
+        name = requested[0]
+        ranked = (
+            sorted(boxes, key=lambda box: box.centre_x)
+            if name == "left"
+            else sorted(boxes, key=lambda box: box.centre_x, reverse=True)
+            if name == "right"
+            else sorted(boxes, key=lambda box: abs(box.centre_x - 0.5))
+        )
+        if len(ranked) == 1:
+            return ranked[0]
+        first_distance = (
+            ranked[0].centre_x if name == "left"
+            else 1.0 - ranked[0].centre_x if name == "right"
+            else abs(ranked[0].centre_x - 0.5)
+        )
+        second_distance = (
+            ranked[1].centre_x if name == "left"
+            else 1.0 - ranked[1].centre_x if name == "right"
+            else abs(ranked[1].centre_x - 0.5)
+        )
+        if second_distance - first_distance > 0.05:
+            return ranked[0]
     # Fall back only when one candidate shares a distinguishing word. A
     # common token matching two boxes is ambiguity, not permission to pick
     # whichever the card happened to list first.

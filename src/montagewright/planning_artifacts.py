@@ -16,6 +16,15 @@ def asked(*parts: str) -> str:
     return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
+def _value_checksum(value: Any) -> str:
+    """Detect a torn or manually altered cached provider answer."""
+
+    canonical = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def decided(work: Path, name: str, key: str) -> dict | None:
     """Return a paid decision only when its full question still matches."""
 
@@ -24,7 +33,17 @@ def decided(work: Path, name: str, key: str) -> dict | None:
         saved = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return saved.get("value") if saved.get("key") == key else None
+    if saved.get("key") != key:
+        return None
+    value = saved.get("value")
+    checksum = saved.get("value_sha256")
+    # Compatibility matters here: rejecting every artifact written before
+    # checksums existed would itself trigger paid Direction/Selection reruns.
+    # Callers still validate the answer's current semantic contract.  Once a
+    # checksum exists, however, never accept altered or partially written data.
+    if checksum is not None and checksum != _value_checksum(value):
+        return None
+    return value
 
 
 def decide(work: Path, name: str, key: str, value: dict) -> dict:
@@ -32,7 +51,11 @@ def decide(work: Path, name: str, key: str, value: dict) -> dict:
 
     path = Path(work) / f"{name}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    document = json.dumps({"key": key, "value": value}, ensure_ascii=False)
+    document = json.dumps({
+        "key": key,
+        "value": value,
+        "value_sha256": _value_checksum(value),
+    }, ensure_ascii=False)
     descriptor, temporary = tempfile.mkstemp(
         prefix=f".{path.name}-", suffix=".tmp", dir=path.parent
     )

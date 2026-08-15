@@ -55,22 +55,30 @@ _GRAPHICS_STATE_LOCKS: dict[str, threading.Lock] = {}
 _GRAPHICS_PREVIEW_LOCKS: dict[str, threading.Lock] = {}
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
-# Runs live somewhere they survive a restart. They were in a temp directory
-# keyed by an in-memory dict, so closing the server threw away every finished
-# cut -- and comparing this run against the last one is most of what anybody
-# does with a tool like this.
-RUNS_ROOT = Path(
-    os.environ.get("MONTAGEWRIGHT_RUNS", Path.home() / ".cache" / "montagewright" / "runs")
+# Runs live somewhere they survive a restart.  An installed server keeps its
+# normal user cache.  A server launched from this repository writes inside the
+# repository by default: managed development environments commonly allow the
+# home cache to be read but not written, and discovering that only after the
+# user presses Start wastes a whole setup interaction.
+_USER_RUNS_ROOT = Path.home() / ".cache" / "montagewright" / "runs"
+_PROJECT_RUNS_ROOT = Path.cwd() / "artifacts" / "web-runs"
+_CONFIGURED_RUNS_ROOT = os.environ.get("MONTAGEWRIGHT_RUNS", "").strip()
+RUNS_ROOT = (
+    Path(_CONFIGURED_RUNS_ROOT).expanduser()
+    if _CONFIGURED_RUNS_ROOT
+    else _PROJECT_RUNS_ROOT
+    if (Path.cwd() / "pyproject.toml").is_file()
+    else _USER_RUNS_ROOT
 )
 # A sandboxed/local development server may need to create new runs inside the
 # workspace while still showing older CLI/Codex runs from the normal cache.
 # These roots are discovery-only: every new run is always written to
 # ``RUNS_ROOT``.
-LEGACY_RUNS_ROOTS = tuple(
+LEGACY_RUNS_ROOTS = tuple(dict.fromkeys((
     Path(value).expanduser()
     for value in os.environ.get("MONTAGEWRIGHT_LEGACY_RUNS", "").split(os.pathsep)
     if value.strip()
-)
+))) + (() if RUNS_ROOT == _USER_RUNS_ROOT else (_USER_RUNS_ROOT,))
 # A browser upload of local material copies it into the browser and writes it
 # back out; the bytes were already on disk. Uploading stays for the case where
 # they genuinely are not, and that case has a ceiling.
@@ -123,7 +131,7 @@ class Run:
     def report(self) -> dict | None:
         path = self.output / "report.json"
         if not path.exists():
-            return None
+            return _draft_report_for(self)
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -133,6 +141,119 @@ class Run:
 
 
 RUNS: dict[str, Run] = {}
+
+
+def _prove_writable_directory(path: Path, *, purpose: str) -> Path:
+    """Create and actually write a probe before a paid child is launched."""
+
+    resolved = path.expanduser().resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    probe: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(
+            prefix=".montagewright-write-test-", dir=resolved
+        )
+        os.close(descriptor)
+        probe = Path(name)
+        probe.write_text("ok", encoding="utf-8")
+    except OSError as error:
+        raise PermissionError(
+            f"{purpose} is not writable: {resolved}: {error}"
+        ) from error
+    finally:
+        if probe is not None:
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return resolved
+
+
+def _seed_writable_web_cache(
+    cache_home: Path, library: Path, *, legacy_root: Path | None = None
+) -> None:
+    """Carry forward the old user cache once, without depending on writing it."""
+
+    legacy_root = legacy_root or (Path.home() / ".cache" / "montagewright")
+    legacy_library = legacy_root / "library"
+    try:
+        same_library = legacy_library.resolve() == library.resolve()
+    except OSError:
+        same_library = False
+    try:
+        library_empty = not any(library.iterdir())
+    except OSError:
+        library_empty = False
+    if not same_library and library_empty and legacy_library.is_dir():
+        try:
+            # This cache is content-addressed. A one-time copy preserves paid
+            # cards/identity evidence while all future writes go only to the
+            # preflighted project cache.
+            shutil.copytree(legacy_library, library, dirs_exist_ok=True)
+        except OSError:
+            # Reuse is an optimisation; an unreadable legacy cache must never
+            # make the new writable cache unusable.
+            pass
+
+    upload_parent = cache_home / "montagewright"
+    legacy_uploads = legacy_root / "uploads.json"
+    current_uploads = upload_parent / "uploads.json"
+    if (
+        legacy_uploads.is_file()
+        and not current_uploads.exists()
+        and legacy_uploads != current_uploads
+    ):
+        try:
+            shutil.copy2(legacy_uploads, current_uploads)
+        except OSError:
+            pass
+
+
+def _child_environment() -> dict[str, str]:
+    """Give CLI children a writable cache without losing cross-run reuse.
+
+    The Web server can run in a managed desktop process that may read the
+    user's home cache but cannot write it.  Letting the child inherit that
+    implicit default makes a run fail only when Direction first persists a
+    File API upload.  Keep an explicitly configured XDG cache untouched; when
+    none was configured, put the shared cache beside the Web runs instead.
+    It is deliberately not inside one run, because uploaded assets are keyed
+    by content and should be reusable by later cuts of the same footage.
+    """
+
+    environment = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    configured_cache = environment.get("XDG_CACHE_HOME", "").strip()
+    cache_home = Path(configured_cache) if configured_cache else (
+        RUNS_ROOT.parent / "cache"
+    )
+    cache_home = _prove_writable_directory(
+        cache_home, purpose="Web run cache root"
+    )
+    environment["XDG_CACHE_HOME"] = str(cache_home)
+
+    # Cards, identity confirmations and exact-frame decisions use the
+    # material library rather than uploads.json.  Only redirecting XDG fixed
+    # File API uploads but left this second cache on ~/.cache, so runs failed
+    # minutes later after paying for grounding.  Give both stores the same
+    # explicit, preflighted writable root; the CLI's .env loader uses
+    # setdefault and therefore cannot silently replace it.
+    configured_library = environment.get("MONTAGEWRIGHT_LIBRARY", "").strip()
+    library = Path(configured_library) if configured_library else (
+        cache_home / "montagewright" / "library"
+    )
+    library = _prove_writable_directory(
+        library, purpose="Web run material library"
+    )
+    environment["MONTAGEWRIGHT_LIBRARY"] = str(library)
+
+    # default_cache_path() appends montagewright/uploads.json. Prove its
+    # parent independently so neither upload persistence nor grounding can be
+    # the first operation to discover a sandbox/ACL problem.
+    _prove_writable_directory(
+        cache_home / "montagewright", purpose="Web run upload cache"
+    )
+    _seed_writable_web_cache(cache_home, library)
+    return environment
 
 
 def _lines_on_disk(out: Path) -> list[str]:
@@ -153,6 +274,195 @@ def _lines_on_disk(out: Path) -> list[str]:
         ][-20_000:]
     except OSError:
         return []
+
+
+def _cached_value(path: Path) -> dict:
+    """Read a content-addressed planning artifact, with its envelope."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if isinstance(payload, dict) and isinstance(payload.get("value"), dict):
+        return payload["value"]
+    return payload if isinstance(payload, dict) else {}
+
+
+def _draft_report_for(run: "Run") -> dict | None:
+    """Expose the last paid editorial state even when render never began.
+
+    Selection is already a useful, inspectable edit.  Waiting until the final
+    report to show it made a local coverage fault erase eighteen paid choices
+    from the Web UI.  This projection is deliberately labelled draft-only:
+    it uses Selection's evidence-bounded requested durations, never pretends
+    a segment, crop, review or deliverable exists, and is replaced by the
+    ordinary report the instant that file is written.
+    """
+
+    selection = _cached_value(run.output / "work" / "selection.json")
+    invalid_selection = False
+    if not (selection.get("shots") or []):
+        selection = _cached_value(
+            run.output / "work" / "invalid-selection-draft.json"
+        )
+        invalid_selection = bool(selection.get("shots") or [])
+    raw_shots = selection.get("shots") or []
+    if not isinstance(raw_shots, list) or not raw_shots:
+        return None
+    shots = []
+    rhythm: dict[str, dict] = {}
+    source_motion_details: dict[str, dict] = {}
+    source_identity: dict[str, bool] = {}
+    for line in _lines_on_disk(run.output):
+        found = re.search(
+            r"\bidentity\s+\d+/\d+\s+(\S+)\s+(?:(\d+) confirmed|none)\s*$",
+            line,
+        )
+        if found is not None:
+            source_identity[found.group(1)] = bool(found.group(2))
+    for index, raw in enumerate(raw_shots):
+        if not isinstance(raw, dict):
+            continue
+        shot = dict(raw)
+        # A draft is also how an old invalid answer gets inspected.  Validate
+        # each cached look independently so one pre-contract answer cannot
+        # take down the entire history API.  Invalid looks are omitted from
+        # this explicitly non-executable display projection; current valid
+        # selections retain their complete structured look.
+        draft_looks = []
+        for raw_look in shot.get("looks") or []:
+            if not isinstance(raw_look, dict):
+                continue
+            try:
+                draft_looks.append(
+                    looks_of({"looks": [raw_look]})[0].model_dump(mode="json")
+                )
+            except Exception:
+                continue
+        shot["looks"] = draft_looks
+        targets = tuple(dict.fromkeys(
+            str(look.get("entity_id") or "").strip()
+            for look in draft_looks
+            if str(look.get("entity_id") or "").strip() not in {"", "none"}
+        ))
+        if targets and not shot.get("identity_status"):
+            source_id = str(shot.get("source_id") or "")
+            shot["identity_target_id"] = targets[0]
+            if source_identity.get(source_id):
+                shot["identity_status"] = "source_confirmed"
+                shot["identity_issue"] = (
+                    "來源 exact frame 已確認；本輪尚未完成最終片段追蹤。"
+                )
+            else:
+                shot["identity_status"] = "unverified"
+                shot["identity_issue"] = (
+                    "來源 exact frame 尚未證明；目前只是粗篩候選。"
+                )
+        elif not targets:
+            shot.setdefault("identity_status", "not_applicable")
+        try:
+            subject = subject_of(shot)
+        except Exception:
+            subject = str(
+                (draft_looks[0].get("at") if draft_looks else None)
+                or shot.get("source_id") or "未命名鏡頭"
+            )
+        shot.setdefault("subject", subject)
+        seconds = max(0.1, float(shot.get("seconds_needed") or 0.0))
+        key = f"k{index:02d}"
+        rhythm[key] = {
+            "seconds": seconds,
+            "why": "選片階段保存的內容證據長度；尚未完成最終節奏落點。",
+        }
+        source_motion_details[key] = {
+            "role": shot.get("source_motion_role", "unknown"),
+            "description": shot.get("source_motion_description", ""),
+            "window": [
+                float(shot.get("start_seconds") or 0.0),
+                float(shot.get("start_seconds") or 0.0) + seconds,
+            ],
+        }
+        shots.append(shot)
+    if not shots:
+        return None
+
+    all_by_stage: dict[str, float] = {}
+    by_run: dict[str, dict[str, float]] = {}
+    last_paid_run_id = ""
+    try:
+        spend_lines = (run.output / "spend-events.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    except OSError:
+        spend_lines = []
+    for line in spend_lines:
+        try:
+            event = json.loads(line)
+            stage = str(event.get("stage") or "unknown")
+            usd = float(event.get("usd") or 0.0)
+            if usd <= 0.0:
+                continue
+            all_by_stage[stage] = all_by_stage.get(stage, 0.0) + usd
+            run_id = str(event.get("run_id") or "legacy")
+            last_paid_run_id = run_id
+            current = by_run.setdefault(run_id, {})
+            current[stage] = current.get(stage, 0.0) + usd
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+    direction = _cached_value(run.output / "work" / "direction.json")
+    target = 0.0
+    command = run.command or []
+    if "--seconds" in command:
+        try:
+            target = float(command[command.index("--seconds") + 1])
+        except (IndexError, TypeError, ValueError):
+            target = 0.0
+    faults = [
+        line for line in _lines_on_disk(run.output)
+        if "TimelineCoverageError:" in line
+    ][-1:]
+    faults.extend(
+        str(note) for note in selection.get("plan_disagreements") or []
+    )
+    faults.extend(
+        str(note) for note in selection.get("invalid_selection_faults") or []
+    )
+    return {
+        "draft_only": True,
+        "draft_note": (
+            "Selection 本機契約驗證未通過；這是供檢視的不可發佈草稿。"
+            if invalid_selection else
+            "Selection 已保存，但裁切、追蹤、節奏驗收與渲染尚未完成。"
+        ),
+        "delivery_status": (
+            "release_blocked" if invalid_selection else "needs_review"
+        ),
+        "duration_seconds": round(sum(
+            item["seconds"] for item in rhythm.values()
+        ), 3),
+        "target_seconds": target or None,
+        "selection": {**selection, "shots": shots},
+        "rhythm": rhythm,
+        "direction": direction,
+        "shots": {},
+        "motion": {},
+        "source_motion_details": source_motion_details,
+        "degradations": [],
+        "plan_disagreements": faults,
+        "set_aside": {},
+        "material_ids": sorted(
+            path.stem for path in
+            (run.output / "work" / "proxies").glob("*.mp4")
+        ),
+        "cuts_on_music": "0/0",
+        # A failed/draft run has no report ledger to project.  Reconstruct the
+        # latest paid invocation separately from the output folder's complete
+        # journal; showing the cumulative $3.78 as both "本輪" and "累計" made
+        # the UI look as though a resume had spent the whole project again.
+        "spend": {"by_stage": by_run.get(last_paid_run_id, {})},
+        "spend_all_attempts": {"by_stage": all_by_stage},
+    }
 
 
 def _catch_up(run: "Run") -> "Run":
@@ -189,7 +499,13 @@ def _state_of_a_foreign_run(out: Path) -> str:
     if state == "running":
         try:
             os.kill(int(said.get("pid") or 0), 0)
-        except (OSError, TypeError, ValueError):
+        except PermissionError:
+            # A sandboxed Web process may be allowed to read the CLI run's
+            # state file but not signal its sibling process. EPERM proves a
+            # process occupies that PID; treating it as dead made live CLI
+            # runs appear interrupted the moment they were opened in Web.
+            return "running"
+        except (ProcessLookupError, TypeError, ValueError):
             return "interrupted"
         return "running"
     if state in {"done", "failed", "stopped"}:
@@ -321,6 +637,20 @@ def _brief_of(run) -> str:
         return ""
 
 
+def _grounding_reference_count(run) -> int:
+    """How many locked reference images travel with this run's spec."""
+
+    raw = _ran_with(run, "--grounding-spec")
+    if not raw:
+        return 0
+    try:
+        payload = json.loads(Path(raw).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    references = payload.get("reference_images")
+    return len(references) if isinstance(references, list) else 0
+
+
 def _brief_path_of(run) -> Path | None:
     """The durable Brief path, accepting both CLI flag spellings."""
 
@@ -357,6 +687,17 @@ def _transcript_map(run) -> dict:
         for source_id, path in found.items()
         if (card := load(path)) is not None
     }
+
+
+def _library_of_run(run: Run) -> Path:
+    """The card library the producing CLI command actually used."""
+
+    for index, argument in enumerate(run.command):
+        if argument == "--library" and index + 1 < len(run.command):
+            return Path(run.command[index + 1]).expanduser()
+        if argument.startswith("--library="):
+            return Path(argument.split("=", 1)[1]).expanduser()
+    return default_library()
 
 
 def _current_timeline(run: Run) -> dict:
@@ -1403,6 +1744,29 @@ def create_app() -> FastAPI:
         # Grounding input is parsed by the exact same loader used by the CLI.
         # Browser files are merely staged and their declared spec paths are
         # rewritten before that validation; no model call occurs here.
+        # A new round of an opened run should preserve its identity lock just
+        # as it preserves the rushes and brief.  Do this on the server as
+        # well as in the form: API callers and an older browser tab must not
+        # silently start an ungrounded paid run because one input was absent.
+        explicit_simple_grounding = bool(grounding_target_description.strip())
+        explicit_spec = bool(
+            grounding_spec_path.strip()
+            or grounding_spec_json.strip()
+            or (
+                grounding_spec_file is not None
+                and grounding_spec_file.filename
+            )
+        )
+        if base_run_id and not explicit_spec and not explicit_simple_grounding:
+            try:
+                inherited_grounding = _ran_with(
+                    _run(base_run_id), "--grounding-spec"
+                )
+            except HTTPException:
+                inherited_grounding = None
+            if inherited_grounding:
+                grounding_spec_path = inherited_grounding
+
         spec_path = _typed_path(grounding_spec_path)
         spec_upload = (
             grounding_spec_file
@@ -1643,7 +2007,7 @@ def create_app() -> FastAPI:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=_child_environment(),
             )
         except OSError as error:
             # A launch can fail before the CLI has a chance to print anything
@@ -1847,8 +2211,13 @@ def create_app() -> FastAPI:
                 "source_path": run.source,
                 "seconds": report.get("duration_seconds"),
                 "shots": len(report.get("selection", {}).get("shots", [])),
+                "delivery_status": report.get("delivery_status", "ready"),
                 "spend": round(
-                    sum(report.get("spend", {}).get("by_stage", {}).values()), 4
+                    sum(
+                        report.get(
+                            "spend_all_attempts", report.get("spend", {})
+                        ).get("by_stage", {}).values()
+                    ), 4
                 ) or None,
                 "delivered": sum(
                     1 for entry in (report.get("shots") or {}).values()
@@ -1947,7 +2316,8 @@ def create_app() -> FastAPI:
         current_blocks = current.get("shots") or []
         if current_blocks:
             shots = [
-                original_shots[int(one["selection_index"])]
+                one.get("manual_plan")
+                or original_shots[int(one["selection_index"])]
                 for one in current_blocks
             ]
             rhythm = {
@@ -2034,8 +2404,12 @@ def create_app() -> FastAPI:
         for index, shot in enumerate(shots):
             key = f"k{index:02d}"
             source_key = (
-                f"k{int(current_blocks[index]['selection_index']):02d}"
-                if current_blocks else key
+                "__manual__"
+                if current_blocks and current_blocks[index].get("manual_plan")
+                else (
+                    f"k{int(current_blocks[index]['selection_index']):02d}"
+                    if current_blocks else key
+                )
             )
             seconds = float(rhythm.get(key, {}).get("seconds", 0.0))
             source_id = shot.get("source_id", "")
@@ -2104,12 +2478,34 @@ def create_app() -> FastAPI:
                         "seconds": one.seconds,
                         "framing": one.framing,
                         "whole": one.must_be_whole,
+                        "presentation_intent": one.presentation_intent,
                     }
                     for one in looks_of(shot)
                 ],
                 "why": shot.get("why", ""),
                 "delivered": verdicts.get(source_key, {}).get("delivered"),
                 "note": verdicts.get(source_key, {}).get("note", ""),
+                "identity_status": (
+                    "track_validated"
+                    if (
+                        report.get("reference_grounding", {})
+                        .get(source_key, {}).get("status")
+                        == "sam_geometry_validated"
+                    )
+                    else shot.get("identity_status", "unverified")
+                ),
+                "identity_target_id": shot.get("identity_target_id"),
+                "identity_issue": shot.get("identity_issue", ""),
+                "manual_plan": (
+                    current_blocks[index].get("manual_plan")
+                    if current_blocks else None
+                ),
+                "thumb_url": (
+                    f"/api/runs/{run_id}/source-thumb/{source_id}"
+                    f"?at={float((current_blocks[index] if current_blocks else {}).get('in_seconds', 0.0)) + seconds / 2:.3f}"
+                    if current_blocks and current_blocks[index].get("manual_plan")
+                    else f"/api/runs/{run_id}/thumb/{int(current_blocks[index]['selection_index']) if current_blocks else index}"
+                ),
             })
             cursor += seconds
         # Where the bed came from. The rhythm pass decides it and nothing
@@ -2144,6 +2540,41 @@ def create_app() -> FastAPI:
             # opinion about where they sit would make that preview a lie.
             "safe_area": _safe_area_of(report),
         })
+
+    @app.get("/api/runs/{run_id}/replacement-candidates")
+    def replacement_candidates(run_id: str, needed_seconds: float = 0.0):
+        """List card-approved local spans that preserve this edit slot."""
+
+        from montagewright.clipcard import card_map, load_card
+        from montagewright.spans import seconds_of
+
+        run = _run(run_id)
+        mapped = card_map(
+            run.output / "work" / "proxies", _library_of_run(run) / "cards"
+        )
+        candidates = []
+        for source_id, path in sorted(mapped.items()):
+            card = load_card(path)
+            if not card or not card.get("usable", True):
+                continue
+            for index, span in enumerate(card.get("segments") or []):
+                if span.get("status") != "eligible":
+                    continue
+                start = seconds_of(span.get("from"))
+                end = seconds_of(span.get("to"))
+                if start is None or end is None or end - start + 1e-6 < needed_seconds:
+                    continue
+                candidates.append({
+                    "source_id": source_id,
+                    "span_id": f"{source_id}:s{index:02d}",
+                    "in_seconds": float(start),
+                    "out_seconds": float(end),
+                    "seconds": float(end - start),
+                    "summary": str(card.get("summary") or source_id),
+                    "why": str(span.get("why") or ""),
+                    "motion_role": str(span.get("motion_role") or "unknown"),
+                })
+        return JSONResponse({"candidates": candidates})
 
     def _rebuild(
         run: Run,
@@ -2182,7 +2613,7 @@ def create_app() -> FastAPI:
         )
         cards = card_map(
             run.output / "work" / "proxies",
-            default_library() / "cards",
+            _library_of_run(run) / "cards",
         )
         clips, sources, gains = [], {}, {}
         source_paths = (
@@ -2202,7 +2633,7 @@ def create_app() -> FastAPI:
             return sources[source_id]
 
         for index, entry in enumerate(wanted):
-            plan = original[int(entry["index"])]
+            plan = entry.get("manual_plan") or original[int(entry["index"])]
             source_id = plan["source_id"]
             source_for(source_id)
             start = float(entry["in_seconds"])
@@ -2294,6 +2725,9 @@ def create_app() -> FastAPI:
         for index, entry in enumerate(wanted):
             here = f"k{index:02d}"
             selection_index = int(entry["index"])
+            if entry.get("manual_plan"):
+                stale.append(here)
+                continue
             match = next(
                 (
                     (old_index, old)
@@ -2348,7 +2782,8 @@ def create_app() -> FastAPI:
         projected = dict(report)
         projected_selection = dict(report.get("selection") or {})
         projected_selection["shots"] = [
-            original[int(entry["index"])] for entry in wanted
+            entry.get("manual_plan") or original[int(entry["index"])]
+            for entry in wanted
         ]
         projected["selection"] = projected_selection
         projected["rhythm"] = {
@@ -2402,6 +2837,82 @@ def create_app() -> FastAPI:
         wanted_audio = payload.get(
             "audio_assignments", current_state.get("audio_assignments") or []
         )
+        # Replacement plans are derived from the run's immutable cards.  The
+        # browser chooses an ID; it cannot smuggle in a path, an arbitrary
+        # time range, or a fresh identity claim.  Keeping ``seconds`` from the
+        # existing block leaves every downstream beat boundary unchanged.
+        from montagewright.clipcard import card_map, load_card
+        from montagewright.spans import seconds_of
+
+        card_paths = card_map(
+            run.output / "work" / "proxies", _library_of_run(run) / "cards"
+        )
+        original_plans = (run.report() or {}).get("selection", {}).get("shots", [])
+        for entry in wanted:
+            replacement = entry.get("replacement")
+            if not replacement:
+                # A committed manual plan may round-trip through another trim
+                # or reorder without trusting the browser's copy again.
+                previous = next(
+                    (
+                        one for one in current_state.get("shots") or []
+                        if int(one.get("selection_index", -1)) == int(entry["index"])
+                        and one.get("manual_plan")
+                    ),
+                    None,
+                )
+                if previous:
+                    entry["manual_plan"] = previous["manual_plan"]
+                continue
+            source_id = str(replacement.get("source_id") or "")
+            span_id = str(replacement.get("span_id") or "")
+            path = card_paths.get(source_id)
+            card = load_card(path) if path else None
+            if not card:
+                raise HTTPException(422, "replacement source has no usable card")
+            try:
+                span_index = int(span_id.rsplit(":s", 1)[1])
+                span = (card.get("segments") or [])[span_index]
+            except (IndexError, ValueError):
+                raise HTTPException(422, "replacement span does not exist")
+            if span_id != f"{source_id}:s{span_index:02d}" or span.get("status") != "eligible":
+                raise HTTPException(422, "replacement span is not eligible")
+            start, end = seconds_of(span.get("from")), seconds_of(span.get("to"))
+            duration = float(entry["seconds"])
+            if start is None or end is None or end - start + 1e-6 < duration:
+                raise HTTPException(422, "replacement span is too short for this rhythm slot")
+            base = dict(original_plans[int(entry["index"])])
+            target = str(base.get("identity_target_id") or "")
+            entry["in_seconds"] = float(start)
+            entry["manual_plan"] = {
+                **base,
+                "source_id": source_id,
+                "span_id": span_id,
+                "start_seconds": float(start),
+                "usable_start_seconds": float(start),
+                "usable_end_seconds": float(end),
+                "subject": str(card.get("summary") or source_id),
+                "why": "使用者在 Web UI 指定替換片段；沿用原節奏格。",
+                "camera_intent": "hold",
+                "frame": "settles",
+                "looks": [{
+                    "at": str(card.get("summary") or source_id),
+                    "framing": "center",
+                    "seconds": duration,
+                    "must_be_whole": False,
+                    "entity_id": "none",
+                }],
+                "identity_status": (
+                    "human_verified"
+                    if replacement.get("confirms_identity") else "needs_review"
+                ),
+                "identity_target_id": target or None,
+                "identity_issue": (
+                    ""
+                    if replacement.get("confirms_identity")
+                    else "使用者尚未確認這個替換片段包含指定主體"
+                ),
+            }
         old_shape = [
             (
                 int(one["selection_index"]),
@@ -2502,6 +3013,7 @@ def create_app() -> FastAPI:
                         "audio_completion": segment.audio_completion,
                         "picture_role": segment.picture_role,
                         "coverage_claim_seconds": segment.coverage_claim_seconds,
+                        "manual_plan": wanted[index].get("manual_plan"),
                     }
                     for index, (segment, (start, end)) in enumerate(
                         zip(plan.segments, frame_spans, strict=True)
@@ -2654,25 +3166,35 @@ def create_app() -> FastAPI:
             "source_path": _ran_with(run, "render", after=False),
             "music_path": _ran_with(run, "--music"),
             "brief_text": _brief_of(run),
+            "grounding_spec_path": _ran_with(run, "--grounding-spec"),
+            "grounding_reference_count": _grounding_reference_count(run),
             # What there is to look at while it works. The panel on the left
             # said which stage it was on and the whole middle of the screen
             # stayed black until the last second, so an hour of cutting
             # showed nobody a single frame of what it was cutting.
-            "progress": _what_is_cut_so_far(run) if run.state == "running" else None,
+            "progress": (
+                _what_is_cut_so_far(run)
+                if run.state in {"running", "failed", "stopped", "interrupted"}
+                else None
+            ),
         })
 
     def _what_is_cut_so_far(run: Run) -> dict:
-        """The shots it has planned, and which of them are already film.
+        """The durable state a running cut can safely show.
 
-        Both are on disk long before the report is: the selection as soon as
-        it is chosen, and each shot as a file in segments/ the moment it is
-        rendered.
+        The browser used to infer the whole workflow from prose in stdout.
+        That made an early ``no music map`` message look like SAM had begun,
+        and a resumed run could be put back into an old attempt's last stage.
+        Artifacts are the authority for completed work; the current attempt's
+        small, deliberately parsed log vocabulary only supplies the live
+        phase while an artifact does not yet exist.
         """
 
+        work = run.output / "work"
         planned: list[dict] = []
         try:
             chosen = json.loads(
-                (run.output / "work" / "selection.json").read_text("utf-8")
+                (work / "selection.json").read_text("utf-8")
             )
             shots = (chosen.get("value") or chosen).get("shots") or []
         except (OSError, ValueError, AttributeError):
@@ -2682,6 +3204,7 @@ def create_app() -> FastAPI:
             planned.append({
                 "index": index,
                 "source": str(shot.get("source_id") or span.split(":")[0]),
+                "at": float(shot.get("start_seconds") or 0.0),
                 "seconds": shot.get("seconds_needed"),
                 "role": shot.get("picture_role") or shot.get("role") or "",
                 "why": shot.get("why") or shot.get("intent") or "",
@@ -2691,7 +3214,152 @@ def create_app() -> FastAPI:
             for path in (run.output / "segments").glob("[0-9][0-9][0-9]-*.mp4")
             if ".handles." not in path.name
         )
-        return {"planned": planned, "cut": cut}
+        # Tracking happens before segment rendering, so ``segments/`` alone
+        # made the sheet say 0/N and highlight the first tile for the entire
+        # SAM pass.  The CLI already reports the concrete kXX it is working
+        # on; carry that progress into the UI without inventing another
+        # mutable progress file.
+        tracking_index: int | None = None
+        tracking_done = 0
+        tracking_total = 0
+        attempt_lines = run.lines
+        for index in range(len(run.lines) - 1, -1, -1):
+            if run.lines[index].strip() == "— 續跑 —":
+                attempt_lines = run.lines[index + 1:]
+                break
+
+        direction_ready = (work / "direction.json").exists()
+        selection_ready = (work / "selection.json").exists()
+        rhythm_ready = (work / "rhythm.json").exists()
+        report_ready = (run.output / "report.json").exists()
+
+        # Exact reference confirmation deliberately happens *after*
+        # Direction has narrowed the candidate pool.  Its saved frames are
+        # useful progress even before Selection can create a timeline.
+        identity_candidates: list[dict[str, str]] = []
+        frames_root = work / "identity-frames"
+        try:
+            frame_dirs = sorted(path for path in frames_root.iterdir()
+                                if path.is_dir())
+        except OSError:
+            frame_dirs = []
+        for folder in frame_dirs:
+            frames = sorted(
+                path for pattern in ("identity-*.jpg", "identity-*.jpeg", "identity-*.png")
+                for path in folder.glob(pattern)
+                if "identity-seed-" not in path.name
+            )
+            if frames:
+                identity_candidates.append({
+                    "source": folder.name,
+                    "frame": frames[0].name,
+                })
+
+        identity_done = False
+        identity_current = 0
+        identity_total = 0
+        direction_at = max(
+            (index for index, line in enumerate(attempt_lines)
+             if line.startswith("direction:")),
+            default=-1,
+        )
+        # The initial broad ``identity screen`` is a different, earlier
+        # phase.  Only exact confirmation lines following Direction belong
+        # to this phase.
+        for line in attempt_lines[direction_at + 1:]:
+            exact = re.match(r"\s*identity\s+(\d+)/(\d+)\s+", line)
+            if exact:
+                identity_current = int(exact.group(1))
+                identity_total = int(exact.group(2))
+            if re.match(r"identity confirmed on \d+/\d+ sources", line):
+                identity_done = True
+
+        # A phase must describe the latest *current attempt*, never the
+        # maximum-looking word from every historical log line.  Completion
+        # markers are otherwise durable artifacts, not these messages.
+        phase = "proxy"
+        if report_ready or (run.output / "deliverable.mp4").exists():
+            phase = "done"
+        elif selection_ready:
+            phase = "subject" if rhythm_ready else "rhythm"
+            if rhythm_ready:
+                if planned and len(set(cut)) >= len(planned):
+                    phase = "review" if "--review" in run.command else "done"
+                for line in attempt_lines:
+                    if re.match(r"\s*subject\s+\d+/\d+\s+k\d+\b", line):
+                        phase = "subject"
+                    elif line.startswith("shots:") or line.startswith("review "):
+                        phase = "review"
+                    elif re.match(r"\s*replan\s+", line):
+                        phase = "replan"
+                    elif line.startswith("deliverable"):
+                        phase = "done"
+        elif direction_ready:
+            phase = (
+                "identity_confirmation"
+                if (identity_candidates or identity_total) and not identity_done
+                else "selection"
+            )
+        else:
+            # These only distinguish the early preparation phases.  Unlike
+            # the old frontend regex table, nothing here can claim a later
+            # phase completed.
+            for line in attempt_lines:
+                if line.startswith("identity screen:"):
+                    phase = "identity_screen"
+                elif line.startswith("speech:") or "transcribed" in line:
+                    phase = "speech"
+                elif re.match(r"\s*card\s+\d+/", line) or line.startswith("cards:"):
+                    phase = "cards"
+
+        for line in reversed(attempt_lines):
+            match = re.search(
+                r"\bsubject\s+(\d+)/(\d+)\s+k(\d+)\b", line
+            )
+            if match:
+                tracking_done = int(match.group(1))
+                tracking_total = int(match.group(2))
+                tracking_index = int(match.group(3))
+                break
+        stages = [
+            "proxy", "cards", "speech", "identity_screen", "direction",
+            "identity_confirmation", "selection", "rhythm", "subject", "review",
+            "replan", "done",
+        ]
+        at_phase = stages.index(phase)
+        completed = stages[:at_phase]
+        # Optional speech is still complete once Direction is durable.  The
+        # same holds for the broad screen once the exact post-Direction check
+        # has begun or Selection has been saved.
+        if direction_ready:
+            completed = list(dict.fromkeys(
+                completed + ["proxy", "cards", "speech", "identity_screen", "direction"]
+            ))
+        if selection_ready:
+            completed = list(dict.fromkeys(
+                completed + ["identity_confirmation", "selection"]
+            ))
+        elif identity_done:
+            completed = list(dict.fromkeys(
+                completed + ["identity_confirmation"]
+            ))
+        if report_ready:
+            completed = stages
+        return {
+            "phase": phase,
+            "completed": completed,
+            "planned": planned,
+            "cut": cut,
+            "tracking_index": tracking_index,
+            "tracking_done": tracking_done,
+            "tracking_total": tracking_total,
+            "identity": {
+                "done": identity_done,
+                "current": identity_current,
+                "total": identity_total,
+            },
+            "identity_candidates": identity_candidates,
+        }
 
     @app.post("/api/runs/{run_id}/resume")
     def resume(run_id: str) -> JSONResponse:
@@ -2725,12 +3393,27 @@ def create_app() -> FastAPI:
             raise HTTPException(409, "it is still going")
         run.lines.append("— 續跑 —")
         run.state = "running"
+        # Persistence is part of starting a run, not an afterthought.  The
+        # old order spawned the expensive child first and only then wrote
+        # run.json; if that write was denied the browser reported failure
+        # while an untracked render continued in the background.  Prove that
+        # this run can be recorded before creating the child process.
+        try:
+            run.remember()
+        except OSError as error:
+            run.state = "failed"
+            run.lines.pop()
+            raise HTTPException(
+                500,
+                "無法更新這一輪的狀態檔；剪輯尚未啟動。請檢查 runs "
+                f"資料夾權限後再試（{error}）。",
+            ) from error
         try:
             run.process = subprocess.Popen(
                 run.command,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=_child_environment(),
             )
         except OSError as error:
             # The recorded command cannot be run any more: a virtualenv that
@@ -2743,7 +3426,6 @@ def create_app() -> FastAPI:
                 f"這一輪記下的指令現在跑不起來（{run.command[0]}）。"
                 "素材與已完成的工作都還在，用「新的一輪」指到同一個素材資料夾就會接上。",
             ) from error
-        run.remember()
         threading.Thread(target=_collect, args=(run,), daemon=True).start()
         return JSONResponse({"state": run.state})
 
@@ -3985,6 +4667,7 @@ def create_app() -> FastAPI:
         report = run.report() or {}
         shots = report.get("selection", {}).get("shots", [])
         known = {str(shot.get("source_id", "")) for shot in shots}
+        known.update(path.stem for path in (run.output / "work" / "proxies").glob("*.mp4"))
         if which in known:
             source_id = which
         elif which.isdigit() and int(which) < len(shots):
@@ -4013,6 +4696,51 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"{source_id} is gone")
         return FileResponse(match, media_type="video/mp4")
 
+    @app.get("/api/runs/{run_id}/source-thumb/{source_id}")
+    def source_thumb(run_id: str, source_id: str, at: float = 0.0):
+        """A cached thumbnail for a manually selected source interval."""
+
+        run = _run(run_id)
+        proxy = run.output / "work" / "proxies" / f"{source_id}.mp4"
+        if not proxy.exists():
+            raise HTTPException(404, "no such source")
+        stamp = max(0, int(round(at * 10)))
+        made = run.output / "work" / "thumbs" / f"source-{source_id}-{stamp}.jpg"
+        if not made.exists():
+            made.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-ss", f"{max(0.0, at):.3f}", "-i", str(proxy),
+                 "-frames:v", "1", "-vf", "scale=-2:180", str(made)],
+                check=False,
+            )
+        if not made.exists():
+            raise HTTPException(404, "could not read a source frame")
+        return FileResponse(made, media_type="image/jpeg")
+
+    @app.get("/api/runs/{run_id}/identity-thumb/{source_id}")
+    def identity_thumb(run_id: str, source_id: str):
+        """One sampled exact-identity frame while Selection is still pending."""
+
+        # It is deliberately an allow-list lookup rather than accepting a
+        # filename from the URL.  The progress payload exposes only these
+        # source directory names, and a run must never become a file browser.
+        if Path(source_id).name != source_id:
+            raise HTTPException(404, "no such identity frame")
+        folder = _run(run_id).output / "work" / "identity-frames" / source_id
+        frames = sorted(
+            path for pattern in ("identity-*.jpg", "identity-*.jpeg", "identity-*.png")
+            for path in folder.glob(pattern)
+            if "identity-seed-" not in path.name
+        )
+        if not frames:
+            raise HTTPException(404, "no such identity frame")
+        suffix = frames[0].suffix.lower()
+        media_type = {".png": "image/png", ".jpeg": "image/jpeg"}.get(
+            suffix, "image/jpeg"
+        )
+        return FileResponse(frames[0], media_type=media_type)
+
     @app.get("/api/runs/{run_id}/thumb/{index}")
     def thumb(run_id: str, index: int, at: float = 0.35):
         """A frame from a shot, for recognising it by sight.
@@ -4038,7 +4766,35 @@ def create_app() -> FastAPI:
                 None,
             )
             if segment is None:
-                raise HTTPException(404, "no such shot")
+                # A failed draft has Selection and proxies but no rendered
+                # segments.  Its paid choices are still inspectable: draw the
+                # requested source moment and never present it as a rendered
+                # crop or final frame.
+                shots = (run.report() or {}).get("selection", {}).get(
+                    "shots", []
+                )
+                if index < 0 or index >= len(shots):
+                    raise HTTPException(404, "no such shot")
+                shot = shots[index]
+                source_id = str(shot.get("source_id") or "")
+                proxy = (
+                    run.output / "work" / "proxies" / f"{source_id}.mp4"
+                )
+                if not proxy.exists():
+                    raise HTTPException(404, "no such shot")
+                start = float(shot.get("start_seconds") or 0.0)
+                seconds = float(shot.get("seconds_needed") or 0.0)
+                made.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                     "-ss", f"{max(0.0, start + seconds / 2):.3f}",
+                     "-i", str(proxy), "-frames:v", "1", "-vf",
+                     "scale=-2:180", str(made)],
+                    check=False,
+                )
+                if not made.exists():
+                    raise HTTPException(404, "could not read a frame")
+                return FileResponse(made, media_type="image/jpeg")
             made.parent.mkdir(parents=True, exist_ok=True)
             length = probe_duration(segment)
             subprocess.run(

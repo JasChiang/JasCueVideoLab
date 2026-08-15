@@ -190,6 +190,7 @@ def _source_confirmation_fixture(monkeypatch, tmp_path, *, risky_seed=False):
 
     def decision_for(material, *, risky):
         return SimpleNamespace(
+            verdict="matched_target",
             tracking_box_xyxy_1000=(100, 200, 500, 800),
             excluded_instances=((object(),) if risky else ()),
             visibility_state=("occluded" if risky else "full"),
@@ -211,6 +212,7 @@ def _source_confirmation_fixture(monkeypatch, tmp_path, *, risky_seed=False):
             for material in materials[:2]
         )
         return SimpleNamespace(
+            evaluations=evaluations,
             sam_seed_evaluations=lambda: evaluations,
         ), Usage(2, 1, 0)
 

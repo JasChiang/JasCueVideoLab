@@ -102,6 +102,11 @@ class BriefDocument:
 
         facts: list[CopyFact] = []
         for candidate in self.candidates:
+            if not _fits_copy_fact(candidate.primary_text) or (
+                candidate.secondary_text
+                and not _fits_copy_fact(candidate.secondary_text)
+            ):
+                continue
             for which, text in (
                 ("primary", candidate.primary_text),
                 ("secondary", candidate.secondary_text),
@@ -168,6 +173,19 @@ SPECISH = re.compile(
     r"(?:\d|MP\b|mm\b|m\b|吋|螢幕|相機|處理器|認證|邊框|錄影)",
     re.IGNORECASE,
 )
+MAX_COPY_FACT_CHARS = 240
+
+
+def _fits_copy_fact(text: str) -> bool:
+    """Whether ordinary Brief prose fits the downstream copy contract.
+
+    Long-form creative direction is still authoritative direction, but it is
+    not plausible verbatim screen copy. Keeping this check beside parsing
+    prevents a prose paragraph from failing much later while serialising the
+    graphics candidates.
+    """
+
+    return bool(text) and len(text) <= MAX_COPY_FACT_CHARS
 
 
 def _variants_from_note(
@@ -236,6 +254,17 @@ def extract_brief_candidates(
             continue
         note = "；".join(notes)
         first, rest = body[0], body[1:]
+        secondary = "\n".join(rest)
+        if not _fits_copy_fact(first) or (
+            secondary and not _fits_copy_fact(secondary)
+        ):
+            instructions.append(BriefInstruction(
+                reference, " ".join(body), "editorial"
+            ))
+            instructions.extend(
+                BriefInstruction(reference, one, "layout") for one in notes
+            )
+            continue
         is_first_card = not candidates
         if first.startswith("就在") or first == "SAMSUNG":
             kind, template, position = "end_card", "end_roster", "center"
@@ -251,7 +280,6 @@ def extract_brief_candidates(
             kind, template, position = "feature", "stat_badge", "auto"
         else:
             kind, template, position = "callout", "editorial_rule", "auto"
-        secondary = "\n".join(rest)
         candidates.append(BriefCandidate(
             candidate_id=f"brief.p{paragraph_index:02d}",
             primary_text=first,

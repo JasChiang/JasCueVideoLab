@@ -9,6 +9,7 @@ import pytest
 from montagewright.candidate_commitments import (
     CommitmentError,
     describe_commitments,
+    provider_commitment_schema,
     resolve_candidate_commitments,
     validate_replacement_commitments,
     validate_selection_commitments,
@@ -62,6 +63,11 @@ def _direction(**change):
         "min_supported_seconds": "0:03.5",
         "presentation_intent": "reveal_endpoint",
         "motion_preference": "native_first", "target_id": "device.fold",
+        "recommended_treatment": "use_source_motion",
+        "suggested_move": "source_motion",
+        "camera_route": "preserve the authored reveal and settle on the product",
+        "motion_reason": "the source already performs the reveal cleanly",
+        "fallback_treatment": "reveal",
         "why": "authored movement reaches the product",
     }
     option.update(change)
@@ -86,7 +92,9 @@ def test_local_resolver_keeps_the_full_pool_and_marks_unoffered_spans_deferred()
     assert option.feasible_treatments[:2] == (
         "use_source_motion", "follow_subject"
     )
-    assert "local camera menu=" in describe_commitments(resolved)
+    assert "Selection 在本機量測的可行清單內選 camera_intent" in describe_commitments(
+        resolved
+    )
 
 
 def test_only_identity_primary_and_alternate_sources_are_exact_confirmed():
@@ -119,13 +127,17 @@ def test_local_camera_catalog_exposes_measured_virtual_room_before_hold():
     )]
     resolved = resolve_candidate_commitments(
         _direction(
-            motion_preference="virtual_allowed", min_supported_seconds="0:03"
+            span_id="C1:s01", motion_preference="hold",
+            min_supported_seconds="0:03"
         ), material,
         material_digest="a" * 64, aspect="9:16", target_seconds=20.0,
         grounding_target_ids=("device.fold",), grounding_sha256="b" * 64,
     )
     option = resolved.options[0]
-    assert option.preferred_treatment == "follow_subject"
+    # A named object is trackable, but this locked product shot already has
+    # measured crop room for a deliberate reveal. Ranking follow first would
+    # ask the tracker to follow something static and collapse back to hold.
+    assert option.preferred_treatment == "reveal"
     assert {"reveal", "compare", "push_in", "pull_out", "multi_stop"} <= set(
         option.feasible_treatments
     )
@@ -133,14 +145,113 @@ def test_local_camera_catalog_exposes_measured_virtual_room_before_hold():
     assert option.minimum_camera_seconds == 1.8
 
     faults = validate_selection_commitments([{
-        "commitment_id": "hero", "span_id": "C1:s00",
+        "commitment_id": "hero", "span_id": "C1:s01",
         "seconds_needed": 1.0, "camera_intent": "multi_stop",
         "looks": [{
             "presentation_intent": "reveal_endpoint",
             "entity_id": "device.fold",
         }],
+        }], resolved)
+    # Membership/capability lives here; actual duration is priced once from
+    # Selection's looks plus measured card coordinates in
+    # planner.camera_duration_disagreements.  A second simplified floor table
+    # here was the source of planner/executor drift.
+    assert not any("camera geometry needs" in fault for fault in faults)
+    assert "local camera menu=" in describe_commitments(resolved)
+    assert "local preferred=reveal" in describe_commitments(resolved)
+
+
+def test_direction_hold_does_not_veto_the_camera_intent_selection_watched():
+    """A pre-selection preference must not turn a capable clip hold-only."""
+
+    resolved = _resolved(_direction(
+        motion_preference="hold", min_supported_seconds="0:03",
+        presentation_intent="centered_hold",
+    ))
+    assert resolved.options[0].motion_preference == "native_first"
+    faults = validate_selection_commitments([{
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.0, "camera_intent": "push_in",
+        "looks": [{
+            "presentation_intent": "centered_hold",
+            "entity_id": "device.fold",
+        }],
     }], resolved)
-    assert any("camera geometry needs 1.800s" in fault for fault in faults)
+    assert any("camera treatment" in fault for fault in faults)
+    assert "偏好，不是限制" in describe_commitments(resolved)
+    provider_fields = provider_commitment_schema(
+        ["C1:s00"], ["device.fold"]
+    )["items"]["properties"]
+    assert "motion_preference" not in provider_fields
+    assert {
+        "recommended_treatment", "suggested_move", "camera_route",
+        "motion_reason", "fallback_treatment",
+    } <= set(provider_fields)
+
+
+def test_direction_motion_advice_ranks_a_locally_feasible_treatment_only():
+    material = [Material("C1", (
+        Span("C1:s00", "C1", 0.0, 4.0, "wide logo", "locked"),
+    ))]
+    material[0].pan_room = 0.45
+    direction = _direction(
+        motion_preference="hold",
+        recommended_treatment="reveal",
+        suggested_move="pan",
+        camera_route="read the wide logo from left to right, then settle",
+        motion_reason="the 9:16 crop cannot show the full wide mark at once",
+        fallback_treatment="compare",
+        presentation_intent="partial_reveal",
+        min_supported_seconds="0:03",
+    )
+    resolved = resolve_candidate_commitments(
+        direction, material, material_digest="a" * 64,
+        aspect="9:16", target_seconds=20.0,
+        grounding_target_ids=("device.fold",), grounding_sha256="b" * 64,
+    )
+    option = resolved.options[0]
+    assert option.direction_suggested_move == "pan"
+    assert option.direction_treatment == "reveal"
+    assert option.preferred_treatment == "reveal"
+    assert "reveal" in option.feasible_treatments
+    described = describe_commitments(resolved)
+    assert "move=pan" in described
+    assert "read the wide logo" in described
+
+
+def test_impossible_direction_advice_does_not_expand_local_capability():
+    direction = _direction(
+        recommended_treatment="push_in",
+        suggested_move="push_in",
+    )
+    resolved = _resolved(direction)
+    option = resolved.options[0]
+    assert option.direction_treatment == "push_in"
+    assert "push_in" not in option.feasible_treatments
+    assert option.preferred_treatment == "use_source_motion"
+
+
+def test_direction_motion_advice_is_carried_to_the_reviewable_shot():
+    from montagewright.cli import _annotate_selection_direction_motion
+
+    commitments = _resolved(_direction(
+        recommended_treatment="reveal",
+        suggested_move="pan",
+        camera_route="left logo to right product",
+        motion_reason="the vertical crop should read the wide composition",
+        fallback_treatment="compare",
+    ))
+    selection = {"shots": [{
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "camera_intent": "use_source_motion",
+    }]}
+
+    _annotate_selection_direction_motion(selection, commitments)
+
+    advice = selection["shots"][0]["direction_motion_advice"]
+    assert advice["move"] == "pan"
+    assert advice["route"] == "left logo to right product"
+    assert "use_source_motion" in advice["locally_feasible"]
 
 
 @pytest.mark.parametrize("change, message", [
@@ -155,11 +266,11 @@ def test_local_facts_reject_provider_claims_the_material_cannot_execute(
         _resolved(_direction(**change))
 
 
-def test_motion_preference_can_fallback_when_source_has_no_authored_move():
+def test_source_motion_fact_is_derived_locally_not_chosen_by_direction():
     resolved = _resolved(_direction(
         span_id="C1:s01", min_supported_seconds="0:03",
     ))
-    assert resolved.options[0].motion_preference == "native_first"
+    assert resolved.options[0].motion_preference == "virtual_allowed"
     faults = validate_selection_commitments([{
         "commitment_id": "hero", "span_id": "C1:s01",
         "seconds_needed": 3.0, "camera_intent": "hold",
@@ -323,6 +434,44 @@ def test_review_replacement_may_change_span_but_not_the_story_promise():
     assert "changed commitment" in faults[0]
 
 
+def test_target_and_presentation_must_belong_to_the_same_look():
+    commitments = _resolved()
+    shot = {
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.5, "camera_intent": "use_source_motion",
+        "looks": [{
+            "entity_id": "device.fold",
+            "presentation_intent": "partial_reveal",
+        }, {
+            "entity_id": "none",
+            "presentation_intent": "reveal_endpoint",
+        }],
+    }
+
+    faults = validate_selection_commitments([shot], commitments)
+
+    assert any(
+        "reveal_endpoint on target device.fold" in fault for fault in faults
+    )
+
+
+def test_review_replacement_cannot_bypass_local_camera_capability():
+    commitments = _resolved()
+    failing = [(0, {"commitment_id": "hero", "span_id": "C1:s00"}, "bad")]
+    faults = validate_replacement_commitments(
+        failing,
+        [{
+            "replace_clip_id": "k00",
+            "commitment_id": "hero",
+            "span_id": "C1:s00",
+            "seconds_needed": 3.5,
+            "camera_intent": "push_in",
+        }],
+        commitments,
+    )
+    assert any("camera treatment" in fault for fault in faults)
+
+
 def test_selection_must_execute_duration_motion_presentation_and_target():
     commitments = _resolved()
     shot = {
@@ -442,3 +591,52 @@ def test_the_planner_is_told_the_budget_it_will_be_judged_against():
         if limit is not None:
             assert f"{limit:.2f}" in role, f"{name}'s ceiling is not stated"
     assert "transition" in length, "name the trap that was actually fallen into"
+
+
+def test_exact_hard_negative_primary_promotes_the_surviving_alternate():
+    from montagewright.cli import _commitments_without_exact_hard_negatives
+
+    resolved = _resolved()
+    primary = resolved.options[0]
+    context = resolved.model_copy(update={
+        "options": (
+            primary,
+            primary.model_copy(update={
+                "span_id": "C2:s00", "tier": "alternate",
+            }),
+        ),
+    })
+    pruned = _commitments_without_exact_hard_negatives(
+        context,
+        {(primary.span_id.split(":", 1)[0], primary.target_id): {
+            "status": "hard_negative", "reason": "wrong instance",
+        }},
+    )
+
+    assert len(pruned.options) == 1
+    assert pruned.options[0].span_id == "C2:s00"
+    assert pruned.options[0].tier == "primary"
+
+
+def test_screen_negative_promotion_requires_exact_confirmation():
+    from montagewright.cli import _commitments_without_exact_hard_negatives
+
+    resolved = _resolved()
+    option = resolved.options[0]
+    pair = ("C1", option.target_id)
+
+    with pytest.raises(
+        CommitmentError, match="rejected every candidate commitment"
+    ):
+        _commitments_without_exact_hard_negatives(
+            resolved,
+            {pair: {"status": "uncertain", "reason": "blurred exact seed"}},
+            require_confirmation={pair},
+        )
+
+    confirmed = _commitments_without_exact_hard_negatives(
+        resolved,
+        {pair: {"status": "confirmed", "reason": "master frame matched"}},
+        require_confirmation={pair},
+    )
+    assert confirmed.options == resolved.options

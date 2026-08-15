@@ -76,6 +76,7 @@ TRACK_FPS = 4.0
 # shot, so that is what is required.
 TRACK_QUORUM = 0.34
 TRACK_MINIMUM_OBSERVATIONS = 3
+_SAM_PREFLIGHTED: dict[Path, tuple[int, int]] = {}
 
 # How far outside a cut a confirmed frame may sit and still be worth seeding
 # from. Far enough to reach the close-up that opens a take; not so far that
@@ -884,7 +885,8 @@ def _measure_looks(
         share = PLACEMENT.get(look.framing, 0.5)
         lift = height * (0.5 - share)
         stops.append((
-            max(0.0, float(look.seconds)),
+            -1.0 if look.presentation_intent == "transition_pass"
+            else max(0.0, float(look.seconds)),
             centre_x,
             centre_y + lift,
             width,
@@ -993,6 +995,206 @@ def _write_grounding_record(path: Path, value: Any) -> None:
         json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     temporary.replace(path)
+
+
+def _set_target_grounding(
+    report: "Report", clip_id: str, target_id: str, value: dict[str, Any]
+) -> dict[str, Any]:
+    """Store one target's state without erasing its neighbours.
+
+    The top-level projection remains for old reports and the existing
+    single-target UI.  ``targets`` is the durable authority when a shot names
+    more than one locked entity.
+    """
+
+    current = report.reference_grounding.get(clip_id)
+    if not isinstance(current, dict):
+        current = {}
+    targets = current.get("targets")
+    if not isinstance(targets, dict):
+        targets = {}
+        previous_target = str(current.get("target_id") or "")
+        if previous_target:
+            previous = {
+                key: item for key, item in current.items() if key != "targets"
+            }
+            targets[previous_target] = previous
+    record = {"target_id": target_id, **value}
+    targets[target_id] = record
+    # Compatibility projection: the latest target is still readable by old
+    # single-target consumers, while target-aware consumers never lose data.
+    current = {**record, "targets": targets}
+    report.reference_grounding[clip_id] = current
+    return record
+
+
+def _target_grounding(
+    report: "Report", clip_id: str, target_id: str
+) -> dict[str, Any]:
+    current = report.reference_grounding.get(clip_id, {})
+    targets = current.get("targets") if isinstance(current, dict) else None
+    if isinstance(targets, dict) and isinstance(targets.get(target_id), dict):
+        return targets[target_id]
+    return _set_target_grounding(report, clip_id, target_id, {})
+
+
+def _preflight_sam_checkpoint(checkpoint: Path | None) -> Path:
+    """Reject unavailable local geometry before any paid semantic call."""
+
+    if checkpoint is None:
+        raise FileNotFoundError("SAM checkpoint is not configured")
+    resolved = Path(checkpoint).expanduser().resolve(strict=True)
+    stat = resolved.stat()
+    if not resolved.is_file() or stat.st_size <= 0:
+        raise FileNotFoundError(f"SAM checkpoint is not a non-empty file: {resolved}")
+    # Importing dependencies is cheap and catches a broken local environment
+    # before exact-frame grounding is purchased. Predictor construction stays
+    # in the tracking call because loading the large checkpoint for every shot
+    # would turn a preflight into the dominant local cost.
+    signature = (stat.st_mtime_ns, stat.st_size)
+    if _SAM_PREFLIGHTED.get(resolved) == signature:
+        return resolved
+    from montagewright.measure.sam_tracking import _require_segmentation_dependencies
+
+    _np, torch, _builder = _require_segmentation_dependencies()
+    try:
+        payload = torch.load(
+            str(resolved), map_location="cpu", weights_only=True, mmap=True
+        )
+    except Exception as error:  # noqa: BLE001 -- local health gate
+        raise RuntimeError(
+            f"SAM checkpoint cannot be read safely: {type(error).__name__}: {error}"
+        ) from error
+    if not isinstance(payload, Mapping) or not payload:
+        raise RuntimeError("SAM checkpoint contains no model state")
+    del payload
+    _SAM_PREFLIGHTED[resolved] = signature
+    return resolved
+
+
+def _confirmed_target_frames(
+    confirmed_identities: Mapping[str, Any] | None,
+    source_id: str,
+    target_id: str,
+) -> tuple[Any, ...]:
+    """Resolve target-keyed confirmations and refuse legacy cross-target use."""
+
+    if not confirmed_identities:
+        return ()
+    source_confirmed = confirmed_identities.get(source_id)
+    if isinstance(source_confirmed, Mapping):
+        frames = source_confirmed.get(target_id, ())
+    else:
+        # Transitional support for source-only callers: newly written and
+        # migrated cached frames carry target_id, so filtering makes the old
+        # container fail closed instead of routing A's box into B's tracker.
+        frames = source_confirmed or ()
+    return tuple(
+        one for one in frames
+        if getattr(one, "target_id", None) == target_id
+    )
+
+
+FINAL_EXACT_LOCAL_VALIDATOR_VERSION = (
+    "pipeline-final-window-exact-v2:lineage+two-anchors+sam-seeds"
+)
+
+
+def _final_exact_cache_key(
+    spec: Any,
+    target_id: str,
+    prepared: list[tuple[Any, str]],
+    *,
+    discovery: Any | None = None,
+    model_id: str | None = None,
+    reference_resolution: str = "high",
+    frame_resolution: str = "high",
+    minimum_matched_anchors: int = 2,
+    local_validator_version: str = FINAL_EXACT_LOCAL_VALIDATOR_VERSION,
+) -> str:
+    """Name a cached answer by the complete semantic request contract."""
+
+    from montagewright.reference_grounding import (
+        EXACT_OUTPUT_POLICY_VERSION,
+        MODEL_ID,
+        _exact_frame_batch_schema,
+        _read_prompt,
+    )
+
+    candidate_ids = tuple(
+        dict.fromkeys(candidate_id for _, candidate_id in prepared)
+    )
+    schema = _exact_frame_batch_schema(
+        target_id, candidate_ids, len(prepared)
+    )
+    contract = {
+        "cache_contract_version": "final-window-exact-cache-v2",
+        "grounding_spec_sha256": spec.definition_sha256(),
+        "target_id": target_id,
+        "frame_requests": [
+            {
+                "lineage": (
+                    frame.lineage.model_dump(mode="json", exclude_none=True)
+                    if hasattr(frame.lineage, "model_dump")
+                    else {
+                        "frame_pts": frame.lineage.frame_pts,
+                        "frame_sha256": frame.lineage.frame_sha256,
+                    }
+                ),
+                "candidate": (
+                    discovery.candidate(candidate_id).model_dump(
+                        mode="json", exclude_none=True
+                    )
+                    if discovery is not None else {"candidate_id": candidate_id}
+                ),
+            }
+            for frame, candidate_id in prepared
+        ],
+        "model_id": model_id or MODEL_ID,
+        "prompt_sha256": hashlib.sha256(_read_prompt().encode("utf-8")).hexdigest(),
+        "response_schema_sha256": hashlib.sha256(json.dumps(
+            schema, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest(),
+        "local_validator_version": local_validator_version,
+        "reference_resolution": reference_resolution,
+        "frame_resolution": frame_resolution,
+        "minimum_matched_anchors": minimum_matched_anchors,
+        "max_frames_per_call": 6,
+        "generation": {
+            "thinking_level": "low",
+            "max_output_policy": EXACT_OUTPUT_POLICY_VERSION,
+        },
+    }
+    return hashlib.sha256(json.dumps(
+        contract, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def _read_final_exact_cache(
+    path: Path, contract_key: str, result_type: Any
+) -> Any | None:
+    """Read only the v2 wrapper; raw/legacy batches are intentionally stale."""
+
+    try:
+        cached = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(cached, dict) or set(cached) != {
+            "cache_contract_sha256", "batch",
+        }:
+            return None
+        if cached["cache_contract_sha256"] != contract_key:
+            return None
+        return result_type.model_validate(cached["batch"])
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _write_final_exact_cache(path: Path, contract_key: str, batch: Any) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _write_grounding_record(destination, {
+        "cache_contract_sha256": contract_key,
+        "batch": batch.model_dump(mode="json"),
+    })
 
 
 def _reaches(one: Any, opens: float, closes: float) -> bool:
@@ -1155,7 +1357,8 @@ def _geometry_from_confirmed(
             seed.frame_pts,
         ], separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:20]
-    report.reference_grounding[clip.clip_id].update({
+    grounding_record = _target_grounding(report, clip.clip_id, target_id)
+    grounding_record.update({
         "matched_anchors": len(confirmed),
         "tracked_frames": kept,
         "analysed_frames": analysed,
@@ -1170,9 +1373,10 @@ def _geometry_from_confirmed(
         "paid_checkpoint_count": 0,
     })
     if kept < TRACK_MINIMUM_OBSERVATIONS or kept / analysed < TRACK_QUORUM:
-        report.reference_grounding[clip.clip_id]["status"] = (
+        grounding_record["status"] = (
             "local_geometry_unverified"
         )
+        _set_target_grounding(report, clip.clip_id, target_id, grounding_record)
         raise ReferenceGeometryUnavailable(
             clip.clip_id, target_id,
             f"{clip.clip_id}: tracking from the confirmed frame at "
@@ -1183,7 +1387,10 @@ def _geometry_from_confirmed(
             )
             + "refusing Gemini-box fallback",
         )
-    report.reference_grounding[clip.clip_id]["status"] = "sam_geometry_validated"
+    grounding_record["status"] = "sam_geometry_validated"
+    # Keep the compatibility projection in sync after mutating the durable
+    # per-target record in place.
+    _set_target_grounding(report, clip.clip_id, target_id, grounding_record)
     return (
         boxes,
         times,
@@ -1229,18 +1436,17 @@ def _reference_subject_samples(
         materialize_frame_at_time,
     )
 
-    if checkpoint is None:
-        report.reference_grounding[clip.clip_id] = {
-            "target_id": target_id,
+    try:
+        checkpoint = _preflight_sam_checkpoint(checkpoint)
+    except (FileNotFoundError, ImportError, RuntimeError) as error:
+        _set_target_grounding(report, clip.clip_id, target_id, {
             "status": "local_geometry_unavailable",
-            "reason": "SAM checkpoint is required for reference-critical framing",
-        }
+            "reason": str(error)[:200],
+        })
         raise RuntimeError(
             f"{clip.clip_id}: reference-critical target {target_id} requires "
             "SAM/local geometry; Gemini boxes are semantic seeds, not crop geometry"
-        )
-    if not _may_ask(client):
-        return [], [], ()
+        ) from error
     clip_start_ms = round(float(clip.approx_in_seconds) * 1000)
     clip_end_ms = round(float(clip.approx_out_seconds) * 1000)
     # Identity was settled for this source, at the moments it was clearest,
@@ -1252,6 +1458,10 @@ def _reference_subject_samples(
     # Only from inside the same sighting, though. A box proved while the
     # subject was in shot says nothing after it left and came back, and the
     # tracker cannot cross that gap either.
+    confirmed = tuple(
+        one for one in (confirmed or ())
+        if getattr(one, "target_id", None) == target_id
+    )
     if confirmed:
         # Only from inside a sighting that this cut is part of. A box proved
         # while the subject was in shot says nothing after it left and came
@@ -1291,13 +1501,13 @@ def _reference_subject_samples(
                 single = min(
                     single_candidates, key=lambda one: abs(one.at_seconds - centre)
                 )
-                report.reference_grounding[clip.clip_id] = {
-                    "target_id": target_id,
+                grounding_record = _set_target_grounding(
+                    report, clip.clip_id, target_id, {
                     "status": "identity_from_source",
                     "confirmed_at": [round(single.at_seconds, 3)],
                     "seeded_inside_cut": single in inside,
                     "validation_mode": "single_seed_continuity",
-                }
+                })
                 try:
                     return _geometry_from_confirmed(
                         source, clip, target_id, [single],
@@ -1306,18 +1516,20 @@ def _reference_subject_samples(
                         validation_mode="single_seed_continuity",
                     )
                 except ReferenceShotUnusable as unusable:
-                    report.reference_grounding[clip.clip_id][
-                        "fallback_reason"
-                    ] = str(unusable)[:200]
+                    grounding_record["fallback_reason"] = str(unusable)[:200]
+                    _set_target_grounding(
+                        report, clip.clip_id, target_id, grounding_record
+                    )
                     report.subject_notes[clip.clip_id] = str(unusable)[:200]
                 except Exception as error:  # noqa: BLE001 -- fallback is safe
                     reason = (
                         f"single-seed tracking failed: "
                         f"{type(error).__name__}: {error}"
                     )[:200]
-                    report.reference_grounding[clip.clip_id][
-                        "fallback_reason"
-                    ] = reason
+                    grounding_record["fallback_reason"] = reason
+                    _set_target_grounding(
+                        report, clip.clip_id, target_id, grounding_record
+                    )
                     report.subject_notes[clip.clip_id] = reason
 
             fallback_reason = report.subject_notes.get(clip.clip_id)
@@ -1329,14 +1541,13 @@ def _reference_subject_samples(
                     "single seed ineligible"
                     + (f": {', '.join(risks)}" if risks else "")
                 )
-            report.reference_grounding[clip.clip_id] = {
-                "target_id": target_id,
+            _set_target_grounding(report, clip.clip_id, target_id, {
                 "status": "identity_from_source",
                 "confirmed_at": [round(one.at_seconds, 3) for one in usable],
                 "seeded_inside_cut": bool(inside),
                 "validation_mode": "multi_anchor_fallback",
                 "fallback_reason": fallback_reason,
-            }
+            })
             try:
                 return _geometry_from_confirmed(
                     source, clip, target_id, usable, inside,
@@ -1471,24 +1682,26 @@ def _reference_subject_samples(
     # including the shots it was not repairing.
     batch = None
     remembered = None
+    cache_contract_key = None
     if memory is not None:
-        key = hashlib.sha256(json.dumps([
-            spec.definition_sha256(),
-            target_id,
-            [
-                [frame.lineage.frame_pts, frame.lineage.frame_sha256]
-                for frame, _ in prepared
-            ],
-        ], sort_keys=True).encode("utf-8")).hexdigest()
-        remembered = Path(memory) / f"exact-{key[:24]}.json"
+        cache_contract_key = _final_exact_cache_key(
+            spec, target_id, prepared,
+            discovery=discovery,
+            reference_resolution="high",
+            frame_resolution="high",
+            minimum_matched_anchors=2,
+        )
+        remembered = Path(memory) / f"exact-v2-{cache_contract_key[:24]}.json"
         if remembered.exists():
-            try:
-                batch = ExactFrameBBoxBatchResult.model_validate_json(
-                    remembered.read_text(encoding="utf-8")
-                )
-            except (OSError, ValueError):
-                batch = None
+            batch = _read_final_exact_cache(
+                remembered, cache_contract_key, ExactFrameBBoxBatchResult
+            )
 
+    if batch is None and not _may_ask(client):
+        report.subject_notes[clip.clip_id] = (
+            "no client was available and no exact-frame cache matched this window"
+        )
+        return [], [], ()
     if batch is None:
         _afford(report)
         try:
@@ -1516,10 +1729,8 @@ def _reference_subject_samples(
         batch, usage = decided
         _charge(report, "reference_exact", usage)
         if remembered is not None:
-            remembered.parent.mkdir(parents=True, exist_ok=True)
-            remembered.write_text(
-                json.dumps(batch.model_dump(mode="json"), ensure_ascii=False),
-                encoding="utf-8",
+            _write_final_exact_cache(
+                remembered, str(cache_contract_key), batch
             )
     if output is not None:
         _write_grounding_record(
@@ -1532,11 +1743,10 @@ def _reference_subject_samples(
         matched = batch.sam_seed_evaluations()
     except ReferenceGroundingError as error:
         report.subject_notes[clip.clip_id] = str(error)[:160]
-        report.reference_grounding[clip.clip_id] = {
-            "target_id": target_id,
+        _set_target_grounding(report, clip.clip_id, target_id, {
             "status": "identity_unverified",
             "matched_anchors": batch.matched_anchor_count,
-        }
+        })
         return [], [], ()
 
     anchors: list[
@@ -1583,11 +1793,10 @@ def _reference_subject_samples(
             seed_lineage=seed.lineage,
         )
     except Exception as error:
-        report.reference_grounding[clip.clip_id] = {
-            "target_id": target_id,
+        _set_target_grounding(report, clip.clip_id, target_id, {
             "status": "local_geometry_failed",
             "reason": type(error).__name__,
-        }
+        })
         raise ReferenceGeometryUnavailable(
             clip.clip_id, target_id,
             f"{clip.clip_id}: SAM/local geometry failed for locked reference "
@@ -1601,15 +1810,14 @@ def _reference_subject_samples(
     # successful handoff for a reference-critical target.
     kept = len(tracked)
     if kept < TRACK_MINIMUM_OBSERVATIONS or kept / total < TRACK_QUORUM:
-        report.reference_grounding[clip.clip_id] = {
-            "target_id": target_id,
+        _set_target_grounding(report, clip.clip_id, target_id, {
             "status": "local_geometry_unverified",
             "tracked_frames": kept,
             "analysed_frames": total,
             "anchors_agreed": states.get("_anchors_agreed"),
             "anchors_offered": states.get("_anchors_offered"),
             "best_agreement_pct": states.get("_best_agreement_pct"),
-        }
+        })
         if states.get("identity_unverified"):
             raise ReferenceGeometryUnavailable(
                 clip.clip_id, target_id,
@@ -1645,8 +1853,8 @@ def _reference_subject_samples(
         })
     from montagewright.measure.geometry import native_yxyx_to_canonical_xyxy
 
-    report.reference_grounding[clip.clip_id] = {
-        "target_id": target_id,
+    grounding_record = _set_target_grounding(
+        report, clip.clip_id, target_id, {
         "status": "sam_geometry_validated",
         "query_lock_sha256": batch.query_lock_sha256,
         "grounding_spec_sha256": batch.grounding_spec_sha256,
@@ -1683,8 +1891,8 @@ def _reference_subject_samples(
             for item in matched
             for instance in item.decision.excluded_instances
         ],
-    }
-    lookalikes = report.reference_grounding[clip.clip_id]["excluded_instances"]
+    })
+    lookalikes = grounding_record["excluded_instances"]
     if lookalikes:
         report.plan_disagreements.append(
             f"{clip.clip_id} shares the frame with "
@@ -1759,28 +1967,35 @@ def follow_subjects(
                     ],
                 ] = {}
                 if grounding_spec is not None:
+                    entity_faults: list[ReferenceShotUnusable] = []
                     for entity_id in dict.fromkeys(
                         look.entity_id
                         for look in reframe.looks
                         if look.entity_id
                     ):
-                        samples = _reference_subject_samples(
-                            source,
-                            clip,
-                            entity_id,
-                            spec=grounding_spec,
-                            client=client,
-                            upload_cache=upload_cache,
-                            report=report,
-                            work=work,
-                            output=grounding_output,
-                            discoveries=discoveries,
-                            checkpoint=checkpoint,
-                            memory=grounding_memory,
-                            confirmed=(confirmed_identities or {}).get(
-                                clip.source_id
-                            ),
-                        )
+                        try:
+                            samples = _reference_subject_samples(
+                                source,
+                                clip,
+                                entity_id,
+                                spec=grounding_spec,
+                                client=client,
+                                upload_cache=upload_cache,
+                                report=report,
+                                work=work,
+                                output=grounding_output,
+                                discoveries=discoveries,
+                                checkpoint=checkpoint,
+                                memory=grounding_memory,
+                                confirmed=_confirmed_target_frames(
+                                    confirmed_identities,
+                                    clip.source_id,
+                                    entity_id,
+                                ),
+                            )
+                        except ReferenceShotUnusable as unusable:
+                            entity_faults.append(unusable)
+                            continue
                         if samples[0]:
                             reference_samples[entity_id] = samples
                         else:
@@ -1797,7 +2012,7 @@ def follow_subjects(
                                     measured={"confirmed_anchors": 0.0},
                                 )
                             )
-                            raise ReferenceIdentityUnconfirmed(
+                            entity_faults.append(ReferenceIdentityUnconfirmed(
                                 clip.clip_id, entity_id,
                                 f"{clip.clip_id}: locked reference identity "
                                 f"{entity_id} could not be delivered from "
@@ -1808,7 +2023,10 @@ def follow_subjects(
                                 )
                                 + "); reselect the shot instead of "
                                 "substituting a lookalike",
-                            )
+                            ))
+                    if entity_faults:
+                        unusable_shots.extend(entity_faults)
+                        continue
                 card = (
                     load_card(cards[clip.source_id])
                     if cards and clip.source_id in cards
@@ -2642,6 +2860,18 @@ def run(
 
     report = Report(ledger=ledger)
 
+    # Everything needed to prove source-clock feasibility is already local at
+    # this boundary.  Refuse an impossible Selection before paying Rhythm to
+    # choose timings that no answer could make executable.
+    from montagewright.planning_release import resolved_source_contract_faults
+
+    preflight_faults = resolved_source_contract_faults(edl)
+    if preflight_faults:
+        raise ValueError(
+            "selection has unresolved source-clock contracts before Rhythm: "
+            + "; ".join(preflight_faults)
+        )
+
     # Runs whether or not there is a track. It was gated on having one --
     # the reasoning being that with no music there is nothing to reconcile --
     # and that was wrong: what it reconciles is the sequence against itself.
@@ -2664,6 +2894,7 @@ def run(
             duration_mode=duration_mode,
             client=client,
             ledger=ledger,
+            artifact_dir=output_dir / "work",
         )
         _charge(report, "rhythm", usage)
 
@@ -2769,6 +3000,23 @@ def run(
     # of the continuing audio assignment.  It must precede SAM/reframing.
     edl, speaker_notes = align_speaker_pictures_to_audio(edl)
     report.plan_disagreements.extend(speaker_notes)
+    # Lip-sync owns the final source in-point for speaker pictures.  It runs
+    # after musical/dialogue grounding, so it must not be allowed to move a
+    # clip through an action, source-motion or usable-window boundary that was
+    # proved on the earlier window.
+    from montagewright.planning_release import (
+        audio_timeline_faults, resolved_source_contract_faults,
+    )
+
+    resolved_faults = (
+        *resolved_source_contract_faults(edl),
+        *audio_timeline_faults(edl),
+    )
+    if resolved_faults:
+        raise ValueError(
+            "resolved timeline violates local source/audio contracts: "
+            + "; ".join(dict.fromkeys(resolved_faults))
+        )
     for clip in edl.clips:
         if clip.clip_id in report.rhythm_decisions:
             report.rhythm_decisions[clip.clip_id]["seconds"] = round(

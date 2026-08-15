@@ -8,6 +8,7 @@ deliverable as much as the file is.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -34,10 +35,16 @@ from montagewright.clipcard import (
 )
 from montagewright.cost import BudgetSpent, Ledger
 from montagewright.grounding import (
-    analyse_track, beat_grid_payload, load_beat_grid, read_runtime_beat_grid,
-    shots_in,
+    analyse_track, beat_grid_from_payload, beat_grid_payload, load_beat_grid,
+    read_runtime_beat_grid, shots_in,
 )
-from montagewright.pipeline import ReferenceShotsUnusable, probe, run
+from montagewright.measure.media import sha256_file
+from montagewright.pipeline import (
+    ReferenceShotsUnusable,
+    _preflight_sam_checkpoint,
+    probe,
+    run,
+)
 from montagewright.planning_bridge import (
     material_planning_state,
     publish_planning_state,
@@ -67,13 +74,16 @@ from montagewright.planner import (
     PROMPTS,
     THINKING_HIGH,
     MaterialItem,
+    SelectionUnrenderable,
     _describe_one,
     _direction_schema,
     _selection_schema,
     _shot_count_bounds,
+    audit_cached_selection,
     correct_candidate_options,
     decide_direction,
     replan_shots,
+    repair_single_look_hold_overflow,
     sequence_disagreements,
     select_shots,
 )
@@ -333,10 +343,11 @@ def _swap_for_alternate(
     return None
 
 
-def _confirm_material_identity(
+def _confirm_material_identity_for_target(
     material: list[Any],
     sightings: dict[str, Any],
     spec: Any,
+    target: str,
     *,
     masters: dict[str, Path],
     client: Any,
@@ -345,8 +356,9 @@ def _confirm_material_identity(
     library: Path,
     work: Path,
     spread: bool = False,
-) -> dict[str, tuple[tuple[float, tuple[float, float, float, float]], ...]]:
-    """Where each source's identity was proved, on the master's clock."""
+    outcomes: dict[tuple[str, str], dict[str, str]] | None = None,
+) -> dict[str, tuple[Any, ...]]:
+    """Where one target was proved in each source, on the master's clock."""
 
     from montagewright.reference_grounding import (
         confirm_source_identity,
@@ -354,18 +366,12 @@ def _confirm_material_identity(
         decide_cross_asset_exact_frame_bboxes,
         prepare_source_identity_seed,
         read_source_confirmation_cache,
+        read_source_confirmation_status,
         source_confirmation_cache_path,
         write_source_confirmation_cache,
     )
 
-    required = tuple(
-        spec.identity_lock.framing.required_target_ids
-        or [target.target_id for target in spec.identity_lock.identity.targets]
-    )
-    if not required:
-        return {}
-    target = required[0]
-    confirmed: dict[str, tuple[tuple[float, tuple[float, float, float, float]], ...]] = {}
+    confirmed: dict[str, tuple[Any, ...]] = {}
     paid_before = float(getattr(ledger, "spent_usd", 0.0))
     total = len(material)
     prepared = []
@@ -387,6 +393,12 @@ def _confirm_material_identity(
         )
         remembered = read_source_confirmation_cache(cache_path, target)
         if remembered is not None:
+            if outcomes is not None:
+                outcomes[(item.source_id, target)] = {
+                    "status": read_source_confirmation_status(cache_path, target)
+                    or ("confirmed" if remembered else "uncertain"),
+                    "reason": "source confirmation cache",
+                }
             if remembered:
                 confirmed[item.source_id] = remembered
             continue
@@ -432,11 +444,14 @@ def _confirm_material_identity(
             )
             fallback.extend(item for item, _, _, _ in prepared_sources)
         else:
-            outcomes = judged[0].outcomes if judged is not None else ()
+            batch_outcomes = judged[0].outcomes if judged is not None else ()
             for index, (item, seed, cache_path, source) in enumerate(
                 prepared_sources
             ):
-                outcome = outcomes[index] if index < len(outcomes) else None
+                outcome = (
+                    batch_outcomes[index]
+                    if index < len(batch_outcomes) else None
+                )
                 found = ()
                 video_sha256 = ""
                 semantic_answer = False
@@ -454,6 +469,10 @@ def _confirm_material_identity(
                     if frame is not None and not frame.seed_risk_flags:
                         found = (frame,)
                 if found:
+                    if outcomes is not None:
+                        outcomes[(item.source_id, target)] = {
+                            "status": "confirmed", "reason": "clean exact seed",
+                        }
                     confirmed[item.source_id] = found
                     write_source_confirmation_cache(
                         cache_path,
@@ -464,13 +483,11 @@ def _confirm_material_identity(
                 else:
                     if semantic_answer and decision is not None:
                         if decision.verdict != "matched_target":
-                            # A negative/uncertain decision is a valid
-                            # semantic answer, not a protocol failure. Record
-                            # it and do not pay repeatedly in search of a more
-                            # convenient verdict.
-                            write_source_confirmation_cache(
-                                cache_path, target, video_sha256, ()
-                            )
+                            # This verdict belongs to one exact frame, not the
+                            # whole source.  An occluded recommended seed must
+                            # not become a durable source-negative cache entry;
+                            # let the mature path sample independent moments.
+                            fallback.append(item)
                             continue
                     # A matched but risky seed needs independent anchors; a
                     # structural failure needs the mature singleton path.
@@ -482,6 +499,7 @@ def _confirm_material_identity(
         if discovery is None or source is None:
             continue
         ledger.check()
+        detail: dict[str, str] = {}
         try:
             found = confirm_source_identity(
                 Path(source), spec, discovery, target,
@@ -494,6 +512,7 @@ def _confirm_material_identity(
                         for share in (0.1, 0.3, 0.5, 0.7, 0.9)
                     ) if spread else ()
                 ),
+                outcome=detail,
             )
         except BudgetSpent:
             raise
@@ -504,6 +523,14 @@ def _confirm_material_identity(
                 flush=True,
             )
             found = ()
+            detail = {
+                "status": "provider_failure",
+                "reason": f"{type(error).__name__}: {error}",
+            }
+        if outcomes is not None:
+            outcomes[(item.source_id, target)] = detail or {
+                "status": "uncertain", "reason": "no confirmed source frame",
+            }
         if found:
             confirmed[item.source_id] = found
 
@@ -522,6 +549,46 @@ def _confirm_material_identity(
     return confirmed
 
 
+def _confirm_material_identity(
+    material: list[Any],
+    sightings: dict[str, Any],
+    spec: Any,
+    *,
+    masters: dict[str, Path],
+    client: Any,
+    cache: Any,
+    ledger: Any,
+    library: Path,
+    work: Path,
+    spread: bool = False,
+    outcomes: dict[tuple[str, str], dict[str, str]] | None = None,
+) -> dict[str, dict[str, tuple[Any, ...]]]:
+    """Return exact source confirmations keyed by both source and target."""
+
+    required = tuple(dict.fromkeys(
+        spec.identity_lock.framing.required_target_ids
+        or [target.target_id for target in spec.identity_lock.identity.targets]
+    ))
+    confirmed: dict[str, dict[str, tuple[Any, ...]]] = {}
+    for target_id in required:
+        for source_id, frames in _confirm_material_identity_for_target(
+            material,
+            sightings,
+            spec,
+            target_id,
+            masters=masters,
+            client=client,
+            cache=cache,
+            ledger=ledger,
+            library=library,
+            work=work,
+            spread=spread,
+            outcomes=outcomes,
+        ).items():
+            confirmed.setdefault(source_id, {})[target_id] = frames
+    return confirmed
+
+
 def _identity_commitment_sources(commitments: Any) -> set[str]:
     """Sources whose primary/alternate picture promises the locked target."""
 
@@ -530,6 +597,237 @@ def _identity_commitment_sources(commitments: Any) -> set[str]:
         for option in commitments.options
         if option.target_id != "none"
     }
+
+
+def _commitments_without_exact_hard_negatives(
+    commitments: Any,
+    outcomes: dict[tuple[str, str], dict[str, str]],
+    *,
+    require_confirmation: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset(),
+) -> Any:
+    """Remove only source/target pairs disproved by independent exact frames.
+
+    `uncertain` and provider failures normally remain reviewable candidates.
+    The exception is a source/target pair which Direction promoted after the
+    cheap screen explicitly found it absent: that disagreement was allowed
+    through only so master-resolution exact frames could settle it.  If those
+    frames do not confirm it, the pair remains useful context but may not
+    satisfy an identity-bearing commitment.
+    """
+
+    from montagewright.candidate_commitments import CandidateCommitments
+
+    grouped: dict[str, list[Any]] = {}
+    order: list[str] = []
+    for option in commitments.options:
+        if option.commitment_id not in grouped:
+            grouped[option.commitment_id] = []
+            order.append(option.commitment_id)
+        grouped[option.commitment_id].append(option)
+    kept: list[Any] = []
+    warnings = list(commitments.warnings)
+    for commitment_id in order:
+        original = grouped[commitment_id]
+        surviving = []
+        for option in original:
+            pair = (option.span_id.split(":", 1)[0], option.target_id)
+            status = outcomes.get(pair, {}).get("status")
+            if status == "hard_negative":
+                continue
+            if pair in require_confirmation and status != "confirmed":
+                warnings.append(
+                    f"{commitment_id} option {option.span_id} was promoted "
+                    "after a negative proxy screen but exact master frames "
+                    "did not confirm the target"
+                )
+                continue
+            surviving.append(option)
+        if not surviving:
+            warnings.append(
+                f"{commitment_id} has no exact-eligible option; omitted from "
+                "Selection rather than substituting a known wrong identity"
+            )
+            continue
+        if not any(option.tier == "primary" for option in surviving):
+            surviving[0] = surviving[0].model_copy(update={"tier": "primary"})
+        kept.extend(surviving)
+    if not kept:
+        raise CommitmentError(
+            "exact identity confirmation rejected every candidate commitment"
+        )
+    payload = commitments.model_dump(mode="python")
+    payload.update({"options": tuple(kept), "warnings": tuple(dict.fromkeys(warnings))})
+    return CandidateCommitments.model_validate(payload)
+
+
+def _annotate_selection_identity_evidence(
+    selection: dict[str, Any], confirmed: dict[str, Any]
+) -> None:
+    """Say what identity evidence exists before final-window tracking.
+
+    Source confirmation is useful evidence but is not proof that the identity
+    remains inside the exact selected window, and neither is a positive proxy
+    screen.  Keeping these states distinct prevents an unfinished draft from
+    reporting every target-bearing shot as fully confirmed.
+    """
+
+    notes = selection.setdefault("plan_disagreements", [])
+    for index, shot in enumerate(selection.get("shots") or []):
+        targets = tuple(dict.fromkeys(
+            str(look.get("entity_id") or "").strip()
+            for look in shot.get("looks") or []
+            if str(look.get("entity_id") or "").strip() not in {"", "none"}
+        ))
+        if not targets:
+            shot.setdefault("identity_status", "not_applicable")
+            continue
+        source_id = str(shot.get("source_id") or "")
+        shot["identity_target_id"] = targets[0]
+        shot["identity_target_ids"] = list(targets)
+        source_confirmed = confirmed.get(source_id) or {}
+        if isinstance(source_confirmed, dict):
+            missing = [
+                target for target in targets
+                if not source_confirmed.get(target)
+            ]
+        else:
+            # Transitional source-only data can never prove which target its
+            # frames belong to; inspect their embedded lineage and fail closed.
+            missing = [
+                target for target in targets
+                if not any(
+                    getattr(frame, "target_id", None) == target
+                    for frame in source_confirmed
+                )
+            ]
+        if not missing:
+            shot["identity_status"] = "source_confirmed"
+            shot["identity_issue"] = (
+                "來源中的 exact frame 已確認；仍要等這個最終片段的 SAM "
+                "連續性通過，才算最終追蹤已驗證。"
+            )
+        else:
+            shot["identity_status"] = "unverified"
+            shot["identity_issue"] = (
+                "粗篩認為來源可能包含指定主體，但來源 exact frame 尚未證明；"
+                "保留為可檢視草稿，不冒充已確認。"
+            )
+            note = (
+                f"k{index:02d} {source_id} claims {', '.join(missing)} but has no "
+                "confirmed source exact frame; final-window grounding must "
+                "confirm it or leave the shot marked for review"
+            )
+            if note not in notes:
+                notes.append(note)
+
+
+def _annotate_selection_direction_motion(
+    selection: dict[str, Any], commitments: Any
+) -> None:
+    """Carry Direction's camera advice beside Selection's final choice."""
+
+    by_pair = {
+        (option.commitment_id, option.span_id): option
+        for option in commitments.options
+    }
+    for shot in selection.get("shots") or []:
+        option = by_pair.get((
+            str(shot.get("commitment_id") or ""),
+            str(shot.get("span_id") or ""),
+        ))
+        if option is None:
+            continue
+        shot["direction_motion_advice"] = {
+            "treatment": option.direction_treatment,
+            "move": option.direction_suggested_move,
+            "route": option.direction_camera_route,
+            "reason": option.direction_motion_reason,
+            "fallback": option.direction_fallback_treatment,
+            "locally_feasible": list(option.feasible_treatments),
+        }
+
+
+def _project_track_confirmed(selection: dict[str, Any], report: Any) -> None:
+    """Project final per-target SAM proof back onto the reviewable shot state."""
+
+    grounding = getattr(report, "reference_grounding", {}) or {}
+    for index, shot in enumerate(selection.get("shots") or []):
+        targets = tuple(dict.fromkeys(
+            str(look.get("entity_id") or "").strip()
+            for look in shot.get("looks") or []
+            if str(look.get("entity_id") or "").strip() not in {"", "none"}
+        ))
+        if not targets:
+            continue
+        record = grounding.get(f"k{index:02d}") or {}
+        per_target = record.get("targets") if isinstance(record, dict) else {}
+        if not isinstance(per_target, dict):
+            per_target = {}
+        statuses = {
+            target: str((per_target.get(target) or {}).get("status") or "")
+            for target in targets
+        }
+        shot["identity_track_statuses"] = statuses
+        if statuses and all(
+            status == "sam_geometry_validated" for status in statuses.values()
+        ):
+            shot["identity_status"] = "track_confirmed"
+            shot["identity_issue"] = ""
+
+
+def _merge_identity_windows(
+    windows: list[tuple[float, float]], *, tolerance: float = 1e-3
+) -> tuple[tuple[float, float], ...]:
+    """Merge overlaps but never bridge an interval where a target was absent."""
+
+    merged: list[list[float]] = []
+    for starts, ends in sorted(windows):
+        if ends <= starts:
+            continue
+        if merged and starts <= merged[-1][1] + tolerance:
+            merged[-1][1] = max(merged[-1][1], ends)
+        else:
+            merged.append([starts, ends])
+    return tuple((round(one[0], 3), round(one[1], 3)) for one in merged)
+
+
+def _spans_inside_identity_windows(
+    spans: tuple[Any, ...], windows: tuple[tuple[float, float], ...]
+) -> tuple[Any, ...]:
+    """Intersect spans with connected sightings, preserving every dry gap."""
+
+    surviving: list[Any] = []
+    for span in spans:
+        overlaps = _merge_identity_windows([
+            (max(span.starts_seconds, starts), min(span.ends_seconds, ends))
+            for starts, ends in windows
+            if span.starts_seconds < ends and span.ends_seconds > starts
+        ])
+        usable = [one for one in overlaps if one[1] - one[0] >= 0.5]
+        for part_index, (opens, closes) in enumerate(usable):
+            unchanged = (
+                len(usable) == 1
+                and opens <= span.starts_seconds + 1e-3
+                and closes >= span.ends_seconds - 1e-3
+            )
+            surviving.append(span if unchanged else replace(
+                span,
+                span_id=(
+                    span.span_id if part_index == 0
+                    else f"{span.span_id}:identity{part_index:02d}"
+                ),
+                starts_seconds=round(opens, 3),
+                ends_seconds=round(closes, 3),
+            ))
+    return tuple(surviving)
+
+
+def _replace_identity_material(item: Any, **updates: Any) -> Any:
+    """Update new identity fields while retaining lightweight test adapters."""
+
+    return replace(item, **{
+        name: value for name, value in updates.items() if hasattr(item, name)
+    })
 
 
 def _screen_material_identity(
@@ -619,30 +917,42 @@ def _screen_material_identity(
             summary for summary in discovery.target_summaries
             if summary.target_id in required and summary.verdict == "absent"
         ]
-        if absent:
-            # Not the subject, still the film. The brief that locks a product
-            # also asks for the venue it was shown in, and says in as many
-            # words that those shots need not contain it. Deleting the source
-            # answered a question nobody asked -- whether every clip has the
-            # product -- and threw away the entrance, the main visual and the
-            # people at the stand. Mark it: selection may use it for context,
-            # and the look-semantics gate refuses to let it claim the target.
-            context[item.source_id] = (
-                f"{absent[0].target_id} is not in this source: "
-                f"{absent[0].reason}"
-            )
-            kept.append(replace(item, carries_identity=False))
-            continue
+        absent_targets = tuple(sorted({one.target_id for one in absent}))
         # Sightings are in milliseconds from the first decoded frame, which
         # is the clock the card's segments are on too.
-        seen = [
-            (candidate.start_ms / 1000.0, candidate.end_ms / 1000.0)
-            for candidate in discovery.candidates
-            if candidate.target_id in required
-            and candidate.identity_status != "hard_negative"
-        ]
+        windows_by_target = tuple(
+            (target_id, _merge_identity_windows([
+                (candidate.start_ms / 1000.0, candidate.end_ms / 1000.0)
+                for candidate in discovery.candidates
+                if candidate.target_id == target_id
+                and candidate.identity_status != "hard_negative"
+            ]))
+            for target_id in required
+        )
+        seen = _merge_identity_windows([
+            window
+            for _, target_windows in windows_by_target
+            for window in target_windows
+        ])
+        unresolved = set(required) - set(absent_targets) - {
+            target_id for target_id, target_windows in windows_by_target
+            if target_windows
+        }
+        identity_update = {
+            "identity_windows_by_target": windows_by_target,
+            "identity_absent_targets": absent_targets,
+        }
         if not seen:
-            kept.append(item)
+            if unresolved:
+                kept.append(_replace_identity_material(item, **identity_update))
+                continue
+            context[item.source_id] = "; ".join(
+                f"{one.target_id} is not in this source: {one.reason}"
+                for one in absent
+            ) or "the locked identities are absent from this source"
+            kept.append(_replace_identity_material(
+                item, carries_identity=False, **identity_update
+            ))
             continue
         # Any overlap at all was enough to keep a span, and selection is
         # free to cut anywhere inside one -- so a span that clipped a
@@ -650,41 +960,24 @@ def _screen_material_identity(
         # in the part where the target is not, and the shot died four
         # stages later with the frames judged and no target in them. Keep
         # the part of the span the identity was actually seen in.
-        surviving = []
-        for span in item.spans:
-            inside = [
-                (max(span.starts_seconds, starts), min(span.ends_seconds, ends))
-                for starts, ends in seen
-                if span.starts_seconds < ends and span.ends_seconds > starts
-            ]
-            if not inside:
-                continue
-            opens = min(one[0] for one in inside)
-            closes = max(one[1] for one in inside)
-            if closes - opens < 0.5:
-                # Too little of it to cut anything from; leaving it out is
-                # honest, and leaving it in offers a window nothing can use.
-                continue
-            if (
-                opens <= span.starts_seconds + 1e-3
-                and closes >= span.ends_seconds - 1e-3
-            ):
-                surviving.append(span)
-                continue
-            surviving.append(replace(
-                span, starts_seconds=round(opens, 3), ends_seconds=round(closes, 3)
-            ))
-        surviving = tuple(surviving)
+        surviving = _spans_inside_identity_windows(item.spans, seen)
         if not surviving:
+            if unresolved:
+                kept.append(_replace_identity_material(item, **identity_update))
+                continue
             # Seen, but never in a stretch anything can be cut from. Same
             # treatment: it is still material, it is just not the subject.
             context[item.source_id] = (
                 "the locked identity was seen in this source but never "
                 "inside a usable span"
             )
-            kept.append(replace(item, carries_identity=False))
+            kept.append(_replace_identity_material(
+                item, carries_identity=False, **identity_update
+            ))
             continue
-        kept.append(replace(item, spans=surviving))
+        kept.append(_replace_identity_material(
+            item, spans=surviving, carries_identity=True, **identity_update
+        ))
     print(
         f"  {len(kept) - len(context)} sources carry the identity, "
         f"{len(context)} kept for context only, {len(aside)} set aside "
@@ -1004,6 +1297,15 @@ def command_render(args: argparse.Namespace) -> int:
     # That made CLI renders silently less accurate than Web UI renders. Keep
     # one resolved value for the command record and every review round.
     args.sam_checkpoint = _sam_checkpoint_for(args)
+    if args.sam_checkpoint is not None:
+        try:
+            args.sam_checkpoint = _preflight_sam_checkpoint(
+                args.sam_checkpoint
+            )
+        except (ImportError, OSError, RuntimeError) as error:
+            raise SystemExit(
+                f"SAM local preflight failed before paid planning: {error}"
+            ) from error
 
     recorded_argv = _command_with_canonical_grounding(
         list(getattr(args, "_argv", sys.argv[1:])),
@@ -1198,6 +1500,11 @@ def command_render(args: argparse.Namespace) -> int:
                         audio=originals.get(source_id),
                         ledger=ledger,
                     )
+                except BudgetSpent:
+                    # Money running out says nothing about this clip.  Treating
+                    # it as missing speech freezes a partial, false inventory
+                    # and lets later paid stages keep trying.
+                    raise
                 except Exception as error:
                     print(
                         f"  {source_id} — no transcript: "
@@ -1223,6 +1530,9 @@ def command_render(args: argparse.Namespace) -> int:
     # good coin shot" had no answer anywhere in the output.
     set_aside: dict[str, str] = {}
     confirmed_identities: dict[str, Any] = {}
+    identity_confirmation_outcomes: dict[
+        tuple[str, str], dict[str, str]
+    ] = {}
     sightings: dict[str, Any] = {}
     for source_id, proxy in proxies.items():
         card = load_card(cards[source_id]) if source_id in cards else None
@@ -1263,7 +1573,16 @@ def command_render(args: argparse.Namespace) -> int:
                 pan_room=_room[source_id][0],
                 tilt_room=_room[source_id][1],
                 action=tuple(
-                    f"{beat.what} {beat.starts_seconds:.1f}-{beat.ends_seconds:.1f}s"
+                    f"`{beat.beat_id}` {beat.what} "
+                    f"{beat.starts_seconds:.1f}-{beat.ends_seconds:.1f}s"
+                    for beat in action_beats(card or {})[:4]
+                ),
+                action_ids=tuple(
+                    beat.beat_id
+                    for beat in action_beats(card or {})[:4]
+                ),
+                action_windows=tuple(
+                    (beat.beat_id, beat.starts_seconds, beat.ends_seconds)
                     for beat in action_beats(card or {})[:4]
                 ),
                 needs=tuple(
@@ -1272,6 +1591,13 @@ def command_render(args: argparse.Namespace) -> int:
                 ),
                 subjects=tuple(
                     _subject_line(box, _aspect(proxy), ASPECTS[args.aspect])
+                    for box in subjects_from_card(card or {})
+                ),
+                subject_geometry=tuple(
+                    (
+                        box.label, box.entity_id, box.centre_x, box.centre_y,
+                        box.width, box.height,
+                    )
                     for box in subjects_from_card(card or {})
                 ),
                 # The label a look will name, beside the moment it was seen
@@ -1378,8 +1704,22 @@ def command_render(args: argparse.Namespace) -> int:
     if args.music_map:
         grid = load_beat_grid(args.music_map)
     elif args.music:
-        print("no music map given; measuring the track", flush=True)
-        grid = analyse_track(args.music)
+        grid = None
+        music_key = _asked(
+            "runtime-music-analysis-v1",
+            sha256_file(Path(args.music).expanduser().resolve(strict=True)),
+        )
+        remembered_music = _decided(work, "music-analysis", music_key)
+        if remembered_music is not None:
+            try:
+                grid = beat_grid_from_payload(remembered_music)
+                print("music analysis: reused from the last attempt", flush=True)
+            except (KeyError, TypeError, ValueError):
+                remembered_music = None
+        if grid is None:
+            print("no music map given; measuring the track", flush=True)
+            grid = analyse_track(args.music)
+            _decide(work, "music-analysis", music_key, beat_grid_payload(grid))
     else:
         grid = None
         print("no music; lengths will be led by content", flush=True)
@@ -1518,20 +1858,45 @@ def command_render(args: argparse.Namespace) -> int:
     # model that was right about a table of three handsets, twice, at the
     # price of a paid correction each time, and then ended the run.
     promoted: list[str] = []
+    promoted_pairs: set[tuple[str, str]] = set()
     if args.reference_grounding_spec is not None and grounding_target_refs:
-        wanted = {
-            str(option.get("span_id") or "").split(":")[0]
+        wanted_pairs = {
+            (
+                str(option.get("span_id") or "").split(":")[0],
+                str(option.get("target_id") or "none"),
+            )
             for option in (direction.get("candidate_options") or [])
             if str(option.get("target_id") or "none") in set(grounding_target_refs)
         }
-        promoted = [
-            item.source_id for item in material
-            if item.source_id in wanted and not item.carries_identity
-        ]
+        promoted_pairs = {
+            (source_id, target_id)
+            for source_id, target_id in wanted_pairs
+            for item in material
+            if item.source_id == source_id
+            and (
+                not item.carries_identity
+                or target_id in set(item.identity_absent_targets)
+            )
+        }
+        promoted = sorted({source_id for source_id, _ in promoted_pairs})
         if promoted:
             material = [
-                replace(item, carries_identity=True)
-                if item.source_id in promoted else item
+                replace(
+                    item,
+                    carries_identity=True,
+                    identity_absent_targets=tuple(
+                        target_id for target_id in item.identity_absent_targets
+                        if (item.source_id, target_id) not in promoted_pairs
+                    ),
+                    identity_windows_by_target=tuple(
+                        (
+                            target_id,
+                            () if (item.source_id, target_id) in promoted_pairs
+                            else windows,
+                        )
+                        for target_id, windows in item.identity_windows_by_target
+                    ),
+                ) if item.source_id in promoted else item
                 for item in material
             ]
             print(
@@ -1655,13 +2020,19 @@ def command_render(args: argparse.Namespace) -> int:
             masters=originals,
             client=client, cache=cache, ledger=ledger, library=library,
             work=work,
+            outcomes=identity_confirmation_outcomes,
         ))
         confirmed_identities.update(_confirm_material_identity(
             promoted_material, sightings, args.reference_grounding_spec,
             masters=originals,
             client=client, cache=cache, ledger=ledger, library=library,
             work=work, spread=True,
+            outcomes=identity_confirmation_outcomes,
         ))
+        commitments = _commitments_without_exact_hard_negatives(
+            commitments, identity_confirmation_outcomes,
+            require_confirmation=promoted_pairs,
+        )
     # Keep the paid full Direction immutable. Candidate corrections have
     # their own content-addressed artifacts above and are never allowed to
     # overwrite the decision that watched all rushes and heard the music.
@@ -1717,6 +2088,9 @@ def command_render(args: argparse.Namespace) -> int:
             commitment_ids=list(dict.fromkeys(
                 option.commitment_id for option in commitments.options
             )),
+            action_ids=list(dict.fromkeys(
+                action_id for item in material for action_id in item.action_ids
+            )),
         ),
     )
     chose = _asked(
@@ -1729,23 +2103,119 @@ def command_render(args: argparse.Namespace) -> int:
         # rules. Bump this when those rules change so a paid answer accepted
         # by an older binary is audited again instead of bypassing the new
         # Selection repair loop on resume.
-        "selection-local-contract-v3-context-only-sources",
+        "selection-local-contract-v7-canonical-camera-duration",
     )
-    selection = _decided(work, "selection", chose)
-    if selection is None:
-        ledger.check()
-        selection, usage_selection = select_shots(
-            material, direction, brief=brief, cache=cache, client=client,
-            ledger=ledger,
-            graphic_candidates=brief_document.graphics_candidates(),
-            grounding_spec=args.reference_grounding_spec,
-            music_grid=grid,
+    provider_selection = _decided(work, "selection", chose)
+    selection_to_repair: dict[str, Any] | None = None
+    if provider_selection is None:
+        # Migrate the immediately preceding contract without throwing away a
+        # paid edit. The v7 audit below decides whether it can be reused or is
+        # the starting point for a scoped repair; successful output is saved
+        # under v7 and this compatibility read disappears naturally.
+        legacy_chose = _asked(
+            asked,
+            json.dumps(direction, sort_keys=True, ensure_ascii=False),
+            commitments.sha256(),
+            selection_contract,
+            "selection-local-contract-v6-explicit-action-treatment",
+        )
+        provider_selection = _decided(work, "selection", legacy_chose)
+    if provider_selection is not None:
+        # Keep the paid answer on disk as the audit record, but make the one
+        # unambiguous monotonic duration repair on a copy before deciding that
+        # the whole 18-shot edit needs another paid Selection pass.
+        executable_cached_selection = copy.deepcopy(provider_selection)
+        cached_hold_repairs = repair_single_look_hold_overflow(
+            executable_cached_selection
+        )
+        if cached_hold_repairs:
+            executable_cached_selection.setdefault(
+                "duration_repairs", []
+            ).extend(cached_hold_repairs)
+        from montagewright.planner import repair_camera_rests_to_duration
+
+        cached_camera_repairs = repair_camera_rests_to_duration(
+            executable_cached_selection, material
+        )
+        if cached_camera_repairs:
+            executable_cached_selection.setdefault(
+                "duration_repairs", []
+            ).extend(cached_camera_repairs)
+        cached_selection_faults = audit_cached_selection(
+            executable_cached_selection,
+            material,
+            direction,
             commitments=commitments,
+            grounding_spec=args.reference_grounding_spec,
             duration_mode=args.duration_mode,
         )
-        _decide(work, "selection", chose, selection)
+        if cached_selection_faults:
+            print(
+                "selection: cached answer failed the current local audit; "
+                "asking Selection to repair it\n  - "
+                + "\n  - ".join(cached_selection_faults),
+                flush=True,
+            )
+            selection_to_repair = executable_cached_selection
+            provider_selection = None
+        else:
+            provider_selection = executable_cached_selection
+            if cached_hold_repairs or cached_camera_repairs:
+                print(
+                    "selection: fitted executable shot timing locally; "
+                    "all shots and commitments are unchanged",
+                    flush=True,
+                )
+    if provider_selection is None:
+        ledger.check()
+        try:
+            provider_selection, usage_selection = select_shots(
+                material, direction, brief=brief, cache=cache, client=client,
+                ledger=ledger,
+                graphic_candidates=brief_document.graphics_candidates(),
+                grounding_spec=args.reference_grounding_spec,
+                music_grid=grid,
+                commitments=commitments,
+                duration_mode=args.duration_mode,
+                initial_selection=selection_to_repair,
+            )
+        except SelectionUnrenderable as error:
+            # Keep the paid editorial answer visible without confusing it
+            # with the executable Selection cache. Resume must still repair
+            # it, while Web can show exactly where this run stopped.
+            draft = copy.deepcopy(error.draft)
+            _annotate_selection_identity_evidence(draft, confirmed_identities)
+            _annotate_selection_direction_motion(draft, commitments)
+            draft["invalid_selection_faults"] = list(error.faults)
+            draft["delivery_status"] = "release_blocked"
+            draft["draft_only"] = True
+            _decide(work, "invalid-selection-draft", chose, draft)
+            raise
+        _annotate_selection_identity_evidence(
+            provider_selection, confirmed_identities
+        )
+        _decide(work, "selection", chose, provider_selection)
     else:
         print("selection: reused from the last attempt", flush=True)
+        _annotate_selection_identity_evidence(
+            provider_selection, confirmed_identities
+        )
+    _annotate_selection_direction_motion(provider_selection, commitments)
+    resolved_selection_key = _asked(
+        chose,
+        json.dumps(provider_selection, sort_keys=True, ensure_ascii=False),
+        "resolved-selection-v2-camera-rest-fit-identity-needs-review-hold",
+    )
+    selection = _decided(
+        work, "resolved-selection", resolved_selection_key
+    )
+    if selection is None:
+        # The provider answer is an audit record.  Local execution repairs
+        # live in their own artifact so they can resume without rewriting or
+        # pretending the paid answer said something it did not.
+        selection = copy.deepcopy(provider_selection)
+    else:
+        print("selection: reused locally resolved execution plan", flush=True)
     cached_sequence_faults = sequence_disagreements(selection.get("shots") or [])
     if cached_sequence_faults:
         raise RuntimeError(
@@ -1755,9 +2225,18 @@ def command_render(args: argparse.Namespace) -> int:
     travelling = sum(
         1 for shot in selection["shots"] if str(shot.get("frame", "")) == "travels"
     )
+    source_motion = sum(
+        1 for shot in selection["shots"]
+        if str(shot.get("camera_intent") or "") == "use_source_motion"
+    )
+    deliberate_holds = sum(
+        1 for shot in selection["shots"]
+        if str(shot.get("camera_intent") or "hold") == "hold"
+    )
     print(
-        f"selection: {len(selection['shots'])} shots, {travelling} with the "
-        f"frame travelling",
+        f"selection: {len(selection['shots'])} shots; {travelling} digital "
+        f"crop moves, {source_motion} using source camera motion, "
+        f"{deliberate_holds} deliberate holds",
         flush=True,
     )
     planning_state = selection_planning_state(
@@ -1789,8 +2268,19 @@ def command_render(args: argparse.Namespace) -> int:
         print(f"  {note}", flush=True)
 
     edl, snaps = _edl_from_selection(
-        selection, rushes, cards, transcripts=transcripts, library=library
+        selection, rushes, cards, transcripts=transcripts, library=library,
+        material=material,
     )
+    camera_rest_repairs = _fit_camera_rests_to_shot(selection, edl)
+    if camera_rest_repairs:
+        selection.setdefault("duration_repairs", []).extend(camera_rest_repairs)
+        for note in camera_rest_repairs:
+            print(f"  {note}", flush=True)
+        _decide(work, "resolved-selection", resolved_selection_key, selection)
+        edl, snaps = _edl_from_selection(
+            selection, rushes, cards, transcripts=transcripts, library=library,
+            material=material,
+        )
     if snaps:
         print(f"cut on action: {len(snaps)} in-points moved", flush=True)
     found = {path.stem: path for path in sources_paths}
@@ -1862,13 +2352,13 @@ def command_render(args: argparse.Namespace) -> int:
             upload_cache=cache,
         )
 
-    # A shot whose identity cannot be proved is one shot, not the film. The
-    # direction paid for an alternate against every commitment and nothing
-    # had ever read them; failing that, the brief for these rushes says in
-    # as many words that a short cut beats a padded one. Bounded, because
-    # each attempt renders again, and swapping forever would be a planner.
+    # A shot whose identity cannot be proved is one review item, not a reason
+    # to throw away the draft.  Do not silently replace it with another model
+    # choice: that made repeated repairs expensive and, worse, repeatedly
+    # selected the same attractive lookalike.  Keep the editor's timing, make
+    # the picture a safe untracked hold, and let the report/Web editor say
+    # exactly which shot needs a human replacement.
     identity_swaps: list[str] = []
-    exhausted_spans: set[str] = set()
     for attempt in range(3):
         try:
             result, plan, report, resolved = cut(edl, sources, rhythm_context)
@@ -1876,12 +2366,8 @@ def command_render(args: argparse.Namespace) -> int:
         except ReferenceShotsUnusable as unproved:
             if attempt == 2:
                 raise
-            # Repair them all at once, from the end backwards so that
-            # dropping one does not renumber the shots still to be handled.
             repaired = 0
-            for fault in sorted(
-                unproved.faults, key=lambda one: one.clip_id, reverse=True
-            ):
+            for fault in unproved.faults:
                 index = next(
                     (
                         at for at, shot in enumerate(selection["shots"])
@@ -1892,41 +2378,38 @@ def command_render(args: argparse.Namespace) -> int:
                 if index is None:
                     continue
                 shot = selection["shots"][index]
-                exhausted_spans.add(str(shot.get("span_id") or ""))
-                swapped = _swap_for_alternate(
-                    shot, direction,
-                    taken={
-                        str(one.get("span_id") or "")
-                        for one in selection["shots"]
-                    },
-                    exhausted=exhausted_spans,
-                )
-                if swapped is not None:
-                    selection["shots"][index] = swapped
-                    identity_swaps.append(
-                        f"{fault.clip_id}: {shot.get('span_id')} could not "
-                        f"deliver {fault.entity_id} ({_why(fault)}); took "
-                        f"the alternate {swapped.get('span_id')}"
-                    )
-                elif (
-                    args.duration_mode != "exact"
-                    and len(selection["shots"]) > 2
-                ):
-                    selection["shots"].pop(index)
-                    identity_swaps.append(
-                        f"{fault.clip_id}: {shot.get('span_id')} could not "
-                        f"deliver {fault.entity_id} ({_why(fault)}) and its "
-                        "commitment has no alternate left; dropped the shot "
-                        "and delivered shorter"
-                    )
-                else:
+                failed_looks = [
+                    look for look in shot.get("looks") or []
+                    if look.get("entity_id") == fault.entity_id
+                ]
+                if not failed_looks:
                     continue
+                issue = _why(fault)
+                shot["identity_status"] = "needs_review"
+                shot.setdefault("identity_target_id", fault.entity_id)
+                prior_issue = str(shot.get("identity_issue") or "")
+                shot["identity_issue"] = "; ".join(
+                    one for one in (prior_issue, issue) if one
+                )
+                shot["camera_intent"] = "hold"
+                shot["frame"] = "settles"
+                for look in failed_looks:
+                    look["entity_id"] = "none"
+                identity_swaps.append(
+                    f"{fault.clip_id}: {shot.get('span_id')} could not prove "
+                    f"{fault.entity_id} ({issue}); kept as an untracked draft "
+                    "shot and marked needs_review for manual replacement"
+                )
                 repaired += 1
                 print(f"  {identity_swaps[-1]}", flush=True)
             if not repaired:
                 raise
+            _decide(
+                work, "resolved-selection", resolved_selection_key, selection
+            )
             edl, snaps = _edl_from_selection(
-                selection, rushes, cards, transcripts=transcripts, library=library
+                selection, rushes, cards, transcripts=transcripts, library=library,
+                material=material,
             )
             sources = {
                 one["source_id"]: probe(one["source_id"], found[one["source_id"]])
@@ -1941,6 +2424,8 @@ def command_render(args: argparse.Namespace) -> int:
             rhythm_context = _rhythm_context(selection, cards)
     else:  # pragma: no cover - the bounded loop either cuts or raises.
         raise RuntimeError("identity recovery did not converge")
+    _project_track_confirmed(selection, report)
+    _decide(work, "resolved-selection", resolved_selection_key, selection)
     report.plan_disagreements.extend(identity_swaps)
     if grid is not None:
         from montagewright.measure.storage import write_json
@@ -2088,7 +2573,8 @@ def command_render(args: argparse.Namespace) -> int:
                           commitments=commitments,
                       )
                       edl, snaps = _edl_from_selection(
-                          selection, rushes, cards, transcripts=transcripts, library=library
+                          selection, rushes, cards, transcripts=transcripts,
+                          library=library, material=material,
                       )
                       sources = {
                           shot["source_id"]: probe(
@@ -2296,7 +2782,8 @@ def command_render(args: argparse.Namespace) -> int:
               # the next round renders a different film rather than re-reading
               # the same one.
               edl, snaps = _edl_from_selection(
-                  selection, rushes, cards, transcripts=transcripts, library=library
+                  selection, rushes, cards, transcripts=transcripts,
+                  library=library, material=material,
               )
               sources = {
                   shot["source_id"]: probe(
@@ -2775,10 +3262,15 @@ def _rhythm_context(
             )
             if box is not None:
                 entry["subject_share"] = round(box.width * box.height, 4)
-            beats = action_beats(card)
+            selected_action = str(shot.get("action_id") or "none")
+            local_action = selected_action.rsplit(":", 1)[-1]
+            beats = [
+                beat for beat in action_beats(card)
+                if selected_action != "none" and beat.beat_id == local_action
+            ]
             if beats:
                 entry["action"] = "；".join(
-                    f"{beat.what} {beat.starts_seconds:.1f}-"
+                    f"{beat.beat_id}: {beat.what} {beat.starts_seconds:.1f}-"
                     f"{beat.ends_seconds:.1f}s"
                     for beat in beats[:3]
                 )
@@ -2806,13 +3298,99 @@ def _look_boxes(card: dict, reframe) -> list[tuple[float, float, float]]:
     return out
 
 
+def _fit_camera_rests_to_shot(
+    selection: dict, edl: EDL,
+) -> list[str]:
+    """Fit declared multi-look rests without deleting the chosen move.
+
+    Selection chooses both a shot duration and preferred dwell at each look.
+    Once card geometry is attached, the local solver knows the actual travel
+    time as well.  A small conflict between those two preferences should not
+    kill an otherwise executable edit: preserve the journey and the minimum
+    readable settle at every real stop, then share the remaining time in the
+    same proportions Selection requested.  If even those minimum settles do
+    not fit, leave the shot untouched so the structural gate still rejects it.
+    """
+
+    from montagewright.capabilities import SETTLE_SECONDS
+    from montagewright.grounding import _floor_for
+    from montagewright.schema import looks_of
+
+    repairs: list[str] = []
+    shots = list(selection.get("shots") or [])
+    for index, (shot, clip) in enumerate(zip(shots, edl.clips)):
+        reframe = clip.reframe
+        if reframe is None or len(reframe.looks) < 2:
+            continue
+        duration = max(
+            0.0, float(clip.approx_out_seconds) - float(clip.approx_in_seconds)
+        )
+        floor = _floor_for(clip)
+        if floor <= duration + 1e-6:
+            continue
+        raw_looks = list(shot.get("looks") or [])
+        stop_indices = [
+            at for at, look in enumerate(raw_looks)
+            if str(look.get("presentation_intent") or "")
+            != "transition_pass"
+        ]
+        if len(stop_indices) < 2:
+            continue
+        declared = sum(
+            max(0.0, float(raw_looks[at].get("seconds") or 0.0))
+            for at in stop_indices
+        )
+        # _floor_for is travel plus the declared rests. Geometry remains the
+        # same while only rest durations are shortened.
+        travel = max(0.0, floor - declared)
+        available_rests = duration - travel
+        minimum_rests = SETTLE_SECONDS * len(stop_indices)
+        if available_rests < minimum_rests - 1e-6:
+            continue
+        flexible = [
+            max(
+                0.0,
+                float(raw_looks[at].get("seconds") or 0.0) - SETTLE_SECONDS,
+            )
+            for at in stop_indices
+        ]
+        extra = max(0.0, available_rests - minimum_rests)
+        weight = sum(flexible)
+        before = [float(raw_looks[at].get("seconds") or 0.0) for at in stop_indices]
+        for position, at in enumerate(stop_indices):
+            share = (
+                extra * flexible[position] / weight
+                if weight > 1e-9
+                else extra / len(stop_indices)
+            )
+            raw_looks[at]["seconds"] = SETTLE_SECONDS + share
+        trial_reframe = reframe.model_copy(update={"looks": looks_of(shot)})
+        trial_clip = clip.model_copy(update={"reframe": trial_reframe})
+        fitted = _floor_for(trial_clip)
+        if fitted > duration + 1e-5:
+            for at, seconds in zip(stop_indices, before):
+                raw_looks[at]["seconds"] = seconds
+            continue
+        repairs.append(
+            f"k{index:02d}: shortened look rests from "
+            f"{sum(before):.2f}s to {available_rests:.2f}s so "
+            f"{reframe.camera_move} keeps its travel and settles inside "
+            f"the {duration:.2f}s shot"
+        )
+    return repairs
+
+
 def _edl_from_selection(
     selection: dict, rushes: Path, cards: dict[str, Path], *,
     transcripts: dict[str, dict] | None = None,
     library: Path | None = None,
+    material: list[Any] | None = None,
 ) -> tuple[EDL, dict[str, str]]:
     clips = []
     snaps: dict[str, str] = {}
+    material_by_source = {
+        str(item.source_id): item for item in (material or [])
+    }
 
     def focus_of(source_id: str) -> list:
         """How this take's focus behaves, measured once per file ever."""
@@ -2846,9 +3424,31 @@ def _edl_from_selection(
         # flat four seconds for every shot, which meant the layer that chose
         # the material had no say in how long it ran and the layer that chose
         # the length started from a constant.
-        wanted = float(shot.get("seconds_needed") or 0.0) or 4.0
+        # Pre-span cached selections did not carry this field at all and keep
+        # their historical four-second placeholder. A present but malformed or
+        # zero field is a current contract failure and must never become 4s.
+        legacy_missing_duration = (
+            "seconds_needed" not in shot and "span_id" not in shot
+        )
+        wanted = (
+            4.0 if legacy_missing_duration
+            else float(shot.get("seconds_needed") or 0.0)
+        )
+        if wanted <= 0.0:
+            raise ValueError(
+                f"{clip_id} has no positive resolved seconds_needed; invalid "
+                "MM:SS must be repaired at Selection, not changed into 4s"
+            )
+        item = material_by_source.get(str(shot["source_id"]))
         card = load_card(cards[shot["source_id"]]) if shot["source_id"] in cards else None
         action_contract = None
+        selected_action = str(shot.get("action_id") or "none")
+        # Legacy direct callers omitted the treatment.  Current paid and
+        # cached Selection answers are schema/audit gated and must carry it.
+        action_treatment = str(
+            shot.get("action_treatment")
+            or ("complete_here" if selected_action != "none" else "none")
+        )
         window = _usable_window(shot)
         if window is not None:
             # The card said where this take is worth cutting into and until
@@ -2860,20 +3460,84 @@ def _edl_from_selection(
             room = max(0.0, last - first)
             wanted = min(wanted, room) if room > 0 else wanted
             start = min(max(start, first), max(first, last - wanted))
-        if card is not None:
-            start, action_contract, note = snap_to_action_contract(
-                card, start, wanted, within=window,
-                focus=focus_of(str(shot["source_id"])),
+        action_card = card
+        if action_card is None and selected_action != "none" and item is not None:
+            local_action = selected_action.rsplit(":", 1)[-1]
+            boundary = next(
+                (
+                    (float(first), float(last))
+                    for action_id, first, last in item.action_windows
+                    if action_id == selected_action or action_id == local_action
+                ),
+                None,
             )
-            if action_contract is not None:
-                # Selection names the action; its completion is a local
-                # source-clock floor.  Extend here before rhythm sees the
-                # shot, rather than asking rhythm to rediscover the action.
-                wanted = max(
-                    wanted, action_contract.minimum_duration_from(start)
+            if boundary is not None:
+                # MaterialItem is built from this same canonical card reader.
+                # Keep action completion executable when the persisted card
+                # path is unavailable instead of silently dropping the duty.
+                action_card = {"action": [{
+                    "id": local_action,
+                    "what": "selected source action",
+                    "from": boundary[0],
+                    "to": boundary[1],
+                }]}
+        if action_card is not None:
+            note = None
+            if action_treatment == "complete_here":
+                start, action_contract, note = snap_to_action_contract(
+                    action_card, start, wanted, action_id=selected_action, within=window,
+                    focus=focus_of(str(shot["source_id"])),
+                )
+                if selected_action == "none" or action_contract is None:
+                    raise ValueError(
+                        f"{clip_id} selected action {selected_action!r}, but it "
+                        "cannot be resolved and completed inside this source window"
+                    )
+                minimum = action_contract.minimum_duration_from(start)
+                if wanted + 1e-3 < minimum:
+                    raise ValueError(
+                        f"{clip_id} gives {wanted:.2f}s to complete action "
+                        f"{selected_action!r}, which needs {minimum:.2f}s; "
+                        "Selection must repair this before Rhythm"
+                    )
+            elif action_treatment == "after_completion":
+                local_action = selected_action.rsplit(":", 1)[-1]
+                beat = next(
+                    (
+                        one for one in action_beats(action_card)
+                        if one.beat_id == local_action
+                    ),
+                    None,
+                )
+                if beat is None or selected_action == "none":
+                    raise ValueError(
+                        f"{clip_id} cannot resolve after_completion for action "
+                        f"{selected_action!r}"
+                    )
+                start = beat.ends_seconds
+                if window is not None:
+                    first, last = window
+                    if start < first - 1e-3 or start + wanted > last + 1e-3:
+                        raise ValueError(
+                            f"{clip_id} cannot fit {wanted:.2f}s after action "
+                            f"{selected_action!r} inside this source window"
+                        )
+                note = (
+                    f"entered after {selected_action} completed at "
+                    f"{beat.ends_seconds:.2f}s"
+                )
+            elif action_treatment != "none" or selected_action != "none":
+                raise ValueError(
+                    f"{clip_id} has inconsistent action_id/action_treatment"
                 )
             if note:
                 snaps[clip_id] = note
+        elif action_treatment != "none" or selected_action != "none":
+            raise ValueError(
+                f"{clip_id} cannot resolve selected action {selected_action!r} "
+                "from either its card or local material action windows"
+            )
+        if card is not None:
             # Where the card already measured each look. This is what makes
             # "how long does this shot need" a fact about this shot rather
             # than a constant per move: the distance between two watches on
@@ -2882,6 +3546,41 @@ def _edl_from_selection(
             reframe = reframe.model_copy(
                 update={"look_boxes": _look_boxes(card, reframe)}
             )
+        coverage_claim = shot.get("coverage_claim_seconds")
+        source_motion_contract = None
+        if item is not None:
+            from montagewright.coverage import (
+                source_motion_contract_for, visual_supported_max,
+            )
+
+            coverage_claim = visual_supported_max(
+                item,
+                role=str(shot.get("picture_role") or "primary_action"),
+                source_start=start,
+                available_seconds=wanted,
+                motion_role=(
+                    str(shot.get("source_motion_role") or "")
+                    if str(shot.get("camera_intent") or "")
+                    == "use_source_motion" else ""
+                ),
+                presentation_intent=next((
+                    str(look.get("presentation_intent") or "")
+                    for look in shot.get("looks") or []
+                    if look.get("presentation_intent")
+                ), ""),
+                target_id=next((
+                    str(look.get("entity_id") or "none")
+                    for look in shot.get("looks") or []
+                    if str(look.get("entity_id") or "none") != "none"
+                ), "none"),
+            )
+            if str(shot.get("camera_intent") or "") == "use_source_motion":
+                source_motion_contract = source_motion_contract_for(
+                    item,
+                    source_start=start,
+                    source_end=start + wanted,
+                    motion_role=str(shot.get("source_motion_role") or ""),
+                )
         clips.append(
             Clip(
                 clip_id=clip_id,
@@ -2893,7 +3592,7 @@ def _edl_from_selection(
                 audio_role=shot.get("audio_role", "auto"),
                 audio_completion=shot.get("audio_completion", "none"),
                 picture_role=shot.get("picture_role", "primary_action"),
-                coverage_claim_seconds=shot.get("coverage_claim_seconds"),
+                coverage_claim_seconds=coverage_claim,
                 reframe=reframe,
                 # Carried on the clip so the layers after this one can see
                 # it. Rhythm stretches shots to land on beats and the
@@ -2904,10 +3603,18 @@ def _edl_from_selection(
                 # can point at one and grounding can put it on a beat.
                 moments={
                     one.beat_id: one.starts_seconds
-                    for one in action_beats(card or {})
+                    for one in action_beats(action_card or {})
+                    if action_treatment == "complete_here"
+                    and str(shot.get("action_id") or "none") != "none"
+                    and one.beat_id
+                    == str(shot.get("action_id")).rsplit(":", 1)[-1]
                 },
                 action_contracts=(
                     [action_contract] if action_contract is not None else []
+                ),
+                source_motion_contracts=(
+                    [source_motion_contract]
+                    if source_motion_contract is not None else []
                 ),
                 usable_from_seconds=(window[0] if window else 0.0),
                 usable_to_seconds=(window[1] if window else 0.0),
@@ -2982,14 +3689,42 @@ def _usable_window(shot: dict) -> tuple[float, float] | None:
     return (first, last) if last > first else None
 
 
+def _delivery_selection(
+    selection: dict[str, Any], reference_grounding: dict[str, dict]
+) -> tuple[dict[str, Any], str]:
+    """Project immutable planning evidence into honest delivery status."""
+
+    delivery_selection = copy.deepcopy(selection)
+    for index, shot in enumerate(delivery_selection.get("shots") or []):
+        if (
+            reference_grounding.get(f"k{index:02d}", {}).get("status")
+            == "sam_geometry_validated"
+        ):
+            shot["identity_status"] = "track_validated"
+            shot["identity_issue"] = ""
+    delivery_status = (
+        "needs_review"
+        if any(
+            shot.get("identity_status") in {"needs_review", "unverified"}
+            for shot in delivery_selection.get("shots") or []
+        )
+        else "ready"
+    )
+    return delivery_selection, delivery_status
+
+
 def _write_report(output: Path, **parts) -> None:
     """The account of what was decided and what it cost."""
 
     report = parts["report"]
     plan = parts.get("plan")
+    delivery_selection, delivery_status = _delivery_selection(
+        parts["selection"], report.reference_grounding
+    )
     payload = {
         "direction": parts["direction"],
-        "selection": parts["selection"],
+        "selection": delivery_selection,
+        "delivery_status": delivery_status,
         # Which part of the track was used. Decided by the rhythm pass and
         # otherwise invisible: the bed sounding right or wrong is the most
         # audible thing in a cut and nothing recorded where it came from.

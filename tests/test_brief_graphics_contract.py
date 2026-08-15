@@ -78,3 +78,35 @@ def test_markdown_bullet_constraints_are_instructions_not_one_copy_card():
     assert len(document.instructions) == 3
     assert all(note.kind == "editorial" for note in document.instructions)
     assert document.candidate_facts() == ()
+
+
+def test_long_form_direction_is_not_misread_as_verbatim_screen_copy():
+    brief = (
+        "剪輯一支產品直式影片，沿用指定音樂並保持俐落但不倉促的節奏。"
+        "影片也必須納入毛片中的教學與操作內容，讓觀眾看懂操作對象、手勢、"
+        "介面反應與完成結果；不可只取漂亮但無法理解的零碎片段。"
+        "操作流程若跨多個步驟，可用相鄰鏡頭或精簡蒙太奇呈現，但要保留因果順序。"
+        "產品展示與教學內容交錯安排，避免全片都是定鏡；數位運鏡必須服務閱讀與動作，"
+        "不可為動而動。若目標片長與內容完成度衝突，應優先保留完整的操作過程。"
+        "每一段操作都應建立清楚的觀看方向，保留必要停頓，並在完成狀態可辨識後才切走。"
+        "不要以無關的產品空鏡取代教學證據，也不要改變原始操作順序。"
+    )
+    assert len(brief) > 240
+
+    document = parse_brief_markdown(brief)
+
+    assert document.candidates == ()
+    assert document.candidate_facts() == ()
+    assert [note.kind for note in document.instructions] == ["editorial"]
+    assert document.instructions[0].text == brief
+
+
+def test_legacy_overlong_candidate_cannot_break_fact_serialisation():
+    from dataclasses import replace
+
+    document = parse_brief_markdown("Pixel 11\n操作教學")
+    unsafe = replace(document.candidates[0], primary_text="x" * 241)
+    legacy = replace(document, candidates=(unsafe,))
+
+    assert legacy.candidate_facts() == ()
+    assert legacy.candidates_json()["facts"] == []

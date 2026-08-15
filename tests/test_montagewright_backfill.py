@@ -558,7 +558,7 @@ def test_a_finished_pass_is_parsed_normally():
 
 
 def test_the_ceiling_is_the_models_own():
-    # 65536 for gemini-3.6-flash. Half of it was still a ration, and the
+    # 65536 for gemini-3.7-flash. Half of it was still a ration, and the
     # billing is on what is produced rather than on what is allowed.
     from montagewright.planner import MAX_OUTPUT_TOKENS
 
@@ -862,8 +862,8 @@ def test_the_overlay_reports_the_move_that_happened():
     assert "if (planned !== did)" in page
 
 
-def test_selection_is_told_a_row_needs_two_endpoints():
-    """A pan with one static subject is the one combination that cannot work.
+def test_selection_is_told_pan_cannot_make_a_wide_subject_whole():
+    """A pan may scan a row, but cannot contain the whole row in one frame.
 
     The prompt advised `pan` for a subject too wide to frame without saying
     it needs both ends named, so a row of watches came back as one subject,
@@ -877,19 +877,11 @@ def test_selection_is_told_a_row_needs_two_endpoints():
         / "prompts" / "selection_zh-TW.txt"
     ).read_text(encoding="utf-8")
 
-    # Asserted as a property rather than as a sentence. The wording here has
-    # been rewritten three times and each rewrite broke this test without
-    # anything being wrong; what has to stay true is that a subject the frame
-    # cannot hold whole is answered with more than one place to look.
+    # Preserve the distinction between sequentially reading a wide subject
+    # and fulfilling simultaneous whole-frame containment.
     assert "只能露出" in prompt
-    assert "兩個落點" in prompt
-    assert "`reveal`" in prompt or "`compare`" in prompt
-    # And that both ends have to be told apart, which is the part that makes
-    # the two endpoints measurable rather than two names for the same place.
-    assert (
-        "能分辨起點與終點" in prompt
-        or ("起點終點" in prompt and "描述到能分辨" in prompt)
-    )
+    assert "依序展示局部" in prompt
+    assert "同一畫面完整入鏡" in prompt
 
 
 # --- a move has to arrive somewhere and stay there -----------------------
@@ -1685,13 +1677,15 @@ def test_the_planner_is_shown_each_shot_s_measured_floor():
     )
 
     assert _needs_at_least(clip) > 0.0
-    # And a shot whose looks were never located says nothing rather than zero.
+    # Unknown geometry uses the same conservative move fallback that release
+    # will enforce; telling Rhythm zero here only postpones a deterministic
+    # refusal until after the paid answer.
     bare = Clip(
         clip_id="k01", source_id="s", approx_in_seconds=0.0,
         approx_out_seconds=3.0,
         reframe=reframe_of({"looks": [{"at": "A"}, {"at": "B"}], "why": "x"}),
     )
-    assert _needs_at_least(bare) == 0.0
+    assert _needs_at_least(bare) == 2.5
 
 
 def test_no_prompt_teaches_a_field_the_schema_does_not_have():

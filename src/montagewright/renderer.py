@@ -214,6 +214,11 @@ def _render_segment(
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)
         filters.append(f"crop={width}:{height}:{x}:{y}")
         filters.append(f"scale={output_size[0]}:{output_size[1]}")
+    # Source cameras frequently carry a non-square display aspect ratio.  A
+    # 1080x1920 render that inherits a 256:81 SAR is advertised to players as
+    # 16:9 even though its pixels are portrait.  The delivery canvas always
+    # uses square pixels, so make that metadata explicit before encoding.
+    filters.append("setsar=1")
     # Mixed 23.976/25/29.97/30/60 footage is now already on one explicit CFR
     # editing timeline. Editorial times remain seconds; this is the single
     # boundary where they are quantised to deliverable frames.
@@ -229,6 +234,7 @@ def _render_segment(
             f"crop={width}:{height}:{x}:{y}",
             f"scale={output_size[0]}:{output_size[1]}",
         ])
+    handle_filters.append("setsar=1")
     if output_frames is not None:
         filters.extend([
             "tpad=stop_mode=clone:stop_duration=1",
@@ -517,7 +523,7 @@ def _preview(source: Path, destination: Path, *, video_encoder: str) -> Path:
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(source),
-            "-vf", f"scale=-2:{PREVIEW_HEIGHT}",
+            "-vf", f"scale=-2:{PREVIEW_HEIGHT},setsar=1",
             "-c:v", video_encoder, "-b:v", "1200k",
             "-c:a", "aac", "-b:a", "96k",
             "-movflags", "+faststart",

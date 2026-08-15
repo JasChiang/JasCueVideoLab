@@ -32,6 +32,10 @@ CameraTreatment = Literal[
     "hold", "use_source_motion", "follow_subject", "reveal", "compare",
     "push_in", "pull_out", "multi_stop",
 ]
+SuggestedMove = Literal[
+    "hold", "source_motion", "pan", "tilt", "diagonal", "push_in",
+    "pull_out", "follow", "compound",
+]
 Tier = Literal["primary", "alternate"]
 
 
@@ -55,6 +59,14 @@ class CandidateOption(StrictFrozen):
     motion_preference: MotionPreference
     target_id: str = Field(min_length=1, max_length=256)
     why: str = Field(min_length=1, max_length=1200)
+    # Direction owns the editorial idea.  These fields are advice carried to
+    # Selection, never geometry truth: the local feasibility menu below is
+    # still the authority on what the renderer can actually deliver.
+    direction_treatment: CameraTreatment = "hold"
+    direction_suggested_move: SuggestedMove = "hold"
+    direction_camera_route: str = Field(default="keep the useful framing", max_length=800)
+    direction_motion_reason: str = Field(default="no directional advice", max_length=1200)
+    direction_fallback_treatment: CameraTreatment = "hold"
     # Local feasibility, derived from the selected source/span rather than
     # invented by the provider.  Selection and replan see the menu in ranked
     # order, so "hold" is no longer the only obviously safe answer when the
@@ -86,26 +98,34 @@ def _camera_treatments(
     if preference == "native_first" and role in {"authored", "subject_follow"}:
         treatments.append("use_source_motion")
         reasons.append(f"span has {role} source motion")
-    if preference != "hold":
-        if target_id != "none":
-            treatments.append("follow_subject")
-            reasons.append("named subject can be tracked locally")
-        travel_room = max(pan_room, tilt_room)
-        if travel_room > 0.02 and seconds >= 1.0:
-            treatments.extend(("reveal", "compare"))
-            minimum = max(minimum, 1.0)
-            reasons.append(f"crop has {travel_room:.0%} measured travel room")
-        if push_room > 1.02 and seconds >= 1.0:
-            treatments.extend(("push_in", "pull_out"))
-            minimum = max(minimum, 1.0)
-            reasons.append(f"resolution permits up to {push_room:.2f}x push")
-        if travel_room > 0.02 and seconds >= 1.8:
-            treatments.append("multi_stop")
-            minimum = max(minimum, 1.8)
+    # Direction's preference ranks storytelling options; it must not erase
+    # measured abilities before Selection has watched the actual clip. That
+    # mistake made `hold` self-fulfilling: a conservative preference removed
+    # every pan/push treatment from the schema, so Gemini could never choose
+    # the movement the footage clearly supported.
+    travel_room = max(pan_room, tilt_room)
+    if travel_room > 0.02 and seconds >= 1.0:
+        treatments.extend(("reveal", "compare"))
+        minimum = max(minimum, 1.0)
+        reasons.append(f"crop has {travel_room:.0%} measured travel room")
+    if push_room > 1.02 and seconds >= 1.0:
+        treatments.extend(("push_in", "pull_out"))
+        minimum = max(minimum, 1.0)
+        reasons.append(f"resolution permits up to {push_room:.2f}x push")
+    if travel_room > 0.02 and seconds >= 1.8:
+        treatments.append("multi_stop")
+        minimum = max(minimum, 1.8)
+    # A named target makes following possible, not necessarily useful. Put
+    # it after moves supported by measured crop room: ranking follow first
+    # for every static product shot told Selection to track a subject that
+    # was not moving, and the renderer correctly collapsed that to hold.
+    if target_id != "none":
+        treatments.append("follow_subject")
+        reasons.append("named subject can be tracked locally if it moves")
     treatments.append("hold")
     ranked = tuple(dict.fromkeys(treatments))
     preferred = ranked[0]
-    return ranked, preferred, minimum, "; ".join(reasons) or "hold requested or no measured move room"
+    return ranked, preferred, minimum, "; ".join(reasons) or "no measured move room"
 
 
 class CandidateCommitments(StrictFrozen):
@@ -194,7 +214,9 @@ def provider_commitment_schema(
             "required": [
                 "commitment_id", "purpose", "required", "picture_role",
                 "span_id", "tier", "min_supported_seconds",
-                "presentation_intent", "motion_preference", "target_id", "why",
+                "presentation_intent", "target_id", "why",
+                "recommended_treatment", "suggested_move", "camera_route",
+                "motion_reason", "fallback_treatment",
             ],
             "properties": {
                 "commitment_id": {"type": "string"},
@@ -225,8 +247,38 @@ def provider_commitment_schema(
                 "presentation_intent": {
                     "type": "string", "enum": list(PresentationIntent.__args__)
                 },
-                "motion_preference": {
-                    "type": "string", "enum": list(MotionPreference.__args__)
+                "recommended_treatment": {
+                    "type": "string", "enum": list(CameraTreatment.__args__),
+                    "description": (
+                        "依敘事目的與目標輸出比例建議的運鏡 treatment。這是"
+                        "創作建議，不是本機能力宣告；不要因為不確定就一律 hold。"
+                    ),
+                },
+                "suggested_move": {
+                    "type": "string", "enum": list(SuggestedMove.__args__),
+                    "description": (
+                        "建議的實體畫框運動。寬內容進直式畫面時可考慮 pan，"
+                        "高度方向可考慮 tilt；景別變化用 push/pull；主體自己動"
+                        "才用 follow；多段敘事可用 compound。"
+                    ),
+                },
+                "camera_route": {
+                    "type": "string",
+                    "description": (
+                        "用畫面中的可辨識落點描述起點、終點與必要停留，例如"
+                        "由左側標誌讀到右側產品後停住。不要寫座標或小數秒。"
+                    ),
+                },
+                "motion_reason": {
+                    "type": "string",
+                    "description": (
+                        "說明這個運鏡為何適合原素材、故事目的與目標比例；若"
+                        "原生運鏡應保留，也要明說。"
+                    ),
+                },
+                "fallback_treatment": {
+                    "type": "string", "enum": list(CameraTreatment.__args__),
+                    "description": "首選幾何不可交付時，仍保留同一敘事目的的替代 treatment。",
                 },
                 "target_id": {
                     "type": "string", "enum": ["none", *grounding_target_ids]
@@ -280,9 +332,16 @@ def resolve_candidate_commitments(
                 f"{available:.3f}s"
             )
             continue
-        preference = cast(
-            MotionPreference, str(raw.get("motion_preference") or "")
-        )
+        # Direction decides what the shot must prove, not its final camera
+        # move. Derive only the source-motion fact here; Selection watches the
+        # actual clip and chooses camera_intent directly. Older cached
+        # Directions may still contain motion_preference and are intentionally
+        # ignored so a stale `hold` cannot veto a later push or reveal.
+        preference = cast(MotionPreference, (
+            "native_first"
+            if str(span.motion_role or "") in {"authored", "subject_follow"}
+            else "virtual_allowed"
+        ))
         from montagewright.coverage import visual_supported_max
 
         supported = visual_supported_max(
@@ -328,6 +387,11 @@ def resolve_candidate_commitments(
                     target_id=target_id,
                 )
             )
+            direction_treatment = cast(CameraTreatment, str(
+                raw.get("recommended_treatment") or "hold"
+            ))
+            if direction_treatment in treatments:
+                preferred = direction_treatment
             options.append(CandidateOption(
                 commitment_id=raw.get("commitment_id"),
                 purpose=raw.get("purpose"),
@@ -340,6 +404,17 @@ def resolve_candidate_commitments(
                 motion_preference=preference,
                 target_id=target_id,
                 why=raw.get("why"),
+                direction_treatment=direction_treatment,
+                direction_suggested_move=raw.get("suggested_move") or "hold",
+                direction_camera_route=(
+                    raw.get("camera_route") or "keep the useful framing"
+                ),
+                direction_motion_reason=(
+                    raw.get("motion_reason") or "legacy direction gave no motion advice"
+                ),
+                direction_fallback_treatment=(
+                    raw.get("fallback_treatment") or "hold"
+                ),
                 feasible_treatments=treatments,
                 preferred_treatment=preferred,
                 minimum_camera_seconds=camera_floor,
@@ -386,11 +461,20 @@ def describe_commitments(commitments: CandidateCommitments) -> str:
             f"- {option.commitment_id} [{option.tier}] span={option.span_id}; "
             f"role={option.picture_role}; minimum={option.min_supported_seconds:g}s; "
             f"presentation={option.presentation_intent}; motion="
-            f"{option.motion_preference}; target={option.target_id}; "
+            f"{option.motion_preference}（Direction 的偏好，不是限制；"
+            "Selection 在本機量測的可行清單內選 camera_intent）; "
+            f"Direction recommends treatment={option.direction_treatment}, "
+            f"move={option.direction_suggested_move}, "
+            f"route={option.direction_camera_route}, "
+            f"reason={option.direction_motion_reason}, "
+            f"fallback={option.direction_fallback_treatment}; "
             f"local camera menu={','.join(option.feasible_treatments)}; "
-            f"preferred={option.preferred_treatment}; camera floor="
-            f"{option.minimum_camera_seconds:g}s; feasibility="
-            f"{option.feasibility_reason}; "
+            f"local preferred={option.preferred_treatment}; "
+            "camera timing=Selection chooses readable dwell, then local card "
+            "geometry prices actual travel at the chosen energy before the "
+            "answer is saved; unknown look geometry is marked conservative; "
+            f"feasibility={option.feasibility_reason}; "
+            f"target={option.target_id}; "
             f"purpose={option.purpose}"
         )
     return "\n".join(lines)
@@ -429,38 +513,37 @@ def validate_selection_commitments(
                 f"shot {index} gives {commitment_id} {seconds:.3f}s but its "
                 f"content needs {option.min_supported_seconds:.3f}s"
             )
-        from montagewright.schema import camera_intent_of
-
-        treatment = camera_intent_of(shot)
-        if treatment not in option.feasible_treatments:
+        # Direction's preference is editorial advice, but the locally derived
+        # treatment menu is a physical capability contract.  Keeping those
+        # concepts separate lets Selection choose a push for a static lineup
+        # without allowing a move for which the crop has no room.
+        camera_intent = str(shot.get("camera_intent") or "hold")
+        if camera_intent not in option.feasible_treatments:
             faults.append(
-                f"shot {index} chooses locally infeasible camera treatment "
-                f"{treatment!r}; {option.span_id} offers "
-                f"{', '.join(option.feasible_treatments)}"
+                f"shot {index} camera treatment {camera_intent!r} is not "
+                f"locally feasible for {option.span_id}; allowed="
+                f"{','.join(option.feasible_treatments)}"
             )
-        if (
-            treatment != "hold"
-            and seconds + 1e-6 < option.minimum_camera_seconds
-        ):
-            faults.append(
-                f"shot {index} gives {treatment} {seconds:.3f}s but local "
-                f"camera geometry needs {option.minimum_camera_seconds:.3f}s"
-            )
-        # Motion is an editorial preference, not a content invariant. A
-        # locked source can fulfil `native_first` with a safe virtual move or
-        # hold; true motion requirements need a separate explicit contract.
+        # Duration is validated once, with the selected looks and the source
+        # card's measured positions, by planner.camera_duration_disagreements.
+        # A second simplified table here was the reason Selection accepted a
+        # move which the canonical executor rejected before Rhythm.
         looks = list(shot.get("looks") or [])
-        presentations = {
-            str(look.get("presentation_intent") or "") for look in looks
-        }
-        if looks and option.presentation_intent not in presentations:
+        matching_looks = [
+            look for look in looks
+            if option.target_id == "none"
+            or str(look.get("entity_id") or "none") == option.target_id
+        ]
+        if looks and option.presentation_intent not in {
+            str(look.get("presentation_intent") or "")
+            for look in matching_looks
+        }:
             faults.append(
                 f"shot {index} does not carry presentation intent "
-                f"{option.presentation_intent} for {commitment_id}"
+                f"{option.presentation_intent} on target {option.target_id} "
+                f"for {commitment_id}"
             )
-        if option.target_id != "none" and option.target_id not in {
-            str(look.get("entity_id") or "none") for look in looks
-        }:
+        if looks and option.target_id != "none" and not matching_looks:
             faults.append(
                 f"shot {index} does not bind target {option.target_id} for "
                 f"{commitment_id}"
@@ -518,6 +601,41 @@ def validate_replacement_commitments(
         if span_id not in allowed.get(expected_id, set()):
             faults.append(
                 f"{clip_id} uses {span_id} outside commitment {expected_id}"
+            )
+            continue
+        option = next((
+            one for one in commitments.options
+            if one.commitment_id == actual_id and one.span_id == span_id
+        ), None)
+        if option is None:
+            continue
+        camera_intent = str(replacement.get("camera_intent") or "hold")
+        if camera_intent not in option.feasible_treatments:
+            faults.append(
+                f"{clip_id} camera treatment {camera_intent!r} is not locally "
+                f"feasible for {span_id}; allowed="
+                f"{','.join(option.feasible_treatments)}"
+            )
+        # The replacement is subjected to the same canonical execution audit
+        # before Rhythm/render; do not maintain a competing floor table here.
+        looks = list(replacement.get("looks") or [])
+        matching_looks = [
+            look for look in looks
+            if option.target_id == "none"
+            or str(look.get("entity_id") or "none") == option.target_id
+        ]
+        if looks and option.target_id != "none" and not matching_looks:
+            faults.append(
+                f"{clip_id} does not bind target {option.target_id} for "
+                f"{expected_id}"
+            )
+        elif looks and option.presentation_intent not in {
+            str(look.get("presentation_intent") or "")
+            for look in matching_looks
+        }:
+            faults.append(
+                f"{clip_id} does not carry presentation intent "
+                f"{option.presentation_intent} on target {option.target_id}"
             )
     missing = set(expected) - seen
     if missing:

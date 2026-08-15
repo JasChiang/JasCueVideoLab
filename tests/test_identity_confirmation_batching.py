@@ -80,6 +80,7 @@ def test_commitment_pool_sources_are_prepared_then_judged_in_one_cross_call(
 
     assert len(calls) == 1 and len(calls[0]) == 7
     assert len(found) == 7 and len(written) == 7
+    assert all(set(by_target) == {"target.one"} for by_target in found.values())
     assert singleton == []
 
 
@@ -135,11 +136,11 @@ def test_risky_cross_source_seed_alone_uses_the_multi_anchor_fallback(
         library=tmp_path / "library", work=tmp_path / "work",
     )
 
-    assert found["C1"] == (fallback,)
+    assert found["C1"]["target.one"] == (fallback,)
     assert len(calls) == 1
 
 
-def test_valid_semantic_negative_is_cached_without_retrying_for_a_match(
+def test_one_frame_semantic_negative_falls_back_before_source_negative_cache(
     monkeypatch, tmp_path: Path,
 ):
     from montagewright import reference_grounding as grounding
@@ -189,8 +190,8 @@ def test_valid_semantic_negative_is_cached_without_retrying_for_a_match(
         library=tmp_path / "library", work=tmp_path / "work",
     )
     assert found == {}
-    assert written == [()]
-    assert retried == []
+    assert written == []
+    assert retried == [True]
 
 
 def test_eager_identity_confirmation_is_after_commitments_not_after_screen():

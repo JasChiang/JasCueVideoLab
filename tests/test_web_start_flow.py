@@ -18,6 +18,110 @@ class _FinishedProcess:
         return 0
 
 
+def test_web_children_get_a_writable_shared_cache_home(tmp_path, monkeypatch):
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    runs = tmp_path / "runs"
+    launched = []
+
+    class CapturedProcess(_FinishedProcess):
+        def __init__(self, command, **kwargs):
+            launched.append(kwargs["env"])
+            super().__init__(command, **kwargs)
+
+    monkeypatch.setattr(web, "RUNS_ROOT", runs)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setattr(web.subprocess, "Popen", CapturedProcess)
+    web.RUNS.clear()
+
+    response = TestClient(web.create_app()).post(
+        "/api/runs",
+        data={"source_path": str(rushes), "review": "false"},
+    )
+
+    assert response.status_code == 200
+    assert launched[0]["XDG_CACHE_HOME"] == str((tmp_path / "cache").resolve())
+    assert launched[0]["MONTAGEWRIGHT_LIBRARY"] == str(
+        (tmp_path / "cache" / "montagewright" / "library").resolve()
+    )
+    assert (tmp_path / "cache").is_dir()
+    assert Path(launched[0]["MONTAGEWRIGHT_LIBRARY"]).is_dir()
+
+    run_id = response.json()["run_id"]
+    resumed = TestClient(web.create_app()).post(f"/api/runs/{run_id}/resume")
+    assert resumed.status_code == 200
+    assert launched[1]["XDG_CACHE_HOME"] == launched[0]["XDG_CACHE_HOME"]
+
+
+def test_web_children_preserve_an_explicit_cache_home(tmp_path, monkeypatch):
+    configured = tmp_path / "configured-cache"
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(configured))
+
+    environment = web._child_environment()
+
+    assert environment["XDG_CACHE_HOME"] == str(configured)
+    assert environment["MONTAGEWRIGHT_LIBRARY"] == str(
+        configured / "montagewright" / "library"
+    )
+    assert environment["PYTHONUNBUFFERED"] == "1"
+
+
+def test_default_material_library_follows_xdg_cache_home(tmp_path, monkeypatch):
+    from montagewright.uploads import default_library
+
+    monkeypatch.delenv("MONTAGEWRIGHT_LIBRARY", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+
+    assert default_library() == tmp_path / "xdg" / "montagewright" / "library"
+
+
+def test_web_cache_migration_preserves_paid_material_evidence(tmp_path):
+    legacy_root = tmp_path / "legacy"
+    old = legacy_root / "library"
+    new_cache = tmp_path / "cache"
+    new_library = new_cache / "montagewright" / "library"
+    (old / "cards").mkdir(parents=True)
+    (old / "cards" / "paid.json").write_text("{}", encoding="utf-8")
+    new_library.mkdir(parents=True)
+
+    web._seed_writable_web_cache(
+        new_cache, new_library, legacy_root=legacy_root
+    )
+
+    assert (new_library / "cards" / "paid.json").is_file()
+
+
+def test_web_refuses_to_launch_before_spend_when_cache_is_not_writable(
+    tmp_path, monkeypatch
+):
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path / "runs")
+    web.RUNS.clear()
+    launched = []
+    monkeypatch.setattr(
+        web.subprocess, "Popen", lambda *args, **kwargs: launched.append(args)
+    )
+
+    def denied(path, *, purpose):
+        raise PermissionError(f"{purpose} denied at {path}")
+
+    monkeypatch.setattr(web, "_prove_writable_directory", denied)
+    response = TestClient(
+        web.create_app(), raise_server_exceptions=False
+    ).post(
+        "/api/runs",
+        data={"source_path": str(rushes), "review": "false"},
+    )
+
+    assert response.status_code == 503
+    assert launched == []
+    assert "cache" in response.json()["detail"]["message"].lower()
+
+
 def test_new_run_click_replaces_completed_progress_and_recovers_from_failure():
     page = (
         Path(__file__).parents[1] / "src" / "montagewright" / "web" / "index.html"
@@ -134,6 +238,59 @@ def test_new_round_inherits_parent_brief_on_the_server(
     assert child_brief.read_text() == parent_brief.read_text()
 
 
+def test_new_round_inherits_parent_grounding_on_the_server(
+    tmp_path, monkeypatch
+):
+    import shutil
+    import montagewright.cli as cli
+
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    roots = tmp_path / "runs"
+    grounding = tmp_path / "approved-grounding.json"
+    grounding.write_text('{"approved": true}', encoding="utf-8")
+    monkeypatch.setattr(web, "RUNS_ROOT", roots)
+    monkeypatch.setattr(web.subprocess, "Popen", _FinishedProcess)
+
+    def prepare(source, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        return destination, "f" * 64
+
+    monkeypatch.setattr(cli, "prepare_grounding_spec_artifact", prepare)
+    web.RUNS.clear()
+    parent_root = roots / "parent"
+    parent_root.mkdir(parents=True)
+    web.RUNS["parent"] = web.Run(
+        "parent", parent_root, source=str(rushes),
+        command=[
+            "render", str(rushes), "--grounding-spec", str(grounding),
+        ],
+    )
+
+    response = TestClient(web.create_app()).post(
+        "/api/runs", data={
+            "source_path": str(rushes), "base_run_id": "parent",
+            "review": "false",
+        },
+    )
+
+    assert response.status_code == 200
+    child = web.RUNS[response.json()["run_id"]]
+    at = child.command.index("--grounding-spec")
+    inherited = Path(child.command[at + 1])
+    assert inherited.parent == child.root / "out" / "work"
+    assert inherited.read_text(encoding="utf-8") == grounding.read_text(
+        encoding="utf-8"
+    )
+    page = (
+        Path(__file__).parents[1] / "src" / "montagewright" / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+    assert "已沿用上一輪 grounding spec" in page
+    assert "grounding_reference_count" in page
+
+
 def test_web_can_start_from_a_brief_file_path(tmp_path, monkeypatch):
     rushes = tmp_path / "rushes"
     rushes.mkdir()
@@ -203,6 +360,17 @@ def test_opening_a_cut_is_addressable_and_survives_a_reload():
     assert "function runIdInUrl" in page
 
 
+def test_the_empty_home_screen_keeps_watching_for_cli_runs():
+    """A terminal run should appear without reloading an empty Web page."""
+
+    page = (
+        Path(__file__).parents[1] / "src" / "montagewright" / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+    empty = page.split("if (!data.runs.length)", 1)[1].split("return;", 1)[0]
+    assert "setTimeout(loadPast, 5000)" in empty
+    assert "if (!runId)" in empty
+
+
 def test_opening_a_running_cut_names_it_and_starts_the_clock():
     """A cut still being made showed a frozen, anonymous workspace.
 
@@ -247,6 +415,17 @@ def test_a_cut_made_from_the_command_line_reads_as_running(tmp_path, monkeypatch
         json.dumps({"state": "running", "pid": os.getpid()}), encoding="utf-8"
     )
     assert _state_of_a_foreign_run(out) == "running", "this process is alive"
+
+    # A sandboxed Web server can see the state file while macOS refuses the
+    # harmless signal-zero probe. EPERM means the pid exists, not that it
+    # died, so a live CLI run must keep polling in the editor.
+    with monkeypatch.context() as guarded:
+        def cannot_signal(pid, signal):
+            del pid, signal
+            raise PermissionError("sandbox")
+
+        guarded.setattr(os, "kill", cannot_signal)
+        assert _state_of_a_foreign_run(out) == "running"
 
     # A pid nobody is using: the claim outlived its process.
     (out / "run-state.json").write_text(

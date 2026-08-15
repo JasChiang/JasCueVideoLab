@@ -720,6 +720,192 @@ def test_money_running_out_stops_the_library_instead_of_truncating_it() -> None:
             build_library(clips, Path(work) / "cards", client=RunsOutAfterOne())
 
 
+def test_transcript_budget_exhaustion_is_not_a_missing_speech_clip() -> None:
+    import inspect
+
+    from montagewright import cli
+
+    source = inspect.getsource(cli.command_render)
+    transcribe_at = source.index("card, usage = transcribe(")
+    budget_at = source.index("except BudgetSpent:", transcribe_at)
+    generic_at = source.index("except Exception as error:", transcribe_at)
+    assert transcribe_at < budget_at < generic_at
+
+
+def test_delivery_projection_keeps_raw_selection_and_exposes_sam_proof() -> None:
+    from montagewright.cli import _delivery_selection
+
+    raw = {"shots": [{
+        "identity_status": "source_confirmed",
+        "identity_issue": "source frame only",
+    }, {
+        "identity_status": "needs_review",
+        "identity_issue": "could not prove target",
+    }]}
+    delivered, status = _delivery_selection(raw, {
+        "k00": {"status": "sam_geometry_validated"},
+        "k01": {"status": "exact_frame_rejected"},
+    })
+
+    assert status == "needs_review"
+    assert delivered["shots"][0]["identity_status"] == "track_validated"
+    assert delivered["shots"][0]["identity_issue"] == ""
+    assert delivered["shots"][1]["identity_status"] == "needs_review"
+    assert raw["shots"][0]["identity_status"] == "source_confirmed"
+
+
+def test_identity_degradation_has_a_separate_resumable_artifact() -> None:
+    import inspect
+
+    from montagewright import cli
+
+    source = inspect.getsource(cli.command_render)
+    assert (
+        '"resolved-selection-v2-camera-rest-fit-identity-needs-review-hold"'
+        in source
+    )
+    assert '_decided(\n        work, "resolved-selection"' in source
+    assert '_decide(\n                work, "resolved-selection"' in source
+
+
+def test_cached_selection_audit_matches_fresh_gates_without_renormalizing() -> None:
+    import copy
+    from types import SimpleNamespace
+
+    from montagewright.planner import (
+        MaterialItem, audit_cached_selection, expand_spans,
+    )
+    from montagewright.spans import Span
+
+    span = Span(
+        span_id="C1:s00", source_id="C1",
+        starts_seconds=0.0, ends_seconds=5.0,
+    )
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=5.0, summary="the target action",
+        spans=(span,), action_ids=("a1",),
+        action_windows=(("a1", 0.0, 2.0),),
+        needs=("complete action",),
+    )]
+    direction = {
+        "target_seconds": 2.0, "target_shot_count": 1,
+        "unusable": [],
+    }
+    option = SimpleNamespace(
+        commitment_id="c1", span_id="C1:s00", required=True,
+        min_supported_seconds=1.0, feasible_treatments=("hold",),
+        presentation_intent="complete_hold", target_id="device.fold",
+    )
+    commitments = SimpleNamespace(options=[option], required_ids=("c1",))
+    target = SimpleNamespace(target_id="device.fold")
+    grounding = SimpleNamespace(identity_lock=SimpleNamespace(
+        identity=SimpleNamespace(targets=[target]),
+    ))
+    chosen = {"shots": [{
+        "commitment_id": "c1", "span_id": "C1:s00",
+        "source_id": "C1", "start_offset_seconds": 0.0,
+        "start_seconds": 0.0, "seconds_needed": 2.0,
+        "usable_from_seconds": 0.0, "usable_to_seconds": 5.0,
+        "source_motion_role": "locked", "camera_intent": "hold",
+        "frame": "settles", "picture_role": "primary_action",
+        "audio_role": "discard", "audio_completion": "none",
+        "action_id": "a1", "action_treatment": "complete_here",
+        "looks": [{
+            "at": "the whole target", "seconds": 2.0,
+            "framing": "centre", "composition": "object_priority",
+            "energy": "low", "must_be_whole": True,
+            "entity_id": "device.fold",
+            "presentation_intent": "complete_hold",
+        }],
+    }], "audio_assignments": []}
+    before = copy.deepcopy(chosen)
+
+    assert audit_cached_selection(
+        chosen, material, direction, commitments=commitments,
+        grounding_spec=grounding,
+    ) == []
+    assert chosen == before, "cache audit must be read-only"
+
+    # This is the exact fresh boundary: provider clocks are normalized once,
+    # then the same local audit accepts the cached shape without doing it a
+    # second time.
+    fresh = copy.deepcopy(chosen)
+    fresh["shots"][0]["start_offset_seconds"] = "0:00"
+    fresh["shots"][0]["seconds_needed"] = "0:02"
+    fresh["shots"][0]["looks"][0]["seconds"] = "0:02"
+    expand_spans(fresh, [span], source_motion={"C1": "locked"})
+    assert audit_cached_selection(
+        fresh, material, direction, commitments=commitments,
+        grounding_spec=grounding,
+    ) == audit_cached_selection(
+        chosen, material, direction, commitments=commitments,
+        grounding_spec=grounding,
+    )
+
+    cases = {
+        "clock": lambda value: value["shots"][0].update(
+            seconds_needed="two seconds"
+        ),
+        "look": lambda value: value["shots"][0]["looks"][0].update(
+            presentation_intent="transition_pass", must_be_whole=True
+        ),
+        "action": lambda value: value["shots"][0].update(action_id="invented"),
+        "frame": lambda value: value["shots"][0].update(camera_intent="reveal"),
+        "commitment": lambda value: value["shots"][0].update(
+            commitment_id="invented"
+        ),
+        "target": lambda value: value["shots"][0]["looks"][0].update(
+            entity_id="unknown.target"
+        ),
+        "audio": lambda value: value.update(audio_assignments=[{
+            "audio_span_id": "invented", "starts_at_shot_index": 9,
+            "offset_seconds": 0.0,
+        }]),
+        "sequence": lambda value: value["shots"].append(
+            copy.deepcopy(value["shots"][0])
+        ),
+        "coverage": lambda value: value["shots"][0].update(
+            seconds_needed=12.0
+        ),
+    }
+    for name, mutate in cases.items():
+        candidate = copy.deepcopy(chosen)
+        mutate(candidate)
+        faults = audit_cached_selection(
+            candidate, material, direction, commitments=commitments,
+            grounding_spec=grounding,
+        )
+        assert faults, f"{name} gate diverged between fresh and cache"
+
+    speech_material = material + [MaterialItem(
+        source_id="C2", duration_seconds=4.0, summary="speaker",
+        speech=("`t1` 0.0–2.0：hello",),
+    )]
+    lip_sync = copy.deepcopy(chosen)
+    lip_sync["shots"][0]["picture_role"] = "speaker"
+    lip_sync["audio_assignments"] = [{
+        "audio_span_id": "t1", "starts_at_shot_index": 0,
+        "offset_seconds": 0.0,
+    }]
+    faults = audit_cached_selection(
+        lip_sync, speech_material, direction, commitments=commitments,
+        grounding_spec=grounding,
+    )
+    assert any("cannot lip-sync" in fault for fault in faults)
+
+
+def test_cli_reaudits_cached_selection_before_rendering() -> None:
+    import inspect
+
+    from montagewright import cli
+
+    source = inspect.getsource(cli.command_render)
+    load_at = source.index('provider_selection = _decided(work, "selection"')
+    audit_at = source.index("audit_cached_selection(", load_at)
+    select_at = source.index("provider_selection, usage_selection = select_shots(")
+    assert load_at < audit_at < select_at
+
+
 def test_clip_cards_can_be_written_at_all() -> None:
     """The request referenced a name the module never imported."""
 
@@ -823,6 +1009,7 @@ def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
         "b.motion?.source", "b.motion?.digital", "motion.camera_intent",
         "motion.composite", "tellDegradation", "實際做到什麼",
         "剪輯意圖", "原素材語意角色", "數位裁切", "最終組合",
+        "素材位移", "sourceFact", "travel_frame_widths",
         "plan_disagreements", "計畫疑點", "全片計畫疑點",
     ):
         assert shown in page, shown
@@ -834,6 +1021,26 @@ def test_the_web_run_reports_what_it_decided_not_just_the_file() -> None:
 
     for relationship in ("source_only", "digital_only", "stacked", "still"):
         assert relationship in page, relationship
+
+
+def test_plan_disagreements_stay_inside_the_inspector_instead_of_floating() -> None:
+    """Persistent warnings stay in document flow instead of covering video."""
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert 'class="stage-notices" aria-live="polite"' in page
+    assert 'class="crop-warning hide" id="crop-warn"' in page
+    assert ".crop-warning {" in page
+    crop_style = page[page.index(".crop-warning {") :]
+    crop_style = crop_style[: crop_style.index("\n  }")]
+    assert "position: absolute" not in crop_style
+    preview_style = page[page.index(".graphic-preview-status {") :]
+    preview_style = preview_style[: preview_style.index("\n  }")]
+    assert "position: absolute" not in preview_style
+    assert ".degs > .warn {" in page
+    assert 'class="deeper shot-doubts"' in page
+    assert "這顆的計畫疑點 ${disagreements.length}" in page
 
 
 def test_a_track_can_be_measured_without_a_reviewed_lock() -> None:
@@ -933,6 +1140,438 @@ def test_every_upload_waits_until_the_file_can_be_used() -> None:
         assert not re.search(r"client\.files\.upload\(", text), (
             f"{module.name} uploads without waiting; use upload_now"
         )
+
+
+def test_upload_processing_has_a_hard_testable_deadline(tmp_path) -> None:
+    """One provider job cannot hold the whole material library forever."""
+
+    from montagewright.uploads import UploadProcessingTimeout, upload_now
+
+    class State:
+        name = "PROCESSING"
+
+    class File:
+        name = "files/stuck"
+        uri = "gemini://stuck"
+        state = State()
+
+    class Files:
+        gets = 0
+
+        @staticmethod
+        def upload(**_):
+            return File()
+
+        @classmethod
+        def get(cls, **_):
+            cls.gets += 1
+            return File()
+
+    class Client:
+        files = Files()
+
+    now = [10.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    source = tmp_path / "stuck.mp4"
+    source.write_bytes(b"video")
+    with pytest.raises(UploadProcessingTimeout, match=r"stuck\.mp4.*5s"):
+        upload_now(
+            source,
+            Client(),
+            processing_timeout_seconds=5.0,
+            poll_seconds=2.0,
+            clock=lambda: now[0],
+            sleep=sleep,
+        )
+
+    assert sleeps == [2.0, 2.0, 1.0]
+    assert Files.gets == 3
+
+
+def test_upload_processing_stops_on_active_or_failed_state(tmp_path) -> None:
+    from montagewright.uploads import upload_now
+
+    class State:
+        def __init__(self, name):
+            self.name = name
+
+    class File:
+        def __init__(self, state):
+            self.name = "files/one"
+            self.uri = "gemini://one"
+            self.state = State(state)
+
+    source = tmp_path / "one.mp4"
+    source.write_bytes(b"video")
+
+    class BecomesActive:
+        class files:
+            @staticmethod
+            def upload(**_):
+                return File("PROCESSING")
+
+            @staticmethod
+            def get(**_):
+                return File("ACTIVE")
+
+    assert upload_now(
+        source, BecomesActive(), clock=lambda: 0.0, sleep=lambda _: None
+    ).state.name == "ACTIVE"
+
+    class BecomesFailed:
+        class files:
+            @staticmethod
+            def upload(**_):
+                return File("PROCESSING")
+
+            @staticmethod
+            def get(**_):
+                return File("FAILED")
+
+    with pytest.raises(RuntimeError, match="ended upload in state FAILED"):
+        upload_now(
+            source, BecomesFailed(), clock=lambda: 0.0, sleep=lambda _: None
+        )
+
+
+def test_file_status_500_never_turns_into_a_duplicate_upload(
+    tmp_path, monkeypatch,
+) -> None:
+    import base64
+    import time
+
+    from montagewright import uploads
+    from montagewright.uploads import UploadCache, content_hash
+
+    class State:
+        name = "ACTIVE"
+
+    class Remote:
+        name = "files/already-there"
+        uri = "gemini://already-there"
+        state = State()
+
+    class ServerError(RuntimeError):
+        code = 503
+
+    source = tmp_path / "one.mp4"
+    source.write_bytes(b"same bytes")
+    digest = content_hash(source)
+    Remote.sha256_hash = base64.b64encode(
+        bytes.fromhex(digest)
+    ).decode("ascii")
+    Remote.size_bytes = source.stat().st_size
+    cache_path = tmp_path / "uploads.json"
+    cache = UploadCache(cache_path, {
+        digest: {
+            "name": Remote.name,
+            "uri": Remote.uri,
+            "source": str(source),
+            "mime_type": "video/mp4",
+            "uploaded_at": time.time(),
+        }
+    })
+
+    class Files:
+        gets = 0
+        uploads = 0
+
+        @classmethod
+        def get(cls, **_):
+            cls.gets += 1
+            if cls.gets < 3:
+                raise ServerError("503 unavailable")
+            return Remote()
+
+        @classmethod
+        def upload(cls, **_):
+            cls.uploads += 1
+            return Remote()
+
+    client = type("Client", (), {"files": Files})()
+    monkeypatch.setattr(uploads.time, "sleep", lambda _: None)
+    uri, hit = cache.uri_for(source, client, mime_type="video/mp4")
+
+    assert (uri, hit) == (Remote.uri, True)
+    assert Files.gets == 3
+    assert Files.uploads == 0
+
+
+def test_a_processing_upload_is_remembered_before_status_polling_fails(
+    tmp_path, monkeypatch,
+) -> None:
+    import base64
+
+    from montagewright import uploads
+    from montagewright.uploads import UploadCache, content_hash
+
+    class State:
+        def __init__(self, name):
+            self.name = name
+
+    class Remote:
+        name = "files/pending"
+        uri = "gemini://pending"
+
+        def __init__(self, state):
+            self.state = State(state)
+
+    class ServerError(RuntimeError):
+        code = 500
+
+    source = tmp_path / "pending.mp4"
+    source.write_bytes(b"video")
+    expected_hash = base64.b64encode(
+        bytes.fromhex(content_hash(source))
+    ).decode("ascii")
+    cache_path = tmp_path / "uploads.json"
+
+    class Files:
+        uploads = 0
+        uploaded = False
+        active = False
+
+        @classmethod
+        def upload(cls, **kwargs):
+            cls.uploads += 1
+            cls.uploaded = True
+            remote = Remote("PROCESSING")
+            remote.name = kwargs["config"]["name"]
+            remote.uri = f"gemini://{remote.name}"
+            return remote
+
+        @classmethod
+        def get(cls, **kwargs):
+            assert cls.uploaded, "a fresh file must upload before any GET"
+            if cls.active:
+                remote = Remote("ACTIVE")
+                remote.name = kwargs["name"]
+                remote.uri = f"gemini://{remote.name}"
+                remote.sha256_hash = expected_hash
+                remote.size_bytes = source.stat().st_size
+                return remote
+            raise ServerError("500 while polling")
+
+    client = type("Client", (), {"files": Files})()
+    monkeypatch.setattr(uploads.time, "sleep", lambda _: None)
+    cache = UploadCache.load(cache_path)
+    with pytest.raises(ServerError):
+        cache.uri_for(source, client, mime_type="video/mp4")
+
+    remembered = UploadCache.load(cache_path)
+    remote_name = next(iter(remembered.entries.values()))["name"]
+    assert remote_name.startswith("files/mw-")
+    Files.active = True
+    uri, hit = remembered.uri_for(source, client, mime_type="video/mp4")
+    assert (uri, hit) == (f"gemini://{remote_name}", True)
+    assert Files.uploads == 1
+
+
+def test_a_lost_upload_500_is_recovered_by_name_hash_and_size(
+    tmp_path, monkeypatch,
+) -> None:
+    """The service may commit bytes before its upload response is lost."""
+
+    import base64
+
+    from montagewright import uploads
+    from montagewright.uploads import UploadCache, content_hash
+
+    class State:
+        name = "ACTIVE"
+
+    class ServerError(RuntimeError):
+        code = 500
+
+    source = tmp_path / "committed.mp4"
+    source.write_bytes(b"the complete file")
+    digest = content_hash(source)
+    expected_hash = base64.b64encode(
+        bytes.fromhex(digest)
+    ).decode("ascii")
+
+    class Files:
+        uploads = 0
+        committed_name = None
+
+        @classmethod
+        def get(cls, *, name):
+            assert cls.uploads == 1, "recovery GET must follow an upload"
+            assert name == cls.committed_name
+            return type("Remote", (), {
+                "name": name,
+                "uri": f"gemini://{name}",
+                "state": State(),
+                "sha256_hash": expected_hash,
+                "size_bytes": source.stat().st_size,
+            })()
+
+        @classmethod
+        def upload(cls, **kwargs):
+            cls.uploads += 1
+            cls.committed_name = kwargs["config"]["name"]
+            raise ServerError("500 response lost after commit")
+
+    client = type("Client", (), {"files": Files})()
+    monkeypatch.setattr(uploads.time, "sleep", lambda _: None)
+    cache = UploadCache.load(tmp_path / "uploads.json")
+
+    uri, hit = cache.uri_for(source, client, mime_type="video/mp4")
+    assert Files.uploads == 1
+    assert Files.committed_name == f"files/mw-{digest[:37]}"
+    assert (uri, hit) == (f"gemini://{Files.committed_name}", False)
+    assert Files.uploads == 1
+
+
+def test_a_failed_recovered_upload_is_never_cached_as_active(
+    tmp_path, monkeypatch,
+) -> None:
+    """A matching hash cannot make a terminal provider object usable."""
+
+    import base64
+
+    from montagewright import uploads
+    from montagewright.uploads import UploadCache, content_hash
+
+    class Conflict(RuntimeError):
+        code = 409
+
+    class State:
+        name = "FAILED"
+
+    source = tmp_path / "failed.mp4"
+    source.write_bytes(b"complete but unusable bytes")
+    digest = content_hash(source)
+    encoded_hash = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+
+    class Files:
+        @staticmethod
+        def upload(**_):
+            raise Conflict("409 name already exists")
+
+        @staticmethod
+        def get(*, name):
+            return type("Remote", (), {
+                "name": name,
+                "uri": f"gemini://{name}",
+                "state": State(),
+                "sha256_hash": encoded_hash,
+                "size_bytes": source.stat().st_size,
+            })()
+
+    cache_path = tmp_path / "uploads.json"
+    cache = UploadCache.load(cache_path)
+    monkeypatch.setattr(uploads.time, "sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="FAILED.*refusing to cache"):
+        cache.uri_for(
+            source,
+            type("Client", (), {"files": Files})(),
+            mime_type="video/mp4",
+        )
+
+    assert digest not in UploadCache.load(cache_path).entries
+
+
+def test_a_fresh_cached_file_uploads_before_its_first_status_get(
+    tmp_path,
+) -> None:
+    """A fabricated remote name must never be probed before creation."""
+
+    import base64
+
+    from montagewright.uploads import UploadCache, content_hash
+
+    source = tmp_path / "fresh.mp4"
+    source.write_bytes(b"fresh bytes")
+    digest = content_hash(source)
+    expected_hash = base64.b64encode(
+        bytes.fromhex(digest)
+    ).decode("ascii")
+    events = []
+
+    class State:
+        name = "ACTIVE"
+
+    class Remote:
+        name = f"files/mw-{digest[:37]}"
+        uri = f"gemini://{name}"
+        state = State()
+        sha256_hash = expected_hash
+        size_bytes = source.stat().st_size
+
+    class Files:
+        @staticmethod
+        def upload(**kwargs):
+            events.append(("upload", kwargs["config"]["name"]))
+            return Remote()
+
+        @staticmethod
+        def get(*, name):
+            events.append(("get", name))
+            return Remote()
+
+    cache = UploadCache.load(tmp_path / "uploads.json")
+    uri, hit = cache.uri_for(
+        source,
+        type("Client", (), {"files": Files})(),
+        mime_type="video/mp4",
+    )
+
+    assert (uri, hit) == (Remote.uri, False)
+    assert events == [("upload", Remote.name), ("get", Remote.name)]
+
+
+def test_remote_hash_accepts_the_live_files_api_hex_encoding(tmp_path) -> None:
+    """Live Files returns base64(hex digest), despite the bytes-format docs."""
+
+    import base64
+
+    from montagewright.uploads import _remote_matches, content_hash
+
+    source = tmp_path / "encoded.mp4"
+    source.write_bytes(b"same complete bytes")
+    digest = content_hash(source)
+    remote = type("Remote", (), {
+        "sha256_hash": base64.b64encode(digest.encode("ascii")).decode(),
+        "size_bytes": source.stat().st_size,
+    })()
+
+    assert _remote_matches(
+        remote, sha256=digest, size_bytes=source.stat().st_size
+    )
+
+
+def test_a_stuck_upload_is_isolated_to_its_card(tmp_path, monkeypatch) -> None:
+    """The timeout is an asset failure, so the next card is still attempted."""
+
+    from montagewright import clipcard
+    from montagewright.uploads import UploadProcessingTimeout
+
+    attempted = []
+
+    def stuck(proxy, **_):
+        attempted.append(proxy.name)
+        raise UploadProcessingTimeout("provider stayed PROCESSING")
+
+    monkeypatch.setattr(clipcard, "describe_clip", stuck)
+    proxies = {}
+    for name in ("a", "b"):
+        source = tmp_path / f"{name}.mp4"
+        source.write_bytes(name.encode())
+        proxies[name] = source
+
+    with pytest.raises(clipcard.CardLibraryEmpty, match="UploadProcessingTimeout"):
+        clipcard.build_library(
+            proxies, tmp_path / "cards", client=object()
+        )
+
+    assert attempted == ["a.mp4", "b.mp4"]
 
 
 def test_the_transcriber_is_reachable_as_its_own_command() -> None:
@@ -1830,6 +2469,158 @@ def test_the_cut_can_be_adjusted_without_replanning_it() -> None:
     assert "function inspect" in page and 'id="inspector"' in page
 
 
+def test_web_distinguishes_final_tracking_review_and_cumulative_cost() -> None:
+    import inspect
+
+    from montagewright import webapp
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+
+    assert "最終追蹤已驗證" in page
+    assert "所有嘗試累計花費" in page
+    assert "供應商重試可能已計費" in page
+    assert "有鏡頭的主體仍待確認" in page
+
+    server = inspect.getsource(webapp.create_app)
+    assert '"delivery_status": report.get("delivery_status", "ready")' in server
+    assert '== "sam_geometry_validated"' in server
+
+
+def test_running_web_sheet_shows_source_frames_before_segments_exist() -> None:
+    """SAM progress is visual even before the first segment is rendered."""
+
+    import inspect
+
+    from montagewright import webapp
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "/source-thumb/${encodeURIComponent(shot.source)}" in page
+    assert "正在找主體與計算裁切" in page
+    assert "progress.tracking_index" in page
+    assert "素材預覽・尚未裁切" in page
+    assert "正在追蹤與裁切" in page
+    assert "追蹤完成・等待渲染" in page
+    assert "已渲染" in page
+    assert 'const sheetKey = `${runId}:${planned.length}`' in page
+
+    server = inspect.getsource(webapp.create_app)
+    assert '"at": float(shot.get("start_seconds") or 0.0)' in server
+    assert 'r"\\bsubject\\s+(\\d+)/(\\d+)\\s+k(\\d+)\\b"' in server
+    assert server.index("run.remember()") < server.index("subprocess.Popen(")
+    assert "剪輯尚未啟動" in server
+
+
+def test_running_web_progress_uses_artifacts_and_separates_exact_identity(
+    tmp_path,
+) -> None:
+    """An early music-analysis line cannot advance the sidebar to SAM.
+
+    Direction deliberately narrows candidates before exact identity checking,
+    so this check is a post-Direction phase with frames to inspect.  Selection
+    is not complete until its atomic artifact exists, and old review lines do
+    not survive a resume into the next attempt's live phase.
+    """
+
+    import json
+
+    from fastapi.testclient import TestClient
+    import montagewright.webapp as web
+
+    root = tmp_path / "live"
+    out = root / "out"
+    frame_dir = out / "work" / "identity-frames" / "C1001"
+    frame_dir.mkdir(parents=True)
+    (frame_dir / "identity-00.jpg").write_bytes(b"not decoded in this test")
+    (out / "work" / "direction.json").write_text(
+        json.dumps({"value": {"target_seconds": 10}}), encoding="utf-8"
+    )
+    lines = [
+        "no music map given; measuring the track",
+        "direction: 10s 9:16, 0 ruled out",
+        "  identity 1/2  C1001  1 confirmed",
+    ]
+    was_runs = dict(web.RUNS)
+    try:
+        web.RUNS.clear()
+        web.RUNS["live"] = web.Run(
+            run_id="live", root=root, lines=lines, state="running",
+            # A non-None process makes this a live in-memory run; no pid or
+            # run-state fixture is needed for this endpoint test.
+            process=object(),  # type: ignore[arg-type]
+        )
+        client = TestClient(web.create_app())
+        progress = client.get("/api/runs/live").json()["progress"]
+        assert progress["phase"] == "identity_confirmation"
+        assert "direction" in progress["completed"]
+        assert "selection" not in progress["completed"]
+        assert progress["identity"] == {"done": False, "current": 1, "total": 2}
+        assert progress["identity_candidates"] == [{
+            "source": "C1001", "frame": "identity-00.jpg"
+        }]
+
+        # The exact-confirmation completion line alone still does not make a
+        # Selection.  The saved selection artifact does.
+        web.RUNS["live"].lines.extend([
+            "identity confirmed on 1/2 sources ($0.01)",
+            "selection: 2 shots; 0 digital crop moves",
+            "review 1: pass (0 issues)",
+            "— 續跑 —",
+        ])
+        (out / "work" / "selection.json").write_text(json.dumps({
+            "value": {"shots": [{
+                "source_id": "C1001", "span_id": "C1001:s00",
+                "start_seconds": 0, "seconds_needed": 2,
+            }]}
+        }), encoding="utf-8")
+        resumed = client.get("/api/runs/live").json()["progress"]
+        assert resumed["phase"] == "rhythm", "old review belongs to the prior attempt"
+        assert "selection" in resumed["completed"]
+    finally:
+        web.RUNS.clear()
+        web.RUNS.update(was_runs)
+
+
+def test_timeline_resize_handle_does_not_look_like_playback_progress() -> None:
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert ".grip.flat:hover, .grip.flat.holding { background: transparent; }" in page
+    assert ".grip.flat:hover::before, .grip.flat.holding::before" in page
+
+
+def test_a_questionable_identity_shot_can_be_replaced_without_moving_beats() -> None:
+    """Manual review is an edit operation, not another paid Selection pass."""
+
+    import inspect
+
+    from montagewright import cli, webapp
+    from montagewright.webapp import PAGE, create_app
+
+    paths = {route.path for route in create_app().routes if hasattr(route, "path")}
+    assert "/api/runs/{run_id}/replacement-candidates" in paths
+    assert "/api/runs/{run_id}/source-thumb/{source_id}" in paths
+
+    server = inspect.getsource(webapp.create_app)
+    assert 'entry["seconds"]' in server
+    assert "replacement span is too short for this rhythm slot" in server
+    assert '"camera_intent": "hold"' in server
+    assert '"entity_id": "none"' in server
+    assert '"manual_plan": wanted[index].get("manual_plan")' in server
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "換這一顆（保留節奏）" in page
+    assert "function chooseReplacement" in page
+    assert "confirms_identity" in page
+    assert "replacement: b.replacement || null" in page
+
+    command = inspect.getsource(cli.command_render)
+    assert 'shot["identity_status"] = "needs_review"' in command
+    assert 'look["entity_id"] = "none"' in command
+    assert "needs_review for manual replacement" in command
+
+
 def test_a_degradation_is_shown_in_words_with_its_number() -> None:
     """"static_on_subject　accept" names the code that raised it.
 
@@ -2314,6 +3105,46 @@ def test_the_overlay_eases_the_way_the_render_does() -> None:
     assert "*(3-2*" in _eased(0.0, 1.0, 0.0, 1.0)
 
 
+def test_dense_tracking_samples_do_not_stop_and_restart_at_every_sample() -> None:
+    """Dense SAM geometry is one continuous move, not many tiny moves."""
+
+    from montagewright.executor import CropBox
+    from montagewright.reframe import (
+        CropPath, Keyframe, ffmpeg_crop_expression,
+        interpolate_crop_keyframes,
+    )
+
+    keys = [
+        Keyframe(float(index), CropBox(index * 0.02, 0.0, 0.3, 1.0))
+        for index in range(5)
+    ]
+    _, _, x_expression, _ = ffmpeg_crop_expression(keys and CropPath(keys), 1000, 1000)
+    assert "*(3-2*" not in x_expression
+
+    as_dicts = [
+        {"at": key.seconds, "x": key.crop.x, "y": key.crop.y,
+         "w": key.crop.width, "h": key.crop.height}
+        for key in keys
+    ]
+    halfway = interpolate_crop_keyframes(as_dicts, 0.5)
+    assert halfway is not None
+    assert halfway["x"] == pytest.approx(0.01)
+
+
+def test_delivery_and_preview_force_square_pixel_metadata() -> None:
+    """A portrait raster must not inherit a source SAR that advertises 16:9."""
+
+    from pathlib import Path
+
+    renderer = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "montagewright" / "renderer.py"
+    ).read_text(encoding="utf-8")
+    assert 'filters.append("setsar=1")' in renderer
+    assert 'handle_filters.append("setsar=1")' in renderer
+    assert 'f"scale=-2:{PREVIEW_HEIGHT},setsar=1"' in renderer
+
+
 def test_the_reel_moves_without_relaying_itself_out_every_frame() -> None:
     """A one-pixel line, sixty times a second, at the cost of a full layout.
 
@@ -2330,9 +3161,22 @@ def test_the_reel_moves_without_relaying_itself_out_every_frame() -> None:
     assert "translateX(${x}px)" in page
     assert "if (now !== clockSaid)" in page
     # Every measurement read before anything is written.
-    move = page[page.index("function movePlayhead()"):]
+    move = page[page.index("function movePlayhead("):]
     move = move[:move.index("\n}")]
     assert move.index("box.scrollLeft, wide") < move.index("style.transform")
+
+
+def test_the_playhead_uses_one_clock_while_playing_seeking_and_scrubbing() -> None:
+    """A paused seek must not leave the red line at its previous time."""
+
+    from montagewright.webapp import PAGE
+
+    page = PAGE.read_text(encoding="utf-8")
+    assert "movePlayhead();\n  });" in page
+    assert "movePlayhead(at + 0.05)" in page
+    assert "movePlayhead(wanted)" in page
+    assert "(e.clientX - box.left) / scale" in page
+    assert "['seeked', 'loadedmetadata', 'durationchange', 'pause']" in page
 
 
 def test_the_crop_overlay_does_not_measure_the_page_every_frame() -> None:
@@ -2407,6 +3251,150 @@ def test_a_run_made_from_the_command_line_is_openable(tmp_path) -> None:
         assert found.source == "/rushes"
         assert found.state == "done"
         assert found.started_at > 0
+    finally:
+        web.RUNS_ROOT = was_root
+        web.RUNS.clear()
+        web.RUNS.update(was_runs)
+
+
+def test_a_failed_selection_is_visible_as_an_unrendered_web_draft(
+    tmp_path,
+) -> None:
+    """A local coverage fault must not erase the paid Selection from Web."""
+
+    import json
+
+    from fastapi.testclient import TestClient
+    import montagewright.webapp as web
+
+    folder = tmp_path / "draft"
+    out = folder / "out"
+    (out / "work" / "proxies").mkdir(parents=True)
+    (out / "command.json").write_text(json.dumps({
+        "source": "/rushes",
+        "command": ["render", "/rushes", "--seconds", "7"],
+    }), encoding="utf-8")
+    (out / "run-state.json").write_text(
+        json.dumps({"state": "failed"}), encoding="utf-8"
+    )
+    shots = [{
+        "source_id": "C0001", "span_id": "C0001:s00",
+        "start_seconds": 1.0, "seconds_needed": 3.0,
+        "coverage_claim_seconds": 3.0, "camera_intent": "hold",
+        "picture_role": "primary_action", "audio_role": "discard",
+        "looks": [{"entity_id": "device.fold", "at": "the action",
+                   "seconds": 3.0, "framing": "centre",
+                   "must_be_whole": False}],
+        "why": "show the action",
+    }, {
+        "source_id": "C0002", "span_id": "C0002:s00",
+        "start_seconds": 0.0, "seconds_needed": 4.0,
+        "coverage_claim_seconds": 4.0, "camera_intent": "hold",
+        "picture_role": "primary_action", "audio_role": "discard",
+        "looks": [{"entity_id": "device.fold", "at": "the result",
+                   "seconds": 4.0, "framing": "centre",
+                   "must_be_whole": False}],
+        "why": "show the result",
+    }]
+    (out / "work" / "selection.json").write_text(json.dumps({
+        "key": "selection", "value": {"shots": shots}
+    }), encoding="utf-8")
+    (out / "run.log").write_text(
+        "CardLibraryEmpty: old failure\n"
+        "  identity 1/2  C0001  1 confirmed\n"
+        "  identity 2/2  C0002  none\n"
+        "TimelineCoverageError: final timeline is too long\n",
+        encoding="utf-8",
+    )
+    (out / "spend-events.jsonl").write_text(
+        json.dumps({"stage": "selection", "usd": 0.25}) + "\n",
+        encoding="utf-8",
+    )
+
+    was_root, was_runs = web.RUNS_ROOT, dict(web.RUNS)
+    try:
+        web.RUNS_ROOT = tmp_path
+        web.RUNS.clear()
+        client = TestClient(web.create_app())
+        status = client.get("/api/runs/draft").json()
+        report = status["report"]
+        assert report["draft_only"] is True
+        assert report["duration_seconds"] == 7.0
+        assert len(report["selection"]["shots"]) == 2
+        assert report["spend"]["by_stage"] == {"selection": 0.25}
+        assert report["plan_disagreements"] == [
+            "TimelineCoverageError: final timeline is too long"
+        ]
+
+        timeline = client.get("/api/runs/draft/timeline-data").json()
+        assert [block["seconds"] for block in timeline["blocks"]] == [3.0, 4.0]
+        assert timeline["seconds"] == 7.0
+        assert [block["identity_status"] for block in timeline["blocks"]] == [
+            "source_confirmed", "unverified",
+        ]
+    finally:
+        web.RUNS_ROOT = was_root
+        web.RUNS.clear()
+        web.RUNS.update(was_runs)
+
+    page = web.PAGE.read_text(encoding="utf-8")
+    assert "未渲染草稿" in page
+    assert "TimelineCoverageError:" in page
+    assert "data.report.draft_only && data.state !== 'done'" in page
+
+
+def test_an_invalid_selection_draft_remains_visible_and_release_blocked(
+    tmp_path,
+) -> None:
+    import json
+
+    from fastapi.testclient import TestClient
+    import montagewright.webapp as web
+
+    out = tmp_path / "invalid" / "out"
+    (out / "work").mkdir(parents=True)
+    (out / "command.json").write_text(json.dumps({
+        "source": "/rushes",
+        "command": ["render", "/rushes", "--seconds", "3"],
+    }), encoding="utf-8")
+    (out / "run-state.json").write_text(
+        json.dumps({"state": "failed"}), encoding="utf-8"
+    )
+    shot = {
+        "source_id": "C8342", "span_id": "C8342:s00",
+        "start_seconds": 1.0, "seconds_needed": 3.0,
+        "camera_intent": "pan", "picture_role": "primary_action",
+        "audio_role": "discard", "why": "follow the product",
+        "looks": [{
+            "entity_id": "device.fold", "at": "the phone detail",
+            "seconds": 1.0, "framing": "centre", "must_be_whole": False,
+            "presentation_intent": "complete_hold",
+        }],
+    }
+    (out / "work" / "invalid-selection-draft.json").write_text(
+        json.dumps({"key": "x", "value": {
+            "shots": [shot],
+            "invalid_selection_faults": ["k00 cannot reach its look"],
+        }}), encoding="utf-8",
+    )
+    (out / "run.log").write_text(
+        "SelectionUnrenderable: selection remained structurally unrenderable\n",
+        encoding="utf-8",
+    )
+
+    was_root, was_runs = web.RUNS_ROOT, dict(web.RUNS)
+    try:
+        web.RUNS_ROOT = tmp_path
+        web.RUNS.clear()
+        status = TestClient(web.create_app()).get("/api/runs/invalid").json()
+        assert status["report"]["draft_only"] is True
+        assert status["report"]["delivery_status"] == "release_blocked"
+        assert status["report"]["selection"]["shots"][0][
+            "camera_intent"
+        ] == "pan"
+        assert "k00 cannot reach its look" in status["report"][
+            "plan_disagreements"
+        ]
     finally:
         web.RUNS_ROOT = was_root
         web.RUNS.clear()
@@ -4302,8 +5290,19 @@ def test_selection_audits_cross_field_look_contract_before_edl():
             "presentation_intent": "complete_hold",
         }],
     }])
+    assert faults == []
+
+    faults = look_contract_disagreements([{
+        "looks": [{
+            "at": "the product passing through frame", "seconds": 0.5,
+            "framing": "centre", "composition": "object_priority",
+            "energy": "high", "must_be_whole": True,
+            "entity_id": "device.fold",
+            "presentation_intent": "transition_pass",
+        }],
+    }])
     assert len(faults) == 1
-    assert "complete_hold requires must_be_whole=true" in faults[0]
+    assert "transition_pass cannot also promise must_be_whole" in faults[0]
 
 
 def test_movement_that_reveals_nothing_is_not_the_source_doing_the_work():
@@ -6692,6 +7691,9 @@ def test_pipeline_reference_grounding_hands_two_exact_pts_to_geometry(monkeypatc
         ], {"tracked": 3}
 
     monkeypatch.setattr("montagewright.pipeline._track_subject", tracked)
+    monkeypatch.setattr(
+        "montagewright.pipeline._preflight_sam_checkpoint", lambda path: path
+    )
     report = Report()
     boxes, times, anchors = _reference_subject_samples(
         Source("A", tmp_path / "A.mp4", 5.0, 1920, 1080),
@@ -6773,12 +7775,13 @@ def test_look_presentation_intent_allows_partial_without_weakening_complete():
     )
     assert partial.presentation_intent == "partial_reveal"
 
-    with pytest.raises(ValidationError, match="complete_hold"):
-        Look(
-            at="the entire readable display",
-            presentation_intent="complete_hold",
-            must_be_whole=False,
-        )
+    complete_detail = Look(
+        at="the phone detail after the pan settles",
+        presentation_intent="complete_hold",
+        must_be_whole=False,
+    )
+    assert complete_detail.presentation_intent == "complete_hold"
+    assert complete_detail.must_be_whole is False
     with pytest.raises(ValidationError, match="partial_reveal"):
         Look(
             at="the entire readable display",
@@ -7254,16 +8257,21 @@ def test_an_exact_frame_verdict_is_remembered_by_the_frames_it_judged():
     from montagewright import pipeline
 
     source = inspect.getsource(pipeline._reference_subject_samples)
-    key = source.split("hashlib.sha256")[1].split(")).hexdigest()")[0]
+    key = inspect.getsource(pipeline._final_exact_cache_key)
     assert "spec.definition_sha256()" in key, "a different lock is a different question"
     assert "target_id" in key
     assert "frame_pts" in key and "frame_sha256" in key, (
         "name the frames that were actually judged, not the shot they came from"
     )
+    assert all(name in key for name in (
+        "model_id", "prompt_sha256", "response_schema_sha256",
+        "local_validator_version", "reference_resolution",
+        "frame_resolution", "minimum_matched_anchors",
+    )), "cache every part of the semantic request and local acceptance contract"
     assert "if batch is None:" in source, "a remembered verdict skips the call"
     # The call, not the import of its name, and not the earlier `_afford`
     # that belongs to discovery.
-    assert source.index("remembered.exists()") < source.index(
+    assert source.index("_read_final_exact_cache(") < source.index(
         "decide_exact_frame_bboxes(\n"
     ), "look before paying"
 
@@ -7298,12 +8306,11 @@ def test_no_silent_exit_from_the_reference_stage():
 def test_a_replacement_that_cannot_be_built_is_asked_again_not_raised():
     """The film was already on disk; everything after it was not.
 
-    A replan promised `complete_hold` without asking for the whole subject
-    -- a contradiction the Look model refuses, but only when one is built,
-    which happens long after the replan call returns. So it came back
-    valid, was accepted, and raised a bare ValidationError out of the
-    rebuild. Building them inside the retry loop turns that into the one
-    thing this pass is already good at: asking again with the reason.
+    A replan may promise `complete_hold` without asking for the whole physical
+    subject: the camera can pan to a face or product detail, settle, and hold.
+    The real contradiction is a deliberately partial pass that also promises
+    every edge remains visible. Build Looks inside the retry loop so that
+    actual contradictions are repaired before EDL construction.
     """
 
     import inspect
@@ -7313,14 +8320,24 @@ def test_a_replacement_that_cannot_be_built_is_asked_again_not_raised():
     from montagewright.planner import replan_shots
     from montagewright.schema import Look, reframe_of
 
+    complete = Look(
+        at="the phone detail", presentation_intent="complete_hold",
+        must_be_whole=False,
+    )
+    assert complete.presentation_intent == "complete_hold"
     with _pytest.raises(Exception):
-        Look(at="the wordmark", presentation_intent="complete_hold")
+        Look(
+            at="the passing wordmark", presentation_intent="transition_pass",
+            must_be_whole=True,
+        )
 
     # The rule is stated where the model reads it, not only where it is
     # enforced.
     fields = Look.model_fields
-    assert "must_be_whole=true" in fields["presentation_intent"].description
-    assert "complete_hold" in fields["must_be_whole"].description
+    assert "does not by itself require every edge" in fields[
+        "presentation_intent"
+    ].description
+    assert "complete hold" in fields["must_be_whole"].description
 
     source = inspect.getsource(replan_shots)
     assert "reframe_of(shot)" in source, "build them while a retry is possible"
@@ -7377,10 +8394,12 @@ def test_the_floor_of_a_shot_has_one_name():
     from montagewright.grounding import ground_timeline
 
     source = inspect.getsource(ground_timeline)
-    assert "floor_seconds = wanted if keeps_source_move else 0.0" in source
+    assert "source_floor = source_motion_floor if keeps_source_move else 0.0" in source
+    assert "floor_seconds = max(floor, source_floor, action_floor)" in source
+    assert "floor_seconds = wanted if keeps_source_move else 0.0" not in source
     # No path may re-derive it from the intent on its own.
     after = source.split(
-        "floor_seconds = wanted if keeps_source_move else 0.0", 1
+        "floor_seconds = max(floor, source_floor, action_floor)", 1
     )[1]
     assert "keeps_source_move else" not in after, (
         "every later path reads the floor rather than recomputing it"
@@ -7621,7 +8640,7 @@ def test_an_unreachable_look_is_dropped_rather_than_ending_the_pass():
         "a shot with nothing left to name still ends the pass"
     )
     assert salvage.index("plan_disagreements") < salvage.index(
-        "raise PlannerError"
+        "raise SelectionUnrenderable"
     ), "and what was given up is reported, not swallowed"
 
 

@@ -255,7 +255,7 @@ class AutonomousEditPolicy(FrozenStrictModel):
     contract_version: Literal["autonomous-edit-policy-v1"] = (
         AUTONOMOUS_POLICY_VERSION
     )
-    model_id: Literal["gemini-3.6-flash"] = "gemini-3.6-flash"
+    model_id: Literal["gemini-3.7-flash"] = "gemini-3.7-flash"
     execution_profile: AutonomousExecutionProfile
     content_mode: Literal["music_led_feature", "visual_demo"]
     requested_aspects: tuple[Aspect, ...] = Field(min_length=1, max_length=2)

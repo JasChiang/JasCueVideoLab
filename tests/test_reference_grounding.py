@@ -1287,3 +1287,130 @@ def test_a_source_without_the_identity_is_context_not_rubbish():
           "looks": [{"entity_id": "device.galaxy_z_fold8"}]}],
         [venue, product], targets,
     ) == []
+
+
+def test_selection_promotes_identity_capable_alternate_over_absent_primary():
+    """An absent primary is not allowed to survive as repair advice."""
+
+    from montagewright.candidate_commitments import (
+        CandidateCommitments, CandidateOption,
+    )
+    from montagewright.planner import (
+        MaterialItem, _commitments_without_context_claims,
+        _context_claiming_source_ids,
+    )
+    from montagewright.spans import Span
+
+    absent = MaterialItem(
+        source_id="C8388", duration_seconds=3.0, summary="weather screen",
+        carries_identity=False,
+        spans=(Span("C8388:s00", "C8388", 0.0, 3.0),),
+    )
+    present = MaterialItem(
+        source_id="C8387", duration_seconds=3.0, summary="folded handset",
+        spans=(Span("C8387:s00", "C8387", 0.0, 3.0),),
+    )
+    common = {
+        "commitment_id": "comm_17", "purpose": "show the cover screen",
+        "required": True, "picture_role": "illustrative_broll",
+        "min_supported_seconds": 1.0,
+        "presentation_intent": "centered_hold",
+        "motion_preference": "hold",
+        "target_id": "device.galaxy_z_fold8", "why": "visible handset",
+    }
+    commitments = CandidateCommitments(
+        contract_version="candidate-commitment-v1",
+        material_digest="a" * 64, direction_sha256="b" * 64,
+        target_aspect="9:16", target_seconds=3.0,
+        options=(
+            CandidateOption(**common, span_id="C8388:s00", tier="primary"),
+            CandidateOption(**common, span_id="C8387:s00", tier="alternate"),
+        ),
+    )
+
+    eligible = _commitments_without_context_claims(
+        commitments, [absent, present], {"device.galaxy_z_fold8"}
+    )
+
+    assert [(one.span_id, one.tier) for one in eligible.options] == [
+        ("C8387:s00", "primary")
+    ]
+    assert [(one.span_id, one.tier) for one in commitments.options] == [
+        ("C8388:s00", "primary"), ("C8387:s00", "alternate")
+    ]
+    assert _context_claiming_source_ids(
+        [{
+            "span_id": "C8388:s00",
+            "looks": [{"entity_id": "device.galaxy_z_fold8"}],
+        }],
+        [absent, present], {"device.galaxy_z_fold8"},
+    ) == {"C8388"}
+
+
+def test_selection_fails_locally_when_absent_required_commitment_is_exhausted():
+    from montagewright.candidate_commitments import (
+        CandidateCommitments, CandidateOption,
+    )
+    from montagewright.planner import (
+        MaterialItem, PlannerError, _commitments_without_context_claims,
+    )
+    from montagewright.spans import Span
+
+    absent = MaterialItem(
+        source_id="C8388", duration_seconds=3.0, summary="wrong handset",
+        carries_identity=False,
+        spans=(Span("C8388:s00", "C8388", 0.0, 3.0),),
+    )
+    commitments = CandidateCommitments(
+        contract_version="candidate-commitment-v1",
+        material_digest="a" * 64, direction_sha256="b" * 64,
+        target_aspect="9:16", target_seconds=3.0,
+        options=(CandidateOption(
+            commitment_id="comm_17", purpose="show the cover screen",
+            required=True, picture_role="illustrative_broll",
+            span_id="C8388:s00", tier="primary",
+            min_supported_seconds=1.0,
+            presentation_intent="centered_hold", motion_preference="hold",
+            target_id="device.galaxy_z_fold8", why="claimed product",
+        ),),
+    )
+
+    with pytest.raises(PlannerError, match="no identity-capable primary"):
+        _commitments_without_context_claims(
+            commitments, [absent], {"device.galaxy_z_fold8"}
+        )
+
+
+def test_selection_distinguishes_source_evidence_from_final_track_proof():
+    from montagewright.cli import _annotate_selection_identity_evidence
+
+    selection = {"shots": [{
+        "source_id": "C1",
+        "looks": [{"entity_id": "device.fold"}],
+    }, {
+        "source_id": "C2",
+        "looks": [{"entity_id": "device.fold"}],
+    }, {
+        "source_id": "C3",
+        "looks": [{"entity_id": "none"}],
+    }]}
+
+    _annotate_selection_identity_evidence(
+        selection, {"C1": {"device.fold": (object(),)}}
+    )
+
+    assert [shot["identity_status"] for shot in selection["shots"]] == [
+        "source_confirmed", "unverified", "not_applicable",
+    ]
+    assert selection["shots"][0]["identity_target_id"] == "device.fold"
+    assert "最終片段" in selection["shots"][0]["identity_issue"]
+    assert len(selection["plan_disagreements"]) == 1
+    assert "C2 claims device.fold" in selection["plan_disagreements"][0]
+
+
+def test_exact_frame_output_budget_scales_for_multi_frame_answers():
+    from montagewright.reference_grounding import exact_frame_output_budget
+
+    assert exact_frame_output_budget(1) == 4096
+    assert exact_frame_output_budget(5) == 7424
+    assert exact_frame_output_budget(8) == 11264

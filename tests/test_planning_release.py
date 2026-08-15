@@ -1,6 +1,6 @@
 from montagewright.grounding import BeatGrid, Cue
 from montagewright.planning_release import rhythm_motion_faults
-from montagewright.schema import Clip, EDL, MusicSync, Reframe
+from montagewright.schema import ActionContract, Clip, EDL, MusicSync, Reframe
 
 
 def _clip(
@@ -36,6 +36,59 @@ def test_named_music_cue_must_really_land():
 def test_named_music_cue_and_feasible_virtual_move_pass():
     authored = EDL(project_id="p", clips=[_clip(sync_to="section_002")])
     assert rhythm_motion_faults(authored, authored, _grid()) == ()
+
+
+def test_music_anchor_may_not_move_past_a_protected_action_start():
+    """Content completion outranks a sub-second beat alignment."""
+
+    clip = Clip(
+        clip_id="k08",
+        source_id="C8361",
+        approx_in_seconds=2.0,
+        approx_out_seconds=6.0,
+        usable_from_seconds=0.0,
+        usable_to_seconds=9.0,
+        moments={"a01": 2.0},
+        action_contracts=[ActionContract(
+            action_id="a01",
+            what="models turn their phones around",
+            source_start_seconds=2.0,
+            source_complete_seconds=6.0,
+            safe_cut_after_seconds=6.0,
+            timing_basis="coarse_mmss",
+        )],
+        music_sync=MusicSync(
+            cut_on_beat=False,
+            anchor="a01",
+            anchor_lands_on="downbeat",
+        ),
+    )
+    grid = BeatGrid(
+        bpm=120.0,
+        meter=4,
+        duration_seconds=10.0,
+        cues=(Cue("d0", 1.918, "downbeat", 1.0),),
+    )
+
+    from montagewright.grounding import ground_timeline
+
+    lead = Clip(
+        clip_id="k07",
+        source_id="C0",
+        approx_in_seconds=0.0,
+        approx_out_seconds=2.0,
+        music_sync=MusicSync(cut_on_beat=False),
+    )
+    grounded = ground_timeline(
+        EDL(project_id="p", clips=[lead, clip]), grid
+    ).clips[1]
+    assert grounded.clip.approx_in_seconds == 2.0
+    assert "kept the complete source action" in (grounded.note or "")
+    assert rhythm_motion_faults(
+        EDL(project_id="p", clips=[lead, clip]),
+        EDL(project_id="p", clips=[lead, clip]),
+        grid,
+    ) == ()
 
 
 def test_music_may_not_shorten_a_native_reveal_below_its_authored_span():
@@ -90,3 +143,51 @@ def test_a_move_is_not_shortened_by_rhythm_when_the_take_simply_ends():
     assert rhythm_motion_faults(
         film(4.0, 10.0), film(3.5, 10.0), grid
     ) != ()
+
+
+def test_speaker_alignment_is_revalidated_against_protected_source_contracts():
+    from montagewright.pipeline import align_speaker_pictures_to_audio
+    from montagewright.planning_release import resolved_source_contract_faults
+    from montagewright.schema import AudioClip
+
+    clip = Clip(
+        clip_id="k00", source_id="C1",
+        approx_in_seconds=5.0, approx_out_seconds=9.0,
+        picture_role="speaker",
+        action_contracts=[ActionContract(
+            action_id="a01", what="phone unfolds",
+            source_start_seconds=5.0,
+            source_complete_seconds=9.0,
+            safe_cut_after_seconds=9.0,
+        )],
+    )
+    edl = EDL(project_id="p", clips=[clip], audio_clips=[AudioClip(
+        audio_id="voice", source_id="C1",
+        in_seconds=7.0, out_seconds=9.0,
+        starts_at_clip_id="k00", role="narrative",
+        completion="complete_thought",
+    )])
+
+    aligned, _ = align_speaker_pictures_to_audio(edl)
+    assert aligned.clips[0].approx_in_seconds == 7.0
+    faults = resolved_source_contract_faults(aligned)
+    assert any("starts after protected action a01" in fault for fault in faults)
+
+
+def test_independent_audio_must_fit_inside_the_resolved_picture_timeline():
+    from montagewright.planning_release import audio_timeline_faults
+    from montagewright.schema import AudioClip
+
+    edl = EDL(project_id="p", clips=[_clip(seconds=2.0)], audio_clips=[
+        AudioClip(
+            audio_id="voice", source_id="C1",
+            in_seconds=0.0, out_seconds=3.0,
+            starts_at_clip_id="k00", role="narrative",
+            completion="complete_thought",
+        )
+    ])
+
+    faults = audio_timeline_faults(edl)
+    assert faults == (
+        "audio voice falls outside the 2.000s picture timeline (0.000-3.000s)",
+    )
