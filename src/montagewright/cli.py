@@ -2245,6 +2245,7 @@ def command_render(args: argparse.Namespace) -> int:
     publish_planning_state(
         work,
         planning_state,
+        allow_incomplete_rollover=True,
         request={
             "stage": "selection",
             "direction_key": asked,
@@ -2845,6 +2846,7 @@ def command_render(args: argparse.Namespace) -> int:
             work,
             planning_state,
             stage="edit",
+            allow_incomplete_rollover=True,
             request={
                 "stage": "reviewed_selection",
                 "selection_key": chose,

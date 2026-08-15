@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -235,8 +236,18 @@ def publish_planning_state(
     response: Any,
     validation: Any,
     stage: str = "edit",
+    allow_incomplete_rollover: bool = False,
 ) -> Path:
-    """Publish or verify an identical immutable revision during resume."""
+    """Publish or verify an immutable revision during resume.
+
+    A failed attempt may have published a selection revision before any
+    executable downstream artifact existed.  If a later local contract
+    repair produces a different selection at that same revision number, the
+    old fact is still useful audit history but must not permanently poison
+    the run.  Callers may opt into archiving that incomplete leaf and
+    publishing its replacement.  Once Rhythm, crop paths, rendered segments,
+    or a report exists, the revision remains strictly immutable.
+    """
 
     destination = Path(work) / "planning" / stage / f"rev-{state.revision}"
     if destination.exists():
@@ -249,6 +260,12 @@ def publish_planning_state(
                 f"stored planning revision is unreadable: {destination}"
             ) from error
         if stored.sha256() != state.sha256():
+            if allow_incomplete_rollover:
+                _archive_incomplete_revision(work, stage, destination, stored)
+                return write_planning_revision(
+                    work, stage, state,
+                    request=request, response=response, validation=validation,
+                )
             told = "\n".join(
                 f"  {note}" for note in _revision_difference(stored, state)
             )
@@ -266,3 +283,50 @@ def publish_planning_state(
         work, stage, state,
         request=request, response=response, validation=validation,
     )
+
+
+def _archive_incomplete_revision(
+    work: Path,
+    stage: str,
+    destination: Path,
+    stored: PlanningState,
+) -> Path:
+    """Move an unconsumed conflicting leaf aside without deleting evidence."""
+
+    work = Path(work)
+    output = work.parent
+    downstream = [
+        work / "rhythm.json",
+        work / "crops.json",
+        output / "preview.mp4",
+        output / "picture.mp4",
+        output / "deliverable.mp4",
+        output / "report.json",
+    ]
+    segments = output / "segments"
+    consumed = [path for path in downstream if path.exists()]
+    if segments.is_dir() and any(segments.iterdir()):
+        consumed.append(segments)
+    if consumed:
+        named = ", ".join(str(path) for path in consumed[:4])
+        raise RuntimeError(
+            "stored planning revision no longer describes the current "
+            f"material: {destination}\n"
+            "  automatic rollover is unsafe because downstream artifacts "
+            f"already consume it: {named}"
+        )
+
+    archive = (
+        work / "planning" / "archive" / stage /
+        f"rev-{stored.revision}-{stored.sha256()[:16]}"
+    )
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if archive.exists():
+        raise RuntimeError(
+            "cannot archive conflicting planning revision because its audit "
+            f"destination already exists: {archive}"
+        )
+    # Same-filesystem rename preserves the complete immutable directory and
+    # makes rev-N available before the replacement is exclusively published.
+    os.rename(destination, archive)
+    return archive

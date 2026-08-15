@@ -10,6 +10,7 @@ from montagewright.planning_bridge import (
     publish_planning_state,
     selection_planning_state,
 )
+from montagewright.planning_state import PlanningState
 from montagewright.spans import Span
 
 
@@ -142,3 +143,65 @@ def test_a_conflicting_revision_says_what_moved_and_how_to_recover(
         "the unchanged source is not what moved"
     )
     assert str(tmp_path / "planning" / "edit") in said, "say what to remove"
+
+
+def test_incomplete_conflicting_leaf_is_archived_and_replaced(tmp_path: Path):
+    base = material_planning_state(
+        [Material("C1", 8.0, (
+            Span("C1:s00", "C1", 0.0, 4.0),
+            Span("C1:s01", "C1", 4.0, 8.0),
+        ))],
+        {},
+    )
+    publish_planning_state(
+        tmp_path, base, request={}, response={}, validation={}
+    )
+    first = selection_planning_state(base, [{"span_id": "C1:s00"}])
+    publish_planning_state(
+        tmp_path, first, request={}, response={}, validation={}
+    )
+    replacement = selection_planning_state(base, [{"span_id": "C1:s01"}])
+
+    current = publish_planning_state(
+        tmp_path, replacement, request={}, response={}, validation={},
+        allow_incomplete_rollover=True,
+    )
+
+    assert PlanningState.model_validate_json(
+        (current / "state.json").read_text(encoding="utf-8")
+    ).sha256() == replacement.sha256()
+    archived = (
+        tmp_path / "planning" / "archive" / "edit" /
+        f"rev-1-{first.sha256()[:16]}" / "state.json"
+    )
+    assert PlanningState.model_validate_json(
+        archived.read_text(encoding="utf-8")
+    ).sha256() == first.sha256()
+
+
+def test_conflicting_leaf_cannot_roll_over_after_downstream_consumes_it(
+    tmp_path: Path,
+):
+    base = material_planning_state(
+        [Material("C1", 8.0, (
+            Span("C1:s00", "C1", 0.0, 4.0),
+            Span("C1:s01", "C1", 4.0, 8.0),
+        ))],
+        {},
+    )
+    publish_planning_state(
+        tmp_path, base, request={}, response={}, validation={}
+    )
+    first = selection_planning_state(base, [{"span_id": "C1:s00"}])
+    publish_planning_state(
+        tmp_path, first, request={}, response={}, validation={}
+    )
+    (tmp_path / "rhythm.json").write_text("{}", encoding="utf-8")
+    replacement = selection_planning_state(base, [{"span_id": "C1:s01"}])
+
+    with pytest.raises(RuntimeError, match="downstream artifacts already consume"):
+        publish_planning_state(
+            tmp_path, replacement, request={}, response={}, validation={},
+            allow_incomplete_rollover=True,
+        )
+    assert (tmp_path / "planning" / "edit" / "rev-1").is_dir()
