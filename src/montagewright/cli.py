@@ -2295,7 +2295,7 @@ def command_render(args: argparse.Namespace) -> int:
         for source_id in audio_source_ids
         if source_id in found and source_id not in sources
     })
-    rhythm_context = _rhythm_context(selection, cards)
+    rhythm_context = _rhythm_context(selection, cards, material=material)
 
     aspect = ASPECTS[args.aspect]
 
@@ -2421,7 +2421,7 @@ def command_render(args: argparse.Namespace) -> int:
                 for source_id in {audio.source_id for audio in edl.audio_clips}
                 if source_id in found and source_id not in sources
             })
-            rhythm_context = _rhythm_context(selection, cards)
+            rhythm_context = _rhythm_context(selection, cards, material=material)
     else:  # pragma: no cover - the bounded loop either cuts or raises.
         raise RuntimeError("identity recovery did not converge")
     _project_track_confirmed(selection, report)
@@ -2591,7 +2591,9 @@ def command_render(args: argparse.Namespace) -> int:
                           if audio.source_id in found
                           and audio.source_id not in sources
                       })
-                      rhythm_context = _rhythm_context(selection, cards)
+                      rhythm_context = _rhythm_context(
+                          selection, cards, material=material
+                      )
                       result, plan, report, resolved = cut(
                           edl, sources, rhythm_context
                       )
@@ -2800,7 +2802,9 @@ def command_render(args: argparse.Namespace) -> int:
                   if audio.source_id in found
                   and audio.source_id not in sources
               })
-              rhythm_context = _rhythm_context(selection, cards)
+              rhythm_context = _rhythm_context(
+                  selection, cards, material=material
+              )
               try:
                   ledger.check()
                   result, plan, report, resolved = cut(
@@ -3232,7 +3236,7 @@ def _aspect(path: Path) -> float:
 
 
 def _rhythm_context(
-    selection: dict, cards: dict[str, Path]
+    selection: dict, cards: dict[str, Path], *, material: list[Any] | None = None,
 ) -> dict[str, dict]:
     """Why each shot exists, what moves in it, how much frame it holds.
 
@@ -3262,7 +3266,18 @@ def _rhythm_context(
             )
             if box is not None:
                 entry["subject_share"] = round(box.width * box.height, 4)
-            selected_action = str(shot.get("action_id") or "none")
+        selected_action = str(shot.get("action_id") or "none")
+        if selected_action != "none" and material is not None:
+            from montagewright.planner import resolve_action_boundary
+
+            boundary = resolve_action_boundary(shot, tuple(material))
+            if boundary is not None:
+                first, last, _, _ = boundary
+                entry["action"] = (
+                    f"{selected_action}: selected source action "
+                    f"{first:.1f}-{last:.1f}s"
+                )
+        elif card is not None:
             local_action = selected_action.rsplit(":", 1)[-1]
             beats = [
                 beat for beat in action_beats(card)
@@ -3450,6 +3465,25 @@ def _edl_from_selection(
             or ("complete_here" if selected_action != "none" else "none")
         )
         window = _usable_window(shot)
+        if item is not None:
+            from montagewright.planner import resolve_named_span
+
+            resolved_span = resolve_named_span(shot, tuple(material or ()))
+            if resolved_span is not None:
+                window = (
+                    float(resolved_span.starts_seconds),
+                    float(resolved_span.ends_seconds),
+                )
+        resolved_action = None
+        if selected_action != "none" and item is not None:
+            from montagewright.planner import resolve_action_boundary
+
+            resolved_action = resolve_action_boundary(
+                shot, tuple(material or ())
+            )
+            if resolved_action is not None:
+                _, _, usable_from, usable_to = resolved_action
+                window = (usable_from, usable_to)
         if window is not None:
             # The card said where this take is worth cutting into and until
             # now that answer only ever reached a line of prompt text. A
@@ -3460,27 +3494,26 @@ def _edl_from_selection(
             room = max(0.0, last - first)
             wanted = min(wanted, room) if room > 0 else wanted
             start = min(max(start, first), max(first, last - wanted))
-        action_card = card
-        if action_card is None and selected_action != "none" and item is not None:
+        action_card = None
+        if selected_action != "none" and resolved_action is not None:
             local_action = selected_action.rsplit(":", 1)[-1]
-            boundary = next(
-                (
-                    (float(first), float(last))
-                    for action_id, first, last in item.action_windows
-                    if action_id == selected_action or action_id == local_action
-                ),
-                None,
-            )
-            if boundary is not None:
-                # MaterialItem is built from this same canonical card reader.
-                # Keep action completion executable when the persisted card
-                # path is unavailable instead of silently dropping the duty.
-                action_card = {"action": [{
-                    "id": local_action,
-                    "what": "selected source action",
-                    "from": boundary[0],
-                    "to": boundary[1],
-                }]}
+            action_start, action_end, _, _ = resolved_action
+            # Selection and EDL must execute the same immutable local
+            # contract.  Reopening and reparsing the card here created a
+            # second authority that could disagree after Selection had
+            # already passed.
+            action_card = {"action": [{
+                "id": local_action,
+                "what": "selected source action",
+                "from": action_start,
+                "to": action_end,
+            }]}
+        elif selected_action == "none":
+            action_card = card
+        elif item is None:
+            # Compatibility for direct/legacy EDL callers that predate the
+            # material catalogue. Production render paths always provide it.
+            action_card = card
         if action_card is not None:
             note = None
             if action_treatment == "complete_here":
@@ -3561,7 +3594,13 @@ def _edl_from_selection(
                 f"{clip_id} cannot resolve selected action {selected_action!r} "
                 "from either its card or local material action windows"
             )
-        if card is not None:
+        if item is not None:
+            from montagewright.planner import material_look_boxes
+
+            reframe = reframe.model_copy(
+                update={"look_boxes": material_look_boxes(item, reframe)}
+            )
+        elif card is not None:
             # Where the card already measured each look. This is what makes
             # "how long does this shot need" a fact about this shot rather
             # than a constant per move: the distance between two watches on

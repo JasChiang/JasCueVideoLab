@@ -2827,6 +2827,42 @@ def _beaten_and_broken(
     return beaten, broken
 
 
+def material_look_boxes(
+    item: MaterialItem, reframe: Any,
+) -> list[tuple[float, float, float]]:
+    """Resolve look geometry from Selection's immutable material facts."""
+
+    from montagewright.clipcard import find_subject
+
+    card = {
+        "subjects": [
+            {
+                "label": label,
+                "entity_id": entity_id,
+                "centre_x": centre_x,
+                "centre_y": centre_y,
+                "width": width,
+                "height": height,
+                "moves": False,
+            }
+            for (
+                label, entity_id, centre_x, centre_y, width, height
+            ) in item.subject_geometry
+        ]
+    }
+    measured: list[tuple[float, float, float]] = []
+    for look in reframe.looks:
+        box = find_subject(card, look.at, entity_id=look.entity_id)
+        if box is None:
+            return []
+        crop_width = (
+            min(1.0, max(0.2, box.height / 0.66))
+            if look.framing == "fill" else 1.0
+        )
+        measured.append((box.centre_x, box.centre_y, crop_width))
+    return measured
+
+
 def camera_duration_disagreements(
     shots: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     material: list[MaterialItem] | tuple[MaterialItem, ...],
@@ -2839,7 +2875,6 @@ def camera_duration_disagreements(
     prevents an impossible answer from becoming the cached EDL.
     """
 
-    from montagewright.clipcard import find_subject
     from montagewright.grounding import camera_floor_for
     from montagewright.schema import reframe_of
 
@@ -2852,33 +2887,7 @@ def camera_duration_disagreements(
         reframe = reframe_of(shot)
         if not reframe.looks:
             continue
-        card = {
-            "subjects": [
-                {
-                    "label": label,
-                    "entity_id": entity_id,
-                    "centre_x": centre_x,
-                    "centre_y": centre_y,
-                    "width": width,
-                    "height": height,
-                    "moves": False,
-                }
-                for (
-                    label, entity_id, centre_x, centre_y, width, height
-                ) in item.subject_geometry
-            ]
-        }
-        measured: list[tuple[float, float, float]] = []
-        for look in reframe.looks:
-            box = find_subject(card, look.at, entity_id=look.entity_id)
-            if box is None:
-                measured = []
-                break
-            crop_width = (
-                min(1.0, max(0.2, box.height / 0.66))
-                if look.framing == "fill" else 1.0
-            )
-            measured.append((box.centre_x, box.centre_y, crop_width))
+        measured = material_look_boxes(item, reframe)
         priced = reframe.model_copy(update={"look_boxes": measured})
         floor = camera_floor_for(priced)
         seconds = float(shot.get("seconds_needed") or 0.0)
@@ -2912,7 +2921,6 @@ def repair_camera_rests_to_duration(
     """
 
     from montagewright.capabilities import SETTLE_SECONDS
-    from montagewright.clipcard import find_subject
     from montagewright.grounding import camera_floor_for
     from montagewright.schema import looks_of, reframe_of
 
@@ -2934,33 +2942,7 @@ def repair_camera_rests_to_duration(
         if len(stop_indices) < 2:
             continue
 
-        card = {
-            "subjects": [
-                {
-                    "label": label,
-                    "entity_id": entity_id,
-                    "centre_x": centre_x,
-                    "centre_y": centre_y,
-                    "width": width,
-                    "height": height,
-                    "moves": False,
-                }
-                for (
-                    label, entity_id, centre_x, centre_y, width, height
-                ) in item.subject_geometry
-            ]
-        }
-        measured: list[tuple[float, float, float]] = []
-        for look in reframe.looks:
-            box = find_subject(card, look.at, entity_id=look.entity_id)
-            if box is None:
-                measured = []
-                break
-            crop_width = (
-                min(1.0, max(0.2, box.height / 0.66))
-                if look.framing == "fill" else 1.0
-            )
-            measured.append((box.centre_x, box.centre_y, crop_width))
+        measured = material_look_boxes(item, reframe)
         priced = reframe.model_copy(update={"look_boxes": measured})
         floor = camera_floor_for(priced)
         duration = max(0.0, float(shot.get("seconds_needed") or 0.0))
@@ -3393,6 +3375,9 @@ def select_shots(
         chosen.setdefault("duration_repairs", []).extend(
             repair_camera_rests_to_duration(chosen, usable)
         )
+        faults.extend(span_contract_disagreements(
+            chosen.get("shots") or [], usable
+        ))
         faults.extend(look_contract_disagreements(chosen.get("shots") or []))
         faults.extend(action_contract_disagreements(
             chosen.get("shots") or [], usable
@@ -3760,6 +3745,7 @@ def audit_cached_selection(
             f"shot count {len(shots)} is outside {min_shots}–{max_shots}"
         )
     check("clock", lambda: selection_clock_disagreements(shots))
+    check("span", lambda: span_contract_disagreements(shots, usable))
     check("look", lambda: look_contract_disagreements(shots))
     check("action", lambda: action_contract_disagreements(shots, usable))
     check("frame", lambda: frame_disagreements(shots, material))
@@ -3927,13 +3913,6 @@ def action_contract_disagreements(
         item.source_id: set(item.action_ids)
         for item in material
     }
-    windows = {
-        item.source_id: {
-            action_id: (float(start), float(end))
-            for action_id, start, end in item.action_windows
-        }
-        for item in material
-    }
     faults: list[str] = []
     for index, shot in enumerate(shots):
         selected = str(shot.get("action_id") or "none")
@@ -3975,18 +3954,14 @@ def action_contract_disagreements(
                 f"action offered by source {source}"
             )
             continue
-        boundary = windows.get(source, {}).get(selected)
-        if boundary is None:
+        resolved = resolve_action_boundary(shot, material)
+        if resolved is None:
             faults.append(
                 f"k{index:02d} action {selected!r} has no local source-clock boundary"
             )
             continue
-        action_start, action_end = boundary
+        action_start, action_end, usable_from, usable_to = resolved
         seconds = float(shot.get("seconds_needed") or 0.0)
-        usable_from = float(shot.get("usable_from_seconds", 0.0) or 0.0)
-        usable_to = float(
-            shot.get("usable_to_seconds", action_end) or action_end
-        )
         if treatment == "complete_here":
             needed = max(0.0, action_end - action_start)
             if action_start < usable_from - 1e-3 or action_end > usable_to + 1e-3:
@@ -4021,6 +3996,110 @@ def action_contract_disagreements(
                     "complete_here or after_completion"
                 )
     return faults
+
+
+def resolve_named_span(
+    shot: dict[str, Any],
+    material: "list[MaterialItem] | tuple[MaterialItem, ...]",
+) -> Any | None:
+    """Return the immutable local span named by a normalized shot."""
+
+    span_id = str(shot.get("span_id") or "")
+    if not span_id:
+        return None
+    for item in material:
+        for span in item.spans:
+            if str(getattr(span, "span_id", "")) == span_id:
+                return span
+    return None
+
+
+def span_contract_disagreements(
+    shots: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    material: "list[MaterialItem] | tuple[MaterialItem, ...]",
+) -> list[str]:
+    """Prove normalized source clocks still echo their named local span."""
+
+    faults: list[str] = []
+    for index, shot in enumerate(shots):
+        if not shot.get("span_id"):
+            continue
+        span = resolve_named_span(shot, material)
+        if span is None:
+            faults.append(
+                f"k{index:02d} names missing span {shot.get('span_id')!r}"
+            )
+            continue
+        if str(shot.get("source_id") or "") != str(span.source_id):
+            faults.append(
+                f"k{index:02d} source does not match named span "
+                f"{span.span_id}"
+            )
+        first = float(shot.get("usable_from_seconds", 0.0) or 0.0)
+        last = float(shot.get("usable_to_seconds", 0.0) or 0.0)
+        if (
+            abs(first - float(span.starts_seconds)) > 1e-3
+            or abs(last - float(span.ends_seconds)) > 1e-3
+        ):
+            faults.append(
+                f"k{index:02d} cached source window {first:.3f}-{last:.3f}s "
+                f"does not match named span {span.span_id} at "
+                f"{span.starts_seconds:.3f}-{span.ends_seconds:.3f}s"
+            )
+    return faults
+
+
+def resolve_action_boundary(
+    shot: dict[str, Any],
+    material: "list[MaterialItem] | tuple[MaterialItem, ...]",
+) -> tuple[float, float, float, float] | None:
+    """Resolve one selected action and its usable span exactly once.
+
+    The paid Selection gate and the EDL builder used to read the same action
+    through different routes: Selection used ``MaterialItem.action_windows``
+    while EDL reopened the card and parsed it again.  A normalized card, a
+    stale path, or a slightly different span lookup could therefore pass the
+    first gate and fail the second.  MaterialItem is the immutable local
+    catalogue supplied to Selection, so it is the authority for both the
+    action boundary and the named span that contains the edit.
+    """
+
+    source = str(shot.get("source_id") or "")
+    selected = str(shot.get("action_id") or "none")
+    if not source or selected == "none":
+        return None
+    local_action = selected.rsplit(":", 1)[-1]
+    for item in material:
+        if str(item.source_id) != source:
+            continue
+        boundary = next(
+            (
+                (float(start), float(end))
+                for action_id, start, end in item.action_windows
+                if action_id == selected or action_id == local_action
+            ),
+            None,
+        )
+        if boundary is None:
+            continue
+        span = resolve_named_span(shot, material)
+        if span is not None:
+            usable_from = float(span.starts_seconds)
+            usable_to = float(span.ends_seconds)
+        else:
+            # Legacy/direct callers may not carry named spans.  Their already
+            # resolved local clocks remain supported, but production spans
+            # always take the branch above and cannot be contradicted by a
+            # model echo.
+            usable_from = float(
+                shot.get("usable_from_seconds", 0.0) or 0.0
+            )
+            usable_to = float(
+                shot.get("usable_to_seconds", item.duration_seconds)
+                or item.duration_seconds
+            )
+        return boundary[0], boundary[1], usable_from, usable_to
+    return None
 
 
 def _shot_count_bounds(

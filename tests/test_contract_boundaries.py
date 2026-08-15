@@ -298,7 +298,10 @@ def test_after_completion_is_a_safe_short_treatment(tmp_path):
         "version": CARD_VERSION,
         "action": [{
             "id": "a01", "what": "phone unfolds",
-            "from": "0:00", "to": "0:14",
+            # Deliberately stale/conflicting. The EDL must execute the exact
+            # MaterialItem contract that Selection validated, not reparse a
+            # second authority after the paid decision has passed.
+            "from": "0:00", "to": "0:18",
         }],
     }), encoding="utf-8")
     material = [MaterialItem(
@@ -326,6 +329,87 @@ def test_after_completion_is_a_safe_short_treatment(tmp_path):
     assert clip.approx_out_seconds == 17.0
     assert clip.action_contracts == []
     assert clip.moments == {}, "a finished action cannot be reintroduced as a Rhythm anchor"
+
+
+def test_action_validation_uses_the_named_span_not_selection_echoes():
+    from montagewright.planner import MaterialItem, action_contract_disagreements
+    from montagewright.spans import Span
+
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=30.0, summary="result hold",
+        action_ids=("a01",), action_windows=(("a01", 0.0, 14.0),),
+        spans=(Span("C1:s02", "C1", 0.0, 16.0),),
+    )]
+    shot = {
+        "source_id": "C1", "span_id": "C1:s02",
+        "action_id": "a01", "action_treatment": "after_completion",
+        "seconds_needed": 3.0,
+        # A stale/model-derived echo says there is room to 20s. The named
+        # local span ends at 16s and is the only boundary execution may use.
+        "usable_from_seconds": 0.0, "usable_to_seconds": 20.0,
+    }
+
+    faults = action_contract_disagreements([shot], material)
+
+    assert len(faults) == 1
+    assert "cannot hold 3.00s" in faults[0]
+
+
+def test_normalized_selection_cannot_keep_stale_span_clock_echoes():
+    from montagewright.planner import MaterialItem, span_contract_disagreements
+    from montagewright.spans import Span
+
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=30.0, summary="one usable island",
+        spans=(Span("C1:s02", "C1", 4.0, 12.0),),
+    )]
+
+    faults = span_contract_disagreements([{
+        "source_id": "C1", "span_id": "C1:s02",
+        "usable_from_seconds": 0.0, "usable_to_seconds": 20.0,
+    }], material)
+
+    assert len(faults) == 1
+    assert "does not match named span C1:s02" in faults[0]
+
+
+def test_edl_uses_the_same_material_look_geometry_as_selection(tmp_path):
+    from montagewright.cli import _edl_from_selection
+    from montagewright.clipcard import CARD_VERSION
+    from montagewright.planner import MaterialItem
+
+    card_path = tmp_path / "C1.json"
+    card_path.write_text(json.dumps({
+        "version": CARD_VERSION,
+        "subjects": [{
+            "label": "phone", "centre_x": 0.9, "centre_y": 0.5,
+            "width": 0.2, "height": 0.4, "moves": False,
+        }],
+    }), encoding="utf-8")
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="phone",
+        subject_geometry=(("phone", None, 0.2, 0.4, 0.2, 0.5),),
+    )]
+    shot = {
+        "source_id": "C1", "span_id": "C1:s00",
+        "start_seconds": 0.0, "seconds_needed": 3.0,
+        "usable_from_seconds": 0.0, "usable_to_seconds": 8.0,
+        "action_id": "none", "action_treatment": "none",
+        "camera_intent": "push_in", "source_motion_role": "locked",
+        "frame": "travels", "energy": "medium", "why": "show phone",
+        "audio_role": "discard", "audio_completion": "none",
+        "picture_role": "illustrative_broll",
+        "looks": [
+            {"at": "phone", "seconds": 1.0, "framing": "thirds"},
+            {"at": "phone", "seconds": 1.0, "framing": "fill"},
+        ],
+    }
+
+    edl, _ = _edl_from_selection(
+        {"shots": [shot]}, tmp_path, {"C1": card_path}, material=material,
+    )
+
+    assert edl.clips[0].reframe.look_boxes[0][:2] == (0.2, 0.4)
 
 
 def test_intentional_cut_is_explicit_but_does_not_create_completion_floor(tmp_path):
