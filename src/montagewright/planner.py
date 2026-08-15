@@ -2331,12 +2331,18 @@ def _selection_schema(
                         },
                         "action_treatment": {
                             "type": "string",
-                            "enum": ["none", "complete_here", "after_completion"],
+                            "enum": [
+                                "none", "complete_here", "after_completion",
+                                "intentional_cut",
+                            ],
                             "description": (
                                 "none：這顆不以具名動作為切點，action_id 也必須是 none。"
                                 "complete_here：從動作開始看到動作完整結束，seconds_needed "
                                 "必須容得下整段，系統不會事後偷偷延長。after_completion："
                                 "動作已完成後才進鏡，保留結果／停頓，不重播動作。"
+                                "intentional_cut：刻意在具名動作完成前切走；仍須選 action_id，"
+                                "並在 why 寫明剪輯目的。primary_action 若來源提供具名動作，"
+                                "不得用 none 逃避這個選擇。"
                             ),
                         },
                         "audio_role": {
@@ -3933,8 +3939,23 @@ def action_contract_disagreements(
         selected = str(shot.get("action_id") or "none")
         treatment = str(shot.get("action_treatment") or "")
         source = str(shot.get("source_id") or "")
-        if treatment not in {"none", "complete_here", "after_completion"}:
+        if treatment not in {
+            "none", "complete_here", "after_completion", "intentional_cut",
+        }:
             faults.append(f"k{index:02d} has no valid action_treatment")
+            continue
+        offered_actions = allowed.get(source, set())
+        if (
+            str(shot.get("picture_role") or "") == "primary_action"
+            and offered_actions
+            and treatment == "none"
+        ):
+            faults.append(
+                f"k{index:02d} is primary_action and source {source} offers "
+                "named actions, so it must choose complete_here, "
+                "after_completion, or intentional_cut instead of silently "
+                "dropping the action contract"
+            )
             continue
         if treatment == "none":
             if selected != "none":
@@ -3979,11 +4000,26 @@ def action_contract_disagreements(
                     f"but complete_here needs at least {needed:.2f}s; choose "
                     "fewer shots, after_completion, or a different action"
                 )
-        elif action_end + seconds > usable_to + 1e-3:
+        elif treatment == "after_completion" and action_end + seconds > usable_to + 1e-3:
             faults.append(
                 f"k{index:02d} cannot hold {seconds:.2f}s after action "
                 f"{selected!r} completes at {action_end:.2f}s inside this window"
             )
+        elif treatment == "intentional_cut":
+            why = str(shot.get("why") or "").strip()
+            source_start = float(shot.get("start_seconds") or usable_from)
+            source_end = source_start + seconds
+            if not why:
+                faults.append(
+                    f"k{index:02d} intentionally cuts action {selected!r} "
+                    "without an editorial reason"
+                )
+            elif source_end >= action_end - 1e-3:
+                faults.append(
+                    f"k{index:02d} labels action {selected!r} intentional_cut, "
+                    "but its selected window already reaches completion; use "
+                    "complete_here or after_completion"
+                )
     return faults
 
 

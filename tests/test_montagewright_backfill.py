@@ -930,8 +930,10 @@ def test_a_move_that_cannot_cross_in_the_time_says_so():
     _handoff(1.2, energy="calm", degradations=degradations)
 
     assert [one.ladder_other for one in degradations] == [
-        "move_does_not_fit_the_time"
+        "move_does_not_fit_the_time",
+        "camera_endpoint_not_reached_before_cut",
     ]
+    assert degradations[-1].adjudication == "replan"
     measured = degradations[0].measured
     assert measured["needed_speed_vw_s"] > measured["max_speed_vw_s"]
 

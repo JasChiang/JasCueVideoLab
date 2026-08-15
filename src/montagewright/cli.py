@@ -3526,6 +3526,30 @@ def _edl_from_selection(
                     f"entered after {selected_action} completed at "
                     f"{beat.ends_seconds:.2f}s"
                 )
+            elif action_treatment == "intentional_cut":
+                local_action = selected_action.rsplit(":", 1)[-1]
+                beat = next(
+                    (
+                        one for one in action_beats(action_card)
+                        if one.beat_id == local_action
+                    ),
+                    None,
+                )
+                if beat is None or selected_action == "none":
+                    raise ValueError(
+                        f"{clip_id} cannot resolve intentional_cut for action "
+                        f"{selected_action!r}"
+                    )
+                if start >= beat.ends_seconds - 1e-3 or start + wanted >= beat.ends_seconds - 1e-3:
+                    raise ValueError(
+                        f"{clip_id} marks {selected_action!r} intentional_cut, "
+                        "but its source window does not actually cut before "
+                        "the action completes"
+                    )
+                note = (
+                    f"intentionally cuts {selected_action} before its "
+                    f"{beat.ends_seconds:.2f}s completion"
+                )
             elif action_treatment != "none" or selected_action != "none":
                 raise ValueError(
                     f"{clip_id} has inconsistent action_id/action_treatment"

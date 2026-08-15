@@ -278,6 +278,57 @@ SETTLE_SHARE = 0.25
 SCREEN_DEADBAND = 0.02
 
 
+def _crop_distance(before: CropBox, after: CropBox) -> float:
+    """Largest visible disagreement between two crop destinations."""
+
+    return max(
+        abs((after.x + after.width / 2) - (before.x + before.width / 2)),
+        abs((after.y + after.height / 2) - (before.y + before.height / 2)),
+        abs(after.width - before.width),
+        abs(after.height - before.height),
+    )
+
+
+def _record_missed_endpoint(
+    *,
+    intended: CropBox,
+    delivered: CropPath,
+    clip_id: str,
+    degradations: list[DegradationStep] | None,
+) -> None:
+    """Make a camera move that cuts before its subject a replan fault.
+
+    Speed limiting is allowed to soften a move, but it must never quietly
+    change the destination.  A reveal/push which ends short is a different
+    editorial shot: the subject it promised may never be shown.  Mark it for
+    bounded replanning rather than presenting an incomplete path as delivered.
+    """
+
+    if not delivered.keyframes:
+        return
+    missed = _crop_distance(delivered.keyframes[-1].crop, intended)
+    if missed <= 1e-4 or degradations is None:
+        return
+    degradations.append(
+        DegradationStep(
+            clip_id=clip_id,
+            ladder="other",
+            ladder_other="camera_endpoint_not_reached_before_cut",
+            trigger=(
+                "the compiled crop is still travelling when the shot cuts, "
+                "so it never reaches the subject or framing promised by the "
+                "last look"
+            ),
+            measured={"endpoint_error_vw": round(missed, 4)},
+            adjudication="replan",
+            adjudication_reason=(
+                "extend to a legal cue, choose a shorter journey, or select "
+                "another locally feasible treatment"
+            ),
+        )
+    )
+
+
 def _with_rest(
     keyframes: list[Keyframe],
     duration_seconds: float,
@@ -355,7 +406,14 @@ def _with_rest(
         Keyframe(duration_seconds, end),
     ]
     limited, _ = _limit_speed(rested, ENERGY_LIMITS[energy])
-    return CropPath(limited)
+    delivered = CropPath(limited)
+    _record_missed_endpoint(
+        intended=end,
+        delivered=delivered,
+        clip_id=clip_id,
+        degradations=degradations,
+    )
+    return delivered
 
 
 def _rest_for_stop(seconds: float) -> float:
@@ -368,7 +426,12 @@ def _rest_for_stop(seconds: float) -> float:
 
     if float(seconds) < 0.0:
         return 0.0
-    return max(0.0, float(seconds)) or SETTLE_SECONDS
+    # A positive model value is a preferred dwell, not permission to create
+    # a stop too short for the eye to register.  Previously 0.10 meant 0.10
+    # while 0 meant 0.35, an inverted contract which let a reveal touch its
+    # endpoint and cut immediately.  Every real stop keeps the same local
+    # readability floor; transition_pass is the explicit zero-rest escape.
+    return max(SETTLE_SECONDS, float(seconds))
 
 
 def seconds_needed_for(
@@ -693,7 +756,14 @@ def build_look_path(
                 )
             at = leg_end
     limited, _ = _limit_speed(keyframes, ENERGY_LIMITS[energy])
-    return CropPath(_dedupe(limited))
+    delivered = CropPath(_dedupe(limited))
+    _record_missed_endpoint(
+        intended=boxes[-1],
+        delivered=delivered,
+        clip_id=clip_id,
+        degradations=degradations,
+    )
+    return delivered
 
 
 def _across(

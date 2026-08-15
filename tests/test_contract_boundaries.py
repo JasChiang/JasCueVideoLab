@@ -163,7 +163,7 @@ def test_selection_schema_requires_explicit_action_and_strict_mmss():
     assert "action_treatment" in shot["required"]
     assert shot["properties"]["action_id"]["enum"] == ["none", "a01"]
     assert shot["properties"]["action_treatment"]["enum"] == [
-        "none", "complete_here", "after_completion",
+        "none", "complete_here", "after_completion", "intentional_cut",
     ]
     assert shot["properties"]["seconds_needed"]["pattern"]
 
@@ -184,6 +184,90 @@ def test_action_id_is_validated_against_the_selected_source():
     }], material)
 
     assert "not an action offered by source C1" in faults[0]
+
+
+def test_primary_action_cannot_silently_drop_an_offered_action_contract():
+    from montagewright.planner import (
+        MaterialItem, action_contract_disagreements,
+    )
+
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=6.0, summary="tap then result",
+        action_ids=("a01",), action_windows=(("a01", 1.0, 4.0),),
+    )]
+    shot = {
+        "source_id": "C1", "picture_role": "primary_action",
+        "action_id": "none", "action_treatment": "none",
+    }
+
+    faults = action_contract_disagreements([shot], material)
+
+    assert len(faults) == 1
+    assert "must choose complete_here" in faults[0]
+
+
+def test_intentional_action_cut_must_really_end_before_completion():
+    from montagewright.planner import (
+        MaterialItem, action_contract_disagreements,
+    )
+
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="long gesture",
+        action_ids=("a01",), action_windows=(("a01", 1.0, 6.0),),
+    )]
+    common = {
+        "source_id": "C1", "picture_role": "primary_action",
+        "action_id": "a01", "action_treatment": "intentional_cut",
+        "start_seconds": 1.0, "usable_from_seconds": 0.0,
+        "usable_to_seconds": 8.0, "why": "cut on the gesture for momentum",
+    }
+
+    assert action_contract_disagreements([
+        {**common, "seconds_needed": 2.0}
+    ], material) == []
+    faults = action_contract_disagreements([
+        {**common, "seconds_needed": 5.0}
+    ], material)
+    assert "already reaches completion" in faults[0]
+
+
+def test_compiled_camera_move_that_misses_its_last_look_requires_replan():
+    from montagewright.reframe import build_look_path
+
+    degradations = []
+    path = build_look_path(
+        [(0.35, 0.2, 0.5, 0.3164), (0.35, 0.8, 0.5, 0.3164)],
+        source_aspect=16 / 9,
+        target_aspect=9 / 16,
+        duration_seconds=0.6,
+        energy="calm",
+        clip_id="k00",
+        degradations=degradations,
+    )
+
+    missed = [
+        step for step in degradations
+        if step.ladder_other == "camera_endpoint_not_reached_before_cut"
+    ]
+    assert path.keyframes
+    assert len(missed) == 1
+    assert missed[0].adjudication == "replan"
+
+
+def test_real_camera_stop_never_shrinks_below_readable_settle():
+    from montagewright.capabilities import SETTLE_SECONDS
+    from montagewright.reframe import seconds_needed_for
+
+    needed = seconds_needed_for([
+        (0.05, 0.25, 0.5, 0.3164),
+        (0.10, 0.75, 0.5, 0.3164),
+    ], "calm")
+    travelling_only = seconds_needed_for([
+        (-1.0, 0.25, 0.5, 0.3164),
+        (-1.0, 0.75, 0.5, 0.3164),
+    ], "calm")
+
+    assert needed >= travelling_only + SETTLE_SECONDS * 2
 
 
 def test_short_complete_action_is_rejected_before_rhythm():
@@ -242,6 +326,46 @@ def test_after_completion_is_a_safe_short_treatment(tmp_path):
     assert clip.approx_out_seconds == 17.0
     assert clip.action_contracts == []
     assert clip.moments == {}, "a finished action cannot be reintroduced as a Rhythm anchor"
+
+
+def test_intentional_cut_is_explicit_but_does_not_create_completion_floor(tmp_path):
+    from montagewright.cli import _edl_from_selection
+    from montagewright.clipcard import CARD_VERSION
+    from montagewright.planner import MaterialItem
+
+    card_path = tmp_path / "C1.json"
+    card_path.write_text(json.dumps({
+        "version": CARD_VERSION,
+        "action": [{
+            "id": "a01", "what": "hand crosses the display",
+            "from": "0:01", "to": "0:06",
+        }],
+    }), encoding="utf-8")
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="gesture",
+        action_ids=("a01",), action_windows=(("a01", 1.0, 6.0),),
+    )]
+    shot = {
+        "source_id": "C1", "span_id": "C1:s00",
+        "start_seconds": 1.0, "seconds_needed": 2.0,
+        "usable_from_seconds": 0.0, "usable_to_seconds": 8.0,
+        "action_id": "a01", "action_treatment": "intentional_cut",
+        "camera_intent": "hold", "source_motion_role": "locked",
+        "frame": "settles", "energy": "medium",
+        "why": "cut on the hand crossing frame to carry momentum",
+        "audio_role": "discard", "audio_completion": "none",
+        "picture_role": "primary_action",
+        "looks": [{"at": "display", "seconds": 0.0, "framing": "thirds"}],
+    }
+
+    edl, snaps = _edl_from_selection(
+        {"shots": [shot]}, tmp_path, {"C1": card_path}, material=material,
+    )
+
+    assert edl.clips[0].approx_in_seconds == 1.0
+    assert edl.clips[0].approx_out_seconds == 3.0
+    assert edl.clips[0].action_contracts == []
+    assert "intentionally cuts" in snaps["k00"]
 
 
 def test_local_clock_gate_keeps_invalid_mmss_visible_for_repair():
