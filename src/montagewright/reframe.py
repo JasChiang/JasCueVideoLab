@@ -572,6 +572,7 @@ def build_look_path(
     continuous_read: bool = False,
     monotonic_route: bool = False,
     native_speed: float = 0.0,
+    native_settles_at: float | None = None,
 ) -> CropPath:
     """Walk a shot through the places it looks, resting at each.
 
@@ -1046,6 +1047,52 @@ def build_look_path(
         clip_id=clip_id,
         degradations=degradations,
     )
+    # The take's own move comes to rest at a measured moment. If the digital
+    # crop is still travelling well after that, the tail of the move slides
+    # over a plate the source has already locked -- a lone drift, which is a
+    # different shot from the composite the earlier part shows. It is not
+    # silently retimed: compressing the move into the pre-settle window would
+    # raise its speed past the budget on exactly the shots that settle
+    # earliest, so the disagreement is surfaced for review instead.
+    if (
+        native_settles_at is not None
+        # The take has to have sustained a real move for its settle to be a
+        # stop the digital tail then violates. A source that locked off inside
+        # the first readable settle barely moved in the window, so a digital
+        # move over it is the shot's intended motion, not a drift.
+        and native_settles_at > SETTLE_SECONDS
+        and degradations is not None
+        and len(delivered.keyframes) >= 2
+    ):
+        final = delivered.keyframes[-1].crop
+        arrival = next(
+            (
+                one.seconds for one in delivered.keyframes
+                if _crop_distance(one.crop, final) < 1e-4
+            ),
+            delivered.keyframes[-1].seconds,
+        )
+        drift = arrival - native_settles_at
+        if drift > 0.25:
+            degradations.append(
+                DegradationStep(
+                    clip_id=clip_id,
+                    ladder="other",
+                    ladder_other="digital_moves_after_take_settles",
+                    trigger=(
+                        f"the take's own move settles at {native_settles_at:.2f}s "
+                        f"but the digital crop keeps travelling until "
+                        f"{arrival:.2f}s, so its last {drift:.2f}s slide over a "
+                        f"frame the source has already locked"
+                    ),
+                    measured={
+                        "settles_at_seconds": round(native_settles_at, 3),
+                        "digital_arrives_seconds": round(arrival, 3),
+                        "drift_seconds": round(drift, 3),
+                    },
+                    severity="advisory",
+                )
+            )
     # Always render the speed-limited route.  Returning the unlimited path on
     # the very condition that reported a speed shortfall made the degradation
     # describe a path that was not rendered and bypassed the camera budget.

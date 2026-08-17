@@ -982,13 +982,14 @@ def test_a_push_rests_too():
 WIDE, TIGHT = 0.3164, 0.20
 
 
-def _looks(stops, seconds=4.0, degradations=None, energy="active", native_speed=0.0):
+def _looks(stops, seconds=4.0, degradations=None, energy="active", native_speed=0.0, native_settles_at=None):
     from montagewright.reframe import build_look_path
 
     return build_look_path(
         stops, source_aspect=16 / 9, target_aspect=1080 / 1920,
         duration_seconds=seconds, energy=energy, clip_id="k00",
         degradations=degradations, native_speed=native_speed,
+        native_settles_at=native_settles_at,
     )
 
 
@@ -2500,3 +2501,54 @@ def test_a_digital_move_leaves_room_for_the_takes_own_motion():
         for earlier, later in zip(locked.keyframes, locked.keyframes[1:])
     )
     assert locked_peak > peak
+
+
+def test_a_move_that_drifts_past_the_takes_settle_is_reported():
+    """A crop still travelling after the source locks off is a lone drift.
+
+    It is not silently retimed: compressing the move into the pre-settle
+    window would raise its speed past the budget on exactly the shots that
+    settle earliest, so the disagreement is surfaced for review instead.
+    """
+
+    degradations = []
+    _looks(
+        [(0.4, 0.16, 0.5, WIDE), (0.4, 0.84, 0.5, WIDE)],
+        seconds=3.0, degradations=degradations, native_settles_at=0.6,
+    )
+    drift = [
+        one for one in degradations
+        if one.ladder_other == "digital_moves_after_take_settles"
+    ]
+    assert len(drift) == 1
+    m = drift[0].measured
+    assert m["settles_at_seconds"] == 0.6
+    assert m["digital_arrives_seconds"] > 0.3
+    assert drift[0].severity == "advisory"
+
+
+def test_a_move_that_lands_before_the_take_settles_is_not_flagged():
+    degradations = []
+    _looks(
+        [(0.4, 0.16, 0.5, WIDE), (0.4, 0.84, 0.5, WIDE)],
+        seconds=3.0, degradations=degradations, native_settles_at=2.9,
+    )
+    assert not [
+        one for one in degradations
+        if one.ladder_other == "digital_moves_after_take_settles"
+    ]
+
+
+def test_a_take_that_barely_moved_is_not_a_drift():
+    """A source that locked inside the first readable settle barely moved,
+    so a digital move over it is the shot's intended motion, not a drift."""
+
+    degradations = []
+    _looks(
+        [(0.4, 0.16, 0.5, WIDE), (0.4, 0.84, 0.5, WIDE)],
+        seconds=3.0, degradations=degradations, native_settles_at=0.12,
+    )
+    assert not [
+        one for one in degradations
+        if one.ladder_other == "digital_moves_after_take_settles"
+    ]

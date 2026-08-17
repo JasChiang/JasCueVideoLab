@@ -6604,6 +6604,10 @@ def test_selected_window_reports_local_source_motion_separately_from_semantics()
         "travel_frame_widths": 0.2,
         "peak_frame_widths_per_second": 0.3,
         "settles": True,
+        # The moving interval flagged as settling ends at source-time 2.0,
+        # which is 1.0s into the window that starts at 1.0 -- the moment the
+        # crop should have reached its last landing by.
+        "settles_at_seconds": 1.0,
         "event_ids": ["m00", "m01"],
     }
 

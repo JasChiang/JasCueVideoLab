@@ -496,6 +496,19 @@ def _source_motion_measurement(
             travel += float(interval.travel_vw) * overlap / seconds
             peak = max(peak, float(interval.peak_vw_s))
     states = tuple(dict.fromkeys(str(one.state) for one in selected))
+    # When the take's own move comes to rest, in shot time. The digital crop
+    # should reach its last landing by then: a crop still travelling after the
+    # source has locked off is a lone drift over a static plate, and a crop
+    # that stops at a different moment gives the shot two settles. The moment
+    # is the end of the last moving interval the flow flagged as settling.
+    settles_at = None
+    for interval in selected:
+        if str(interval.state) == "moving" and bool(interval.settles):
+            shot_time = float(interval.ends_seconds) - starts_seconds
+            if 0.0 < shot_time <= ends_seconds - starts_seconds + 1e-6:
+                settles_at = (
+                    shot_time if settles_at is None else max(settles_at, shot_time)
+                )
     return {
         "available": bool(selected),
         "states": list(states),
@@ -503,6 +516,9 @@ def _source_motion_measurement(
         "travel_frame_widths": round(travel, 4),
         "peak_frame_widths_per_second": round(peak, 4),
         "settles": any(bool(one.settles) for one in selected),
+        "settles_at_seconds": (
+            round(settles_at, 4) if settles_at is not None else None
+        ),
         "event_ids": [str(one.event_id) for one in selected],
     }
 
@@ -857,31 +873,34 @@ def _already_explained(report: "Report", clip_id: str) -> bool:
     )
 
 
-def _native_speed_for(
+def _native_motion_for(
     clip, reframe, measurements: "Mapping[str, Any] | None",
-) -> float:
-    """How much of the shot's motion budget the take is already spending.
+) -> tuple[float, float | None]:
+    """The take's own speed and settle time, before the crop is compiled.
 
     Only an authored or subject-following take contributes: its move is added
-    to the digital crop's on screen. A locked take contributes nothing, and a
-    handheld texture is jitter, not travel, so neither reduces the budget. The
-    number is the same peak the report records; it is read here, before the
-    crop is compiled, so the crop can be given the speed that is actually left
-    rather than the whole ceiling.
+    to the digital crop on screen. A locked take contributes nothing, and a
+    handheld texture is jitter, not travel, so neither counts. Both numbers
+    are the ones the report records; they are read here, before the crop is
+    built, so the crop can be given the speed the take leaves it and its
+    drift past the take's own settle can be seen.
     """
 
     if reframe is None or reframe.source_motion_role not in {
         "authored", "subject_follow",
     }:
-        return 0.0
+        return 0.0, None
     measured = _source_motion_measurement(
         (measurements or {}).get(clip.source_id, ()),
         clip.approx_in_seconds,
         clip.approx_out_seconds,
     )
     if not measured.get("available") or not measured.get("moving"):
-        return 0.0
-    return float(measured.get("peak_frame_widths_per_second") or 0.0)
+        return 0.0, None
+    return (
+        float(measured.get("peak_frame_widths_per_second") or 0.0),
+        measured.get("settles_at_seconds"),
+    )
 
 
 def _card_widths(card: dict[str, Any] | None) -> dict[str, float]:
@@ -2580,6 +2599,9 @@ def follow_subjects(
                         )
                     if len(stops) >= 2:
                         out_w, out_h = output_size
+                        _native = _native_motion_for(
+                            clip, reframe, source_motion_measurements,
+                        )
                         paths[clip.clip_id] = build_declared_look_path(
                             stops,
                             reframe=reframe,
@@ -2601,12 +2623,12 @@ def follow_subjects(
                             # planned to follow somebody walking held on a point
                             # halfway along the walk.
                             tracks=tracks,
-                            # What the take is already spending, so the crop is
-                            # given the speed that is left rather than the whole
-                            # ceiling and the two do not sum past it on screen.
-                            native_speed=_native_speed_for(
-                                clip, reframe, source_motion_measurements,
-                            ),
+                            # What the take is already spending and when it
+                            # comes to rest, so the crop is given the speed
+                            # that is left and its drift past the take's own
+                            # settle is surfaced.
+                            native_speed=_native[0],
+                            native_settles_at=_native[1],
                         )
                         tightest = min(
                             paths[clip.clip_id].keyframes,
