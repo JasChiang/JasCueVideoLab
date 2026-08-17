@@ -43,6 +43,13 @@ AudioCompletion = Literal[
 ActionCompletionPolicy = Literal[
     "must_complete", "may_cut_on_action", "loopable", "hold_after_result",
 ]
+ContentPolicy = Literal[
+    "complete_action",
+    "representative_excerpt",
+    "result_hold",
+    "continuous_process",
+    "static_display",
+]
 
 
 class ModelFacing(BaseModel):
@@ -223,6 +230,23 @@ class Look(ModelFacing):
             "again at a different framing -- that is what a push in is."
         )
     )
+    includes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Card subject labels that must remain legible together at this "
+            "landing. Empty means `at` alone. This is used for interactions "
+            "such as a hand using a tool on a target, a person holding an "
+            "object, or a comparison group; local code measures the union "
+            "instead of centring one participant and silently cropping the "
+            "others. It is a visual relationship, not a product-specific rule."
+        ),
+    )
+    # Local execution facts projected from a Direction content contract.
+    # They are deliberately absent from the provider Selection schema: the
+    # model names the semantic evidence, while local binding decides which
+    # landing must prove it and from what source-clock boundary onward.
+    geometry_query: str | None = None
+    geometry_after_source_seconds: float | None = Field(default=None, ge=0.0)
     entity_id: str | None = Field(
         default=None,
         pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$",
@@ -267,6 +291,7 @@ class Look(ModelFacing):
         "complete_hold",
         "centered_hold",
         "reveal_endpoint",
+        "sequential_read",
         "partial_reveal",
         "transition_pass",
     ] = Field(
@@ -278,6 +303,9 @@ class Look(ModelFacing):
             "physical subject to remain visible. `must_be_whole` separately "
             "answers that spatial constraint. centered_hold requires a stable recognizable "
             "landing; reveal_endpoint is the destination of a move; "
+            "sequential_read means a subject too wide for one delivery frame "
+            "is read edge-to-edge through locally generated landings, with a "
+            "brief readable pause at each; it never claims simultaneous whole; "
             "partial_reveal and transition_pass explicitly allow an object "
             "to enter, leave, or remain partly outside the frame. This is an "
             "editorial promise, not a detector result."
@@ -286,7 +314,9 @@ class Look(ModelFacing):
 
     @model_validator(mode="after")
     def presentation_matches_whole_promise(self) -> "Look":
-        if self.presentation_intent in {"partial_reveal", "transition_pass"} and self.must_be_whole:
+        if self.presentation_intent in {
+            "sequential_read", "partial_reveal", "transition_pass",
+        } and self.must_be_whole:
             raise ValueError(
                 f"{self.presentation_intent} cannot also promise must_be_whole"
             )
@@ -498,6 +528,26 @@ class ActionContract(Local):
         return max(0.0, self.safe_cut_after_seconds - source_in_seconds)
 
 
+class ContentContract(Local):
+    """The editorial reason a selected shot must remain on screen.
+
+    Direction decides the policy and minimum dwell while it can still compare
+    the complete rushes.  Selection chooses an executable source window, then
+    this local contract carries the decision through musical grounding and
+    release.  It intentionally contains no source-specific heuristics: a
+    product operation, a human gesture and a cooking step use the same five
+    policies.
+    """
+
+    commitment_id: str = Field(min_length=1)
+    purpose: str = Field(min_length=1)
+    policy: ContentPolicy
+    minimum_seconds: float = Field(gt=0.0)
+
+    def minimum_duration(self) -> float:
+        return self.minimum_seconds
+
+
 class SourceMotionContract(Local):
     """A locally measured source move that this shot explicitly keeps whole.
 
@@ -617,6 +667,14 @@ class Clip(ModelFacing):
         description=(
             "Local action-completion obligations for this selected source "
             "window. Gemini never authors these resolved seconds."
+        ),
+    )
+    content_contracts: list[ContentContract] = Field(
+        default_factory=list,
+        description=(
+            "Locally bound editorial dwell obligations inherited from the "
+            "selected candidate commitment. Rhythm may lengthen them, but "
+            "may not shorten them below their proven minimum."
         ),
     )
     source_motion_contracts: list[SourceMotionContract] = Field(
@@ -863,6 +921,7 @@ def looks_of(shot: dict) -> "list[Look]":
     looks = [
         Look(
             at=str(one.get("at", "")),
+            includes=[str(value) for value in (one.get("includes") or [])],
             entity_id=(
                 str(one["entity_id"])
                 if one.get("entity_id") not in {None, "", "none"}
@@ -874,6 +933,15 @@ def looks_of(shot: dict) -> "list[Look]":
             presentation_intent=str(
                 one.get("presentation_intent", "centered_hold")
                 or "centered_hold"
+            ),
+            geometry_query=(
+                str(one["geometry_query"])
+                if one.get("geometry_query") else None
+            ),
+            geometry_after_source_seconds=(
+                float(one["geometry_after_source_seconds"])
+                if one.get("geometry_after_source_seconds") is not None
+                else None
             ),
         )
         for one in (shot.get("looks") or [])

@@ -2596,7 +2596,7 @@ def test_a_questionable_identity_shot_can_be_replaced_without_moving_beats() -> 
     import inspect
 
     from montagewright import cli, webapp
-    from montagewright.webapp import PAGE, create_app
+    from montagewright.webapp import PAGE, _manual_replacement_plan, create_app
 
     paths = {route.path for route in create_app().routes if hasattr(route, "path")}
     assert "/api/runs/{run_id}/replacement-candidates" in paths
@@ -2605,8 +2605,11 @@ def test_a_questionable_identity_shot_can_be_replaced_without_moving_beats() -> 
     server = inspect.getsource(webapp.create_app)
     assert 'entry["seconds"]' in server
     assert "replacement span is too short for this rhythm slot" in server
-    assert '"camera_intent": "hold"' in server
-    assert '"entity_id": "none"' in server
+    rebinding = inspect.getsource(_manual_replacement_plan)
+    assert 'supported = {"hold"}' in rebinding
+    assert '"camera_intent": treatment' in rebinding
+    assert '"entity_id": None' in rebinding
+    assert '"delivery_status": "needs_review"' in rebinding
     assert '"manual_plan": wanted[index].get("manual_plan")' in server
 
     page = PAGE.read_text(encoding="utf-8")
@@ -5159,7 +5162,7 @@ def test_the_production_path_passes_the_output_size_to_the_looks_builder():
     from montagewright import pipeline
 
     source = inspect.getsource(pipeline.follow_subjects)
-    call = source[source.index("build_look_path("):]
+    call = source[source.index("build_declared_look_path("):]
     call = call[: call.index(")\n")]
     for given in ("source_width=", "source_height=", "output_width=", "output_height="):
         assert given in call, given
@@ -5602,7 +5605,7 @@ def test_the_production_path_hands_the_tracks_to_the_builder():
     from montagewright import pipeline
 
     source = inspect.getsource(pipeline.follow_subjects)
-    call = source[source.index("build_look_path("):]
+    call = source[source.index("build_declared_look_path("):]
     assert "tracks=tracks" in call[: call.index(")\n")]
 
     # And the sampler's timestamps reach the measurement, which is what
@@ -8395,11 +8398,14 @@ def test_the_floor_of_a_shot_has_one_name():
 
     source = inspect.getsource(ground_timeline)
     assert "source_floor = source_motion_floor if keeps_source_move else 0.0" in source
-    assert "floor_seconds = max(floor, source_floor, action_floor)" in source
+    assert (
+        "floor_seconds = max(floor, source_floor, action_floor, content_floor)"
+        in source
+    )
     assert "floor_seconds = wanted if keeps_source_move else 0.0" not in source
     # No path may re-derive it from the intent on its own.
     after = source.split(
-        "floor_seconds = max(floor, source_floor, action_floor)", 1
+        "floor_seconds = max(floor, source_floor, action_floor, content_floor)", 1
     )[1]
     assert "keeps_source_move else" not in after, (
         "every later path reads the floor rather than recomputing it"

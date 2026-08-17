@@ -775,7 +775,11 @@ def test_a_subject_that_only_jitters_is_not_chased():
     # wobble, which reads worse than aiming at one point.
     still = [(3.0 * i / 4, 0.5 + 0.001 * i, 0.5) for i in range(5)]
 
-    assert len(_zoom(track=still).keyframes) == 2
+    path = _zoom(track=still)
+    centres = [one.crop.x + one.crop.width / 2.0 for one in path.keyframes]
+    assert max(centres) - min(centres) < 1e-6
+    assert path.keyframes[0].crop == path.keyframes[1].crop
+    assert path.keyframes[-2].crop == path.keyframes[-1].crop
 
 
 # --- what a crop cannot measure ------------------------------------------
@@ -1356,7 +1360,7 @@ def test_a_three_look_plan_actually_reaches_the_look_builder(monkeypatch):
             "centre_y": 0.5, "width": 0.1, "height": 0.3, "frame_index": 0,
         }], Used()
 
-    monkeypatch.setattr(pipeline, "build_look_path", look_path)
+    monkeypatch.setattr(pipeline, "build_declared_look_path", look_path)
     monkeypatch.setattr(pipeline, "locate_subject", located)
     monkeypatch.setattr(pipeline, "_sample_frames", lambda *a, **k: ([], []))
     monkeypatch.setattr(pipeline, "_may_ask", lambda client: True)

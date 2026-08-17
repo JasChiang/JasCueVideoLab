@@ -476,7 +476,12 @@ def camera_floor_for(reframe: object | None) -> float:
         )
         for one in reframe.looks
     ]
-    if len(reframe.looks) < 2:
+    sequential_read = (
+        len(reframe.looks) == 1
+        and reframe.looks[0].presentation_intent == "sequential_read"
+        and len(reframe.look_boxes or []) >= 2
+    )
+    if len(reframe.looks) < 2 and not sequential_read:
         # With one look there is no camera journey whose declared dwell times
         # must add up.  `look.seconds` is then the Selection pass's preferred
         # shot length, and Rhythm exists precisely to reconsider that length
@@ -498,10 +503,14 @@ def camera_floor_for(reframe: object | None) -> float:
             MOVE_FLOORS.get(reframe.camera_move, 0.0), readable_rests
         )
 
-    stops = [
-        (rest, where[0], where[1], where[2])
-        for rest, where in zip(declared_stops, seen)
-    ]
+    if sequential_read:
+        rest = declared_stops[0]
+        stops = [(rest, where[0], where[1], where[2]) for where in seen]
+    else:
+        stops = [
+            (rest, where[0], where[1], where[2])
+            for rest, where in zip(declared_stops, seen)
+        ]
     return seconds_needed_for(stops, reframe.camera_energy)
 
 
@@ -531,6 +540,15 @@ def _source_motion_floor_for(clip: Clip) -> float:
             contract.minimum_duration_from(clip.approx_in_seconds)
             for contract in clip.source_motion_contracts
         ),
+        default=0.0,
+    )
+
+
+def _content_floor_for(clip: Clip) -> float:
+    """The editorial dwell promised before Selection chose a beat."""
+
+    return max(
+        (contract.minimum_duration() for contract in clip.content_contracts),
         default=0.0,
     )
 
@@ -688,6 +706,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         # to be remembered in four places is a rule that will be forgotten
         # in a fifth.
         action_floor = _action_floor_for(clip)
+        content_floor = _content_floor_for(clip)
         # The Selection duration is a pacing request, not proof that source
         # motion lasts that long. Only locally measured motion intervals are a
         # completion floor.
@@ -712,7 +731,7 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
         # physically selected move is the same kind of obligation: finish it
         # cleanly, or leave the musical grid.  No-music timelines use this
         # exact path too, so content rhythm and music rhythm cannot drift.
-        floor_seconds = max(floor, source_floor, action_floor)
+        floor_seconds = max(floor, source_floor, action_floor, content_floor)
         # Landing on a beat may lengthen a shot that exists to let the
         # source's own move play; it may not shorten one. `nearest_cue`
         # takes the closest event in either direction, so a cue thirteen
@@ -741,7 +760,16 @@ def ground_timeline(edl: EDL, grid: BeatGrid | None) -> GroundedTimeline:
                 )
             else:
                 end, landed, landed_kind = floor_end, None, None
-            if floor >= source_floor and floor >= action_floor:
+            if content_floor >= max(floor, source_floor, action_floor):
+                policy = (
+                    clip.content_contracts[0].policy
+                    if clip.content_contracts else "content"
+                )
+                obligation = (
+                    f"the selected {policy} content needs "
+                    f"{content_floor:.2f}s"
+                )
+            elif floor >= source_floor and floor >= action_floor:
                 obligation = f"the planned {move} needs {floor:.2f}s"
             elif source_floor >= action_floor:
                 obligation = f"the source move needs {source_floor:.2f}s"

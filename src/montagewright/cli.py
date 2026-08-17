@@ -19,7 +19,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 if TYPE_CHECKING:
     from montagewright.reference_grounding import ReferenceGroundingSpec
@@ -54,6 +54,7 @@ from montagewright.planning_artifacts import (
     asked as _asked,
     decide as _decide,
     decided as _decided,
+    latest_decision as _latest_decision,
     planning_contract as _planning_contract,
 )
 from montagewright.candidate_commitments import (
@@ -83,6 +84,8 @@ from montagewright.planner import (
     correct_candidate_options,
     decide_direction,
     replan_shots,
+    repair_selection_motion_contracts,
+    repair_selection_source_windows,
     repair_single_look_hold_overflow,
     sequence_disagreements,
     select_shots,
@@ -90,6 +93,7 @@ from montagewright.planner import (
 from montagewright.schema import (
     EDL,
     Clip,
+    ContentContract,
     looks_of,
     move_of_shot,
     reframe_of,
@@ -1804,6 +1808,9 @@ def command_render(args: argparse.Namespace) -> int:
         "direction_zh-TW.txt", _direction_schema(
             [span.span_id for item in material for span in item.spans],
             list(grounding_target_refs),
+            list(dict.fromkeys(
+                action_id for item in material for action_id in item.action_ids
+            )),
         )
     )
     asked = _asked(
@@ -1817,6 +1824,40 @@ def command_render(args: argparse.Namespace) -> int:
         ),
     )
     direction = _decided(work, "direction", asked)
+    migrated_direction_key = False
+    if direction is None:
+        # v5 replaced natural-language subject labels with source-scoped
+        # v01/v02 ids. A paid Direction written immediately before that
+        # migration belongs to this same run/brief/material but naturally has
+        # the previous schema key. Re-open only that narrow artifact shape;
+        # resolve_candidate_commitments still validates every span, action,
+        # label migration and geometry before it can be used. This is not a
+        # general stale-cache bypass.
+        try:
+            saved_direction = json.loads(
+                (work / "direction.json").read_text(encoding="utf-8")
+            )
+            legacy_key = str(saved_direction.get("key") or "")
+            legacy_value = _decided(work, "direction", legacy_key)
+            legacy_options = (
+                legacy_value.get("candidate_options") or []
+                if legacy_value is not None else []
+            )
+            if (
+                legacy_value is not None
+                and legacy_options
+                and all("required_visuals" in one for one in legacy_options)
+                and all("required_evidence" not in one for one in legacy_options)
+            ):
+                direction = legacy_value
+                migrated_direction_key = True
+                print(
+                    "direction: migrating the paid label-based visual contract "
+                    "to stable local ids",
+                    flush=True,
+                )
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
     if direction is None:
         ledger.check()
         direction, usage_direction = decide_direction(
@@ -1960,6 +2001,8 @@ def command_render(args: argparse.Namespace) -> int:
     for correction in range(3):
         try:
             commitments = bind_commitments(direction)
+            if migrated_direction_key:
+                _decide(work, "direction", asked, direction)
             break
         except CommitmentError as error:
             correction_fault = error
@@ -2117,7 +2160,7 @@ def command_render(args: argparse.Namespace) -> int:
             json.dumps(direction, sort_keys=True, ensure_ascii=False),
             commitments.sha256(),
             selection_contract,
-            "selection-local-contract-v6-explicit-action-treatment",
+            "selection-local-contract-v8-direction-bound-action",
         )
         provider_selection = _decided(work, "selection", legacy_chose)
     if provider_selection is not None:
@@ -2125,6 +2168,18 @@ def command_render(args: argparse.Namespace) -> int:
         # unambiguous monotonic duration repair on a copy before deciding that
         # the whole 18-shot edit needs another paid Selection pass.
         executable_cached_selection = copy.deepcopy(provider_selection)
+        # Cache and fresh answers must enter the same local contract graph.
+        # Newly added immutable action bounds live on commitments, not on an
+        # older provider artifact; project them before the source-window
+        # solver runs or resume will repeat an EDL failure that fresh planning
+        # already knows how to avoid.
+        from montagewright.candidate_commitments import (
+            bind_selection_content_contracts,
+        )
+
+        bind_selection_content_contracts(
+            executable_cached_selection.get("shots") or [], commitments, material
+        )
         cached_hold_repairs = repair_single_look_hold_overflow(
             executable_cached_selection
         )
@@ -2141,6 +2196,18 @@ def command_render(args: argparse.Namespace) -> int:
             executable_cached_selection.setdefault(
                 "duration_repairs", []
             ).extend(cached_camera_repairs)
+        cached_contract_repairs = (
+            *repair_selection_motion_contracts(
+                executable_cached_selection, material
+            ),
+            *repair_selection_source_windows(
+                executable_cached_selection, material
+            ),
+        )
+        if cached_contract_repairs:
+            executable_cached_selection.setdefault(
+                "duration_repairs", []
+            ).extend(cached_contract_repairs)
         cached_selection_faults = audit_cached_selection(
             executable_cached_selection,
             material,
@@ -2160,14 +2227,102 @@ def command_render(args: argparse.Namespace) -> int:
             provider_selection = None
         else:
             provider_selection = executable_cached_selection
-            if cached_hold_repairs or cached_camera_repairs:
+            if (
+                cached_hold_repairs
+                or cached_camera_repairs
+                or cached_contract_repairs
+            ):
                 print(
                     "selection: fitted executable shot timing locally; "
                     "all shots and commitments are unchanged",
                     flush=True,
                 )
     if provider_selection is None:
+        saved_attempt = (
+            _decided(work, "selection-attempt", chose)
+            or _latest_decision(work, "selection-attempt")
+        )
+        if saved_attempt is not None and selection_to_repair is None:
+            candidate = saved_attempt.get("selection")
+            if isinstance(candidate, dict):
+                selection_to_repair = copy.deepcopy(candidate)
+                print(
+                    "selection: recovered the latest paid provider attempt "
+                    "for local validation before asking again",
+                    flush=True,
+                )
+    if provider_selection is None:
+        # SelectionUnrenderable preserves the last paid editorial answer for
+        # Web inspection.  It used to be write-only from the CLI's point of
+        # view, so every resume paid Gemini to recreate the same 18 shots --
+        # even when a newer local contract could now normalize and accept the
+        # saved answer. Re-audit the content-addressed draft first and only
+        # ask the provider when substantive faults remain.
+        blocked_draft = (
+            _decided(work, "invalid-selection-draft", chose)
+            or _latest_decision(work, "invalid-selection-draft")
+        )
+        if blocked_draft is not None:
+            recovered = copy.deepcopy(blocked_draft)
+            for local_only in (
+                "invalid_selection_faults", "delivery_status", "draft_only",
+            ):
+                recovered.pop(local_only, None)
+            from montagewright.candidate_commitments import (
+                bind_selection_content_contracts,
+            )
+            from montagewright.planner import repair_camera_rests_to_duration
+
+            bind_selection_content_contracts(
+                recovered.get("shots") or [], commitments, material
+            )
+            recovered.setdefault("duration_repairs", []).extend(
+                repair_single_look_hold_overflow(recovered)
+            )
+            recovered.setdefault("duration_repairs", []).extend(
+                repair_camera_rests_to_duration(recovered, material)
+            )
+            recovered.setdefault("duration_repairs", []).extend(
+                repair_selection_motion_contracts(recovered, material)
+            )
+            recovered.setdefault("duration_repairs", []).extend(
+                repair_selection_source_windows(recovered, material)
+            )
+            recovered_faults = audit_cached_selection(
+                recovered,
+                material,
+                direction,
+                commitments=commitments,
+                grounding_spec=args.reference_grounding_spec,
+                duration_mode=args.duration_mode,
+            )
+            if not recovered_faults:
+                provider_selection = recovered
+                _decide(work, "selection", chose, provider_selection)
+                print(
+                    "selection: recovered the paid draft after current local "
+                    "contract validation; no provider repair needed",
+                    flush=True,
+                )
+            elif selection_to_repair is None:
+                selection_to_repair = recovered
+                print(
+                    "selection: the saved paid draft still needs a scoped "
+                    "editorial decision after local normalization\n  - "
+                    + "\n  - ".join(recovered_faults),
+                    flush=True,
+                )
+    if provider_selection is None:
         ledger.check()
+        def record_selection_attempt(
+            draft: dict[str, Any], faults: tuple[str, ...], attempt: int,
+        ) -> None:
+            _decide(work, "selection-attempt", chose, {
+                "attempt": attempt,
+                "selection": draft,
+                "faults": list(faults),
+            })
+
         try:
             provider_selection, usage_selection = select_shots(
                 material, direction, brief=brief, cache=cache, client=client,
@@ -2178,6 +2333,7 @@ def command_render(args: argparse.Namespace) -> int:
                 commitments=commitments,
                 duration_mode=args.duration_mode,
                 initial_selection=selection_to_repair,
+                attempt_recorder=record_selection_attempt,
             )
         except SelectionUnrenderable as error:
             # Keep the paid editorial answer visible without confusing it
@@ -2282,6 +2438,13 @@ def command_render(args: argparse.Namespace) -> int:
             selection, rushes, cards, transcripts=transcripts, library=library,
             material=material,
         )
+    from montagewright.planning_release import resolve_preferred_camera_durations
+
+    edl, camera_resolutions = resolve_preferred_camera_durations(
+        edl, duration_mode=args.duration_mode
+    )
+    for note in camera_resolutions:
+        print(f"  camera duration resolution: {note}", flush=True)
     if snaps:
         print(f"cut on action: {len(snaps)} in-points moved", flush=True)
     found = {path.stem: path for path in sources_paths}
@@ -3575,6 +3738,11 @@ def _edl_from_selection(
                         f"{clip_id} cannot resolve intentional_cut for action "
                         f"{selected_action!r}"
                     )
+                if start + wanted <= beat.starts_seconds + 1e-3:
+                    raise ValueError(
+                        f"{clip_id} marks {selected_action!r} intentional_cut, "
+                        "but its source window ends before that action begins"
+                    )
                 if start >= beat.ends_seconds - 1e-3 or start + wanted >= beat.ends_seconds - 1e-3:
                     raise ValueError(
                         f"{clip_id} marks {selected_action!r} intentional_cut, "
@@ -3646,6 +3814,23 @@ def _edl_from_selection(
                     source_end=start + wanted,
                     motion_role=str(shot.get("source_motion_role") or ""),
                 )
+        content_contract = None
+        content_policy = str(shot.get("content_policy") or "")
+        content_minimum = float(shot.get("content_min_seconds") or 0.0)
+        commitment_id = str(shot.get("commitment_id") or "")
+        content_purpose = str(shot.get("content_purpose") or "")
+        if (
+            content_policy
+            and content_minimum > 0.0
+            and commitment_id
+            and content_purpose
+        ):
+            content_contract = ContentContract(
+                commitment_id=commitment_id,
+                purpose=content_purpose,
+                policy=content_policy,
+                minimum_seconds=content_minimum,
+            )
         clips.append(
             Clip(
                 clip_id=clip_id,
@@ -3676,6 +3861,9 @@ def _edl_from_selection(
                 },
                 action_contracts=(
                     [action_contract] if action_contract is not None else []
+                ),
+                content_contracts=(
+                    [content_contract] if content_contract is not None else []
                 ),
                 source_motion_contracts=(
                     [source_motion_contract]
@@ -3755,11 +3943,27 @@ def _usable_window(shot: dict) -> tuple[float, float] | None:
 
 
 def _delivery_selection(
-    selection: dict[str, Any], reference_grounding: dict[str, dict]
+    selection: dict[str, Any], reference_grounding: dict[str, dict],
+    degradations: Sequence[Any] = (),
 ) -> tuple[dict[str, Any], str]:
     """Project immutable planning evidence into honest delivery status."""
 
     delivery_selection = copy.deepcopy(selection)
+    unresolved_by_clip: dict[str, list[str]] = {}
+    for step in degradations:
+        adjudication = getattr(step, "adjudication", "unadjudicated")
+        if adjudication == "accept":
+            continue
+        clip_id = str(getattr(step, "clip_id", "") or "")
+        if not clip_id:
+            continue
+        reason = str(
+            getattr(step, "adjudication_reason", "")
+            or getattr(step, "trigger", "camera treatment was not delivered")
+        )
+        if adjudication == "unadjudicated":
+            reason = "尚未逐顆驗收：" + reason
+        unresolved_by_clip.setdefault(clip_id, []).append(reason)
     for index, shot in enumerate(delivery_selection.get("shots") or []):
         if (
             reference_grounding.get(f"k{index:02d}", {}).get("status")
@@ -3767,12 +3971,16 @@ def _delivery_selection(
         ):
             shot["identity_status"] = "track_validated"
             shot["identity_issue"] = ""
+        clip_id = f"k{index:02d}"
+        if clip_id in unresolved_by_clip:
+            shot["delivery_status"] = "needs_review"
+            shot["delivery_issue"] = "; ".join(unresolved_by_clip[clip_id])
     delivery_status = (
         "needs_review"
-        if any(
-            shot.get("identity_status") in {"needs_review", "unverified"}
-            for shot in delivery_selection.get("shots") or []
-        )
+        if unresolved_by_clip or any(
+                shot.get("identity_status") in {"needs_review", "unverified"}
+                for shot in delivery_selection.get("shots") or []
+            )
         else "ready"
     )
     return delivery_selection, delivery_status
@@ -3784,7 +3992,7 @@ def _write_report(output: Path, **parts) -> None:
     report = parts["report"]
     plan = parts.get("plan")
     delivery_selection, delivery_status = _delivery_selection(
-        parts["selection"], report.reference_grounding
+        parts["selection"], report.reference_grounding, report.degradations
     )
     payload = {
         "direction": parts["direction"],

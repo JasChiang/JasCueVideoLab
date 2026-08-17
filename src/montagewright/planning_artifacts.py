@@ -46,6 +46,25 @@ def decided(work: Path, name: str, key: str) -> dict | None:
     return value
 
 
+def latest_decision(work: Path, name: str) -> dict | None:
+    """Return a checksum-valid older artifact only as migration input.
+
+    Callers must run their current full local validator before publishing the
+    value under a new question key.  Normal cache reads remain strict.
+    """
+
+    path = Path(work) / f"{name}.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = saved.get("value")
+    checksum = saved.get("value_sha256")
+    if checksum is None or checksum != _value_checksum(value):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def decide(work: Path, name: str, key: str, value: dict) -> dict:
     """Atomically publish the compatibility cache used by existing runs."""
 

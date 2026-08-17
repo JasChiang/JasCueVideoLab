@@ -1479,6 +1479,124 @@ def _typed_path(raw: str) -> Path | None:
     return Path(text).expanduser()
 
 
+def _manual_replacement_plan(
+    base: dict,
+    card: dict,
+    *,
+    source_id: str,
+    span_id: str,
+    start: float,
+    end: float,
+    duration: float,
+    confirms_identity: bool,
+) -> dict:
+    """Rebind a treatment to a person-selected source span."""
+
+    subjects = [
+        one for one in (card.get("subjects") or [])
+        if isinstance(one, dict) and str(one.get("label") or "").strip()
+    ]
+    labels = [str(one["label"]).strip() for one in subjects]
+    moving = any(bool(one.get("moves")) for one in subjects)
+    try:
+        span_index = int(span_id.rsplit(":s", 1)[1])
+        span = (card.get("segments") or [])[span_index]
+    except (IndexError, TypeError, ValueError):
+        span = {}
+    motion_role = str(span.get("motion_role") or "unknown")
+
+    supported = {"hold"}
+    if labels:
+        supported.update({"push_in", "pull_out"})
+    if moving:
+        supported.add("follow_subject")
+    if len(labels) >= 2:
+        supported.update({"reveal", "compare"})
+    if len(labels) >= 3:
+        supported.add("multi_stop")
+    if motion_role in {"authored", "subject_follow"}:
+        supported.add("use_source_motion")
+
+    aliases = {
+        "pan": "reveal", "tilt": "reveal", "push": "push_in",
+        "pull": "pull_out", "follow": "follow_subject",
+    }
+    candidates = [
+        base.get("camera_intent"), base.get("fallback_treatment"),
+        base.get("preferred_treatment"), base.get("recommended_treatment"),
+    ]
+    requested = aliases.get(
+        str(candidates[0] or "hold"), str(candidates[0] or "hold")
+    )
+    treatment = next(
+        (
+            aliases.get(str(value), str(value))
+            for value in candidates
+            if aliases.get(str(value), str(value)) in supported
+        ),
+        "hold",
+    )
+
+    count = 1
+    if treatment in {"reveal", "compare"}:
+        count = 2
+    elif treatment == "multi_stop":
+        count = 3
+    chosen_labels = labels[:count] or [str(card.get("summary") or source_id)]
+    per_look = duration / max(1, len(chosen_labels))
+    old_looks = [one for one in (base.get("looks") or []) if isinstance(one, dict)]
+    looks = []
+    for index, label in enumerate(chosen_labels):
+        old = old_looks[min(index, len(old_looks) - 1)] if old_looks else {}
+        presentation = "centered_hold"
+        if treatment in {"reveal", "compare", "multi_stop"}:
+            presentation = (
+                "reveal_endpoint"
+                if index == len(chosen_labels) - 1 else "complete_hold"
+            )
+        looks.append({
+            **old,
+            "at": label,
+            "includes": [],
+            "entity_id": None,
+            "seconds": per_look,
+            "must_be_whole": False,
+            "presentation_intent": presentation,
+        })
+
+    target = str(base.get("identity_target_id") or "")
+    changed = treatment != requested
+    if not confirms_identity and target:
+        issue = "使用者尚未確認這個替換片段包含指定主體"
+    elif changed:
+        issue = f"原計畫 {requested} 不適用此素材；已改用 {treatment}，等待逐顆驗收"
+    else:
+        issue = "手動替換後已重新編譯運鏡，等待逐顆驗收"
+    return {
+        **base,
+        "source_id": source_id,
+        "span_id": span_id,
+        "start_seconds": start,
+        "usable_start_seconds": start,
+        "usable_end_seconds": end,
+        "subject": str(card.get("summary") or source_id),
+        "why": "使用者在 Web UI 指定替換片段；沿用原節奏格並重新驗算運鏡。",
+        "camera_intent": treatment,
+        "source_motion_role": motion_role,
+        "frame": "settles",
+        "action_id": "none",
+        "content_action_id": "none",
+        "looks": looks,
+        "identity_status": "human_verified" if confirms_identity else (
+            "needs_review" if target else "not_applicable"
+        ),
+        "identity_target_id": target or None,
+        "identity_issue": issue,
+        "delivery_status": "needs_review",
+        "delivery_issue": issue,
+    }
+
+
 def _save(upload: UploadFile, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as handle:
@@ -2882,37 +3000,12 @@ def create_app() -> FastAPI:
             if start is None or end is None or end - start + 1e-6 < duration:
                 raise HTTPException(422, "replacement span is too short for this rhythm slot")
             base = dict(original_plans[int(entry["index"])])
-            target = str(base.get("identity_target_id") or "")
             entry["in_seconds"] = float(start)
-            entry["manual_plan"] = {
-                **base,
-                "source_id": source_id,
-                "span_id": span_id,
-                "start_seconds": float(start),
-                "usable_start_seconds": float(start),
-                "usable_end_seconds": float(end),
-                "subject": str(card.get("summary") or source_id),
-                "why": "使用者在 Web UI 指定替換片段；沿用原節奏格。",
-                "camera_intent": "hold",
-                "frame": "settles",
-                "looks": [{
-                    "at": str(card.get("summary") or source_id),
-                    "framing": "center",
-                    "seconds": duration,
-                    "must_be_whole": False,
-                    "entity_id": "none",
-                }],
-                "identity_status": (
-                    "human_verified"
-                    if replacement.get("confirms_identity") else "needs_review"
-                ),
-                "identity_target_id": target or None,
-                "identity_issue": (
-                    ""
-                    if replacement.get("confirms_identity")
-                    else "使用者尚未確認這個替換片段包含指定主體"
-                ),
-            }
+            entry["manual_plan"] = _manual_replacement_plan(
+                base, card, source_id=source_id, span_id=span_id,
+                start=float(start), end=float(end), duration=duration,
+                confirms_identity=bool(replacement.get("confirms_identity")),
+            )
         old_shape = [
             (
                 int(one["selection_index"]),

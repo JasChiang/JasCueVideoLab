@@ -1,6 +1,8 @@
 import json
 
-from montagewright.planning_artifacts import asked, decide, decided
+from montagewright.planning_artifacts import (
+    asked, decide, decided, latest_decision,
+)
 
 
 def test_paid_decision_cache_is_keyed_and_atomically_round_trips(tmp_path):
@@ -34,3 +36,16 @@ def test_legacy_paid_decision_without_checksum_remains_readable(tmp_path):
     )
 
     assert decided(tmp_path, "selection", key) == value
+
+
+def test_latest_decision_is_only_a_checksum_valid_migration_input(tmp_path):
+    decide(tmp_path, "selection-attempt", "old-key", {"shots": [1]})
+
+    assert decided(tmp_path, "selection-attempt", "new-key") is None
+    assert latest_decision(tmp_path, "selection-attempt") == {"shots": [1]}
+
+    path = tmp_path / "selection-attempt.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved["value"]["shots"] = [2]
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    assert latest_decision(tmp_path, "selection-attempt") is None

@@ -17,7 +17,7 @@ from montagewright.planning_state import canonical_json
 from montagewright.spans import seconds_of
 
 
-COMMITMENT_VERSION = "candidate-commitment-v1"
+COMMITMENT_VERSION = "candidate-commitment-v6-outcome-endpoint"
 PictureRole = Literal[
     "speaker", "primary_action", "illustrative_broll", "reaction",
     "establishing", "transition", "punchline_hold", "end_hold",
@@ -25,7 +25,7 @@ PictureRole = Literal[
 ]
 PresentationIntent = Literal[
     "complete_hold", "centered_hold", "reveal_endpoint",
-    "partial_reveal", "transition_pass",
+    "sequential_read", "partial_reveal", "transition_pass",
 ]
 MotionPreference = Literal["native_first", "virtual_allowed", "hold"]
 CameraTreatment = Literal[
@@ -37,6 +37,16 @@ SuggestedMove = Literal[
     "pull_out", "follow", "compound",
 ]
 Tier = Literal["primary", "alternate"]
+ContentPolicy = Literal[
+    "complete_action",
+    "representative_excerpt",
+    "result_hold",
+    "continuous_process",
+    "static_display",
+]
+VisualRelationship = Literal[
+    "single", "simultaneous", "ordered", "action_sequence",
+]
 
 
 class CommitmentError(ValueError):
@@ -56,6 +66,18 @@ class CandidateOption(StrictFrozen):
     tier: Tier
     min_supported_seconds: float = Field(gt=0.0)
     presentation_intent: PresentationIntent
+    content_policy: ContentPolicy = "static_display"
+    # The semantic action Direction chose for this content promise.  This is
+    # provider-authored as an id, then resolved to immutable source-clock
+    # facts below.  Selection must not freely pair a purpose with a different
+    # nearby action merely because both happen to be in the same take.
+    content_action_id: str = "none"
+    content_action_start_seconds: float | None = None
+    content_action_complete_seconds: float | None = None
+    required_visuals: tuple[str, ...] = ()
+    required_evidence: tuple[str, ...] = ()
+    outcome_evidence: str | None = None
+    visual_relationship: VisualRelationship = "single"
     motion_preference: MotionPreference
     target_id: str = Field(min_length=1, max_length=256)
     why: str = Field(min_length=1, max_length=1200)
@@ -129,7 +151,13 @@ def _camera_treatments(
 
 
 class CandidateCommitments(StrictFrozen):
-    contract_version: Literal["candidate-commitment-v1"]
+    contract_version: Literal[
+        "candidate-commitment-v1", "candidate-commitment-v2-content-policy",
+        "candidate-commitment-v3-action-bound-content-policy",
+        "candidate-commitment-v4-sequential-read",
+        "candidate-commitment-v5-visual-relationships",
+        "candidate-commitment-v6-outcome-endpoint",
+    ]
     material_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     direction_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_aspect: str = Field(min_length=1, max_length=16)
@@ -195,7 +223,8 @@ def _role_budget_sentence() -> str:
 
 
 def provider_commitment_schema(
-    span_ids: Sequence[str], grounding_target_ids: Sequence[str]
+    span_ids: Sequence[str], grounding_target_ids: Sequence[str],
+    action_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Flat provider grammar; local facts and hashes are deliberately absent."""
 
@@ -214,7 +243,10 @@ def provider_commitment_schema(
             "required": [
                 "commitment_id", "purpose", "required", "picture_role",
                 "span_id", "tier", "min_supported_seconds",
-                "presentation_intent", "target_id", "why",
+                "presentation_intent", "content_policy", "content_action_id",
+                "required_visuals", "required_evidence", "outcome_evidence",
+                "visual_relationship",
+                "target_id", "why",
                 "recommended_treatment", "suggested_move", "camera_route",
                 "motion_reason", "fallback_treatment",
             ],
@@ -245,7 +277,89 @@ def provider_commitment_schema(
                     ),
                 },
                 "presentation_intent": {
-                    "type": "string", "enum": list(PresentationIntent.__args__)
+                    "type": "string", "enum": list(PresentationIntent.__args__),
+                    "description": (
+                        "畫面如何被讀懂。寬文字、橫向 UI、產品列在直式比例"
+                        "無法同幀看全，但可以從一端讀到另一端時，選 "
+                        "sequential_read 並建議 reveal 或 multi_stop；本機會依"
+                        "主體實測範圍產生兩到三個落點並在落點短暫停留。只有"
+                        "真的必須同一瞬間完整看見時才用 must_be_whole 的"
+                        "完整型意圖並換較寬素材。"
+                    ),
+                },
+                "content_policy": {
+                    "type": "string", "enum": list(ContentPolicy.__args__),
+                    "description": (
+                        "這顆如何履行內容：complete_action 必須從具名動作開始"
+                        "看到完成；representative_excerpt 可有理由地取代表片段；"
+                        "result_hold 是結果已出現後的可讀停留；continuous_process "
+                        "是瀏覽、旋轉、舞蹈等沒有唯一終點的持續過程；"
+                        "static_display 是建立場景、產品細節或靜態資訊。需要先操作"
+                        "再看結果時，不要把長流程硬塞一顆：建立兩個相鄰 commitment。"
+                        "目前執行器沒有任意 speed-ramp 契約；不要用較短秒數假裝"
+                        "快轉完整動作。冗長但無唯一終點的中段可選 "
+                        "representative_excerpt／continuous_process，具因果的起點與"
+                        "結果則拆成相鄰 commitment，直到時間映射能被逐段驗證。"
+                    ),
+                },
+                "content_action_id": {
+                    "type": "string",
+                    "enum": ["none", *dict.fromkeys(action_ids)],
+                    "description": (
+                        "content_policy 所指的素材卡具名動作。complete_action "
+                        "必須選一個能在 span 內完整開始並完成的 action id；"
+                        "result_hold 只有在這個 span 仍包含動作完成點、且完成後"
+                        "留得下 min_supported_seconds 時才填該 id，否則填 none；"
+                        "representative_excerpt／continuous_process 只有刻意在該"
+                        "動作中取樣時才填 id；static_display 一律填 none。"
+                    ),
+                },
+                "required_visuals": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {"type": "string"},
+                    "description": (
+                        "Copy only the stable v01/v02... ids shown beside this "
+                        "source's 可框住的主體. Never translate or rewrite their "
+                        "labels. Include every spatial participant in an interaction: "
+                        "actor/hand, tool/product, target/document, and result "
+                        "when it has a v-id. This applies equally to tutorials, "
+                        "people holding products, comparisons, cooking, UI, "
+                        "performances and scene reveals."
+                    ),
+                },
+                "required_evidence": {
+                    "type": "array",
+                    "maxItems": 4,
+                    "items": {"type": "string"},
+                    "description": (
+                        "Semantic proof that has no v-id/box: an interface state, "
+                        "recognition result, completed gesture or causal outcome. "
+                        "Do not put it in required_visuals. Named source actions "
+                        "remain bound separately by content_action_id."
+                    ),
+                },
+                "outcome_evidence": {
+                    "type": "string",
+                    "description": (
+                        "For complete_action/result_hold, copy exactly one item "
+                        "from required_evidence that must be visible at the final "
+                        "stable landing after the action completes. Write none "
+                        "when there is no causal visual result. Do not name the "
+                        "carrier object here; it remains in required_visuals."
+                    ),
+                },
+                "visual_relationship": {
+                    "type": "string",
+                    "enum": list(VisualRelationship.__args__),
+                    "description": (
+                        "single: one subject carries the beat; simultaneous: "
+                        "all required visuals must be readable in the same "
+                        "landing; ordered: the camera may read them in order; "
+                        "action_sequence: their setup/action/result must be "
+                        "preserved across the selected action window."
+                    ),
                 },
                 "recommended_treatment": {
                     "type": "string", "enum": list(CameraTreatment.__args__),
@@ -367,6 +481,144 @@ def resolve_candidate_commitments(
         if target_id not in known_targets:
             faults.append(f"option {index} names unknown target {target_id!r}")
             continue
+        content_policy = str(raw.get("content_policy") or "static_display")
+        content_action_id = str(raw.get("content_action_id") or "none")
+        local_item = item_index.get(str(span.source_id))
+        requested_visuals = tuple(dict.fromkeys(
+            str(value).strip()
+            for value in (raw.get("required_visuals") or ())
+            if str(value).strip()
+        ))
+        requested_evidence = tuple(dict.fromkeys(
+            str(value).strip()
+            for value in (raw.get("required_evidence") or ())
+            if str(value).strip()
+        ))
+        requested_outcome = str(raw.get("outcome_evidence") or "none").strip()
+        relationship = str(raw.get("visual_relationship") or "single")
+        geometry = tuple(getattr(local_item, "subject_geometry", ()) or ())
+        visual_ids = {
+            f"v{at:02d}": str(entry[0])
+            for at, entry in enumerate(geometry, start=1)
+        }
+        ids_by_label = {label: visual_id for visual_id, label in visual_ids.items()}
+        # v5 provider answers use stable ids. A cached v4-era Direction from
+        # the first paid attempt used the exact card label; migrate that
+        # locally so resuming does not buy Direction again. Anything it named
+        # that never had geometry is semantic evidence, not a phantom bbox.
+        is_stable_answer = "required_evidence" in raw
+        required_visuals: list[str] = []
+        migrated_evidence = list(requested_evidence)
+        unknown_visuals: list[str] = []
+        for value in requested_visuals:
+            if value in visual_ids:
+                required_visuals.append(value)
+            elif value in ids_by_label:
+                required_visuals.append(ids_by_label[value])
+            elif is_stable_answer:
+                unknown_visuals.append(value)
+            else:
+                migrated_evidence.append(value)
+        if unknown_visuals:
+            faults.append(
+                f"option {index} names unknown visual ids for "
+                f"{span.source_id}: {', '.join(unknown_visuals)}"
+            )
+            continue
+        if requested_outcome == "none" and (
+            "outcome_evidence" not in raw
+            and content_policy in {"complete_action", "result_hold"}
+            and len(migrated_evidence) == 1
+        ):
+            # Safe migration for cached v5 Directions such as the Pixel LED
+            # run. Multiple semantic facts are ambiguous and are never
+            # guessed into an endpoint.
+            requested_outcome = migrated_evidence[0]
+        outcome_evidence = (
+            requested_outcome if requested_outcome != "none" else None
+        )
+        if outcome_evidence is not None and outcome_evidence not in migrated_evidence:
+            faults.append(
+                f"option {index} outcome_evidence must copy one item from "
+                "required_evidence"
+            )
+            continue
+        if relationship == "simultaneous" and len(required_visuals) < 2:
+            faults.append(
+                f"option {index} says simultaneous but names fewer than two visuals"
+            )
+            continue
+        if relationship == "action_sequence" and content_action_id == "none":
+            faults.append(
+                f"option {index} says action_sequence but binds no content action"
+            )
+            continue
+        actions_reaching_span = tuple(
+            (str(action_id), float(start), float(end))
+            for action_id, start, end in (
+                getattr(local_item, "action_windows", ()) or ()
+            )
+            if float(start) <= float(span.ends_seconds) + 1e-6
+            and float(end) >= float(span.starts_seconds) - 1e-6
+        )
+        actions_inside_span = tuple(
+            action for action in actions_reaching_span
+            if action[1] >= float(span.starts_seconds) - 1e-6
+            and action[2] <= float(span.ends_seconds) + 1e-6
+        )
+        selected_action = next((
+            action for action in actions_reaching_span
+            if action[0] == content_action_id
+            or action[0] == content_action_id.rsplit(":", 1)[-1]
+        ), None)
+        if content_action_id != "none" and selected_action is None:
+            faults.append(
+                f"option {index} binds action {content_action_id!r}, which is "
+                f"not reachable inside {span_id}"
+            )
+            continue
+        if content_policy == "complete_action":
+            if content_action_id == "none" or selected_action not in actions_inside_span:
+                faults.append(
+                    f"option {index} promises complete_action but does not bind "
+                    f"a locally timed action that starts and completes inside {span_id}; "
+                    "name content_action_id or choose another content policy"
+                )
+                continue
+        elif content_policy == "result_hold" and selected_action is not None:
+            remaining = float(span.ends_seconds) - selected_action[2]
+            if remaining + 1e-6 < seconds:
+                faults.append(
+                    f"option {index} binds result_hold to {content_action_id!r}, "
+                    f"but only {remaining:.3f}s remains after completion inside "
+                    f"{span_id}; use content_action_id=none for an already-visible "
+                    "result span or choose a later span"
+                )
+                continue
+        elif content_policy == "static_display" and content_action_id != "none":
+            faults.append(
+                f"option {index} marks static_display but binds action "
+                f"{content_action_id!r}; use none"
+            )
+            continue
+        effective_seconds = seconds
+        if content_policy == "complete_action" and selected_action is not None:
+            effective_seconds = max(
+                seconds, selected_action[2] - selected_action[1]
+            )
+        if effective_seconds > available + 0.001:
+            faults.append(
+                f"option {index} needs {effective_seconds:.3f}s after binding "
+                f"{content_action_id!r}, but {span_id} has {available:.3f}s"
+            )
+            continue
+        if effective_seconds > supported + 0.001:
+            faults.append(
+                f"option {index} needs {effective_seconds:.3f}s after binding "
+                f"{content_action_id!r}, but {span_id} has only "
+                f"{supported:.3f}s of locally supported evidence"
+            )
+            continue
         # A source the screen found the identity absent from may still be
         # promised it here, and that disagreement is not this stage's to
         # settle. The screen reads a 640-pixel proxy at a frame a second and
@@ -390,7 +642,88 @@ def resolve_candidate_commitments(
             direction_treatment = cast(CameraTreatment, str(
                 raw.get("recommended_treatment") or "hold"
             ))
-            if direction_treatment in treatments:
+            presentation_intent = str(
+                raw.get("presentation_intent") or "centered_hold"
+            )
+            # A wide required visual or ordered group cannot be made readable
+            # by centring one narrow delivery crop. Promote that promise to
+            # an edge-to-edge sequential read using source geometry already
+            # measured for this exact aspect. This is content-agnostic: it
+            # applies equally to signage, a UI, people, or a product row.
+            if (
+                relationship in {"single", "ordered"}
+                and required_visuals
+                # A wide carrier does not imply that the viewer must read the
+                # whole carrier. When Direction names a causal result without
+                # its own box, that result -- not the carrier edge -- is the
+                # endpoint of the shot.
+                and not (
+                    outcome_evidence
+                    and content_policy in {"complete_action", "result_hold"}
+                )
+                and local_item is not None
+                and presentation_intent not in {
+                    "sequential_read", "partial_reveal", "transition_pass",
+                }
+            ):
+                visual_geometry = {
+                    f"v{at:02d}": entry
+                    for at, entry in enumerate(geometry, start=1)
+                    if f"v{at:02d}" in required_visuals
+                }
+                if len(visual_geometry) == len(set(required_visuals)):
+                    left = min(
+                        float(entry[2]) - float(entry[4]) / 2.0
+                        for entry in visual_geometry.values()
+                    )
+                    right = max(
+                        float(entry[2]) + float(entry[4]) / 2.0
+                        for entry in visual_geometry.values()
+                    )
+                    if right - left > float(
+                        getattr(local_item, "crop_width", 1.0)
+                    ) + 0.02:
+                        presentation_intent = "sequential_read"
+            if presentation_intent == "sequential_read":
+                readable = tuple(
+                    treatment for treatment in (
+                        "reveal", "multi_stop", "use_source_motion"
+                    )
+                    if treatment in treatments
+                )
+                if not readable:
+                    faults.append(
+                        f"option {index} uses sequential_read on {span_id}, but "
+                        "local crop geometry has no readable travel treatment"
+                    )
+                    continue
+                if direction_treatment in readable:
+                    preferred = direction_treatment
+                else:
+                    # Geometry is a local fact discovered while binding the
+                    # Direction answer.  If that fact promotes a centred hold
+                    # into a sequential read, the provider's earlier hold,
+                    # push, or follow preference is advice about a contract
+                    # that no longer exists.  Select the least elaborate
+                    # locally executable reader instead of buying correction
+                    # calls merely to have Gemini repeat that fact.
+                    preferred = (
+                        "multi_stop"
+                        if (
+                            relationship == "ordered"
+                            and len(required_visuals) > 2
+                            and "multi_stop" in readable
+                        )
+                        else "reveal"
+                        if "reveal" in readable
+                        else readable[0]
+                    )
+                    feasibility_reason = (
+                        f"{feasibility_reason}; local aspect geometry promoted "
+                        f"the content to sequential_read and selected {preferred} "
+                        f"instead of advisory {direction_treatment}"
+                    )
+            elif direction_treatment in treatments:
                 preferred = direction_treatment
             options.append(CandidateOption(
                 commitment_id=raw.get("commitment_id"),
@@ -399,8 +732,24 @@ def resolve_candidate_commitments(
                 picture_role=raw.get("picture_role"),
                 span_id=span_id,
                 tier=raw.get("tier"),
-                min_supported_seconds=seconds,
-                presentation_intent=raw.get("presentation_intent"),
+                min_supported_seconds=effective_seconds,
+                presentation_intent=presentation_intent,
+                # Legacy cached/test Directions predate the field. They are
+                # treated as static rather than being granted permission to
+                # cut a named action; every new provider answer is required
+                # by the v2 schema to make the policy explicit.
+                content_policy=content_policy,
+                content_action_id=content_action_id,
+                content_action_start_seconds=(
+                    selected_action[1] if selected_action is not None else None
+                ),
+                content_action_complete_seconds=(
+                    selected_action[2] if selected_action is not None else None
+                ),
+                required_visuals=tuple(dict.fromkeys(required_visuals)),
+                required_evidence=tuple(dict.fromkeys(migrated_evidence)),
+                outcome_evidence=outcome_evidence,
+                visual_relationship=cast(VisualRelationship, relationship),
                 motion_preference=preference,
                 target_id=target_id,
                 why=raw.get("why"),
@@ -460,7 +809,19 @@ def describe_commitments(commitments: CandidateCommitments) -> str:
         lines.append(
             f"- {option.commitment_id} [{option.tier}] span={option.span_id}; "
             f"role={option.picture_role}; minimum={option.min_supported_seconds:g}s; "
-            f"presentation={option.presentation_intent}; motion="
+            f"content_policy={option.content_policy}; "
+            + (
+                f"content_action={option.content_action_id} "
+                f"({option.content_action_start_seconds:g}–"
+                f"{option.content_action_complete_seconds:g}s source clock; "
+                f"complete duration="
+                f"{option.content_action_complete_seconds - option.content_action_start_seconds:g}s); "
+                if option.content_action_id != "none"
+                and option.content_action_start_seconds is not None
+                and option.content_action_complete_seconds is not None
+                else "content_action=none; "
+            )
+            + f"presentation={option.presentation_intent}; motion="
             f"{option.motion_preference}（Direction 的偏好，不是限制；"
             "Selection 在本機量測的可行清單內選 camera_intent）; "
             f"Direction recommends treatment={option.direction_treatment}, "
@@ -475,9 +836,105 @@ def describe_commitments(commitments: CandidateCommitments) -> str:
             "answer is saved; unknown look geometry is marked conservative; "
             f"feasibility={option.feasibility_reason}; "
             f"target={option.target_id}; "
+            f"visuals={','.join(option.required_visuals) or 'legacy-unspecified'}; "
+            f"evidence={','.join(option.required_evidence) or 'none'}; "
+            f"relationship={option.visual_relationship}; "
             f"purpose={option.purpose}"
         )
     return "\n".join(lines)
+
+
+def _allowed_action_treatments(option: Any) -> set[str] | None:
+    """Treatments implied by Direction's content/action pair.
+
+    Legacy fixtures do not carry the new fields and keep their historical
+    validator behaviour.  Production v3 commitments always do.
+    """
+
+    policy = getattr(option, "content_policy", None)
+    if policy is None:
+        return None
+    action_id = str(getattr(option, "content_action_id", "none") or "none")
+    if policy == "complete_action":
+        return {"complete_here"}
+    if policy == "result_hold":
+        return {"after_completion"} if action_id != "none" else {"none"}
+    if policy in {"representative_excerpt", "continuous_process"}:
+        return (
+            {"intentional_cut", "complete_here"}
+            if action_id != "none" else {"none"}
+        )
+    return {"none"}
+
+
+def _visual_relationship_fault(
+    *, label: str, looks: Sequence[dict[str, Any]], option: CandidateOption,
+) -> str | None:
+    """Prove Selection did not drop a required visual participant."""
+
+    required_visuals = tuple(
+        getattr(option, "required_visuals", ()) or ()
+    )
+    required = set(required_visuals)
+    if not required or not looks:
+        return None
+    per_look: list[set[str]] = []
+    for look in looks:
+        visible = {str(one) for one in (look.get("includes") or ())}
+        at = str(look.get("at") or "")
+        visible.update(one for one in required if one == at or one in at)
+        per_look.append(visible)
+    relationship = str(getattr(option, "visual_relationship", "single"))
+    if relationship == "simultaneous":
+        if not any(required <= visible for visible in per_look):
+            return (
+                f"{label} must keep {', '.join(required_visuals)} "
+                "visible together in one landing"
+            )
+    else:
+        covered = set().union(*per_look) if per_look else set()
+        missing = required - covered
+        if missing:
+            return (
+                f"{label} drops required visual participants: "
+                f"{', '.join(sorted(missing))}"
+            )
+    return None
+
+
+def _outcome_visual_fault(
+    *, label: str, looks: Sequence[dict[str, Any]], option: CandidateOption,
+) -> str | None:
+    """Prove a named action result survives as the final stable landing."""
+
+    if getattr(option, "content_policy", None) not in {
+        "complete_action", "result_hold",
+    }:
+        return None
+    evidence = str(getattr(option, "outcome_evidence", None) or "").strip()
+    if not evidence:
+        return None
+    stable = [
+        look for look in looks
+        if str(look.get("presentation_intent") or "") != "transition_pass"
+    ]
+    if not stable:
+        return f"{label} drops required action outcome: {evidence}"
+    endpoint = stable[-1]
+    if str(endpoint.get("geometry_query") or "") != evidence:
+        return (
+            f"{label} does not bind its final landing to action outcome: "
+            f"{evidence}"
+        )
+    after = endpoint.get("geometry_after_source_seconds")
+    if (
+        option.content_action_complete_seconds is not None
+        and (after is None or float(after) + 1e-6 < float(
+            option.content_action_complete_seconds
+        ))
+    ):
+        return f"{label} may measure action outcome before it exists: {evidence}"
+    return None
 
 
 def validate_selection_commitments(
@@ -513,6 +970,28 @@ def validate_selection_commitments(
                 f"shot {index} gives {commitment_id} {seconds:.3f}s but its "
                 f"content needs {option.min_supported_seconds:.3f}s"
             )
+        action_treatment = str(shot.get("action_treatment") or "none")
+        content_policy = getattr(option, "content_policy", None)
+        allowed_action_treatments = _allowed_action_treatments(option)
+        if (
+            allowed_action_treatments is not None
+            and action_treatment not in allowed_action_treatments
+        ):
+            faults.append(
+                f"shot {index} uses action treatment {action_treatment!r}, but "
+                f"content policy {content_policy!r} allows only "
+                f"{','.join(sorted(allowed_action_treatments))}"
+            )
+        expected_action = str(
+            getattr(option, "content_action_id", "none") or "none"
+        )
+        selected_action = str(shot.get("action_id") or "none")
+        if content_policy is not None and selected_action != expected_action:
+            faults.append(
+                f"shot {index} selects action {selected_action!r}, but "
+                f"{option.span_id} content policy {content_policy!r} is bound "
+                f"to {expected_action!r}"
+            )
         # Direction's preference is editorial advice, but the locally derived
         # treatment menu is a physical capability contract.  Keeping those
         # concepts separate lets Selection choose a push for a static lineup
@@ -534,13 +1013,14 @@ def validate_selection_commitments(
             if option.target_id == "none"
             or str(look.get("entity_id") or "none") == option.target_id
         ]
-        if looks and option.presentation_intent not in {
+        expected_presentation = option.presentation_intent
+        if looks and expected_presentation not in {
             str(look.get("presentation_intent") or "")
             for look in matching_looks
         }:
             faults.append(
                 f"shot {index} does not carry presentation intent "
-                f"{option.presentation_intent} on target {option.target_id} "
+                f"{expected_presentation} on target {option.target_id} "
                 f"for {commitment_id}"
             )
         if looks and option.target_id != "none" and not matching_looks:
@@ -548,6 +1028,16 @@ def validate_selection_commitments(
                 f"shot {index} does not bind target {option.target_id} for "
                 f"{commitment_id}"
             )
+        visual_fault = _visual_relationship_fault(
+            label=f"shot {index}", looks=looks, option=option,
+        )
+        if visual_fault:
+            faults.append(visual_fault)
+        outcome_fault = _outcome_visual_fault(
+            label=f"shot {index}", looks=looks, option=option,
+        )
+        if outcome_fault:
+            faults.append(outcome_fault)
     for commitment_id in commitments.required_ids:
         count = seen.get(commitment_id, 0)
         if count != 1:
@@ -609,6 +1099,28 @@ def validate_replacement_commitments(
         ), None)
         if option is None:
             continue
+        action_treatment = str(replacement.get("action_treatment") or "none")
+        content_policy = getattr(option, "content_policy", None)
+        allowed_action_treatments = _allowed_action_treatments(option)
+        if (
+            allowed_action_treatments is not None
+            and action_treatment not in allowed_action_treatments
+        ):
+            faults.append(
+                f"{clip_id} uses action treatment {action_treatment!r}, but "
+                f"content policy {content_policy!r} allows only "
+                f"{','.join(sorted(allowed_action_treatments))}"
+            )
+        expected_action = str(
+            getattr(option, "content_action_id", "none") or "none"
+        )
+        selected_action = str(replacement.get("action_id") or "none")
+        if content_policy is not None and selected_action != expected_action:
+            faults.append(
+                f"{clip_id} selects action {selected_action!r}, but "
+                f"{option.span_id} content policy {content_policy!r} is bound "
+                f"to {expected_action!r}"
+            )
         camera_intent = str(replacement.get("camera_intent") or "hold")
         if camera_intent not in option.feasible_treatments:
             faults.append(
@@ -637,10 +1149,189 @@ def validate_replacement_commitments(
                 f"{clip_id} does not carry presentation intent "
                 f"{option.presentation_intent} on target {option.target_id}"
             )
+        visual_fault = _visual_relationship_fault(
+            label=clip_id, looks=looks, option=option,
+        )
+        if visual_fault:
+            faults.append(visual_fault)
+        outcome_fault = _outcome_visual_fault(
+            label=clip_id, looks=looks, option=option,
+        )
+        if outcome_fault:
+            faults.append(outcome_fault)
     missing = set(expected) - seen
     if missing:
         faults.append("missing replacements for " + ", ".join(sorted(missing)))
     return faults
+
+
+def bind_selection_content_contracts(
+    shots: Sequence[dict[str, Any]], commitments: CandidateCommitments,
+    material: Sequence[Any] = (),
+) -> None:
+    """Project immutable candidate policy onto normalized selected shots.
+
+    These keys are local facts, not provider-authored schema fields. Keeping
+    them on the shot lets EDL construction survive cache/resume without
+    reopening Direction prose or guessing from ``why``.
+    """
+
+    options = {
+        (option.commitment_id, option.span_id): option
+        for option in commitments.options
+    }
+    visual_labels = {
+        str(getattr(item, "source_id", "")): {
+            f"v{at:02d}": str(entry[0])
+            for at, entry in enumerate(
+                getattr(item, "subject_geometry", ()) or (), start=1,
+            )
+        }
+        for item in material
+    }
+    for shot in shots:
+        option = options.get((
+            str(shot.get("commitment_id") or ""),
+            str(shot.get("span_id") or ""),
+        ))
+        if option is None:
+            continue
+        shot["content_policy"] = option.content_policy
+        shot["content_min_seconds"] = option.min_supported_seconds
+        shot["content_purpose"] = option.purpose
+        shot["content_required_visuals"] = list(option.required_visuals)
+        shot["content_required_evidence"] = list(option.required_evidence)
+        shot["content_visual_relationship"] = option.visual_relationship
+        shot["content_action_start_seconds"] = (
+            option.content_action_start_seconds
+        )
+        shot["content_action_complete_seconds"] = (
+            option.content_action_complete_seconds
+        )
+        shot["direction_motion_advice"] = {
+            "treatment": option.direction_treatment,
+            "move": option.direction_suggested_move,
+            "route": option.direction_camera_route,
+            "reason": option.direction_motion_reason,
+            "fallback": option.direction_fallback_treatment,
+            "locally_feasible": list(option.feasible_treatments),
+        }
+        # Direction owns how this commitment is meant to be read. Selection
+        # chooses the source window and executable treatment; asking it to
+        # copy the same presentation enum into a nested look created paid
+        # repair loops when it otherwise selected the right commitment. Keep
+        # the provider's subject/box wording, but project the immutable
+        # commitment intent onto the matching look locally.
+        looks = list(shot.get("looks") or [])
+        matching = [
+            look for look in looks
+            if option.target_id == "none"
+            or str(look.get("entity_id") or "none") == option.target_id
+        ]
+        if matching:
+            primary = matching[0]
+            if option.visual_relationship == "simultaneous":
+                primary["includes"] = list(option.required_visuals)
+            elif len(option.required_visuals) == 1:
+                # ``required_visuals`` uses stable local IDs while Gemini's
+                # ``look.at`` deliberately remains readable card language.
+                # Project the one unambiguous ID locally instead of asking
+                # the provider to copy an implementation identifier.
+                primary["includes"] = list(dict.fromkeys([
+                    *list(primary.get("includes") or []),
+                    option.required_visuals[0],
+                ]))
+            elif (
+                option.visual_relationship == "ordered"
+                and len(matching) == len(option.required_visuals)
+            ):
+                # Direction already fixed the participant order and
+                # Selection supplied the same number of semantic landings.
+                # Pairing by order is therefore deterministic; without this
+                # bridge the local validator falsely reports that every
+                # human-readable look dropped v01/v02.
+                for look, visual_id in zip(
+                    matching, option.required_visuals, strict=True,
+                ):
+                    look["includes"] = list(dict.fromkeys([
+                        *list(look.get("includes") or []), visual_id,
+                    ]))
+            # ``sequential_read`` is the content promise: every required
+            # region must become readable in order.  The executor used to
+            # erase that promise when Selection chose native motion by
+            # rewriting it as a generic endpoint reveal.  A tiny authored
+            # drift could then pass while most of a wide sign or UI remained
+            # outside the vertical crop.  Keep the promise intact; the
+            # selection audit below proves whether the selected source window
+            # actually travels far enough, or asks for a designed reveal.
+            effective_presentation = option.presentation_intent
+            if effective_presentation in {
+                "sequential_read", "partial_reveal", "transition_pass",
+            }:
+                primary.update(
+                    presentation_intent=effective_presentation,
+                    must_be_whole=False,
+                )
+            else:
+                primary["presentation_intent"] = effective_presentation
+
+            # Semantic evidence without a card bbox is not decorative prose.
+            # Bind it to the final stable landing and action-completion clock.
+            # Identity remains the carrier contract and is never replaced by
+            # this smaller detail box.
+            outcome = str(option.outcome_evidence or "").strip()
+            if outcome and option.content_policy in {
+                "complete_action", "result_hold",
+            }:
+                endpoint = next((
+                    look for look in reversed(matching)
+                    if str(look.get("presentation_intent") or "")
+                    != "transition_pass"
+                ), matching[-1])
+                endpoint["geometry_query"] = outcome
+                endpoint["geometry_after_source_seconds"] = (
+                    option.content_action_complete_seconds
+                )
+                shot["outcome_visual_contract"] = {
+                    "action_id": option.content_action_id,
+                    "evidence": outcome,
+                    "carrier_visual_ids": list(option.required_visuals),
+                    "carrier_entity_id": (
+                        option.target_id if option.target_id != "none" else None
+                    ),
+                    "visible_after_source_seconds": (
+                        option.content_action_complete_seconds
+                    ),
+                    "endpoint": "final_stable_look",
+                }
+
+        # ``includes`` is the stable local visual contract; ``at`` is model
+        # display copy.  They used to part company here: a shot promised the
+        # phone through v01/v03 while ``at`` said "the green vase", and the
+        # runtime detector faithfully centred the vase.  Once Direction has
+        # bound stable ids, resolve the actual geometry query from those ids
+        # instead of letting later prose override the contract.  Keep the
+        # provider wording only when the card has no local label for every id.
+        labels = visual_labels.get(str(shot.get("source_id") or ""), {})
+        for look in looks:
+            included = tuple(dict.fromkeys(
+                str(one) for one in (look.get("includes") or ())
+            ))
+            canonical = [labels.get(one) for one in included]
+            if included and all(canonical) and not look.get("geometry_query"):
+                look["at"] = " + ".join(dict.fromkeys(
+                    str(one) for one in canonical if one
+                ))
+        action_id = str(option.content_action_id or "none")
+        shot["action_id"] = action_id
+        if option.content_policy == "complete_action":
+            shot["action_treatment"] = "complete_here"
+        elif option.content_policy == "result_hold":
+            shot["action_treatment"] = (
+                "after_completion" if action_id != "none" else "none"
+            )
+        elif option.content_policy == "static_display" or action_id == "none":
+            shot["action_treatment"] = "none"
 
 
 def minimum_supported_seconds_for_shot(

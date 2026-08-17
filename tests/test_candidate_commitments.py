@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from montagewright.candidate_commitments import (
+    bind_selection_content_contracts,
+    CandidateCommitments,
+    CandidateOption,
     CommitmentError,
     describe_commitments,
     provider_commitment_schema,
@@ -28,13 +31,14 @@ class Material:
     action: tuple[str, ...] = ()
     motion: tuple[object, ...] = ()
     camera_moves: bool = False
+    action_windows: tuple[tuple[str, float, float], ...] = ()
 
 
 def _material():
     return [Material("C1", (
         Span("C1:s00", "C1", 0.0, 4.0, "reveal", "authored"),
         Span("C1:s01", "C1", 4.0, 8.0, "detail", "locked"),
-    ))]
+    ), action_windows=(("a01", 0.0, 3.5),))]
 
 
 class _Interactions:
@@ -62,6 +66,7 @@ def _direction(**change):
         "span_id": "C1:s00", "tier": "primary",
         "min_supported_seconds": "0:03.5",
         "presentation_intent": "reveal_endpoint",
+        "content_action_id": "none",
         "motion_preference": "native_first", "target_id": "device.fold",
         "recommended_treatment": "use_source_motion",
         "suggested_move": "source_motion",
@@ -217,6 +222,223 @@ def test_direction_motion_advice_ranks_a_locally_feasible_treatment_only():
     described = describe_commitments(resolved)
     assert "move=pan" in described
     assert "read the wide logo" in described
+
+
+def test_sequential_read_can_preserve_verified_authored_source_motion():
+    material = [Material("C1", (
+        Span("C1:s00", "C1", 0.0, 4.0, "wide moving wordmark", "authored"),
+    ))]
+    direction = _direction(
+        presentation_intent="sequential_read",
+        recommended_treatment="use_source_motion",
+        suggested_move="source_motion",
+        camera_route="read the wide wordmark from left to right",
+        motion_reason="the authored pan already performs the sequential read",
+        fallback_treatment="reveal",
+        min_supported_seconds="0:03",
+    )
+
+    resolved = resolve_candidate_commitments(
+        direction, material, material_digest="a" * 64,
+        aspect="9:16", target_seconds=20.0,
+        grounding_target_ids=("device.fold",), grounding_sha256="b" * 64,
+    )
+
+    option = resolved.options[0]
+    assert option.presentation_intent == "sequential_read"
+    assert option.direction_treatment == "use_source_motion"
+    assert option.preferred_treatment == "use_source_motion"
+    assert "use_source_motion" in option.feasible_treatments
+
+
+def test_commitment_presentation_is_projected_into_selection_locally():
+    material = [Material("C1", (
+        Span("C1:s00", "C1", 0.0, 4.0, "wide moving wordmark", "authored"),
+    ))]
+    commitments = resolve_candidate_commitments(
+        _direction(
+            presentation_intent="sequential_read",
+            recommended_treatment="use_source_motion",
+            min_supported_seconds="0:03",
+        ),
+        material, material_digest="a" * 64, aspect="9:16",
+        target_seconds=20.0, grounding_target_ids=("device.fold",),
+        grounding_sha256="b" * 64,
+    )
+    shots = [{
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.0,
+        "seconds_needed": 3.0, "camera_intent": "hold",
+        "looks": [{
+            "at": "the wordmark", "entity_id": "device.fold",
+            "presentation_intent": "centered_hold", "must_be_whole": True,
+        }],
+    }]
+
+    bind_selection_content_contracts(shots, commitments)
+
+    assert shots[0]["looks"][0]["presentation_intent"] == "sequential_read"
+    assert shots[0]["looks"][0]["must_be_whole"] is False
+    assert validate_selection_commitments(shots, commitments) == []
+
+
+def test_stable_visual_ids_are_projected_onto_readable_ordered_looks():
+    option = CandidateOption(
+        commitment_id="hero", purpose="show the interaction",
+        required=True, picture_role="primary_action", target_id="none",
+        span_id="C1:s00", min_supported_seconds=2.0,
+        tier="primary", presentation_intent="sequential_read",
+        motion_preference="virtual_allowed", why="read both in order",
+        required_visuals=("v01", "v02"), visual_relationship="ordered",
+    )
+    commitments = CandidateCommitments(
+        contract_version="candidate-commitment-v5-visual-relationships",
+        material_digest="a" * 64, direction_sha256="b" * 64,
+        grounding_sha256=None, target_aspect="9:16", target_seconds=20.0,
+        options=(option,),
+    )
+    shots = [{
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.0,
+        "looks": [
+            {"at": "phone screen", "includes": []},
+            {"at": "LED result", "includes": []},
+        ],
+    }]
+
+    bind_selection_content_contracts(shots, commitments)
+
+    assert shots[0]["looks"][0]["includes"] == ["v01"]
+    assert shots[0]["looks"][1]["includes"] == ["v02"]
+    assert validate_selection_commitments(shots, commitments) == []
+
+
+def test_native_motion_preserves_the_direction_sequential_read_contract():
+    material = [Material("C1", (
+        Span("C1:s00", "C1", 0.0, 4.0, "moving wordmark", "authored"),
+    ))]
+    commitments = resolve_candidate_commitments(
+        _direction(
+            presentation_intent="sequential_read",
+            recommended_treatment="use_source_motion",
+            min_supported_seconds="0:03",
+        ),
+        material, material_digest="a" * 64, aspect="9:16",
+        target_seconds=20.0, grounding_target_ids=("device.fold",),
+        grounding_sha256="b" * 64,
+    )
+    shots = [{
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.0, "camera_intent": "use_source_motion",
+        "looks": [{
+            "at": "the wordmark", "entity_id": "device.fold",
+            "presentation_intent": "sequential_read", "must_be_whole": False,
+        }],
+    }]
+
+    bind_selection_content_contracts(shots, commitments)
+
+    assert shots[0]["looks"][0]["presentation_intent"] == "sequential_read"
+    assert validate_selection_commitments(shots, commitments) == []
+
+
+def test_direction_schema_requires_a_generic_content_policy():
+    fields = provider_commitment_schema(
+        ["C1:s00"], ["device.fold"], ["a01"]
+    )["items"]
+
+    assert "content_policy" in fields["required"]
+    assert "content_action_id" in fields["required"]
+    assert fields["properties"]["content_action_id"]["enum"] == ["none", "a01"]
+    assert set(fields["properties"]["content_policy"]["enum"]) == {
+        "complete_action", "representative_excerpt", "result_hold",
+        "continuous_process", "static_display",
+    }
+    assert "兩個相鄰 commitment" in fields["properties"]["content_policy"][
+        "description"
+    ]
+
+
+def test_complete_action_policy_cannot_be_downgraded_to_an_intentional_cut():
+    resolved = _resolved(_direction(
+        content_policy="complete_action", content_action_id="a01",
+    ))
+    shot = {
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.5, "camera_intent": "use_source_motion",
+        "action_treatment": "intentional_cut",
+        "looks": [{
+            "presentation_intent": "reveal_endpoint",
+            "entity_id": "device.fold",
+        }],
+    }
+
+    faults = validate_selection_commitments([shot], resolved)
+
+    assert any("complete_action" in fault and "complete_here" in fault for fault in faults)
+
+
+def test_representative_excerpt_policy_allows_a_deliberate_early_cut():
+    resolved = _resolved(_direction(
+        content_policy="representative_excerpt", content_action_id="a01",
+    ))
+    shot = {
+        "commitment_id": "hero", "span_id": "C1:s00",
+        "seconds_needed": 3.5, "camera_intent": "use_source_motion",
+        "action_id": "a01",
+        "action_treatment": "intentional_cut",
+        "looks": [{
+            "presentation_intent": "reveal_endpoint",
+            "entity_id": "device.fold",
+        }],
+    }
+
+    faults = validate_selection_commitments([shot], resolved)
+
+    assert not any("content policy" in fault for fault in faults)
+
+
+def test_selected_candidate_projects_its_content_floor_without_model_repeating_it():
+    from montagewright.candidate_commitments import bind_selection_content_contracts
+
+    resolved = _resolved(_direction(
+        content_policy="result_hold",
+        min_supported_seconds="0:02.5",
+    ))
+    shot = {"commitment_id": "hero", "span_id": "C1:s00"}
+
+    bind_selection_content_contracts([shot], resolved)
+
+    assert shot["content_policy"] == "result_hold"
+    assert shot["content_min_seconds"] == 2.5
+    assert shot["content_purpose"] == "complete product reveal"
+
+
+def test_complete_action_binds_local_action_duration_before_selection():
+    from montagewright.candidate_commitments import bind_selection_content_contracts
+
+    resolved = _resolved(_direction(
+        content_policy="complete_action", content_action_id="a01",
+        min_supported_seconds="0:01",
+    ))
+    option = resolved.options[0]
+    shot = {"commitment_id": "hero", "span_id": "C1:s00"}
+
+    bind_selection_content_contracts([shot], resolved)
+
+    assert option.min_supported_seconds == 3.5
+    assert option.content_action_start_seconds == 0.0
+    assert option.content_action_complete_seconds == 3.5
+    assert shot["action_id"] == "a01"
+    assert shot["action_treatment"] == "complete_here"
+    assert shot["content_min_seconds"] == 3.5
+
+
+def test_complete_action_without_a_direction_bound_action_is_rejected():
+    with pytest.raises(CommitmentError, match="content_action_id"):
+        _resolved(_direction(
+            content_policy="complete_action", content_action_id="none",
+        ))
 
 
 def test_impossible_direction_advice_does_not_expand_local_capability():

@@ -20,7 +20,7 @@ import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from montagewright.schema import camera_intent_of, looks_of, move_of_shot
 from montagewright.capabilities import (
@@ -1517,6 +1517,7 @@ class MaterialItem:
 def _direction_schema(
     span_ids: list[str] | None = None,
     grounding_target_ids: list[str] | None = None,
+    action_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     schema = {
         "type": "object",
@@ -1628,7 +1629,7 @@ def _direction_schema(
 
         schema["required"].append("candidate_options")
         schema["properties"]["candidate_options"] = provider_commitment_schema(
-            span_ids, grounding_target_ids or []
+            span_ids, grounding_target_ids or [], action_ids or []
         )
     return schema
 
@@ -1724,6 +1725,21 @@ def _actions_for_span(item: MaterialItem, span: Any) -> tuple[str, ...]:
     last = float(span.ends_seconds)
     return tuple(
         action_id
+        for action_id, action_start, action_end in item.action_windows
+        if float(action_start) <= last + 1e-3
+        and float(action_end) >= first - 1e-3
+    )
+
+
+def _action_details_for_span(item: MaterialItem, span: Any) -> tuple[str, ...]:
+    """Human/model-facing action menu with the local duration contract."""
+
+    first = float(span.starts_seconds)
+    last = float(span.ends_seconds)
+    return tuple(
+        f"{action_id}（source {float(action_start):.1f}–"
+        f"{float(action_end):.1f}s；完整播放至少 "
+        f"{max(0.0, float(action_end) - float(action_start)):.1f}s）"
         for action_id, action_start, action_end in item.action_windows
         if float(action_start) <= last + 1e-3
         and float(action_end) >= first - 1e-3
@@ -1912,7 +1928,8 @@ def _describe_material(material: list[MaterialItem]) -> str:
                     else ""
                 )
                 + (
-                    "，此段可用動作=" + "、".join(_actions_for_span(item, span))
+                    "，此段可用動作="
+                    + "、".join(_action_details_for_span(item, span))
                     if _actions_for_span(item, span)
                     else "，此段沒有可綁定的命名動作"
                 )
@@ -1926,7 +1943,10 @@ def _describe_material(material: list[MaterialItem]) -> str:
         if item.speech:
             head += "\n    說了什麼：\n      " + "\n      ".join(item.speech)
         if item.subjects:
-            head += "\n    可框住的主體：" + "；".join(item.subjects)
+            head += "\n    可框住的主體（Direction 只能回傳 v-id）：" + "；".join(
+                f"v{at:02d}={subject}"
+                for at, subject in enumerate(item.subjects, start=1)
+            )
         lines.append(head)
     return "\n".join(lines)
 
@@ -2102,6 +2122,7 @@ def decide_direction(
         response_format=structured_json(_direction_schema(
             [span.span_id for item in material for span in item.spans],
             grounding_target_ids,
+            _action_ids_for_material(material),
         )),
         ledger=ledger,
         budget_stage="direction",
@@ -2178,7 +2199,8 @@ def correct_candidate_options(
         "required": ["candidate_options", "repair_summary"],
         "properties": {
             "candidate_options": provider_commitment_schema(
-                span_ids, grounding_target_ids
+                span_ids, grounding_target_ids,
+                _action_ids_for_material(material),
             ),
             "repair_summary": {"type": "string"},
         },
@@ -2192,6 +2214,7 @@ def correct_candidate_options(
         f"- {span.span_id} | source={span.source_id} | "
         f"{span.starts_seconds:.3f}-{span.ends_seconds:.3f}s | "
         f"duration={span.seconds:.3f}s | motion={span.motion_role} | "
+        f"actions={','.join(_action_details_for_span(item_by_source[str(span.source_id)], span)) or 'none'} | "
         f"why={span.why or '未標'} | "
         f"summary={item_by_source[str(span.source_id)].summary}"
         for span in spans if str(span.source_id) not in excluded_source_ids
@@ -2537,8 +2560,10 @@ def _selection_schema(
                                             "手持物件、一張臉填 false，出框仍"
                                             "成立。這是宣告不是開關：本機不會"
                                             "為它把畫面縮小塞進去。要它成真得"
-                                            "靠規劃——兩個落點帶過去、換一顆更"
-                                            "窄的素材、或填 false 接受局部。"
+                                            "靠換一顆同幀放得下的素材；兩個落點"
+                                            "只能依序讀完，不能讓它同幀完整。若"
+                                            "依序讀取即可，填 false 並用 "
+                                            "sequential_read。sequential_read、"
                                             "partial_reveal 或 transition_pass "
                                             "明確允許局部，因此只能填 false。"
                                         ),
@@ -2549,6 +2574,7 @@ def _selection_schema(
                                             "complete_hold",
                                             "centered_hold",
                                             "reveal_endpoint",
+                                            "sequential_read",
                                             "partial_reveal",
                                             "transition_pass",
                                         ],
@@ -2559,6 +2585,11 @@ def _selection_schema(
                                             "邊緣由 must_be_whole 另外回答。"
                                             "centered_hold 要有穩定可辨識落點；"
                                             "reveal_endpoint 是運鏡最後真的要到達的主體；"
+                                            "sequential_read 用在比直式裁切更寬的文字、UI、"
+                                            "產品列：只寫一個可辨識的寬主體，搭配 reveal 或 "
+                                            "multi_stop，本機會按實測邊界產生依序讀取的落點並"
+                                            "短暫停住；must_be_whole 必須是 false，因為這不是"
+                                            "同一幀完整看見。"
                                             "partial_reveal 明確允許主體只進出一部分；"
                                             "transition_pass 是經過而非落點。"
                                             "不要因為 partial 就棄用素材，也不要把半個入鏡"
@@ -2738,35 +2769,43 @@ def _selection_schema(
 
 
 def _selection_patch_schema(
-    span_ids: list[str], shot_indices: list[int], *,
-    grounding_target_ids: list[str] | None = None,
-    commitment_ids: list[str] | None = None,
-    action_ids: list[str] | None = None,
+    option_ids: list[str], shot_indices: list[int], *,
+    camera_treatments: list[str] | None = None,
+    **_legacy: Any,
 ) -> dict[str, Any]:
-    """A shallow provider contract that cannot rewrite the whole edit."""
+    """Provider grammar for an editorial choice, never a replacement shot.
 
-    full = _selection_schema(
-        span_ids,
-        grounding_target_ids=grounding_target_ids,
-        commitment_ids=commitment_ids,
-        action_ids=action_ids,
-    )
-    shot = copy.deepcopy(full["properties"]["shots"]["items"])
-    shot["required"] = ["shot_index", *shot["required"]]
-    shot["properties"] = {
-        "shot_index": {"type": "integer", "enum": shot_indices},
-        **shot["properties"],
+    Gemini has already watched the footage during Selection.  A repair only
+    chooses one of the immutable candidate options and a locally advertised
+    treatment.  Source clocks, duration, action/audio contracts and looks are
+    deliberately absent: local code reconstructs them, so an answer such as
+    ``seconds_needed=0:00`` cannot corrupt a previously valid timeline.
+    """
+
+    choice = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["shot_index", "option_id", "camera_treatment", "why"],
+        "properties": {
+            "shot_index": {"type": "integer", "enum": shot_indices},
+            "option_id": {"type": "string", "enum": option_ids},
+            "camera_treatment": {
+                "type": "string",
+                "enum": camera_treatments or list(CAMERA_INTENT_NAMES),
+            },
+            "why": {"type": "string"},
+        },
     }
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["replacements", "repair_summary"],
+        "required": ["choices", "repair_summary"],
         "properties": {
-            "replacements": {
+            "choices": {
                 "type": "array",
                 "minItems": len(shot_indices),
                 "maxItems": len(shot_indices),
-                "items": shot,
+                "items": choice,
             },
             "repair_summary": {"type": "string"},
         },
@@ -2777,32 +2816,53 @@ def _merge_selection_patch(
     base: dict[str, Any], patch: dict[str, Any], *,
     allowed_indices: set[int], offered: list[Any],
     source_motion: dict[str, str],
+    commitments: Any | None = None,
+    material: list[Any] | None = None,
     commitment_spans: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
-    """Normalize authorized replacements and preserve every other byte."""
+    """Compile bounded editorial choices into executable local shots.
 
-    raw = list(patch.get("replacements") or [])
+    The provider is not allowed to author clocks or duplicate structural
+    fields.  The old version accepted a complete replacement dictionary and
+    only normalized it afterwards; a syntactically valid ``0:00`` therefore
+    erased paid Selection timing.  Here the immutable CandidateOption and the
+    previous shot are the only construction inputs.
+    """
+
+    raw = list(patch.get("choices") or [])
     indices = [int(one.get("shot_index", -1)) for one in raw]
     if len(indices) != len(set(indices)) or set(indices) != allowed_indices:
         raise PlannerError(
-            "selection patch must replace exactly "
+            "selection choice must name exactly "
             + ", ".join(f"k{one:02d}" for one in sorted(allowed_indices))
         )
+    if commitments is None:
+        raise PlannerError("selection choice requires candidate commitments")
     original_shots = list(base.get("shots") or [])
-    replacements: list[dict[str, Any]] = []
+    options = {
+        (str(option.commitment_id), str(option.span_id)): option
+        for option in commitments.options
+    }
+    spans = {str(span.span_id): span for span in offered}
+    items = {
+        str(getattr(item, "source_id", "")): item
+        for item in (material or [])
+    }
+    compiled: list[tuple[int, dict[str, Any]]] = []
     for one in raw:
         index = int(one["shot_index"])
         if not 0 <= index < len(original_shots):
-            raise PlannerError(f"selection patch index {index} is out of range")
-        replacement = {key: value for key, value in one.items()
-                       if key != "shot_index"}
+            raise PlannerError(f"selection choice index {index} is out of range")
+        original = original_shots[index]
         expected_commitment = str(
-            original_shots[index].get("commitment_id") or ""
+            original.get("commitment_id") or ""
         )
-        if str(replacement.get("commitment_id") or "") != expected_commitment:
+        option_id = str(one.get("option_id") or "")
+        option = options.get((expected_commitment, option_id))
+        if option is None:
             raise PlannerError(
-                f"k{index:02d} patch changed commitment "
-                f"{expected_commitment!r}"
+                f"k{index:02d} choice {option_id!r} is not an option for "
+                f"commitment {expected_commitment!r}"
             )
         allowed_for_commitment = (
             commitment_spans.get(expected_commitment)
@@ -2810,22 +2870,125 @@ def _merge_selection_patch(
         )
         if (
             allowed_for_commitment is not None
-            and str(replacement.get("span_id") or "")
-            not in allowed_for_commitment
+            and option_id not in allowed_for_commitment
         ):
             raise PlannerError(
-                f"k{index:02d} patch chose span "
-                f"{replacement.get('span_id')!r} outside commitment "
+                f"k{index:02d} choice chose span {option_id!r} outside commitment "
                 f"{expected_commitment!r}"
             )
-        replacements.append(replacement)
-    normalized = {"shots": replacements}
+        treatment = str(one.get("camera_treatment") or "")
+        if treatment not in option.feasible_treatments:
+            raise PlannerError(
+                f"k{index:02d} treatment {treatment!r} is not locally feasible "
+                f"for {option_id}; allowed={','.join(option.feasible_treatments)}"
+            )
+        span = spans.get(option_id)
+        if span is None:
+            raise PlannerError(f"k{index:02d} option {option_id!r} has no local span")
+        seconds = float(original.get("seconds_needed") or 0.0)
+        if seconds <= 0.0:
+            raise PlannerError(
+                f"k{index:02d} previous paid Selection has no reusable duration"
+            )
+        action_seconds = 0.0
+        if (
+            option.content_action_start_seconds is not None
+            and option.content_action_complete_seconds is not None
+            and option.content_policy == "complete_action"
+        ):
+            action_seconds = max(
+                0.0,
+                float(option.content_action_complete_seconds)
+                - float(option.content_action_start_seconds),
+            )
+        minimum = max(float(option.min_supported_seconds), action_seconds)
+        if seconds + 1e-6 < minimum:
+            raise PlannerError(
+                f"k{index:02d} keeps {seconds:.2f}s, but option {option_id} "
+                f"needs at least {minimum:.2f}s"
+            )
+        available = float(span.ends_seconds) - float(span.starts_seconds)
+        if seconds > available + 1e-6:
+            raise PlannerError(
+                f"k{index:02d} keeps {seconds:.2f}s, but option {option_id} "
+                f"has only {available:.2f}s"
+            )
+
+        replacement = copy.deepcopy(original)
+        replacement["span_id"] = option_id
+        replacement["camera_intent"] = treatment
+        replacement["frame"] = (
+            "settles" if treatment in {"hold", "use_source_motion"}
+            else "travels"
+        )
+        replacement["picture_role"] = option.picture_role
+        replacement["why"] = str(one.get("why") or original.get("why") or "")
+        replacement["seconds_needed"] = seconds
+        action_id = str(option.content_action_id or "none")
+        replacement["action_id"] = action_id
+        if option.content_policy == "complete_action":
+            replacement["action_treatment"] = "complete_here"
+        elif option.content_policy == "result_hold" and action_id != "none":
+            replacement["action_treatment"] = "after_completion"
+        elif option.content_policy in {
+            "representative_excerpt", "continuous_process",
+        } and action_id != "none":
+            replacement["action_treatment"] = "intentional_cut"
+        else:
+            replacement["action_treatment"] = "none"
+
+        if option_id == str(original.get("span_id") or ""):
+            offset = float(original.get("start_offset_seconds") or 0.0)
+        elif option.content_policy == "complete_action" and (
+            option.content_action_start_seconds is not None
+        ):
+            offset = float(option.content_action_start_seconds) - float(
+                span.starts_seconds
+            )
+        elif option.content_policy == "result_hold" and (
+            option.content_action_complete_seconds is not None
+        ):
+            offset = float(option.content_action_complete_seconds) - float(
+                span.starts_seconds
+            )
+        else:
+            offset = 0.0
+        replacement["start_offset_seconds"] = round(
+            min(max(0.0, offset), max(0.0, available - seconds)), 3
+        )
+
+        item = items.get(str(span.source_id))
+        labels = {
+            f"v{at:02d}": str(entry[0])
+            for at, entry in enumerate(
+                getattr(item, "subject_geometry", ()) or (), start=1,
+            )
+        }
+        required_visuals = list(option.required_visuals)
+        readable = [labels.get(visual) for visual in required_visuals]
+        at = " + ".join(str(label) for label in readable if label)
+        if not at:
+            old_look = next(iter(original.get("looks") or []), {})
+            at = str(old_look.get("at") or option.purpose)
+        old_look = next(iter(original.get("looks") or []), {})
+        replacement["looks"] = [{
+            "entity_id": str(option.target_id or "none"),
+            "at": at,
+            "seconds": seconds,
+            "framing": str(old_look.get("framing") or "centre"),
+            "must_be_whole": False,
+            "presentation_intent": option.presentation_intent,
+            "includes": required_visuals,
+        }]
+        compiled.append((index, replacement))
+
+    normalized = {"shots": [replacement for _, replacement in compiled]}
     expand_spans(normalized, offered, source_motion=source_motion)
     merged = copy.deepcopy(base)
-    for raw_one, replacement in zip(raw, normalized["shots"]):
-        merged["shots"][int(raw_one["shot_index"])] = replacement
+    for (index, _), replacement in zip(compiled, normalized["shots"], strict=True):
+        merged["shots"][index] = replacement
     merged.setdefault("duration_repairs", []).append(
-        "Selection patch changed only "
+        "Selection choice locally rebuilt only "
         + ", ".join(f"k{one:02d}" for one in sorted(allowed_indices))
     )
     return merged
@@ -2862,6 +3025,7 @@ def material_look_boxes(
     """Resolve look geometry from Selection's immutable material facts."""
 
     from montagewright.clipcard import find_subject
+    from montagewright.reframe import declared_look_centres
 
     card = {
         "subjects": [
@@ -2880,15 +3044,52 @@ def material_look_boxes(
         ]
     }
     measured: list[tuple[float, float, float]] = []
+    visual_labels = {
+        f"v{at:02d}": str(entry[0])
+        for at, entry in enumerate(item.subject_geometry, start=1)
+    }
     for look in reframe.looks:
-        box = find_subject(card, look.at, entity_id=look.entity_id)
+        included = list(dict.fromkeys(getattr(look, "includes", ()) or ()))
+        included_boxes = [
+            find_subject(
+                card, str(visual_labels.get(label) or label), entity_id=None
+            )
+            for label in included
+        ]
+        if included and any(one is None for one in included_boxes):
+            return []
+        if included_boxes:
+            boxes = [one for one in included_boxes if one is not None]
+            left = min(one.centre_x - one.width / 2.0 for one in boxes)
+            right = max(one.centre_x + one.width / 2.0 for one in boxes)
+            top = min(one.centre_y - one.height / 2.0 for one in boxes)
+            bottom = max(one.centre_y + one.height / 2.0 for one in boxes)
+            box = type(boxes[0])(
+                label=" + ".join(included),
+                entity_id=None,
+                centre_x=(left + right) / 2.0,
+                centre_y=(top + bottom) / 2.0,
+                width=right - left,
+                height=bottom - top,
+                moves=any(one.moves for one in boxes),
+            )
+        else:
+            box = find_subject(card, look.at, entity_id=look.entity_id)
         if box is None:
             return []
         crop_width = (
             min(1.0, max(0.2, box.height / 0.66))
-            if look.framing == "fill" else 1.0
+            if look.framing == "fill" else float(item.crop_width)
         )
-        measured.append((box.centre_x, box.centre_y, crop_width))
+        measured.extend(
+            (centre_x, box.centre_y, crop_width)
+            for centre_x in declared_look_centres(
+                reframe,
+                centre_x=box.centre_x,
+                subject_width=box.width,
+                crop_width=crop_width,
+            )
+        )
     return measured
 
 
@@ -2916,6 +3117,64 @@ def camera_duration_disagreements(
         reframe = reframe_of(shot)
         if not reframe.looks:
             continue
+        required_visuals = tuple(
+            str(one) for one in (shot.get("content_required_visuals") or ())
+        )
+        if (
+            str(shot.get("content_visual_relationship") or "single")
+            == "simultaneous"
+            and len(required_visuals) > 1
+        ):
+            geometry = {
+                f"v{at:02d}": (entry[2], entry[4])
+                for at, entry in enumerate(item.subject_geometry, start=1)
+                if f"v{at:02d}" in required_visuals
+            }
+            if len(geometry) != len(set(required_visuals)):
+                faults.append(
+                    f"k{index:02d}: simultaneous visual relationship cannot "
+                    "be measured from this material card; choose an ordered "
+                    "read or another take"
+                )
+                continue
+            left = min(cx - width / 2.0 for cx, width in geometry.values())
+            right = max(cx + width / 2.0 for cx, width in geometry.values())
+            centre = (left + right) / 2.0
+            crop_left = centre - float(item.crop_width) / 2.0
+            crop_right = centre + float(item.crop_width) / 2.0
+            insufficient = []
+            for label, (cx, width) in geometry.items():
+                subject_left, subject_right = cx - width / 2.0, cx + width / 2.0
+                visible = max(
+                    0.0,
+                    min(subject_right, crop_right) - max(subject_left, crop_left),
+                ) / max(width, 1e-6)
+                if visible < 0.85:
+                    insufficient.append(f"{label} {visible:.0%}")
+            if insufficient:
+                # Presence and whole-subject containment are different
+                # promises.  A fixed 85% threshold used to reject even looks
+                # that explicitly allow a partial composition, overriding a
+                # model that had actually watched the source.  Keep that
+                # measurement as an auditable advisory, and fail closed only
+                # when Selection explicitly promised whole participants.
+                whole_promised = any(
+                    bool(look.must_be_whole) for look in reframe.looks
+                )
+                message = (
+                    f"k{index:02d}: target aspect shows simultaneous "
+                    f"participants partially ({', '.join(insufficient)})"
+                )
+                if whole_promised:
+                    faults.append(
+                        message + "; choose a wider-composed take, an ordered "
+                        "reveal/pan, split the interaction into setup and "
+                        "result shots, or use a fit canvas"
+                    )
+                    continue
+                advisories = shot.setdefault("visual_fit_advisories", [])
+                if message not in advisories:
+                    advisories.append(message)
         measured = material_look_boxes(item, reframe)
         priced = reframe.model_copy(update={"look_boxes": measured})
         floor = camera_floor_for(priced)
@@ -2960,15 +3219,13 @@ def repair_camera_rests_to_duration(
         if item is None:
             continue
         reframe = reframe_of(shot)
-        if len(reframe.looks) < 2:
-            continue
         raw_looks = list(shot.get("looks") or [])
         stop_indices = [
             at for at, look in enumerate(raw_looks)
             if str(look.get("presentation_intent") or "")
             != "transition_pass"
         ]
-        if len(stop_indices) < 2:
+        if not stop_indices:
             continue
 
         measured = material_look_boxes(item, reframe)
@@ -2978,35 +3235,56 @@ def repair_camera_rests_to_duration(
         if floor <= duration + 1e-6:
             continue
 
-        declared = sum(
-            max(0.0, float(raw_looks[at].get("seconds") or 0.0))
-            for at in stop_indices
+        sequential = (
+            len(reframe.looks) == 1
+            and reframe.looks[0].presentation_intent == "sequential_read"
+            and len(measured) >= 2
         )
+        effective_stops = len(measured) if sequential else len(stop_indices)
+        declared = (
+            max(0.0, float(raw_looks[stop_indices[0]].get("seconds") or 0.0))
+            * effective_stops
+            if sequential else sum(
+                max(0.0, float(raw_looks[at].get("seconds") or 0.0))
+                for at in stop_indices
+            )
+        )
+        # ``camera_floor_for`` already includes the declared rest once per
+        # executable landing. A semantic sequential_read look expands into
+        # several local landings, so subtract its repeated dwell rather than
+        # the one provider field. This keeps the established push/pan timing
+        # model intact while making a one-look wide read locally shrinkable.
         travel = max(0.0, floor - declared)
         available_rests = duration - travel
-        minimum_rests = SETTLE_SECONDS * len(stop_indices)
+        minimum_rests = SETTLE_SECONDS * effective_stops
         if available_rests < minimum_rests - 1e-6:
             continue
 
-        flexible = [
-            max(
-                0.0,
-                float(raw_looks[at].get("seconds") or 0.0) - SETTLE_SECONDS,
-            )
-            for at in stop_indices
-        ]
-        extra = max(0.0, available_rests - minimum_rests)
-        weight = sum(flexible)
         before = [
             float(raw_looks[at].get("seconds") or 0.0)
             for at in stop_indices
         ]
-        for position, at in enumerate(stop_indices):
-            share = (
-                extra * flexible[position] / weight
-                if weight > 1e-9 else extra / len(stop_indices)
+        if sequential:
+            raw_looks[stop_indices[0]]["seconds"] = (
+                available_rests / effective_stops
             )
-            raw_looks[at]["seconds"] = SETTLE_SECONDS + share
+        else:
+            flexible = [
+                max(
+                    0.0,
+                    float(raw_looks[at].get("seconds") or 0.0)
+                    - SETTLE_SECONDS,
+                )
+                for at in stop_indices
+            ]
+            extra = max(0.0, available_rests - minimum_rests)
+            weight = sum(flexible)
+            for position, at in enumerate(stop_indices):
+                share = (
+                    extra * flexible[position] / weight
+                    if weight > 1e-9 else extra / len(stop_indices)
+                )
+                raw_looks[at]["seconds"] = SETTLE_SECONDS + share
 
         trial = priced.model_copy(update={"looks": looks_of(shot)})
         if camera_floor_for(trial) > duration + 1e-5:
@@ -3016,7 +3294,7 @@ def repair_camera_rests_to_duration(
         repairs.append(
             f"k{index:02d}: kept {reframe.camera_move} and the "
             f"{duration:.2f}s edit, fitting preferred look rests from "
-            f"{sum(before):.2f}s to {available_rests:.2f}s after measured "
+            f"{declared:.2f}s to {available_rests:.2f}s after measured "
             "travel time"
         )
     return repairs
@@ -3036,6 +3314,9 @@ def select_shots(
     commitments: Any | None = None,
     duration_mode: str = "exact",
     initial_selection: dict[str, Any] | None = None,
+    attempt_recorder: Callable[
+        [dict[str, Any], tuple[str, ...], int], None
+    ] | None = None,
 ) -> tuple[dict[str, Any], Usage]:
     """Stage two: which shots, in what order, and why each one.
 
@@ -3205,14 +3486,35 @@ def select_shots(
         # writer of the complete answer, so prompt drift cannot alter a good
         # neighbour, duplicate a commitment, or drop a required beat.
         base = copy.deepcopy(initial_selection)
+        base.setdefault("duration_repairs", []).extend(
+            repair_single_look_hold_overflow(base)
+        )
+        base.setdefault("duration_repairs", []).extend(
+            repair_camera_rests_to_duration(base, usable)
+        )
+        base.setdefault("duration_repairs", []).extend(
+            repair_selection_motion_contracts(base, usable)
+        )
+        base.setdefault("duration_repairs", []).extend(
+            repair_selection_source_windows(base, usable)
+        )
         patch_faults = audit_cached_selection(
             base, material, direction,
             commitments=selection_commitments,
             grounding_spec=grounding_spec,
             duration_mode=duration_mode,
         )
-        for _patch_attempt in range(2):
+        patch_attempts_by_index: dict[int, int] = {}
+        for _patch_attempt in range(12):
             if not patch_faults:
+                if selection_commitments is not None:
+                    from montagewright.candidate_commitments import (
+                        bind_selection_content_contracts,
+                    )
+
+                    bind_selection_content_contracts(
+                        base.get("shots") or [], selection_commitments, material
+                    )
                 return base, usage_total
             failing_indices = {
                 int(found.group(1))
@@ -3226,9 +3528,20 @@ def select_shots(
                     "than a shot patch: " + "; ".join(patch_faults),
                     draft=base, faults=patch_faults,
                 )
+            repairable_indices = [
+                index for index in sorted(failing_indices)
+                if patch_attempts_by_index.get(index, 0) < 1
+            ]
+            if not repairable_indices:
+                break
+            repair_index = repairable_indices[0]
+            patch_attempts_by_index[repair_index] = (
+                patch_attempts_by_index.get(repair_index, 0) + 1
+            )
+            requested_indices = {repair_index}
             failing_commitments = {
                 str(base["shots"][index].get("commitment_id") or "")
-                for index in failing_indices
+                for index in requested_indices
                 if 0 <= index < len(base.get("shots") or [])
             }
             allowed_span_ids = {
@@ -3237,38 +3550,51 @@ def select_shots(
             } if selection_commitments is not None else {
                 span.span_id for span in offered
             }
-            scoped_material = [
-                replace(item, spans=tuple(
-                    span for span in item.spans
-                    if span.span_id in allowed_span_ids
-                ))
-                for item in usable
-                if any(span.span_id in allowed_span_ids for span in item.spans)
-            ]
+            scoped_options = [
+                option for option in selection_commitments.options
+                if option.commitment_id in failing_commitments
+                and option.span_id in allowed_span_ids
+            ] if selection_commitments is not None else []
             patch_schema = structured_json(_selection_patch_schema(
-                sorted(allowed_span_ids), sorted(failing_indices),
-                grounding_target_ids=grounding_target_ids,
-                commitment_ids=list(dict.fromkeys(
-                    option.commitment_id
-                    for option in selection_commitments.options
-                )) if selection_commitments is not None else None,
-                action_ids=_action_ids_for_material(scoped_material),
+                [option.span_id for option in scoped_options],
+                sorted(requested_indices),
+                camera_treatments=list(dict.fromkeys(
+                    treatment
+                    for option in scoped_options
+                    for treatment in option.feasible_treatments
+                )),
             ))
             patch_input = [selection_input[0], {
                 "type": "text",
                 "text": (
-                    "你看得到完整方向、音樂與上一版完整時間軸，但 response "
-                    "schema 只允許回傳指定鏡頭的 replacements。不要回傳完整 "
-                    "Selection。每個 replacement 必須維持該 shot 原本的 "
-                    "commitment_id；優先同長替換，讓完整影片總長、順序與其他 "
-                    "shots 完全不變。\n\n## 本機執行錯誤\n- "
-                    + "\n- ".join(patch_faults)
+                    "你已在先前 Selection 看過素材；這次不會重新附影片。"
+                    "只從下面既有候選選 option_id 與 camera_treatment，不要"
+                    "重寫來源時間、鏡頭長度、動作、looks、音訊或其他 shots。"
+                    "本機會保留原長度並由 immutable commitment 重建完整鏡頭。"
+                    "\n\n## 本機執行錯誤\n- "
+                    + "\n- ".join(
+                        fault for fault in patch_faults
+                        if re.search(
+                            rf"(?:^k{repair_index:02d}|^shot {repair_index})(?:\D|$)",
+                            fault,
+                        )
+                    )
                     + "\n\n## 不可修改的完整 Selection\n"
                     + json.dumps(base, ensure_ascii=False, sort_keys=True)
-                    + "\n\n## 這次可用候選\n"
-                    + _describe_material(scoped_material)
+                    + "\n\n## 這次可選的既有 option\n"
+                    + "\n".join(
+                        f"- option_id={option.span_id}; "
+                        f"purpose={option.purpose}; tier={option.tier}; "
+                        f"minimum={option.min_supported_seconds:g}s; "
+                        f"content={option.content_policy}; "
+                        f"presentation={option.presentation_intent}; "
+                        f"treatments={','.join(option.feasible_treatments)}; "
+                        f"Direction建議={option.direction_treatment}; "
+                        f"原因={option.why}"
+                        for option in scoped_options
+                    )
                 ),
-            }] + _attach_material(scoped_material, cache, client, beaten)
+            }]
             interaction = ask(
                 client,
                 model=SELECTION_PATCH_MODEL_ID,
@@ -3289,30 +3615,56 @@ def select_shots(
                 usage_total.thought_tokens + used.thought_tokens,
             )
             try:
-                base = _merge_selection_patch(
+                candidate = _merge_selection_patch(
                     base, _parse(interaction, what="selection shot patch"),
-                    allowed_indices=failing_indices,
+                    allowed_indices=requested_indices,
                     offered=offered,
                     source_motion={
                         item.source_id: item.camera_motion for item in usable
                     },
+                    commitments=selection_commitments,
+                    material=usable,
                     commitment_spans=commitment_span_ids,
                 )
-            except PlannerError as error:
-                patch_faults = [str(error)]
+            except PlannerError:
                 continue
-            base.setdefault("duration_repairs", []).extend(
-                repair_single_look_hold_overflow(base)
+            if selection_commitments is not None:
+                from montagewright.candidate_commitments import (
+                    bind_selection_content_contracts,
+                )
+                bind_selection_content_contracts(
+                    candidate.get("shots") or [], selection_commitments, material
+                )
+            candidate.setdefault("duration_repairs", []).extend(
+                repair_single_look_hold_overflow(candidate)
             )
-            base.setdefault("duration_repairs", []).extend(
-                repair_camera_rests_to_duration(base, usable)
+            candidate.setdefault("duration_repairs", []).extend(
+                repair_camera_rests_to_duration(candidate, usable)
             )
-            patch_faults = audit_cached_selection(
-                base, material, direction,
+            candidate.setdefault("duration_repairs", []).extend(
+                repair_selection_motion_contracts(candidate, usable)
+            )
+            candidate.setdefault("duration_repairs", []).extend(
+                repair_selection_source_windows(candidate, usable)
+            )
+            candidate_faults = audit_cached_selection(
+                candidate, material, direction,
                 commitments=selection_commitments,
                 grounding_spec=grounding_spec,
                 duration_mode=duration_mode,
             )
+            label = rf"(?:^k{repair_index:02d}|^shot {repair_index})(?:\D|$)"
+            old_target = [fault for fault in patch_faults if re.search(label, fault)]
+            new_target = [fault for fault in candidate_faults if re.search(label, fault)]
+            old_other = {fault for fault in patch_faults if not re.search(label, fault)}
+            new_other = {fault for fault in candidate_faults if not re.search(label, fault)}
+            # Transactional commit: a choice may remove the named shot's
+            # faults, but it may not mutate a healthy neighbour or trade one
+            # global problem for another. A rejected answer leaves ``base``
+            # byte-for-byte intact and is never bought twice for this shot.
+            if len(new_target) < len(old_target) and new_other <= old_other:
+                base = candidate
+                patch_faults = candidate_faults
         raise SelectionUnrenderable(
             "selection shot patch remained structurally unrenderable: "
             + "; ".join(patch_faults),
@@ -3370,6 +3722,8 @@ def select_shots(
                     source_motion={
                         item.source_id: item.camera_motion for item in usable
                     },
+                    commitments=selection_commitments,
+                    material=usable,
                     commitment_spans=commitment_span_ids,
                 )
                 pending_patch_base = None
@@ -3399,6 +3753,20 @@ def select_shots(
         )
         chosen.setdefault("duration_repairs", []).extend(
             repair_camera_rests_to_duration(chosen, usable)
+        )
+        if selection_commitments is not None:
+            from montagewright.candidate_commitments import (
+                bind_selection_content_contracts,
+            )
+
+            bind_selection_content_contracts(
+                chosen.get("shots") or [], selection_commitments, material
+            )
+        chosen.setdefault("duration_repairs", []).extend(
+            repair_selection_motion_contracts(chosen, usable)
+        )
+        chosen.setdefault("duration_repairs", []).extend(
+            repair_selection_source_windows(chosen, usable)
         )
         faults.extend(span_contract_disagreements(
             chosen.get("shots") or [], usable
@@ -3525,6 +3893,10 @@ def select_shots(
                 )
         faults.extend(coverage.faults)
         faults.extend(sequence_disagreements(chosen.get("shots") or []))
+        if attempt_recorder is not None and not validating_previous:
+            attempt_recorder(
+                copy.deepcopy(chosen), tuple(dict.fromkeys(faults)), attempt + 1
+            )
         if not faults:
             break
         # A text warning cannot remove a span from a structured answer.  The
@@ -3603,14 +3975,6 @@ def select_shots(
                     and option.span_id.split(":", 1)[0]
                     not in repair_excluded_sources
                 }
-            scoped_material = [
-                replace(item, spans=tuple(
-                    span for span in item.spans
-                    if span.span_id in allowed_span_ids
-                ))
-                for item in usable
-                if any(span.span_id in allowed_span_ids for span in item.spans)
-            ]
             if failing_indices and not unscoped_faults and allowed_span_ids:
                 # The final repair is a patch, not another complete timeline.
                 # A complete response constrained to only the failing spans
@@ -3619,34 +3983,47 @@ def select_shots(
                 # commitments. Local merge is the only writer of neighbours.
                 pending_patch_base = copy.deepcopy(chosen)
                 pending_patch_indices = set(failing_indices)
+                scoped_options = [
+                    option for option in selection_commitments.options
+                    if option.span_id in allowed_span_ids
+                    and option.span_id.split(":", 1)[0]
+                    not in repair_excluded_sources
+                ] if selection_commitments is not None else []
                 attempt_schema = structured_json(_selection_patch_schema(
-                    sorted(allowed_span_ids), sorted(failing_indices),
-                    grounding_target_ids=grounding_target_ids,
-                    commitment_ids=list(dict.fromkeys(
-                        option.commitment_id
-                        for option in selection_commitments.options
-                    )) if selection_commitments is not None else None,
-                    action_ids=_action_ids_for_material(scoped_material),
+                    [option.span_id for option in scoped_options],
+                    sorted(failing_indices),
+                    camera_treatments=list(dict.fromkeys(
+                        treatment
+                        for option in scoped_options
+                        for treatment in option.feasible_treatments
+                    )),
                 ))
                 attempt_input = [selection_input[0], {
                     "type": "text",
                     "text": (
-                        "你只在修正上一版 Selection 的本機執行錯誤。"
-                        "response schema 只允許回傳指定鏡頭的 replacements；"
-                        "不要回傳完整 Selection。每個 replacement 必須維持"
-                        "原本的 shot_index 與 commitment_id，只能使用該 "
-                        "commitment 的候選 span。其他 shots 由本機原樣保留。"
+                        "你已在上一輪 Selection 看過素材；本次不重新附影片。"
+                        "response 只選既有 option_id 與 camera_treatment。"
+                        "不要重填來源時間、秒數、動作、looks 或音訊；本機會"
+                        "保留原鏡頭長度並重建完整 shot，其他 shots 原樣保留。"
                         "\n\n## 本機仍無法執行的原因\n- "
                         + "\n- ".join(faults)
                         + "\n\n## 不可修改的完整 Selection\n"
                         + json.dumps(chosen, ensure_ascii=False, sort_keys=True)
-                        + "\n\n## 這次可用候選\n"
-                        + _describe_material(scoped_material)
+                        + "\n\n## 這次可用既有 option\n"
+                        + "\n".join(
+                            f"- option_id={option.span_id}; "
+                            f"commitment={option.commitment_id}; "
+                            f"purpose={option.purpose}; tier={option.tier}; "
+                            f"minimum={option.min_supported_seconds:g}s; "
+                            f"presentation={option.presentation_intent}; "
+                            f"treatments={','.join(option.feasible_treatments)}; "
+                            f"Direction建議={option.direction_treatment}; "
+                            f"原因={option.why}"
+                            for option in scoped_options
+                        )
                         + exclusion_note
                     ),
-                }] + _attach_material(
-                    scoped_material, cache, client, beaten
-                )
+                }]
             else:
                 # Global faults (for example audio assignment structure) need
                 # a complete answer. Keep the full original span grammar;
@@ -3721,6 +4098,14 @@ def select_shots(
     # A coarse-screen disagreement must be visible, but it must not consume
     # two Selection repairs or prevent a reviewable draft from rendering.
     chosen.setdefault("plan_disagreements", []).extend(identity_advisories)
+    if selection_commitments is not None:
+        from montagewright.candidate_commitments import (
+            bind_selection_content_contracts,
+        )
+
+        bind_selection_content_contracts(
+            chosen.get("shots") or [], selection_commitments, material
+        )
     return chosen, usage_total
 
 
@@ -3954,6 +4339,8 @@ def action_contract_disagreements(
             str(shot.get("picture_role") or "") == "primary_action"
             and offered_actions
             and treatment == "none"
+            and str(shot.get("content_policy") or "")
+            not in {"result_hold", "static_display"}
         ):
             faults.append(
                 f"k{index:02d} is primary_action and source {source} offers "
@@ -4021,6 +4408,11 @@ def action_contract_disagreements(
                 faults.append(
                     f"k{index:02d} intentionally cuts action {selected!r} "
                     "without an editorial reason"
+                )
+            elif source_end <= action_start + 1e-3:
+                faults.append(
+                    f"k{index:02d} labels action {selected!r} intentional_cut, "
+                    "but its selected window ends before that action begins"
                 )
             elif source_end >= action_end - 1e-3:
                 faults.append(
@@ -4486,6 +4878,348 @@ def expand_spans(
         )
 
 
+def repair_selection_motion_contracts(
+    chosen: dict[str, Any], material: "list[MaterialItem]",
+) -> tuple[str, ...]:
+    """Normalize only motion combinations with one unambiguous execution.
+
+    Direction/Selection still choose the editorial treatment.  This helper
+    does not invent a move when several readings are plausible; it only
+    translates combinations that already say the same thing in two
+    incompatible ways (for example a two-stop ``multi_stop`` or an authored
+    source reveal labelled ``hold``).
+    """
+
+    from montagewright.motion import travelled_between
+    from montagewright.reframe import DEADBAND
+    from montagewright.schema import reframe_of
+
+    repaired: list[str] = []
+    items = {item.source_id: item for item in material}
+    for index, shot in enumerate(chosen.get("shots") or []):
+        looks = list(shot.get("looks") or [])
+        stable = [
+            look for look in looks
+            if str(look.get("presentation_intent") or "")
+            != "transition_pass"
+        ]
+        intent = camera_intent_of(shot)
+        relationship = str(
+            shot.get("content_visual_relationship") or "single"
+        )
+        advice = shot.get("direction_motion_advice") or {}
+        preferred = str(advice.get("treatment") or "")
+        feasible = {
+            str(one) for one in (advice.get("locally_feasible") or [])
+        }
+        source_role = str(shot.get("source_motion_role") or "locked")
+
+        # ``sequential_read`` is already an editorial decision: the viewer
+        # must be led across more than one part of the source composition.
+        # Once Direction has supplied the locally feasible menu there is no
+        # creative ambiguity in repairing an executor-incompatible hold,
+        # push or follow.  Prefer the authored move only when this exact
+        # source window measurably travels far enough; otherwise compile a
+        # digital reveal/multi-stop locally instead of buying another model
+        # round merely to rename the treatment.
+        sequential = (
+            len(stable) == 1
+            and str(stable[0].get("presentation_intent") or "")
+            == "sequential_read"
+        )
+        if sequential:
+            source = str(shot.get("source_id") or "")
+            authored_delivers = False
+            if intent == "use_source_motion" and source_role in {
+                "authored", "subject_follow",
+            }:
+                item = items.get(source)
+                boxes = material_look_boxes(item, reframe_of(shot)) if item else []
+                required_travel = (
+                    abs(float(boxes[-1][0]) - float(boxes[0][0]))
+                    if len(boxes) >= 2 else 0.0
+                )
+                begins = float(shot.get("start_seconds") or 0.0)
+                ends = begins + max(
+                    0.0, float(shot.get("seconds_needed") or 0.0)
+                )
+                measured_travel = travelled_between(
+                    item.motion if item is not None else (), begins, ends
+                )
+                # When the required points collapse to one local position,
+                # there is no missing journey to repair.  Do not emit the
+                # nonsensical "needs 0.00" fault seen in the failed run.
+                authored_delivers = (
+                    required_travel <= DEADBAND
+                    or (
+                        measured_travel is not None
+                        and measured_travel + 0.01 >= required_travel * 0.8
+                    )
+                )
+            if intent != "use_source_motion" or not authored_delivers:
+                required_visuals = list(
+                    shot.get("content_required_visuals") or []
+                )
+                replacement = (
+                    "multi_stop"
+                    if len(required_visuals) >= 3 and "multi_stop" in feasible
+                    else "reveal"
+                )
+                if replacement not in feasible:
+                    replacement = (
+                        "multi_stop" if "multi_stop" in feasible else replacement
+                    )
+                if intent != replacement:
+                    repaired.append(
+                        f"k{index:02d}: compiled sequential_read as "
+                        f"{replacement} instead of {intent}; the selected "
+                        "source window does not itself deliver the journey"
+                    )
+                    intent = replacement
+
+        if intent == "hold" and any(
+            str(look.get("presentation_intent") or "")
+            == "reveal_endpoint" for look in stable
+        ):
+            if (
+                preferred == "use_source_motion"
+                and preferred in feasible
+                and source_role in {"authored", "subject_follow"}
+            ):
+                intent = "use_source_motion"
+                repaired.append(
+                    f"k{index:02d}: used the Direction-authored source "
+                    "reveal instead of an impossible static reveal"
+                )
+
+        if intent == "multi_stop" and len(stable) == 2:
+            distinct = len({str(one.get("at") or "") for one in stable}) == 2
+            if distinct:
+                intent = "compare" if relationship == "simultaneous" else "reveal"
+                repaired.append(
+                    f"k{index:02d}: normalized two stops to {intent}; "
+                    "multi_stop is reserved for three or more landings"
+                )
+
+        # Native camera motion is one crop trajectory.  Multiple semantic
+        # participants describe what that source move reveals; they are not
+        # additional digital crop stops.  Collapse them into one landing and
+        # retain the complete participant set as measured includes.
+        if intent == "use_source_motion" and len(stable) > 1 and source_role in {
+            "authored", "subject_follow",
+        }:
+            anchor = copy.deepcopy(
+                stable[-1] if relationship == "ordered" else stable[0]
+            )
+            includes = list(dict.fromkeys([
+                *[str(one) for one in shot.get("content_required_visuals") or []],
+                *[
+                    str(one)
+                    for look in stable for one in (look.get("includes") or [])
+                ],
+            ]))
+            if includes:
+                anchor["includes"] = includes
+            anchor["seconds"] = min(
+                float(shot.get("seconds_needed") or 0.0),
+                sum(float(one.get("seconds") or 0.0) for one in stable),
+            )
+            shot["looks"] = [anchor]
+            stable = [anchor]
+            repaired.append(
+                f"k{index:02d}: kept the authored source move and treated "
+                "its visual participants as evidence, not digital stops"
+            )
+
+        # An authored ordered reveal may retain only its endpoint as a
+        # digital landing: the earlier participant is read while the source
+        # camera travels, not as another crop stop.  The complete source move
+        # is therefore the evidence carrier.  Preserve all Direction-bound
+        # visual IDs on that one landing so the relationship validator does
+        # not mistake a compact execution plan for dropped content.
+        if (
+            intent == "use_source_motion"
+            and stable
+            and source_role in {"authored", "subject_follow"}
+            and relationship in {"ordered", "action_sequence"}
+        ):
+            anchor = stable[-1]
+            required = [
+                str(one)
+                for one in shot.get("content_required_visuals") or []
+            ]
+            if required:
+                anchor["includes"] = list(dict.fromkeys([
+                    *list(anchor.get("includes") or []), *required,
+                ]))
+
+        # A simultaneous/group hold is one composition even when the model
+        # repeats its participants as separate looks.  Preserve the union on
+        # the first landing instead of pretending the held crop travels.
+        if intent == "hold" and len(stable) > 1 and relationship in {
+            "single", "simultaneous",
+        }:
+            anchor = copy.deepcopy(stable[0])
+            includes = list(dict.fromkeys([
+                *[str(one) for one in shot.get("content_required_visuals") or []],
+                *[
+                    str(one)
+                    for look in stable for one in (look.get("includes") or [])
+                ],
+            ]))
+            if includes:
+                anchor["includes"] = includes
+            anchor["seconds"] = min(
+                float(shot.get("seconds_needed") or 0.0),
+                sum(float(one.get("seconds") or 0.0) for one in stable),
+            )
+            shot["looks"] = [anchor]
+            repaired.append(
+                f"k{index:02d}: merged repeated simultaneous hold targets "
+                "into one group composition"
+            )
+
+        shot["camera_intent"] = intent
+        shot["frame"] = (
+            "settles" if intent in {"hold", "use_source_motion"} else "travels"
+        )
+    return tuple(repaired)
+
+
+def _look_evaluation_offset(
+    shot: dict[str, Any], look: dict[str, Any], position: int, total: int,
+) -> float:
+    """Where in a shot a look's recorded source sighting must be reachable."""
+
+    duration = max(0.0, float(shot.get("seconds_needed") or 0.0))
+    rest = max(0.0, float(look.get("seconds") or 0.0))
+    presentation = str(look.get("presentation_intent") or "")
+    if presentation == "reveal_endpoint":
+        return max(0.0, duration - min(duration, rest) / 2)
+    if total > 1:
+        return duration * (position + 0.5) / total
+    return duration / 2
+
+
+def repair_selection_source_windows(
+    chosen: dict[str, Any], material: "list[MaterialItem]",
+) -> tuple[str, ...]:
+    """Place a fixed-duration edit over its already-recorded source evidence.
+
+    Gemini chooses the span, subject and duration.  Exact source arithmetic is
+    local: keep the duration and named span unchanged, and move only the
+    in-point when the card's sighting can be reached without violating a named
+    action contract.  If those constraints conflict, leave the shot untouched
+    so Selection can choose another take.
+    """
+
+    items = {item.source_id: item for item in material}
+    repaired: list[str] = []
+    for index, shot in enumerate(chosen.get("shots") or []):
+        source = str(shot.get("source_id") or "")
+        item = items.get(source)
+        span = resolve_named_span(shot, material)
+        if item is None or span is None:
+            continue
+        duration = max(0.0, float(shot.get("seconds_needed") or 0.0))
+        span_duration = float(span.ends_seconds - span.starts_seconds)
+        if duration <= 0 or duration > span_duration:
+            continue
+        action_start_raw = shot.get("content_action_start_seconds")
+        action_complete_raw = shot.get("content_action_complete_seconds")
+        if (
+            str(shot.get("action_treatment") or "none") == "complete_here"
+            and action_start_raw is not None
+            and action_complete_raw is not None
+        ):
+            action_start = float(action_start_raw)
+            action_complete = float(action_complete_raw)
+            action_duration = max(0.0, action_complete - action_start)
+            if action_duration <= span_duration + 1e-6:
+                original_duration = duration
+                duration = max(duration, action_duration)
+                current = float(
+                    shot.get("start_seconds") or span.starts_seconds
+                )
+                # A source window contains the complete action iff its start
+                # is between complete-duration and action-start. Choose the
+                # nearest such point rather than asking Gemini to do decimal
+                # source-clock arithmetic.
+                earliest = max(
+                    float(span.starts_seconds), action_complete - duration,
+                )
+                latest = min(
+                    action_start, float(span.ends_seconds) - duration,
+                )
+                if earliest <= latest + 1e-6:
+                    proposed = min(max(current, earliest), latest)
+                    changed = (
+                        abs(proposed - current) > 1e-3
+                        or abs(duration - original_duration) > 1e-3
+                    )
+                    if changed:
+                        shot["seconds_needed"] = round(duration, 3)
+                        shot["start_seconds"] = round(proposed, 3)
+                        shot["start_offset_seconds"] = round(
+                            proposed - float(span.starts_seconds), 3
+                        )
+                        repaired.append(
+                            f"k{index:02d}: placed the source window at "
+                            f"{proposed:.2f}–{proposed + duration:.2f}s so "
+                            f"action {shot.get('action_id') or 'selected'} "
+                            "starts and completes before the cut"
+                        )
+                    # Completion is a hard semantic constraint. Do not let a
+                    # softer single-frame sighting move the window away from
+                    # the now-proven action interval.
+                    continue
+        by_label = {label: float(at) for label, at in item.sightings}
+        stable = [
+            look for look in (shot.get("looks") or [])
+            if str(look.get("presentation_intent") or "")
+            != "transition_pass"
+        ]
+        desired_starts: list[float] = []
+        for position, look in enumerate(stable):
+            at = by_label.get(str(look.get("at") or ""))
+            # A whole-source card may record one occurrence of a recurring
+            # label.  Evidence outside this named span cannot prove absence
+            # inside it and must not move this edit across a scene boundary.
+            if at is None or not (
+                float(span.starts_seconds) - 1e-6
+                <= at <= float(span.ends_seconds) + 1e-6
+            ):
+                continue
+            desired_starts.append(
+                at - _look_evaluation_offset(shot, look, position, len(stable))
+            )
+        if not desired_starts:
+            continue
+        desired = sum(desired_starts) / len(desired_starts)
+        latest = float(span.ends_seconds) - duration
+        proposed = min(max(desired, float(span.starts_seconds)), latest)
+        current = float(shot.get("start_seconds") or span.starts_seconds)
+        if abs(proposed - current) <= 1e-3:
+            continue
+
+        trial = copy.deepcopy(shot)
+        trial["start_seconds"] = round(proposed, 3)
+        trial["start_offset_seconds"] = round(
+            proposed - float(span.starts_seconds), 3
+        )
+        before_action = set(action_contract_disagreements([shot], material))
+        after_action = set(action_contract_disagreements([trial], material))
+        if not after_action.issubset(before_action):
+            continue
+        shot.update(trial)
+        repaired.append(
+            f"k{index:02d}: moved the {duration:.2f}s source window from "
+            f"{current:.2f}s to {proposed:.2f}s so its selected look lands "
+            "on the card's recorded source time"
+        )
+    return tuple(repaired)
+
+
 def frame_disagreements(
     shots: list[dict[str, Any]], material: "list[MaterialItem] | None" = None
 ) -> list[str]:
@@ -4505,9 +5239,12 @@ def frame_disagreements(
     """
 
     from montagewright.motion import travelled_between
+    from montagewright.reframe import DEADBAND
+    from montagewright.schema import reframe_of
 
     seen: dict[tuple[str, str], float] = {}
     moved: dict[str, tuple[Any, ...]] = {}
+    items: dict[str, MaterialItem] = {}
     # How far the frame may travel between the moment a subject was measured
     # and the moment a shot uses it, before the measurement stops describing
     # this window. Half the crop this source is delivered through: past that,
@@ -4520,6 +5257,7 @@ def frame_disagreements(
     # clothes of a general one.
     carries: dict[str, float] = {}
     for item in material or []:
+        items[item.source_id] = item
         for label, at in item.sightings:
             seen[(item.source_id, label)] = at
         moved[item.source_id] = item.motion
@@ -4558,13 +5296,63 @@ def frame_disagreements(
                 f"k{index:02d} chose hold for a reveal_endpoint; a static "
                 "crop cannot perform the promised reveal"
             )
-        elif intent in {"reveal", "compare"} and (
+        sequential = (
+            len(stable_looks) == 1
+            and str(stable_looks[0].get("presentation_intent") or "")
+            == "sequential_read"
+        )
+        parsed_looks = looks_of(shot)
+        if sequential and parsed_looks and parsed_looks[0].must_be_whole:
+            off.append(
+                f"k{index:02d} sequential_read cannot promise simultaneous whole"
+            )
+        elif sequential and intent == "use_source_motion":
+            source = str(shot.get("source_id") or "")
+            item = items.get(source)
+            boxes = material_look_boxes(item, reframe_of(shot)) if item else []
+            required_travel = (
+                abs(float(boxes[-1][0]) - float(boxes[0][0]))
+                if len(boxes) >= 2 else 0.0
+            )
+            begins = float(shot.get("start_seconds") or 0.0)
+            ends = begins + max(0.0, float(shot.get("seconds_needed") or 0.0))
+            measured_travel = travelled_between(
+                moved.get(source) or (), begins, ends
+            )
+            # Native motion is a valid treatment only when it performs the
+            # actual sequential read.  Merely classifying a take as authored
+            # is not proof that this selected three-second window crosses the
+            # wide visual.  Leave a small tolerance for coarse 4 fps motion
+            # measurement; anything materially shorter must use a designed
+            # reveal/multi-stop instead.
+            if (
+                required_travel > DEADBAND
+                and (
+                    measured_travel is None
+                    or measured_travel + 0.01 < required_travel * 0.8
+                )
+            ):
+                measured = (
+                    "unknown" if measured_travel is None
+                    else f"{measured_travel:.2f}"
+                )
+                off.append(
+                    f"k{index:02d} sequential_read needs about "
+                    f"{required_travel:.2f} frame widths of travel, but the "
+                    f"selected source window supplies {measured}; choose "
+                    "reveal or multi_stop"
+                )
+        elif sequential and intent not in {"reveal", "multi_stop"}:
+            off.append(
+                f"k{index:02d} sequential_read needs reveal or multi_stop, not {intent}"
+            )
+        elif intent in {"reveal", "compare"} and not sequential and (
             stops < 2 or len(set(labels)) < 2
         ):
             off.append(
                 f"k{index:02d} chose {intent} without two distinct looks"
             )
-        elif intent == "multi_stop" and stops < 3:
+        elif intent == "multi_stop" and not sequential and stops < 3:
             off.append(f"k{index:02d} chose multi_stop and gave {stops} looks")
         elif intent in {"push_in", "pull_out"} and (
             stops != 2 or len(set(labels)) != 1 or len(set(framings)) < 2
@@ -4628,12 +5416,53 @@ def frame_disagreements(
         # until somebody watched it.
         source = str(shot.get("source_id", ""))
         begins = float(shot.get("start_seconds") or 0.0)
-        middle = begins + float(shot.get("seconds_needed") or 0.0) / 2
-        for look in shot.get("looks") or []:
+        named_span = resolve_named_span(shot, material or [])
+        timed_looks = list(shot.get("looks") or [])
+        for position, look in enumerate(timed_looks):
             at = seen.get((source, str(look.get("at", ""))))
             if at is None:
                 continue
-            gone = travelled_between(moved.get(source) or (), at, middle)
+            if named_span is not None and not (
+                float(named_span.starts_seconds) - 1e-6
+                <= at <= float(named_span.ends_seconds) + 1e-6
+            ):
+                # One occurrence recorded elsewhere in the source is not
+                # evidence that a recurring subject is absent from this span.
+                continue
+            # A card sighting is a proposal frame, not a claim that a
+            # recurring participant exists only at that second. When
+            # Direction bound this required visual to a named source action
+            # and the edit overlaps that action, the action interval is the
+            # stronger source-clock evidence. Tutorials commonly keep the
+            # same phone/display through a later tap, scan or result while a
+            # zoom/UI transition appears as ``not_a_shift`` locally.
+            required = {
+                str(one)
+                for one in (shot.get("content_required_visuals") or [])
+            }
+            included = {
+                str(one) for one in (look.get("includes") or [])
+            }
+            action_start = shot.get("content_action_start_seconds")
+            action_complete = shot.get("content_action_complete_seconds")
+            action_treatment = str(
+                shot.get("action_treatment") or "none"
+            )
+            ends = begins + shot_seconds
+            action_proves_window = (
+                action_treatment != "none"
+                and action_start is not None
+                and action_complete is not None
+                and ends > float(action_start) + 1e-6
+                and begins < float(action_complete) - 1e-6
+                and bool(required & included)
+            )
+            if action_proves_window:
+                continue
+            evaluation = begins + _look_evaluation_offset(
+                shot, look, position, len(timed_looks)
+            )
+            gone = travelled_between(moved.get(source) or (), at, evaluation)
             clock = f"{int(at) // 60}:{at % 60:04.1f}"
             if gone is None:
                 off.append(

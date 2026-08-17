@@ -42,10 +42,13 @@ from montagewright.reframe import (
     Observation,
     OutOfFrame,
     build_crop_path,
+    build_declared_look_path,
     build_sweep_path,
-    build_look_path,
     build_tilt_path,
     build_zoom_path,
+    camera_route_policy,
+    camera_delivery_faults,
+    declared_look_centres,
     observations_from_sam,
 )
 from montagewright.renderer import RenderResult, render
@@ -743,13 +746,14 @@ def _measure_looks(
         base, base_height = target_aspect / source.aspect_ratio, 1.0
     else:
         base, base_height = 1.0, source.aspect_ratio / target_aspect
-    seen: dict[str, tuple[float, float, float]] = {}
+    seen: dict[str, tuple[float, float, float, float]] = {}
     walked: dict[str, list[tuple[float, float, float]]] = {}
     stops: list[tuple[float, float, float, float]] = []
     tracks: list[list[tuple[float, float, float]]] = []
     missing: list[str] = []
     for look_index, look in enumerate(looks):
-        subject_key = look.entity_id or look.at
+        geometry_query = look.geometry_query or look.at
+        subject_key = look.geometry_query or look.entity_id or look.at
         if subject_key not in seen:
             reference = (
                 (reference_samples or {}).get(look.entity_id)
@@ -758,7 +762,7 @@ def _measure_looks(
             if look.entity_id and reference is None:
                 missing.append(f"{look.at} ({look.entity_id}: identity unverified)")
                 continue
-            if reference is not None:
+            if reference is not None and not look.geometry_query:
                 boxes, look_times, semantic_anchors = reference
                 look_moments = [
                     at - clip.approx_in_seconds for at in look_times
@@ -766,16 +770,51 @@ def _measure_looks(
             else:
                 _afford(report)
                 boxes, usage = _locate_subject(
-                    frames, look.at, client=client, report=report
+                    frames, geometry_query, client=client, report=report
                 )
                 _charge(report, "subject", usage)
                 look_times = times
                 look_moments = moments
-                semantic_anchors = ()
+                semantic_anchors = reference[2] if reference is not None else ()
             found = [
                 one for one in boxes
                 if one.get("present") and one.get("centre_x") is not None
+                and (
+                    look.geometry_after_source_seconds is None
+                    or (
+                        0 <= int(one.get("frame_index", -1)) < len(look_times)
+                        and look_times[int(one["frame_index"])] + 1e-6
+                        >= look.geometry_after_source_seconds
+                    )
+                )
             ]
+            # Outcome geometry and identity geometry have different jobs.
+            # When both exist, accept the detail only inside the confirmed
+            # carrier on the same sampled frame. The detail never becomes an
+            # identity seed, so adding action endpoints cannot weaken
+            # reference grounding for people or products.
+            if look.geometry_query and reference is not None:
+                carriers = {
+                    int(one.get("frame_index", -1)): one
+                    for one in reference[0]
+                    if one.get("present") and one.get("centre_x") is not None
+                }
+                contained = []
+                for one in found:
+                    carrier = carriers.get(int(one.get("frame_index", -1)))
+                    if carrier is None:
+                        continue
+                    cx, cy = float(one["centre_x"]), float(one["centre_y"])
+                    half_w = float(carrier.get("width") or 0.0) / 2.0
+                    half_h = float(carrier.get("height") or 0.0) / 2.0
+                    carrier_x = float(carrier["centre_x"])
+                    carrier_y = float(carrier["centre_y"])
+                    if (
+                        carrier_x - half_w <= cx <= carrier_x + half_w
+                        and carrier_y - half_h <= cy <= carrier_y + half_h
+                    ):
+                        contained.append(one)
+                found = contained
             if not found:
                 missing.append(look.at)
                 continue
@@ -787,6 +826,7 @@ def _measure_looks(
             seen[subject_key] = (
                 sum(float(one["centre_x"]) for one in found) / len(found),
                 sum(float(one["centre_y"]) for one in found) / len(found),
+                sum(float(one.get("width") or 0.0) for one in found) / len(found),
                 sum(float(one.get("height") or 0.0) for one in found) / len(found),
             )
             walked[subject_key] = sorted(
@@ -876,7 +916,7 @@ def _measure_looks(
                         )
         if subject_key not in seen:
             continue
-        centre_x, centre_y, tall = seen[subject_key]
+        centre_x, centre_y, subject_width, tall = seen[subject_key]
         width = base
         if look.framing == "fill" and tall > 0.0:
             # The same reach a push used to compute, bounded the same way.
@@ -884,6 +924,21 @@ def _measure_looks(
         height = min(1.0, base_height * (width / base) if base > 0 else base_height)
         share = PLACEMENT.get(look.framing, 0.5)
         lift = height * (0.5 - share)
+        centres = declared_look_centres(
+            getattr(clip, "reframe", None),
+            centre_x=centre_x,
+            subject_width=subject_width,
+            crop_width=width,
+        )
+        if len(centres) > 1:
+            stops.extend((
+                max(0.0, float(look.seconds)),
+                one,
+                centre_y + lift,
+                width,
+            ) for one in centres)
+            tracks.extend([] for _ in centres)
+            continue
         stops.append((
             -1.0 if look.presentation_intent == "transition_pass"
             else max(0.0, float(look.seconds)),
@@ -2141,6 +2196,7 @@ def follow_subjects(
                         )
                 if reframe.subject is not None and card is not None:
                     crop_width = target_aspect / source.aspect_ratio
+                    route_policy = camera_route_policy(reframe)
                     # A promise that the subject must be whole, on a subject no
                     # crop of this source can hold, with a move that does not
                     # travel across it. The three cannot all be true, and the
@@ -2179,7 +2235,11 @@ def follow_subjects(
                                 },
                             )
                         )
-                    if known is not None and known.width > crop_width:
+                    if (
+                        known is not None
+                        and known.width > crop_width
+                        and not route_policy.expand_sequential_read
+                    ):
                         report.degradations.append(
                             DegradationStep(
                                 clip_id=clip.clip_id,
@@ -2221,7 +2281,17 @@ def follow_subjects(
                 # `subject` and `then_subject` and there was nowhere for a third
                 # to go, so a row of three watches lost its middle stop with
                 # nothing recorded.
-                if len(reframe.looks) >= 2 and _may_ask(client):
+                route_policy = camera_route_policy(reframe)
+                if (
+                    (
+                        len(reframe.looks) >= 2
+                        or (
+                            route_policy.expand_sequential_read
+                            and move != "use_source_motion"
+                        )
+                    )
+                    and _may_ask(client)
+                ):
                     stops, missing, tracks = _measure_looks(
                         reframe.looks, source, clip, work, report, client,
                         target_aspect, checkpoint, reference_samples,
@@ -2232,8 +2302,9 @@ def follow_subjects(
                         )
                     if len(stops) >= 2:
                         out_w, out_h = output_size
-                        paths[clip.clip_id] = build_look_path(
+                        paths[clip.clip_id] = build_declared_look_path(
                             stops,
+                            reframe=reframe,
                             source_aspect=source.aspect_ratio,
                             target_aspect=target_aspect,
                             duration_seconds=duration,
@@ -2416,7 +2487,7 @@ def follow_subjects(
                     report.following_shots += 1
                     continue
 
-                if move == "hold" or reframe.subject is None:
+                if move == "hold" or move == "use_source_motion" or reframe.subject is None:
                     # No substitution here. This branch used to notice that a
                     # subject too wide to sit in the crop could be read across
                     # instead, and swap the hold for a sweep. It looks like help
@@ -2739,6 +2810,7 @@ def follow_subjects(
                                 observations = tracked
 
                 if wants_tilt:
+                    out_w, out_h = output_size
                     path = build_tilt_path(
                         observations,
                         source_aspect=source.aspect_ratio,
@@ -2746,6 +2818,10 @@ def follow_subjects(
                         energy=reframe.camera_energy,
                         clip_id=clip.clip_id,
                         degradations=report.degradations,
+                        source_width=source.width,
+                        source_height=source.height,
+                        output_width=out_w,
+                        output_height=out_h,
                     )
                 else:
                     path = build_crop_path(
@@ -2773,6 +2849,28 @@ def follow_subjects(
                 # lets the selection repair them in a single pass.
                 unusable_shots.append(unusable)
                 continue
+    for clip in edl.clips:
+        for fault in camera_delivery_faults(
+            clip.reframe,
+            paths.get(clip.clip_id),
+            duration_seconds=(
+                clip.approx_out_seconds - clip.approx_in_seconds
+            ),
+        ):
+            report.degradations.append(
+                DegradationStep(
+                    clip_id=clip.clip_id,
+                    ladder="other",
+                    ladder_other="camera_intent_not_delivered",
+                    trigger=fault,
+                    measured={},
+                    adjudication="replan",
+                    adjudication_reason=(
+                        "keep the editorial intent, then extend the shot, "
+                        "recompile its geometry, or choose another treatment"
+                    ),
+                )
+            )
     if unusable_shots:
         raise ReferenceShotsUnusable(unusable_shots)
     return paths

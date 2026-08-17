@@ -25,7 +25,7 @@ import math
 from dataclasses import dataclass, field
 
 from montagewright.executor import CROP_MARGIN, CropBox
-from montagewright.schema import CameraEnergy, DegradationStep
+from montagewright.schema import CameraEnergy, DegradationStep, Reframe
 
 # Per camera_energy, in viewport widths per second and per second squared.
 # 720 px/s on a 1080-wide portrait viewport, the old constant, is 0.667 vw/s --
@@ -49,6 +49,62 @@ DEADBAND = 0.02
 # is written into the degradation record. Silently returning a hold, which is
 # what this did first, tells the planner its instruction was carried out.
 MIN_DIRECTNESS = 0.6
+
+
+@dataclass(frozen=True)
+class CameraRoutePolicy:
+    """The one interpretation of Selection's looks used by every stage."""
+
+    expand_sequential_read: bool
+    track_during_stops: bool
+    continuous_read: bool
+    monotonic_route: bool
+
+
+def camera_route_policy(reframe: Reframe | None) -> CameraRoutePolicy:
+    """Compile semantic looks into routing behaviour without inventing moves.
+
+    A sequential read expands only when it is the whole treatment.  A look
+    inside a push/pull is an endpoint description, not permission to insert a
+    pan before the zoom.  Keeping this policy here prevents planner geometry
+    and final crop compilation from drifting apart again.
+    """
+
+    looks = tuple(reframe.looks) if reframe is not None else ()
+    sequential = bool(
+        len(looks) == 1
+        and looks[0].presentation_intent == "sequential_read"
+    )
+    intent = str(reframe.editorial_intent) if reframe is not None else "hold"
+    return CameraRoutePolicy(
+        expand_sequential_read=sequential,
+        track_during_stops=intent in {"follow_subject", "push_in", "pull_out"},
+        continuous_read=(
+            sequential
+            and not any(
+                look.presentation_intent == "complete_hold" for look in looks
+            )
+        ),
+        monotonic_route=sequential,
+    )
+
+
+def declared_look_centres(
+    reframe: Reframe | None,
+    *,
+    centre_x: float,
+    subject_width: float,
+    crop_width: float,
+) -> list[float]:
+    """Return the exact horizontal landings shared by planning and render."""
+
+    if not camera_route_policy(reframe).expand_sequential_read:
+        return [centre_x]
+    return list(sequential_read_centres(
+        centre_x=centre_x,
+        subject_width=subject_width,
+        crop_width=crop_width,
+    ))
 
 
 class OutOfFrame(ValueError):
@@ -191,6 +247,19 @@ def _smooth(keyframes: list[Keyframe], strength: float = 0.5) -> list[Keyframe]:
     for previous, current, following in zip(
         keyframes, keyframes[1:], keyframes[2:]
     ):
+        def same(one: CropBox, two: CropBox) -> bool:
+            return all(
+                abs(getattr(one, name) - getattr(two, name)) < 1e-7
+                for name in ("x", "y", "width", "height")
+            )
+
+        # Repeated keys are authored rests. Averaging a rest key with the
+        # next moving sample starts the crop early; averaging the arrival key
+        # with the previous sample makes it settle late. Preserve both sides
+        # of a declared rest and smooth only genuine travelling samples.
+        if same(previous.crop, current.crop) or same(current.crop, following.crop):
+            smoothed.append(current)
+            continue
         blended = (
             previous.crop.x + following.crop.x
         ) / 2.0 * strength + current.crop.x * (1.0 - strength)
@@ -471,6 +540,39 @@ def seconds_needed_for(
     return round(resting + travelling, 3)
 
 
+def sequential_read_centres(
+    *, centre_x: float, subject_width: float, crop_width: float,
+) -> tuple[float, ...]:
+    """Crop centres that read a wide subject from edge to edge.
+
+    A vertical crop cannot make a wide wordmark, UI, product row, or table
+    simultaneously whole.  It *can* show every meaningful region in order.
+    This helper is shared by Selection's local timing check and the executor,
+    so the move priced before a paid answer is saved is the move that renders.
+
+    Two landings are enough for a moderately wide subject.  A subject wider
+    than roughly two delivery crops gets a middle landing as well, avoiding a
+    fast unreadable pass across the part that neither endpoint holds.
+    """
+
+    crop_width = min(1.0, max(1e-6, float(crop_width)))
+    subject_width = min(1.0, max(0.0, float(subject_width)))
+    centre_x = min(1.0, max(0.0, float(centre_x)))
+    if subject_width <= crop_width + 1e-6:
+        return (centre_x,)
+
+    subject_left = max(0.0, centre_x - subject_width / 2.0)
+    subject_right = min(1.0, centre_x + subject_width / 2.0)
+    half = crop_width / 2.0
+    left = min(max(subject_left + half, half), 1.0 - half)
+    right = min(max(subject_right - half, half), 1.0 - half)
+    if right - left < DEADBAND:
+        return ((left + right) / 2.0,)
+    if subject_width > crop_width * 1.8:
+        return (left, (left + right) / 2.0, right)
+    return (left, right)
+
+
 def build_look_path(
     stops: list[tuple[float, float, float, float]],
     *,
@@ -485,6 +587,9 @@ def build_look_path(
     output_width: int = 0,
     output_height: int = 0,
     tracks: "list[list[tuple[float, float, float]]] | None" = None,
+    track_during_stops: bool = True,
+    continuous_read: bool = False,
+    monotonic_route: bool = False,
 ) -> CropPath:
     """Walk a shot through the places it looks, resting at each.
 
@@ -560,6 +665,121 @@ def build_look_path(
             )
 
     boxes = [box(cx, cy, w) for _, cx, cy, w in stops]
+
+    if (monotonic_route or continuous_read) and any(
+        abs(one.width - boxes[0].width) >= 1e-6 for one in boxes[1:]
+    ):
+        raise ValueError(
+            "a sequential-read route cannot also change crop size; "
+            "declare pan/read and push/pull as separate treatments"
+        )
+
+    # Reading one wide visual is allowed to stop at intermediate details, but
+    # it is not allowed to pass the last new detail and then drift back across
+    # content the viewer has already seen.  That return is not a new look; it
+    # is the rebound that made otherwise valid pans feel broken.  Keep this
+    # policy separate from ``continuous_read``: an explicit complete_hold may
+    # legitimately ask for rests at the retained landings, while the route as
+    # a whole must still advance in one direction.
+    if (monotonic_route or continuous_read) and len(boxes) >= 2:
+        centres = [one.x + one.width / 2.0 for one in boxes]
+        first_direction = next(
+            (
+                1.0 if later > earlier else -1.0
+                for earlier, later in zip(centres, centres[1:])
+                if abs(later - earlier) >= DEADBAND
+            ),
+            0.0,
+        )
+        if first_direction:
+            furthest = centres[0]
+            keep = 1
+            for index, centre in enumerate(centres[1:], start=1):
+                advances = (centre - furthest) * first_direction
+                if advances >= -DEADBAND:
+                    furthest = (
+                        max(furthest, centre)
+                        if first_direction > 0 else min(furthest, centre)
+                    )
+                    keep = index + 1
+                    continue
+                break
+            if keep < len(boxes):
+                planned = len(boxes)
+                # Compound pan+zoom routes are no longer inferred from a look:
+                # the canonical policy only expands a sequential read when it
+                # is the whole treatment.  A monotonic route therefore has one
+                # crop width, and anything after its furthest landing is just
+                # redundant read-back.
+                boxes = boxes[:keep]
+                stops = stops[:keep]
+                if tracks is not None:
+                    tracks = tracks[:keep]
+                if degradations is not None:
+                    degradations.append(
+                        DegradationStep(
+                            clip_id=clip_id,
+                            ladder="other",
+                            ladder_other="redundant_readback_suppressed",
+                            trigger=(
+                                "a one-direction reading route ended by "
+                                "returning across content already shown, so "
+                                "the redundant rebound was removed"
+                            ),
+                            measured={
+                                "planned_landings": float(planned),
+                                "delivered_landings": float(len(boxes)),
+                            },
+                            adjudication="accept",
+                            adjudication_reason=(
+                                "the retained route reaches the furthest "
+                                "declared reading edge"
+                            ),
+                        )
+                    )
+
+    if continuous_read and len(boxes) >= 2:
+        # A sequential read is one camera sentence, not a row of unrelated
+        # stop-start moves.  Keep its measured waypoints, but travel through
+        # the internal ones at continuous speed and settle only at the two
+        # ends.  This is especially important for wordmarks and product
+        # line-ups: braking to zero on every generated landing reads as a
+        # stutter rather than as deliberate inspection.
+        route = list(boxes)
+        # Collinear waypoints do not alter the path; retaining them merely
+        # gives the renderer another easing boundary, which brakes the crop
+        # to zero in the middle of an otherwise continuous pan.  The single
+        # eased start-to-end leg still passes through every intermediate x at
+        # the same visual speed, without the characteristic "move, stop,
+        # move" cadence.
+        if len(route) > 2 and all(
+            abs(one.y - route[0].y) < 1e-6
+            and abs(one.width - route[0].width) < 1e-6
+            and abs(one.height - route[0].height) < 1e-6
+            for one in route[1:]
+        ):
+            route = [route[0], route[-1]]
+        if len(route) >= 2:
+            start_rest = min(SETTLE_SECONDS, duration_seconds * 0.2)
+            end_rest = min(SETTLE_SECONDS, duration_seconds * 0.2)
+            moving = max(duration_seconds - start_rest - end_rest, 1e-6)
+            distances = [
+                _crop_distance(before, after)
+                for before, after in zip(route, route[1:])
+            ]
+            total_distance = sum(distances)
+            keys = [Keyframe(0.0, route[0]), Keyframe(start_rest, route[0])]
+            elapsed = start_rest
+            for index, (landing, distance) in enumerate(
+                zip(route[1:], distances), start=1
+            ):
+                elapsed += moving * (
+                    distance / total_distance
+                    if total_distance > 1e-9 else 1.0 / len(distances)
+                )
+                keys.append(Keyframe(round(elapsed, 4), landing))
+            keys.append(Keyframe(duration_seconds, route[-1]))
+            return CropPath(_dedupe(keys))
     def track_matters(
         track: list[tuple[float, float, float]] | None, width: float,
     ) -> bool:
@@ -573,7 +793,8 @@ def build_look_path(
 
     walking = [
         one for one in (tracks or [])
-        if track_matters(one, min(box.width for box in boxes))
+        if track_during_stops
+        and track_matters(one, min(box.width for box in boxes))
     ]
     if len(boxes) == 1 and not walking:
         return CropPath([Keyframe(0.0, boxes[0])])
@@ -675,13 +896,21 @@ def build_look_path(
                     "needed_speed_vw_s": round(worst[1] / worst[2], 4),
                     "max_speed_vw_s": ceiling,
                 },
+                adjudication="replan",
+                adjudication_reason=(
+                    "choose a shorter route, extend the shot, or use a stable "
+                    "primary landing"
+                ),
             )
         )
-
     keyframes: list[Keyframe] = []
     at = 0.0
     for index, crop in enumerate(boxes):
-        seen = tracks[index] if tracks and index < len(tracks) else None
+        seen = (
+            tracks[index]
+            if track_during_stops and tracks and index < len(tracks)
+            else None
+        )
         if not track_matters(seen, crop.width):
             seen = None
         # Resting on a subject that is walking is not the same as resting on
@@ -704,13 +933,13 @@ def build_look_path(
             next_crop = boxes[index + 1]
             from_track = (
                 tracks[index]
-                if tracks and index < len(tracks)
+                if track_during_stops and tracks and index < len(tracks)
                 and track_matters(tracks[index], min(crop.width, next_crop.width))
                 else None
             )
             to_track = (
                 tracks[index + 1]
-                if tracks and index + 1 < len(tracks)
+                if track_during_stops and tracks and index + 1 < len(tracks)
                 and track_matters(
                     tracks[index + 1], min(crop.width, next_crop.width)
                 )
@@ -755,15 +984,100 @@ def build_look_path(
                     Keyframe(round(when, 4), box(centre_x, centre_y, width))
                 )
             at = leg_end
-    limited, _ = _limit_speed(keyframes, ENERGY_LIMITS[energy])
+    # Selection normally prevents a route whose distance and rests do not
+    # fit.  A legacy/cached plan or measurement edge can still arrive here.
+    # In that fallback, reaching the promised endpoint with smooth easing is
+    # less misleading than the old speed limiter: it stalled mid-pan and
+    # made a conspicuous correction at the cut.  Keep the replan degradation
+    # above, but produce a complete reviewable preview instead of silently
+    # changing the treatment to a hold.
+    limited, _ = (
+        (keyframes, False)
+        if hurried else _limit_speed(keyframes, ENERGY_LIMITS[energy])
+    )
     delivered = CropPath(_dedupe(limited))
+    missed = (
+        _crop_distance(delivered.keyframes[-1].crop, boxes[-1])
+        if delivered.keyframes else 0.0
+    )
     _record_missed_endpoint(
         intended=boxes[-1],
         delivered=delivered,
         clip_id=clip_id,
         degradations=degradations,
     )
+    if missed > 1e-4:
+        # Do not show the limiter's unfinished journey.  Preserve the
+        # designed route for a reviewable preview; the endpoint degradation
+        # keeps it from being called final-ready.
+        return CropPath(_dedupe(keyframes))
     return delivered
+
+
+def build_declared_look_path(
+    stops: list[tuple[float, float, float, float]],
+    *,
+    reframe: Reframe,
+    tracks: list[list[tuple[float, float, float]]] | None = None,
+    **geometry,
+) -> CropPath:
+    """Compile measured looks through the canonical semantic route policy."""
+
+    policy = camera_route_policy(reframe)
+    return build_look_path(
+        stops,
+        tracks=tracks,
+        track_during_stops=policy.track_during_stops,
+        continuous_read=policy.continuous_read,
+        monotonic_route=policy.monotonic_route,
+        **geometry,
+    )
+
+
+def camera_delivery_faults(
+    reframe: Reframe | None,
+    path: CropPath | None,
+    *,
+    duration_seconds: float,
+) -> tuple[str, ...]:
+    """Prove that compiled geometry still means what Selection requested.
+
+    This is deliberately small.  It checks semantic invariants, not taste:
+    push must tighten, pull must open, a multi-landing route must move, and a
+    designed move must reach the end of the shot.  A failed proof is surfaced
+    for replan/review instead of being renamed as a successful hold.
+    """
+
+    if reframe is None:
+        return ()
+    intent = str(reframe.editorial_intent or "hold")
+    if intent in {"hold", "use_source_motion"}:
+        return ()
+    if path is None or not path.keyframes:
+        return (f"{intent} produced no digital crop path",)
+
+    first = path.keyframes[0].crop
+    last = path.keyframes[-1].crop
+    faults: list[str] = []
+    if intent == "push_in" and last.width >= first.width - 1e-4:
+        faults.append("push_in did not finish tighter than it started")
+    if intent == "pull_out" and last.width <= first.width + 1e-4:
+        faults.append("pull_out did not finish wider than it started")
+    if (
+        intent in {"reveal", "compare", "multi_stop"}
+        and len(reframe.looks) >= 2
+        and path.is_static
+    ):
+        faults.append(f"{intent} compiled to a static crop")
+    if (
+        len(path.keyframes) >= 2
+        and path.keyframes[-1].seconds + 0.02 < duration_seconds
+    ):
+        faults.append(
+            f"{intent} crop path ends at {path.keyframes[-1].seconds:.3f}s "
+            f"before the {duration_seconds:.3f}s shot ends"
+        )
+    return tuple(faults)
 
 
 def _across(
@@ -966,6 +1280,45 @@ def travel_room(
     )
 
 
+def delivery_crop_size(
+    *,
+    source_aspect: float,
+    target_aspect: float,
+    source_width: int = 0,
+    source_height: int = 0,
+    output_width: int = 0,
+    output_height: int = 0,
+) -> tuple[float, float]:
+    """One crop envelope shared by capability checks and path builders.
+
+    With no pixel facts this preserves the historical largest aspect-fitting
+    crop.  With them it uses the smallest crop that can deliver the requested
+    pixels without enlargement.  That spare resolution is real pan/tilt room:
+    Direction already advertises it through :func:`travel_room`, so an
+    executor that ignores it can promise a vertical move and then compile a
+    hold.
+    """
+
+    if (
+        min(source_width, source_height, output_width, output_height) > 0
+        and source_aspect > 0
+        and target_aspect > 0
+    ):
+        free_x, free_y = travel_room(
+            source_width=source_width,
+            source_height=source_height,
+            target_aspect=target_aspect,
+            output_width=output_width,
+            output_height=output_height,
+        )
+        width, height = 1.0 - free_x, 1.0 - free_y
+        if width > 0 and height > 0:
+            return width, height
+    if target_aspect < source_aspect:
+        return target_aspect / source_aspect, 1.0
+    return 1.0, source_aspect / target_aspect
+
+
 def zoom_budget(
     *,
     source_width: int,
@@ -1029,6 +1382,10 @@ def build_tilt_path(
     energy: CameraEnergy = "calm",
     clip_id: str = "",
     degradations: list[DegradationStep] | None = None,
+    source_width: int = 0,
+    source_height: int = 0,
+    output_width: int = 0,
+    output_height: int = 0,
 ) -> CropPath:
     """Follow a subject up or down the frame.
 
@@ -1047,12 +1404,14 @@ def build_tilt_path(
     if not observations:
         raise ValueError("a tilt needs at least one observation")
 
-    if target_aspect < source_aspect:
-        crop_width = target_aspect / source_aspect
-        crop_height = 1.0
-    else:
-        crop_width = 1.0
-        crop_height = source_aspect / target_aspect
+    crop_width, crop_height = delivery_crop_size(
+        source_aspect=source_aspect,
+        target_aspect=target_aspect,
+        source_width=source_width,
+        source_height=source_height,
+        output_width=output_width,
+        output_height=output_height,
+    )
 
     free_y = max(0.0, 1.0 - crop_height)
     centres_y = [observation.centre_y for observation in observations]
@@ -1207,18 +1566,44 @@ def build_zoom_path(
     if spread < DEADBAND:
         # Measured and barely moving. A track that only jitters would make the
         # push wander, which reads worse than aiming at one point does.
-        return CropPath(
+        return _with_rest(
             [
                 Keyframe(0.0, box(first, centre_x, centre_y)),
                 Keyframe(duration_seconds, box(last, centre_x, centre_y)),
-            ]
+            ],
+            duration_seconds,
+            energy,
+            clip_id=clip_id,
+            degradations=degradations,
         )
 
     # One keyframe per measurement: the size ramps across the shot, the aim
     # comes from where the subject was at that moment.
+    # Remove sub-visible detector jitter before it becomes a crop correction.
+    # This preserves genuine changes of direction above the deadband; it is a
+    # camera stabiliser, not an editorial choice to ignore subject motion.
+    stable = [moving[0]]
+    for seconds, at_x, at_y in moving[1:-1]:
+        _, was_x, was_y = stable[-1]
+        if math.hypot(at_x - was_x, at_y - was_y) < DEADBAND * 0.5:
+            at_x, at_y = was_x, was_y
+        stable.append((seconds, at_x, at_y))
+    stable.append(moving[-1])
+    moving = stable
+
+    # The zoom itself rests even while the crop keeps following a moving
+    # subject.  Starting the size change on frame one and finishing it on the
+    # cut makes every successful push look like a fragment of a longer move.
+    settle = min(SETTLE_SECONDS, duration_seconds * SETTLE_SHARE)
+    zooming = max(duration_seconds - settle * 2.0, 1e-6)
+
     raw: list[Keyframe] = []
     for seconds, at_x, at_y in moving:
-        share = seconds / duration_seconds if duration_seconds > 0 else 0.0
+        share = min(1.0, max(0.0, (seconds - settle) / zooming))
+        # Smoothstep the scale envelope. Dense subject tracking remains
+        # linear between samples, but the authored push takes up and sets down
+        # without braking at every tracking point.
+        share = share * share * (3.0 - 2.0 * share)
         size = (
             first[0] + (last[0] - first[0]) * share,
             first[1] + (last[1] - first[1]) * share,
@@ -1244,6 +1629,11 @@ def build_zoom_path(
                     "subject_spread_vw": round(spread, 4),
                     "samples": float(len(moving)),
                 },
+                adjudication="accept",
+                adjudication_reason=(
+                    "following the measured subject preserves the requested "
+                    "push while the local zoom envelope rests at both ends"
+                ),
             )
         )
     return CropPath(_smooth(limited))
@@ -1290,14 +1680,40 @@ def _report_fit(
     if degradations is None or not observations:
         return path
 
+    def crop_when(seconds: float) -> CropBox:
+        """Read the compiled path on the observation's clock.
+
+        Observation index and keyframe index are not interchangeable: a held
+        path has one keyframe for many observations, while a designed path
+        may have extra rest keys.  Pairing them by list position made the fit
+        report judge a different frame from the one the renderer displays.
+        """
+
+        if seconds <= path.keyframes[0].seconds:
+            return path.keyframes[0].crop
+        if seconds >= path.keyframes[-1].seconds:
+            return path.keyframes[-1].crop
+        for before, after in zip(path.keyframes, path.keyframes[1:]):
+            if before.seconds <= seconds <= after.seconds:
+                span = max(after.seconds - before.seconds, 1e-9)
+                share = (seconds - before.seconds) / span
+                return CropBox(
+                    x=before.crop.x + (after.crop.x - before.crop.x) * share,
+                    y=before.crop.y + (after.crop.y - before.crop.y) * share,
+                    width=(
+                        before.crop.width
+                        + (after.crop.width - before.crop.width) * share
+                    ),
+                    height=(
+                        before.crop.height
+                        + (after.crop.height - before.crop.height) * share
+                    ),
+                )
+        return path.keyframes[-1].crop
+
     worst = min(
-        visible_fraction(
-            path.keyframes[
-                min(index, len(path.keyframes) - 1)
-            ].crop,
-            observation,
-        )
-        for index, observation in enumerate(observations)
+        visible_fraction(crop_when(observation.seconds), observation)
+        for observation in observations
     )
     if worst < min_visible:
         degradations.append(
@@ -1514,7 +1930,13 @@ def build_crop_path(
                 },
             )
         )
-    return path
+    return _report_fit(
+        path,
+        observations,
+        clip_id=clip_id,
+        min_visible=min_visible,
+        degradations=degradations,
+    )
 
 
 def _eased(
@@ -1551,17 +1973,36 @@ def interpolate_crop_keyframes(
     # easing every sample would make the virtual camera brake to zero and
     # accelerate again dozens of times inside one move.  Render and evidence
     # consumers must make the same distinction.
-    if ease is None:
-        ease = len(keys) <= 4
+    automatic = ease is None
     before, after = keys[0], keys[-1]
-    for left, right in zip(keys, keys[1:]):
+    segment_index = max(0, len(keys) - 2)
+    for index, (left, right) in enumerate(zip(keys, keys[1:])):
         if float(left["at"]) <= seconds <= float(right["at"]):
             before, after = left, right
+            segment_index = index
             break
     span = float(after["at"]) - float(before["at"])
     share = 0.0 if span <= 0 else max(
         0.0, min(1.0, (seconds - float(before["at"])) / span)
     )
+    if automatic:
+        def same(one: dict, two: dict) -> bool:
+            return all(
+                abs(float(one[key]) - float(two[key])) < 1e-7
+                for key in ("x", "y", "w", "h")
+            )
+
+        ease = (
+            len(keys) <= 4
+            or (
+                segment_index > 0
+                and same(keys[segment_index - 1], before)
+            )
+            or (
+                segment_index + 2 < len(keys)
+                and same(after, keys[segment_index + 2])
+            )
+        )
     if ease:
         share = share * share * (3.0 - 2.0 * share)
     return {
@@ -1599,20 +2040,38 @@ def retime_crop_path(
 
 
 def _axis_expression(
-    path: CropPath, pick, scale: int, *, ease: bool = True,
+    path: CropPath, pick, scale: int, *, ease: bool | None = True,
     clock: str = "t",
 ) -> str:
     """Piecewise expression for one axis over the whole shot."""
 
     first = pick(path.keyframes[0].crop) * scale
     expression = f"{first:.3f}"
-    for earlier, later in zip(path.keyframes, path.keyframes[1:]):
+    for index, (earlier, later) in enumerate(
+        zip(path.keyframes, path.keyframes[1:])
+    ):
         start = pick(earlier.crop) * scale
         end = pick(later.crop) * scale
         span = max(later.seconds - earlier.seconds, 1e-6)
+        segment_ease = ease
+        if segment_ease is None:
+            segment_ease = (
+                (
+                    index > 0
+                    and _crop_distance(
+                        path.keyframes[index - 1].crop, earlier.crop
+                    ) < 1e-7
+                )
+                or (
+                    index + 2 < len(path.keyframes)
+                    and _crop_distance(
+                        later.crop, path.keyframes[index + 2].crop
+                    ) < 1e-7
+                )
+            )
         ramp = (
             _eased(start, end, earlier.seconds, span, clock=clock)
-            if ease
+            if segment_ease
             else f"{start:.3f}+({end - start:.3f})*({clock}-{earlier.seconds:.3f})/{span:.6f}"
         )
         expression = (
@@ -1644,7 +2103,7 @@ def ffmpeg_crop_expression(
     # Semantic paths contain a few authored stops; dense paths contain SAM
     # samples.  Re-easing every dense sample produces a visible stop/start
     # cadence, so only the former ease each leg.
-    ease = len(path.keyframes) <= 4
+    ease = True if len(path.keyframes) <= 4 else None
     # Crop extents must stay even for chroma subsampling, and must not run off
     # the frame at any point in the ramp.
     w_expr = f"floor(min({_axis_expression(path, lambda c: c.width, width, ease=ease, clock=clock)},{width})/2)*2"
@@ -1690,7 +2149,7 @@ def ffmpeg_crop_filters(
         ]
 
     clock = f"(on/{output_fps}-{clock_offset_seconds:.6f})"
-    ease = len(path.keyframes) <= 4
+    ease = True if len(path.keyframes) <= 4 else None
     left = _axis_expression(path, lambda crop: crop.x, 1, ease=ease, clock=clock)
     top = _axis_expression(path, lambda crop: crop.y, 1, ease=ease, clock=clock)
     right = _axis_expression(

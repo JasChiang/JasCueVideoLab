@@ -184,9 +184,22 @@ class UploadCache:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self.entries, indent=1), encoding="utf-8"
+        # Web and CLI runs may finish uploads concurrently. Publishing bytes
+        # directly exposes a half-written JSON document after interruption or
+        # to a reader arriving mid-write. Stage a complete, flushed generation
+        # beside the cache and switch it atomically.
+        fd, raw = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", dir=self.path.parent
         )
+        staged = Path(raw)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(self.entries, stream, indent=1)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(staged, self.path)
+        finally:
+            staged.unlink(missing_ok=True)
 
     def _live(
         self,

@@ -1,6 +1,8 @@
 from montagewright.grounding import BeatGrid, Cue
 from montagewright.planning_release import rhythm_motion_faults
-from montagewright.schema import ActionContract, Clip, EDL, MusicSync, Reframe
+from montagewright.schema import (
+    ActionContract, Clip, ContentContract, EDL, Look, MusicSync, Reframe,
+)
 
 
 def _clip(
@@ -25,6 +27,40 @@ def _grid():
         bpm=120.0, meter=4, duration_seconds=10.0,
         cues=(Cue("section_002", 4.0, "section_boundary", 1.0),),
     )
+
+
+def test_preferred_camera_duration_extends_the_same_move_inside_usable_window():
+    from montagewright.planning_release import resolve_preferred_camera_durations
+
+    clip = _clip(seconds=2.0, move="reveal", usable_to=6.0).model_copy(update={
+        "reframe": Reframe(
+            looks=[
+                Look(at="left", seconds=1.5, presentation_intent="complete_hold"),
+                Look(at="right", seconds=1.5, presentation_intent="reveal_endpoint"),
+            ],
+            look_boxes=[(0.2, 0.5, 0.3), (0.8, 0.5, 0.3)],
+            camera_move="pan",
+            editorial_intent="reveal",
+            intent="read left to right",
+        )
+    })
+    resolved, notes = resolve_preferred_camera_durations(
+        EDL(project_id="p", clips=[clip]), duration_mode="preferred"
+    )
+
+    assert notes
+    assert resolved.clips[0].reframe.editorial_intent == "reveal"
+    assert resolved.clips[0].approx_out_seconds > 2.0
+    assert not resolved.clips[0].music_sync.cut_on_beat
+
+
+def test_exact_camera_duration_is_never_locally_extended():
+    from montagewright.planning_release import resolve_preferred_camera_durations
+
+    edl = EDL(project_id="p", clips=[_clip(seconds=1.0, move="push_in")])
+    assert resolve_preferred_camera_durations(
+        edl, duration_mode="exact"
+    ) == (edl, ())
 
 
 def test_named_music_cue_must_really_land():
@@ -191,3 +227,21 @@ def test_independent_audio_must_fit_inside_the_resolved_picture_timeline():
     assert faults == (
         "audio voice falls outside the 2.000s picture timeline (0.000-3.000s)",
     )
+
+
+def test_release_refuses_rhythm_that_shortens_a_content_dwell_contract():
+    from montagewright.planning_release import resolved_source_contract_faults
+
+    clip = _clip(seconds=2.0)
+    clip = clip.model_copy(update={"content_contracts": [ContentContract(
+        commitment_id="result",
+        purpose="read the generated result",
+        policy="result_hold",
+        minimum_seconds=3.0,
+    )]})
+
+    faults = resolved_source_contract_faults(EDL(project_id="p", clips=[clip]))
+
+    assert len(faults) == 1
+    assert "result_hold" in faults[0]
+    assert "needs at least 3.000s" in faults[0]

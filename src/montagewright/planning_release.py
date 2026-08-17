@@ -6,6 +6,67 @@ from montagewright.grounding import BeatGrid, ground_timeline
 from montagewright.schema import EDL
 
 
+def resolve_preferred_camera_durations(
+    edl: EDL, *, duration_mode: str,
+) -> tuple[EDL, tuple[str, ...]]:
+    """Give an already-selected move enough time without changing its idea.
+
+    This is the only automatic camera repair.  It may extend a preferred
+    delivery inside the proven usable window when camera duration is the sole
+    unresolved contract.  It never trims content, changes source/treatment,
+    or moves an exact-duration delivery off its requested clock.
+    """
+
+    if duration_mode != "preferred":
+        return edl, ()
+    from montagewright.grounding import camera_floor_for
+
+    rewritten = []
+    notes: list[str] = []
+    for clip in edl.clips:
+        duration = clip.approx_out_seconds - clip.approx_in_seconds
+        required = camera_floor_for(clip.reframe)
+        if required <= duration + 1e-6:
+            rewritten.append(clip)
+            continue
+        isolated = edl.model_copy(update={"clips": [clip], "audio_clips": []})
+        faults = resolved_source_contract_faults(isolated)
+        if not faults or any(
+            " across this shot needs about " not in fault for fault in faults
+        ):
+            rewritten.append(clip)
+            continue
+        window = clip.usable_window
+        desired_out = clip.approx_in_seconds + required
+        if window is None or desired_out > window[1] + 1e-6:
+            rewritten.append(clip)
+            continue
+        sync = clip.music_sync.model_copy(update={
+            "cut_on_beat": False,
+            "beats": None,
+            "sync_to": None,
+            "rhythm_reason": (
+                clip.music_sync.rhythm_reason
+                + "；本機保留完成運鏡所需時間，切點離開拍點"
+            ).strip("；"),
+        })
+        rewritten.append(clip.model_copy(update={
+            "approx_out_seconds": desired_out,
+            "coverage_claim_seconds": max(
+                float(clip.coverage_claim_seconds or 0.0), required
+            ),
+            "music_sync": sync,
+        }))
+        treatment = str(
+            getattr(clip.reframe, "editorial_intent", None) or "hold"
+        )
+        notes.append(
+            f"{clip.clip_id}: kept {treatment} and extended "
+            f"{duration:.3f}s -> {required:.3f}s inside the proven usable window"
+        )
+    return edl.model_copy(update={"clips": rewritten}), tuple(notes)
+
+
 def resolved_source_contract_faults(edl: EDL) -> tuple[str, ...]:
     """Validate source-clock promises on the exact windows to be rendered.
 
@@ -50,6 +111,15 @@ def resolved_source_contract_faults(edl: EDL) -> tuple[str, ...]:
                     f"{contract.safe_cut_after_seconds:.3f}s source time; "
                     f"window ends at {source_out:.3f}s"
                 )
+        duration = source_out - source_in
+        for contract in clip.content_contracts:
+            if duration < contract.minimum_seconds - 1e-6:
+                faults.append(
+                    f"{clip.clip_id}: {contract.policy} for "
+                    f"{contract.commitment_id} needs at least "
+                    f"{contract.minimum_seconds:.3f}s to fulfil "
+                    f"{contract.purpose!r}; window has {duration:.3f}s"
+                )
         for contract in clip.source_motion_contracts:
             if source_in > contract.source_start_seconds + 1e-6:
                 faults.append(
@@ -65,7 +135,6 @@ def resolved_source_contract_faults(edl: EDL) -> tuple[str, ...]:
                     f"window ends at {source_out:.3f}s"
                 )
         floor = _floor_for(clip)
-        duration = source_out - source_in
         if floor > 0.0 and duration < floor - 1e-6:
             move = clip.reframe.camera_move if clip.reframe is not None else "hold"
             faults.append(
