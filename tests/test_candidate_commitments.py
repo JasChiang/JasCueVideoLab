@@ -612,7 +612,15 @@ def test_two_primaries_in_one_commitment_are_reduced_to_one():
     assert len(primaries) == 1
 
 
-def test_conflicting_group_flags_are_a_retryable_commitment_error():
+def test_options_disagreeing_on_required_are_unified_not_rejected():
+    """A group whose options disagree on a group-level flag is a slip.
+
+    Purpose and required belong to the commitment, not the option, so two
+    options for one commitment cannot honestly disagree on them. Rather than
+    throw away a paid direction, the primary's value is applied to the group
+    and the adjustment recorded; the model invariant then holds by
+    construction.
+    """
     direction = _direction()
     alternate = dict(direction["candidate_options"][0])
     alternate.update({
@@ -623,8 +631,15 @@ def test_conflicting_group_flags_are_a_retryable_commitment_error():
         "min_supported_seconds": "0:03",
     })
     direction["candidate_options"].append(alternate)
-    with pytest.raises(CommitmentError, match="conflicting required flags"):
-        _resolved(direction)
+
+    resolved = _resolved(direction)
+
+    group = [
+        one for one in resolved.options if one.commitment_id == "hero"
+    ]
+    assert len({one.required for one in group}) == 1
+    assert group[0].required is True  # the primary's value
+    assert any("required" in warning for warning in resolved.warnings)
 
 
 def test_selection_must_use_an_option_and_fulfil_every_required_commitment():

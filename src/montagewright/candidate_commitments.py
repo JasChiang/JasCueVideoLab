@@ -866,36 +866,70 @@ def resolve_candidate_commitments(
             faults.append(f"option {index} is invalid: {error}")
     if faults and not options:
         raise CommitmentError("; ".join(faults))
-    offered = {one.span_id for one in options}
-    deferred = tuple(sorted(set(span_index) - offered))
+    # The model owns which options exist; the local contract owns that they
+    # are internally coherent. Direction is a model answer that does not
+    # always keep that coherence -- a commitment can come back with two
+    # options for one span, with its options disagreeing on purpose or
+    # required, or with no primary among them. Each is a bookkeeping slip a
+    # single deterministic pass can settle, and none is a reason to throw away
+    # a paid direction and stop the film. The model's structural invariant
+    # stays as the last line of defence; it now holds by construction.
+    repairs: list[str] = []
+
+    seen_pairs: set[tuple[str, str]] = set()
+    deduped: list[CandidateOption] = []
+    for option in options:
+        pair = (option.commitment_id, option.span_id)
+        if pair in seen_pairs:
+            repairs.append(
+                f"{option.commitment_id} offered {option.span_id} twice; "
+                "kept the first"
+            )
+            continue
+        seen_pairs.add(pair)
+        deduped.append(option)
+    options = deduped
+
     grouped: dict[str, list[CandidateOption]] = {}
     for option in options:
         grouped.setdefault(option.commitment_id, []).append(option)
 
-    # Exactly one primary per commitment is a hard invariant of the model, and
-    # Direction is a model answer that does not always hold it: a commitment
-    # can come back with no primary among its options, or with two. That is a
-    # tier bookkeeping slip, not a reason to throw away a paid direction and
-    # stop the film -- the first option is a fine primary and the rest are its
-    # alternates. Repair it here, deterministically, and say which commitment
-    # was adjusted. `options` is rebuilt from the repaired groups in its
-    # original order so nothing else shifts.
-    primary_repairs: list[str] = []
+    changed = bool(repairs)
     for commitment_id, group in grouped.items():
+        purpose = group[0].purpose
+        required = group[0].required
+        if len({one.purpose for one in group}) != 1:
+            repairs.append(
+                f"{commitment_id} options disagreed on purpose; used the "
+                "primary's"
+            )
+        if len({one.required for one in group}) != 1:
+            repairs.append(
+                f"{commitment_id} options disagreed on required; used the "
+                "primary's"
+            )
         primaries = [one for one in group if one.tier == "primary"]
-        if len(primaries) == 1:
-            continue
+        if len(primaries) != 1:
+            repairs.append(
+                f"{commitment_id} had {len(primaries)} primary options; kept "
+                "one primary and made the rest alternates"
+            )
         for position, option in enumerate(group):
+            updates: dict[str, Any] = {}
+            if option.purpose != purpose:
+                updates["purpose"] = purpose
+            if option.required != required:
+                updates["required"] = required
             want = "primary" if position == 0 else "alternate"
-            if option.tier != want:
-                group[position] = option.model_copy(update={"tier": want})
-        primary_repairs.append(
-            f"{commitment_id} had {len(primaries)} primary options; kept one "
-            "primary and made the rest alternates"
-        )
-    if primary_repairs:
+            if len(primaries) != 1 and option.tier != want:
+                updates["tier"] = want
+            if updates:
+                group[position] = option.model_copy(update=updates)
+                changed = True
+
+    if changed:
         # Rebuild in the original order, drawing each commitment's repaired
-        # options in sequence, so only the tiers changed.
+        # options in sequence, so only the fields above changed.
         cursors = {commitment_id: 0 for commitment_id in grouped}
         rebuilt: list[CandidateOption] = []
         for option in options:
@@ -904,9 +938,12 @@ def resolve_candidate_commitments(
             cursors[option.commitment_id] += 1
         options = rebuilt
 
+    offered = {one.span_id for one in options}
+    deferred = tuple(sorted(set(span_index) - offered))
+
     warnings = tuple(dict.fromkeys([
         *faults,
-        *primary_repairs,
+        *repairs,
         *(
             f"{commitment_id} has a single point of failure"
             for commitment_id, group in grouped.items()

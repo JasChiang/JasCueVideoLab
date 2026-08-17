@@ -1780,10 +1780,13 @@ def test_speaker_picture_cannot_pretend_another_sources_voice_is_synced(tmp_path
             "gain_db": 0, "why": "不相符",
         }],
     }
-    with pytest.raises(ValueError, match="speaker picture.*narrative audio"):
-        _edl_from_selection(
-            selection, tmp_path, cards={}, transcripts={"VOICE": transcript}
-        )
+    # A picture lip-synced to the wrong person's voice is one narrative line,
+    # not the film: the mismatched assignment is dropped and the shot keeps no
+    # narrative audio, rather than the whole cut being taken down for it.
+    edl, _ = _edl_from_selection(
+        selection, tmp_path, cards={}, transcripts={"VOICE": transcript}
+    )
+    assert edl.audio_clips == []
 
 
 def test_speaker_can_return_after_broll_on_the_continuing_audio_clock() -> None:

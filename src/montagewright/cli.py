@@ -3771,88 +3771,105 @@ def _edl_from_selection(
             action_card = card
         if action_card is not None:
             note = None
-            if action_treatment == "complete_here":
-                start, action_contract, note = snap_to_action_contract(
-                    action_card, start, wanted, action_id=selected_action, within=window,
-                    focus=focus_of(str(shot["source_id"])),
-                )
-                if selected_action == "none" or action_contract is None:
-                    raise ValueError(
-                        f"{clip_id} selected action {selected_action!r}, but it "
-                        "cannot be resolved and completed inside this source window"
+            # A degraded selection can reach here carrying an action
+            # its window cannot honour -- Selection flagged it and could
+            # not repair it. That is one shot's contract, not the film:
+            # drop the action, render a plain excerpt, and record why,
+            # rather than raising and taking the whole cut down.
+            original_start = start
+            try:
+                if action_treatment == "complete_here":
+                    start, action_contract, note = snap_to_action_contract(
+                        action_card, start, wanted, action_id=selected_action, within=window,
+                        focus=focus_of(str(shot["source_id"])),
                     )
-                minimum = action_contract.minimum_duration_from(start)
-                if wanted + 1e-3 < minimum:
-                    raise ValueError(
-                        f"{clip_id} gives {wanted:.2f}s to complete action "
-                        f"{selected_action!r}, which needs {minimum:.2f}s; "
-                        "Selection must repair this before Rhythm"
-                    )
-            elif action_treatment == "after_completion":
-                local_action = selected_action.rsplit(":", 1)[-1]
-                beat = next(
-                    (
-                        one for one in action_beats(action_card)
-                        if one.beat_id == local_action
-                    ),
-                    None,
-                )
-                if beat is None or selected_action == "none":
-                    raise ValueError(
-                        f"{clip_id} cannot resolve after_completion for action "
-                        f"{selected_action!r}"
-                    )
-                start = beat.ends_seconds
-                if window is not None:
-                    first, last = window
-                    if start < first - 1e-3 or start + wanted > last + 1e-3:
+                    if selected_action == "none" or action_contract is None:
                         raise ValueError(
-                            f"{clip_id} cannot fit {wanted:.2f}s after action "
-                            f"{selected_action!r} inside this source window"
+                            f"{clip_id} selected action {selected_action!r}, but it "
+                            "cannot be resolved and completed inside this source window"
                         )
+                    minimum = action_contract.minimum_duration_from(start)
+                    if wanted + 1e-3 < minimum:
+                        raise ValueError(
+                            f"{clip_id} gives {wanted:.2f}s to complete action "
+                            f"{selected_action!r}, which needs {minimum:.2f}s; "
+                            "Selection must repair this before Rhythm"
+                        )
+                elif action_treatment == "after_completion":
+                    local_action = selected_action.rsplit(":", 1)[-1]
+                    beat = next(
+                        (
+                            one for one in action_beats(action_card)
+                            if one.beat_id == local_action
+                        ),
+                        None,
+                    )
+                    if beat is None or selected_action == "none":
+                        raise ValueError(
+                            f"{clip_id} cannot resolve after_completion for action "
+                            f"{selected_action!r}"
+                        )
+                    start = beat.ends_seconds
+                    if window is not None:
+                        first, last = window
+                        if start < first - 1e-3 or start + wanted > last + 1e-3:
+                            raise ValueError(
+                                f"{clip_id} cannot fit {wanted:.2f}s after action "
+                                f"{selected_action!r} inside this source window"
+                            )
+                    note = (
+                        f"entered after {selected_action} completed at "
+                        f"{beat.ends_seconds:.2f}s"
+                    )
+                elif action_treatment == "intentional_cut":
+                    local_action = selected_action.rsplit(":", 1)[-1]
+                    beat = next(
+                        (
+                            one for one in action_beats(action_card)
+                            if one.beat_id == local_action
+                        ),
+                        None,
+                    )
+                    if beat is None or selected_action == "none":
+                        raise ValueError(
+                            f"{clip_id} cannot resolve intentional_cut for action "
+                            f"{selected_action!r}"
+                        )
+                    if start + wanted <= beat.starts_seconds + 1e-3:
+                        raise ValueError(
+                            f"{clip_id} marks {selected_action!r} intentional_cut, "
+                            "but its source window ends before that action begins"
+                        )
+                    if start >= beat.ends_seconds - 1e-3 or start + wanted >= beat.ends_seconds - 1e-3:
+                        raise ValueError(
+                            f"{clip_id} marks {selected_action!r} intentional_cut, "
+                            "but its source window does not actually cut before "
+                            "the action completes"
+                        )
+                    note = (
+                        f"intentionally cuts {selected_action} before its "
+                        f"{beat.ends_seconds:.2f}s completion"
+                    )
+                elif action_treatment != "none" or selected_action != "none":
+                    raise ValueError(
+                        f"{clip_id} has inconsistent action_id/action_treatment"
+                    )
+            except ValueError as action_fault:
+                start = original_start
+                action_contract = None
                 note = (
-                    f"entered after {selected_action} completed at "
-                    f"{beat.ends_seconds:.2f}s"
-                )
-            elif action_treatment == "intentional_cut":
-                local_action = selected_action.rsplit(":", 1)[-1]
-                beat = next(
-                    (
-                        one for one in action_beats(action_card)
-                        if one.beat_id == local_action
-                    ),
-                    None,
-                )
-                if beat is None or selected_action == "none":
-                    raise ValueError(
-                        f"{clip_id} cannot resolve intentional_cut for action "
-                        f"{selected_action!r}"
-                    )
-                if start + wanted <= beat.starts_seconds + 1e-3:
-                    raise ValueError(
-                        f"{clip_id} marks {selected_action!r} intentional_cut, "
-                        "but its source window ends before that action begins"
-                    )
-                if start >= beat.ends_seconds - 1e-3 or start + wanted >= beat.ends_seconds - 1e-3:
-                    raise ValueError(
-                        f"{clip_id} marks {selected_action!r} intentional_cut, "
-                        "but its source window does not actually cut before "
-                        "the action completes"
-                    )
-                note = (
-                    f"intentionally cuts {selected_action} before its "
-                    f"{beat.ends_seconds:.2f}s completion"
-                )
-            elif action_treatment != "none" or selected_action != "none":
-                raise ValueError(
-                    f"{clip_id} has inconsistent action_id/action_treatment"
+                    f"could not honour action {selected_action!r} "
+                    f"({action_fault}); rendered as a plain excerpt"
                 )
             if note:
                 snaps[clip_id] = note
         elif action_treatment != "none" or selected_action != "none":
-            raise ValueError(
-                f"{clip_id} cannot resolve selected action {selected_action!r} "
-                "from either its card or local material action windows"
+            # The shot names an action but neither its card nor the material
+            # offers one to resolve. Same principle as above: no contract to
+            # honour, so render the excerpt and record it rather than raising.
+            snaps[clip_id] = (
+                f"named action {selected_action!r} with no resolvable action "
+                "on this source; rendered as a plain excerpt"
             )
         if item is not None:
             from montagewright.planner import material_look_boxes
@@ -3967,27 +3984,38 @@ def _edl_from_selection(
 
     available_audio = _audio_spans(transcripts or {})
     audio_clips = []
+    audio_drops: list[str] = []
     speaker_sync: dict[int, tuple[float, str]] = {}
+    # An audio assignment that will not resolve is one narrative line, not the
+    # film: drop it and record why, rather than raising and taking the whole
+    # cut down. A degraded selection can legitimately reach here carrying an
+    # assignment its picture cannot honour.
     for assignment in selection.get("audio_assignments") or []:
         span_id = str(assignment.get("audio_span_id") or "")
         span = available_audio.get(span_id)
         shot_index = int(assignment.get("starts_at_shot_index", -1))
         if span is None or not 0 <= shot_index < len(clips):
-            raise ValueError(f"cannot resolve audio assignment {span_id!r}")
+            audio_drops.append(
+                f"dropped audio assignment {span_id!r}: no such span or shot"
+            )
+            continue
         picture = clips[shot_index]
         if picture.picture_role == "speaker":
             if picture.source_id != str(span["source_id"]):
-                raise ValueError(
-                    f"speaker picture {picture.clip_id} uses {picture.source_id} "
-                    f"but its narrative audio uses {span['source_id']}"
+                audio_drops.append(
+                    f"dropped {picture.clip_id} narrative {span_id!r}: picture "
+                    f"source {picture.source_id} cannot lip-sync audio from "
+                    f"{span['source_id']}"
                 )
+                continue
             offset = float(assignment.get("offset_seconds") or 0.0)
             source_in = float(span["in_seconds"]) - offset
             if source_in < 0:
-                raise ValueError(
-                    f"speaker picture {picture.clip_id} cannot begin "
-                    f"{abs(source_in):.3f}s before its source"
+                audio_drops.append(
+                    f"dropped {picture.clip_id} narrative {span_id!r}: would "
+                    f"begin {abs(source_in):.3f}s before its source"
                 )
+                continue
             speaker_sync[shot_index] = (source_in, span_id)
         audio_clips.append(AudioClip(
             audio_id=str(assignment.get("audio_id") or f"a{len(audio_clips):02d}"),
@@ -4013,6 +4041,8 @@ def _edl_from_selection(
             f"speaker picture source clock aligned to {span_id} at "
             f"{source_in:.3f}s"
         )
+    for dropped in audio_drops:
+        print(f"  {dropped}", flush=True)
     return EDL(
         project_id=rushes.name, clips=clips, audio_clips=audio_clips
     ), snaps
