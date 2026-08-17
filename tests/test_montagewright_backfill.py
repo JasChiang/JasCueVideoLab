@@ -1107,7 +1107,7 @@ def test_a_plan_written_before_looks_still_says_what_it_meant():
     ]
 
 
-def _measured(monkeypatch, looks, places):
+def _measured(monkeypatch, looks, places, reference_samples=None):
     """Run _measure_looks against fake grounding, counting the calls."""
 
     from montagewright import pipeline
@@ -1139,8 +1139,22 @@ def _measured(monkeypatch, looks, places):
         Source(source_id="s", path=None, duration_seconds=6.0,
                width=3840, height=2160),
         Clip(), None, pipeline.Report(), object(), 1080 / 1920,
+        reference_samples=reference_samples,
     )
     return stops, missing, asked
+
+
+def _identity_reference(centre_x: float):
+    """One confirmed carrier box, the shape reference grounding hands over."""
+
+    return (
+        [{
+            "present": True, "centre_x": centre_x, "centre_y": 0.5,
+            "width": 0.4, "height": 0.6, "frame_index": 0,
+        }],
+        [0.0],
+        (),
+    )
 
 
 def test_three_looks_reach_the_renderer_as_three_stops(monkeypatch):
@@ -1180,6 +1194,60 @@ def test_one_subject_looked_at_twice_is_measured_once(monkeypatch):
     # Same place, tighter crop -- which is what a push in is.
     assert stops[0][1] == stops[1][1]
     assert stops[1][3] < stops[0][3]
+
+
+def test_a_push_on_a_locked_target_still_costs_no_grounding(monkeypatch):
+    """The economy that makes a grounded push cheap must survive.
+
+    Both looks name the same thing and carry the same locked identity, so the
+    confirmed reference already answers where it is. Nothing here may buy a
+    description grounding, and both stops must land on the carrier.
+    """
+
+    from montagewright.schema import Look
+
+    stops, missing, asked = _measured(
+        monkeypatch,
+        [
+            Look(at="the phone", entity_id="device.primary", framing="thirds"),
+            Look(at="the phone", entity_id="device.primary", framing="fill"),
+        ],
+        {},
+        reference_samples={"device.primary": _identity_reference(0.42)},
+    )
+
+    assert missing == ""
+    assert asked == []
+    assert [round(one[1], 3) for one in stops] == [0.42, 0.42]
+    assert stops[1][3] < stops[0][3]
+
+
+def test_two_instances_of_one_locked_target_are_measured_apart(monkeypatch):
+    """A compare between siblings is not a push, and must not collapse.
+
+    Selection may ask to compare two phones that are both the locked model.
+    Keying the measurement on the target alone answered the first look and
+    reused it for the second, so the two stops landed on one box, the frame
+    travelled nowhere, and a comparison the material fully supported was
+    reported as `compare compiled to a static crop`. The identity lock says
+    which model; the look's own words say which one of them.
+    """
+
+    from montagewright.schema import Look
+
+    stops, missing, asked = _measured(
+        monkeypatch,
+        [
+            Look(at="the left phone", entity_id="device.primary"),
+            Look(at="the middle phone", entity_id="device.primary"),
+        ],
+        {"the left phone": 0.2, "the middle phone": 0.75},
+        reference_samples={"device.primary": _identity_reference(0.2)},
+    )
+
+    assert missing == ""
+    assert asked == ["the left phone", "the middle phone"]
+    assert [round(one[1], 2) for one in stops] == [0.2, 0.75]
 
 
 def test_multi_look_uses_sam_track_at_the_gemini_seed_time(monkeypatch, tmp_path):

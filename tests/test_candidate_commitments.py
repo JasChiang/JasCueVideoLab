@@ -7,12 +7,14 @@ from types import SimpleNamespace
 import pytest
 
 from montagewright.candidate_commitments import (
+    _camera_treatments,
     bind_selection_content_contracts,
     CandidateCommitments,
     CandidateOption,
     CommitmentError,
     describe_commitments,
     provider_commitment_schema,
+    readable_extent,
     resolve_candidate_commitments,
     validate_replacement_commitments,
     validate_selection_commitments,
@@ -865,3 +867,166 @@ def test_screen_negative_promotion_requires_exact_confirmation():
         require_confirmation={pair},
     )
     assert confirmed.options == resolved.options
+
+
+# The delivery crop for 16:9 material at 9:16, which is what both runs used
+# and the width every travel treatment has to be measured against.
+VERTICAL_CROP = 0.3164
+
+
+def _roomy_source(**change):
+    """A take with plenty of frame to move in, which is the normal case.
+
+    A 16:9 source delivered 9:16 has about 68% travel room on every clip
+    ever shot, so frame room alone can never be the reason a reveal is
+    withheld.
+    """
+
+    item = SimpleNamespace(
+        pan_room=0.6836, tilt_room=0.0, push_room=1.6,
+        crop_width=VERTICAL_CROP,
+    )
+    item.__dict__.update(change)
+    return item
+
+
+def _travel_span(seconds: float = 4.0):
+    return Span("C1:s00", "C1", 0.0, seconds, "detail", "locked")
+
+
+def test_a_subject_the_crop_already_contains_is_offered_no_travel():
+    """Frame room and something to cross it for are different facts.
+
+    A phone measuring 0.19 of the frame sits whole inside a 0.32 crop. A
+    reveal across it has nowhere to go, so the compiler holds -- correctly --
+    and the film carries a review note for a move that was never possible.
+    Withhold it from the menu instead, before Selection is paid to choose it.
+    """
+
+    treatments, _, _, reason = _camera_treatments(
+        _roomy_source(), _travel_span(),
+        preference="native_first", target_id="none",
+        content_extent=0.19,
+    )
+
+    assert "reveal" not in treatments
+    assert "compare" not in treatments
+    assert "multi_stop" not in treatments
+    assert "nothing to travel across" in reason
+    # A push is about resolution, not width, and a contained subject is
+    # exactly what a push in is for.
+    assert "push_in" in treatments
+    assert "hold" in treatments
+
+
+def test_content_wider_than_the_crop_keeps_every_travel_treatment():
+    treatments, _, _, reason = _camera_treatments(
+        _roomy_source(), _travel_span(),
+        preference="native_first", target_id="none",
+        content_extent=0.40,
+    )
+
+    assert {"reveal", "compare", "multi_stop"} <= set(treatments)
+    assert "measured travel room" in reason
+
+
+def test_unmeasured_content_never_loses_a_treatment():
+    """Unknown geometry is not evidence that a move is impossible.
+
+    Cards do not always place every named visual. Treating that silence as
+    "too narrow" would be a new way to lose moves the footage supports, and
+    the failure would look exactly like the one being fixed.
+    """
+
+    treatments, _, _, _ = _camera_treatments(
+        _roomy_source(), _travel_span(),
+        preference="native_first", target_id="none",
+        content_extent=None,
+    )
+
+    assert {"reveal", "compare", "multi_stop"} <= set(treatments)
+
+
+def test_readable_extent_spans_every_named_visual_or_declines():
+    geometry = (
+        ("left phone", None, 0.20, 0.5, 0.10, 0.4),
+        ("right phone", None, 0.80, 0.5, 0.10, 0.4),
+    )
+
+    # Edge to edge across both, not the width of either.
+    assert readable_extent(
+        object(), geometry, ["v01", "v02"]
+    ) == pytest.approx(0.70)
+    assert readable_extent(object(), geometry, ["v01"]) == pytest.approx(0.10)
+    # A visual the card cannot place makes the whole span unmeasurable.
+    assert readable_extent(object(), geometry, ["v01", "v09"]) is None
+    assert readable_extent(object(), (), ["v01"]) is None
+    assert readable_extent(object(), geometry, []) is None
+
+
+def test_a_read_across_contained_content_becomes_a_hold_not_a_lost_option():
+    """Direction may promise a read the delivery crop cannot need.
+
+    Withholding travel for contained content has a second effect: an option
+    Direction marked `sequential_read` then has no readable treatment left.
+    Dropping it would shrink the pool over a framing detail and can cost a
+    commitment its only take, so the option survives as the composition it
+    actually is.
+    """
+
+    narrow = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="one handset, centred",
+        spans=_material()[0].spans, pan_room=0.6836, tilt_room=0.0,
+        push_room=1.4, crop_width=VERTICAL_CROP,
+        subject_geometry=(("the handset", None, 0.5, 0.5, 0.19, 0.55),),
+    )]
+    resolved = resolve_candidate_commitments(
+        _direction(
+            span_id="C1:s01", min_supported_seconds="0:03",
+            presentation_intent="sequential_read",
+            recommended_treatment="reveal",
+            required_visuals=["v01"],
+            visual_relationship="single",
+        ), narrow,
+        material_digest="a" * 64, aspect="9:16", target_seconds=20.0,
+        grounding_target_ids=("device.fold",), grounding_sha256="b" * 64,
+    )
+
+    assert len(resolved.options) == 1
+    option = resolved.options[0]
+    assert option.presentation_intent == "centered_hold"
+    assert not {"reveal", "compare", "multi_stop"} & set(
+        option.feasible_treatments
+    )
+    assert "nothing to travel across" in option.feasibility_reason
+    assert "held composition" in option.feasibility_reason
+
+
+def test_a_read_across_wide_content_keeps_its_reader():
+    wide = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="a row of handsets",
+        spans=_material()[0].spans, pan_room=0.6836, tilt_room=0.0,
+        push_room=1.4, crop_width=VERTICAL_CROP,
+        subject_geometry=(
+            ("left handset", None, 0.20, 0.5, 0.12, 0.5),
+            ("right handset", None, 0.80, 0.5, 0.12, 0.5),
+        ),
+    )]
+    resolved = resolve_candidate_commitments(
+        _direction(
+            span_id="C1:s01", min_supported_seconds="0:03",
+            presentation_intent="sequential_read",
+            recommended_treatment="reveal",
+            required_visuals=["v01", "v02"],
+            visual_relationship="ordered",
+        ), wide,
+        material_digest="a" * 64, aspect="9:16", target_seconds=20.0,
+        grounding_target_ids=("device.fold",), grounding_sha256="b" * 64,
+    )
+
+    option = resolved.options[0]
+    assert option.presentation_intent == "sequential_read"
+    assert option.preferred_treatment == "reveal"
+    assert {"reveal", "compare", "multi_stop"} <= set(
+        option.feasible_treatments
+    )

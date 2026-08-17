@@ -759,14 +759,31 @@ def _measure_looks(
         base, base_height = target_aspect / source.aspect_ratio, 1.0
     else:
         base, base_height = 1.0, source.aspect_ratio / target_aspect
-    seen: dict[str, tuple[float, float, float, float]] = {}
-    walked: dict[str, list[tuple[float, float, float]]] = {}
+    seen: dict[tuple[str, str, str], tuple[float, float, float, float]] = {}
+    walked: dict[tuple[str, str, str], list[tuple[float, float, float]]] = {}
     stops: list[tuple[float, float, float, float]] = []
     tracks: list[list[tuple[float, float, float]]] = []
     missing: list[str] = []
+    # An identity lock names a model, not which one of them is on the left.
+    # Two looks carrying the same target but describing different things are
+    # siblings in one frame -- the comparison Selection asked for -- and the
+    # confirmed reference holds one box per frame, so it can only say where
+    # one of them is. Answering both from it put both stops on the same box,
+    # the frame travelled nowhere, and material that fully supported the
+    # comparison came back as "compare compiled to a static crop".
+    siblings = {
+        entity_id
+        for entity_id in {one.entity_id for one in looks if one.entity_id}
+        if len({one.at for one in looks if one.entity_id == entity_id}) > 1
+    }
     for look_index, look in enumerate(looks):
         geometry_query = look.geometry_query or look.at
-        subject_key = look.geometry_query or look.entity_id or look.at
+        # Everything that decides where this look lands. Keying on the target
+        # alone answered the first sibling and reused it for the rest; keying
+        # on the words alone would buy the same push in twice.
+        subject_key = (
+            look.geometry_query or "", look.entity_id or "", look.at,
+        )
         if subject_key not in seen:
             reference = (
                 (reference_samples or {}).get(look.entity_id)
@@ -775,7 +792,13 @@ def _measure_looks(
             if look.entity_id and reference is None:
                 missing.append(f"{look.at} ({look.entity_id}: identity unverified)")
                 continue
-            if reference is not None and not look.geometry_query:
+            # A detail query and a sibling both need this look located by its
+            # own words; only a look that is the whole confirmed target may
+            # read its position straight off the reference.
+            answers_this_look = not (
+                look.geometry_query or look.entity_id in siblings
+            )
+            if reference is not None and answers_this_look:
                 boxes, look_times, semantic_anchors = reference
                 look_moments = [
                     at - clip.approx_in_seconds for at in look_times

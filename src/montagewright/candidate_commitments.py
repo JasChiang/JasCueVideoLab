@@ -101,12 +101,50 @@ class CandidateOption(StrictFrozen):
     identity_issue: str = ""
 
 
+# The smallest gap between two landings worth crossing, shared with the crop
+# compiler's own deadband. Stated here because this module decides which
+# treatments are offered and the compiler decides whether they moved, and the
+# two must agree about what counts as travel.
+READABLE_MARGIN = 0.02
+
+
+def readable_extent(
+    item: Any, geometry: Any, required_visuals: "Sequence[str]",
+) -> float | None:
+    """How wide this option's content is, edge to edge, in source widths.
+
+    A treatment that carries the eye across something needs something wider
+    than one delivery crop to carry it across. That fact is measured, sits in
+    the card, and belongs to the option rather than to any later stage.
+
+    Returns ``None`` when the card cannot place every named visual. Unknown
+    geometry is not evidence that a move is impossible, and withholding a
+    treatment on it would be a new way to lose moves the footage supports.
+    """
+
+    entries = tuple(geometry or ())
+    wanted = set(required_visuals or ())
+    if not entries or not wanted:
+        return None
+    placed = {
+        f"v{at:02d}": entry
+        for at, entry in enumerate(entries, start=1)
+        if f"v{at:02d}" in wanted
+    }
+    if len(placed) != len(wanted):
+        return None
+    left = min(float(one[2]) - float(one[4]) / 2.0 for one in placed.values())
+    right = max(float(one[2]) + float(one[4]) / 2.0 for one in placed.values())
+    return max(0.0, right - left)
+
+
 def _camera_treatments(
     item: Any,
     span: Any,
     *,
     preference: MotionPreference,
     target_id: str,
+    content_extent: float | None = None,
 ) -> tuple[tuple[CameraTreatment, ...], CameraTreatment, float, str]:
     """Rank treatments using facts that exist before the camera is planned."""
 
@@ -115,6 +153,7 @@ def _camera_treatments(
     pan_room = float(getattr(item, "pan_room", 0.0) or 0.0)
     tilt_room = float(getattr(item, "tilt_room", 0.0) or 0.0)
     push_room = float(getattr(item, "push_room", 1.0) or 1.0)
+    crop_width = float(getattr(item, "crop_width", 1.0) or 1.0)
     treatments: list[CameraTreatment] = []
     reasons: list[str] = []
     minimum = 0.0
@@ -128,7 +167,23 @@ def _camera_treatments(
     # every pan/push treatment from the schema, so Gemini could never choose
     # the movement the footage clearly supported.
     travel_room = max(pan_room, tilt_room)
-    if travel_room > 0.02 and seconds >= 1.0:
+    # Room in the frame and something to cross it for are different facts, and
+    # only the first was being asked. A 16:9 source delivered 9:16 has about
+    # 68% travel room on every clip ever, so reveal and compare were offered
+    # for every shot -- including a phone measuring 0.19 wide inside a 0.32
+    # crop, which the crop already contains whole. Selection reasonably chose
+    # the reveal it was offered, the compiler correctly held, and the film
+    # carried a review note for a move that never had anywhere to go.
+    contained = (
+        content_extent is not None
+        and content_extent <= crop_width + READABLE_MARGIN
+    )
+    if contained:
+        reasons.append(
+            f"content spans {content_extent:.0%} of frame inside a "
+            f"{crop_width:.0%} crop, so there is nothing to travel across"
+        )
+    if travel_room > 0.02 and seconds >= 1.0 and not contained:
         treatments.extend(("reveal", "compare"))
         minimum = max(minimum, 1.0)
         reasons.append(f"crop has {travel_room:.0%} measured travel room")
@@ -136,7 +191,7 @@ def _camera_treatments(
         treatments.extend(("push_in", "pull_out"))
         minimum = max(minimum, 1.0)
         reasons.append(f"resolution permits up to {push_room:.2f}x push")
-    if travel_room > 0.02 and seconds >= 1.8:
+    if travel_room > 0.02 and seconds >= 1.8 and not contained:
         treatments.append("multi_stop")
         minimum = max(minimum, 1.8)
     # A named target makes following possible, not necessarily useful. Put
@@ -633,12 +688,21 @@ def resolve_candidate_commitments(
         # caller; what is left here catches a source that was never offered
         # for promotion at all.
         try:
+            # One measurement, two decisions: whether the eye has to be
+            # carried across this content at all, and -- below -- whether a
+            # centred hold could ever have shown it. They disagreed while
+            # each computed the span itself, so a treatment could be offered
+            # for content the very next block proved a crop already contains.
+            content_extent = readable_extent(
+                local_item, geometry, required_visuals
+            )
             treatments, preferred, camera_floor, feasibility_reason = (
                 _camera_treatments(
                     item_index.get(str(span.source_id)),
                     span,
                     preference=preference,
                     target_id=target_id,
+                    content_extent=content_extent,
                 )
             )
             direction_treatment = cast(CameraTreatment, str(
@@ -668,24 +732,10 @@ def resolve_candidate_commitments(
                     "sequential_read", "partial_reveal", "transition_pass",
                 }
             ):
-                visual_geometry = {
-                    f"v{at:02d}": entry
-                    for at, entry in enumerate(geometry, start=1)
-                    if f"v{at:02d}" in required_visuals
-                }
-                if len(visual_geometry) == len(set(required_visuals)):
-                    left = min(
-                        float(entry[2]) - float(entry[4]) / 2.0
-                        for entry in visual_geometry.values()
-                    )
-                    right = max(
-                        float(entry[2]) + float(entry[4]) / 2.0
-                        for entry in visual_geometry.values()
-                    )
-                    if right - left > float(
-                        getattr(local_item, "crop_width", 1.0)
-                    ) + 0.02:
-                        presentation_intent = "sequential_read"
+                if content_extent is not None and content_extent > float(
+                    getattr(local_item, "crop_width", 1.0)
+                ) + READABLE_MARGIN:
+                    presentation_intent = "sequential_read"
             if presentation_intent == "sequential_read":
                 readable = tuple(
                     treatment for treatment in (
@@ -693,12 +743,25 @@ def resolve_candidate_commitments(
                     )
                     if treatment in treatments
                 )
-                if not readable:
+                if not readable and content_extent is not None:
+                    # Direction promised a read across content the delivery
+                    # crop already contains whole. The promise cannot be kept,
+                    # but the shot can: dropping the option would shrink the
+                    # pool over a framing detail and cost a commitment its
+                    # only take. Keep it as the composition it actually is.
+                    presentation_intent = "centered_hold"
+                    feasibility_reason = (
+                        f"{feasibility_reason}; Direction asked for a "
+                        f"sequential read, and the crop already contains the "
+                        f"content whole, so this is a held composition"
+                    )
+                elif not readable:
                     faults.append(
                         f"option {index} uses sequential_read on {span_id}, but "
                         "local crop geometry has no readable travel treatment"
                     )
                     continue
+            if presentation_intent == "sequential_read":
                 if direction_treatment in readable:
                     preferred = direction_treatment
                 else:
