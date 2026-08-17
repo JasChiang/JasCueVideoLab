@@ -509,6 +509,7 @@ def ask(
     patience_seconds: float | None = None,
     ledger: Any | None = None,
     budget_stage: str | None = None,
+    upload_cache: Any | None = None,
     **request: Any,
 ) -> Any:
     """Make one model call, and say what happened in this project's terms.
@@ -561,6 +562,7 @@ def ask(
             model_id=str(request["model"]),
         )
     interaction = None
+    refreshed_media = False
     for attempt in range(SERVER_ERROR_ATTEMPTS):
         try:
             interaction = _asked(client).interactions.create(**request)
@@ -572,6 +574,27 @@ def ask(
                     ledger.cancel(reservation_id)
                 raise BudgetSpent(provider_budget) from error
             status = _provider_status_code(error)
+            media_input_fault = status in {400, 403} and any(
+                phrase in str(error).lower()
+                for phrase in (
+                    "invalid argument", "permission", "file", "expired",
+                )
+            )
+            if media_input_fault and not refreshed_media and upload_cache is not None:
+                refreshed_input, refreshed_count = (
+                    upload_cache.refresh_request_uris(
+                        request.get("input"), client
+                    )
+                )
+                if refreshed_count:
+                    request["input"] = refreshed_input
+                    refreshed_media = True
+                    print(
+                        f"Gemini {status}: refreshed {refreshed_count} expired "
+                        "File input(s) and retrying this stage once",
+                        flush=True,
+                    )
+                    continue
             retryable = status in {500, 502, 503, 504}
             if retryable and attempt + 1 < SERVER_ERROR_ATTEMPTS:
                 if ledger is not None and budget_stage is not None:
@@ -779,10 +802,12 @@ def decide_rhythm(
     attempt_input = request_input
     coverage_faults: tuple[str, ...] = ()
     release_faults: tuple[str, ...] = ()
+    candidate = edl
     for attempt in range(2):
         request["input"] = attempt_input
         interaction = ask(
-            client, ledger=ledger, budget_stage="rhythm", **request
+            client, ledger=ledger, budget_stage="rhythm",
+            upload_cache=cache, **request
         )
         used = Usage.from_interaction(interaction)
         usage_total = Usage(
@@ -885,11 +910,16 @@ def decide_rhythm(
                     + json.dumps(payload, ensure_ascii=False)
                 ),
             }]
-    raise PlannerError(
-        "rhythm cannot satisfy the target with evidence from the selected "
-        "shots; structural selection must add content or shorten the target: "
-        + "; ".join((*coverage_faults, *release_faults))
+    # A bounded rhythm disagreement is not a process failure.  Return the most
+    # recent executable candidate; the caller records the measured delivery
+    # shortfall and contract notes for review.  This preserves all paid work
+    # and lets one-shot delivery finish with an honest degradation.
+    print(
+        "rhythm: delivering the best executable candidate with advisories: "
+        + "; ".join((*coverage_faults, *release_faults)),
+        flush=True,
     )
+    return candidate, usage_total
 
 
 def _rhythm_artifact_key(
@@ -2126,6 +2156,7 @@ def decide_direction(
         )),
         ledger=ledger,
         budget_stage="direction",
+        upload_cache=cache,
     )
     decided = _parse(interaction, what="direction pass")
     from montagewright.spans import seconds_of
@@ -2310,6 +2341,8 @@ def _selection_schema(
                         "action_id",
                         "action_treatment",
                         "camera_intent",
+                        "agrees_with_direction",
+                        "direction_disagreement_reason",
                         "pacing_exception",
                         "pacing_exception_reason",
                         "looks",
@@ -2465,6 +2498,21 @@ def _selection_schema(
                                 "寫出相符落點；完整語彙見 prompt 的運鏡能力。"
                             ),
                         },
+                        "agrees_with_direction": {
+                            "type": "boolean",
+                            "description": (
+                                "這個 camera_intent 是否同意 Direction option 的 "
+                                "local preferred。Direction 是較早的風格建議；看過"
+                                "實際片段後可以不同意，但必須明確留下判斷。"
+                            ),
+                        },
+                        "direction_disagreement_reason": {
+                            "type": "string",
+                            "description": (
+                                "同意時留空；不同意時用片段中可見的幾何、原生"
+                                "運鏡或敘事任務說明原因，不能只寫比較好看。"
+                            ),
+                        },
                         "pacing_exception": {
                             "type": "boolean",
                             "description": (
@@ -2484,7 +2532,10 @@ def _selection_schema(
                             "description": (
                                 "畫面依序停在哪裡，每個落點填 at／seconds／"
                                 "framing。你選語意意圖與看什麼；本機量位置、"
-                                "方向、速度與可行性。"
+                                "方向、速度與可行性。合法組合：sequential_read "
+                                "只能搭配 reveal 或 multi_stop；push_in／pull_out "
+                                "必須是同一主體由鬆到緊／由緊到鬆；"
+                                "use_source_motion 不新增數位落點。"
                             ),
                             "items": {
                                 "type": "object",
@@ -3300,6 +3351,58 @@ def repair_camera_rests_to_duration(
     return repairs
 
 
+def normalize_selection(
+    chosen: dict[str, Any],
+    material: "list[MaterialItem] | tuple[MaterialItem, ...]",
+    *,
+    commitments: Any | None = None,
+) -> tuple[str, ...]:
+    """Run the sole deterministic Selection normalization sequence.
+
+    Cached, patched, recovered and fresh answers used to carry five copies of
+    these four calls, with content contracts bound at different points.  That
+    made the same paid answer executable on one resume path and invalid on
+    another.  Every entry path now uses this order and records the same repairs.
+    """
+
+    from montagewright.camera import shot_key
+
+    if commitments is not None:
+        from montagewright.candidate_commitments import (
+            bind_selection_content_contracts,
+        )
+
+        bind_selection_content_contracts(
+            chosen.get("shots") or [], commitments, list(material)
+        )
+    repairs = (
+        *repair_single_look_hold_overflow(chosen),
+        *repair_camera_rests_to_duration(chosen, material),
+        *repair_selection_motion_contracts(chosen, list(material)),
+        *repair_selection_source_windows(chosen, list(material)),
+    )
+    if repairs:
+        chosen.setdefault("duration_repairs", []).extend(repairs)
+    for shot in chosen.get("shots") or []:
+        shot["shot_key"] = shot_key(shot)
+    return tuple(repairs)
+
+
+def degrade_selection(
+    chosen: dict[str, Any], faults: "list[str] | tuple[str, ...]",
+) -> dict[str, Any]:
+    """Keep a paid Selection executable and make unresolved faults explicit."""
+
+    unique = list(dict.fromkeys(str(fault) for fault in faults))
+    chosen["invalid_selection_faults"] = unique
+    chosen["delivery_status"] = "needs_review"
+    chosen.setdefault("plan_disagreements", []).extend(
+        fault for fault in unique
+        if fault not in chosen.get("plan_disagreements", [])
+    )
+    return chosen
+
+
 def select_shots(
     material: list[MaterialItem],
     direction: dict[str, Any],
@@ -3486,17 +3589,8 @@ def select_shots(
         # writer of the complete answer, so prompt drift cannot alter a good
         # neighbour, duplicate a commitment, or drop a required beat.
         base = copy.deepcopy(initial_selection)
-        base.setdefault("duration_repairs", []).extend(
-            repair_single_look_hold_overflow(base)
-        )
-        base.setdefault("duration_repairs", []).extend(
-            repair_camera_rests_to_duration(base, usable)
-        )
-        base.setdefault("duration_repairs", []).extend(
-            repair_selection_motion_contracts(base, usable)
-        )
-        base.setdefault("duration_repairs", []).extend(
-            repair_selection_source_windows(base, usable)
+        normalize_selection(
+            base, usable, commitments=selection_commitments
         )
         patch_faults = audit_cached_selection(
             base, material, direction,
@@ -3523,11 +3617,7 @@ def select_shots(
                 if found is not None
             }
             if not failing_indices:
-                raise SelectionUnrenderable(
-                    "selection needs a global structural decision rather "
-                    "than a shot patch: " + "; ".join(patch_faults),
-                    draft=base, faults=patch_faults,
-                )
+                return degrade_selection(base, patch_faults), usage_total
             repairable_indices = [
                 index for index in sorted(failing_indices)
                 if patch_attempts_by_index.get(index, 0) < 1
@@ -3607,6 +3697,7 @@ def select_shots(
                 response_format=patch_schema,
                 ledger=ledger,
                 budget_stage="selection",
+                upload_cache=cache,
             )
             used = Usage.from_interaction(interaction)
             usage_total = Usage(
@@ -3628,24 +3719,8 @@ def select_shots(
                 )
             except PlannerError:
                 continue
-            if selection_commitments is not None:
-                from montagewright.candidate_commitments import (
-                    bind_selection_content_contracts,
-                )
-                bind_selection_content_contracts(
-                    candidate.get("shots") or [], selection_commitments, material
-                )
-            candidate.setdefault("duration_repairs", []).extend(
-                repair_single_look_hold_overflow(candidate)
-            )
-            candidate.setdefault("duration_repairs", []).extend(
-                repair_camera_rests_to_duration(candidate, usable)
-            )
-            candidate.setdefault("duration_repairs", []).extend(
-                repair_selection_motion_contracts(candidate, usable)
-            )
-            candidate.setdefault("duration_repairs", []).extend(
-                repair_selection_source_windows(candidate, usable)
+            normalize_selection(
+                candidate, usable, commitments=selection_commitments
             )
             candidate_faults = audit_cached_selection(
                 candidate, material, direction,
@@ -3665,11 +3740,7 @@ def select_shots(
             if len(new_target) < len(old_target) and new_other <= old_other:
                 base = candidate
                 patch_faults = candidate_faults
-        raise SelectionUnrenderable(
-            "selection shot patch remained structurally unrenderable: "
-            + "; ".join(patch_faults),
-            draft=base, faults=patch_faults,
-        )
+        return degrade_selection(base, patch_faults), usage_total
 
     chosen: dict[str, Any] = {}
     faults: list[str] = []
@@ -3699,6 +3770,7 @@ def select_shots(
                 response_format=attempt_schema,
                 ledger=ledger,
                 budget_stage="selection",
+                upload_cache=cache,
             )
             used = Usage.from_interaction(interaction)
             usage_total = Usage(
@@ -3748,25 +3820,8 @@ def select_shots(
                     item.source_id: item.camera_motion for item in usable
                 },
             )
-        chosen.setdefault("duration_repairs", []).extend(
-            repair_single_look_hold_overflow(chosen)
-        )
-        chosen.setdefault("duration_repairs", []).extend(
-            repair_camera_rests_to_duration(chosen, usable)
-        )
-        if selection_commitments is not None:
-            from montagewright.candidate_commitments import (
-                bind_selection_content_contracts,
-            )
-
-            bind_selection_content_contracts(
-                chosen.get("shots") or [], selection_commitments, material
-            )
-        chosen.setdefault("duration_repairs", []).extend(
-            repair_selection_motion_contracts(chosen, usable)
-        )
-        chosen.setdefault("duration_repairs", []).extend(
-            repair_selection_source_windows(chosen, usable)
+        normalize_selection(
+            chosen, usable, commitments=selection_commitments
         )
         faults.extend(span_contract_disagreements(
             chosen.get("shots") or [], usable
@@ -4085,12 +4140,7 @@ def select_shots(
             faults = frame_disagreements(chosen.get("shots") or [], material)
             chosen.setdefault("plan_disagreements", []).extend(salvaged)
     if faults:
-        raise SelectionUnrenderable(
-            "selection remained structurally unrenderable after two repairs: "
-            + "; ".join(faults),
-            draft=chosen,
-            faults=faults,
-        )
+        degrade_selection(chosen, faults)
     chosen["frame_disagreements"] = frame_disagreements(
         chosen.get("shots") or [], material
     )
@@ -5079,7 +5129,7 @@ def repair_selection_motion_contracts(
                 "into one group composition"
             )
 
-        shot["camera_intent"] = intent
+        shot["delivered_camera_intent"] = intent
         shot["frame"] = (
             "settles" if intent in {"hold", "use_source_motion"} else "travels"
         )
@@ -5309,7 +5359,14 @@ def frame_disagreements(
         elif sequential and intent == "use_source_motion":
             source = str(shot.get("source_id") or "")
             item = items.get(source)
-            boxes = material_look_boxes(item, reframe_of(shot)) if item else []
+            if item is not None:
+                measured_reframe = reframe_of(shot).model_copy(update={
+                    "editorial_intent": "reveal",
+                    "camera_move": "pan",
+                })
+                boxes = material_look_boxes(item, measured_reframe)
+            else:
+                boxes = []
             required_travel = (
                 abs(float(boxes[-1][0]) - float(boxes[0][0]))
                 if len(boxes) >= 2 else 0.0
@@ -5665,6 +5722,7 @@ def replan_shots(
             response_format=schema,
             ledger=ledger,
             budget_stage="replan",
+            upload_cache=cache,
         )
         used = Usage.from_interaction(interaction)
         usage_total = Usage(

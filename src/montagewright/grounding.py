@@ -463,7 +463,6 @@ def camera_floor_for(reframe: object | None) -> float:
     explicitly a conservative estimate, not content-derived geometry.
     """
 
-    from montagewright.capabilities import MOVE_FLOORS
     from montagewright.reframe import seconds_needed_for
 
     if reframe is None or not getattr(reframe, "looks", None):
@@ -499,9 +498,10 @@ def camera_floor_for(reframe: object | None) -> float:
     seen = reframe.look_boxes
     if not seen or len(seen) < len(reframe.looks):
         readable_rests = sum(max(0.0, one) for one in declared_stops)
-        return max(
-            MOVE_FLOORS.get(reframe.camera_move, 0.0), readable_rests
-        )
+        # Unknown geometry cannot justify a made-up physical floor.  Preserve
+        # only the declared readable rests and report the missing measurement
+        # as an advisory upstream.
+        return readable_rests
 
     if sequential_read:
         rest = declared_stops[0]

@@ -25,6 +25,7 @@ import math
 from dataclasses import dataclass, field
 
 from montagewright.executor import CROP_MARGIN, CropBox
+from montagewright.camera import CameraRoutePolicy, camera_route_policy
 from montagewright.schema import CameraEnergy, DegradationStep, Reframe
 
 # Per camera_energy, in viewport widths per second and per second squared.
@@ -49,44 +50,6 @@ DEADBAND = 0.02
 # is written into the degradation record. Silently returning a hold, which is
 # what this did first, tells the planner its instruction was carried out.
 MIN_DIRECTNESS = 0.6
-
-
-@dataclass(frozen=True)
-class CameraRoutePolicy:
-    """The one interpretation of Selection's looks used by every stage."""
-
-    expand_sequential_read: bool
-    track_during_stops: bool
-    continuous_read: bool
-    monotonic_route: bool
-
-
-def camera_route_policy(reframe: Reframe | None) -> CameraRoutePolicy:
-    """Compile semantic looks into routing behaviour without inventing moves.
-
-    A sequential read expands only when it is the whole treatment.  A look
-    inside a push/pull is an endpoint description, not permission to insert a
-    pan before the zoom.  Keeping this policy here prevents planner geometry
-    and final crop compilation from drifting apart again.
-    """
-
-    looks = tuple(reframe.looks) if reframe is not None else ()
-    sequential = bool(
-        len(looks) == 1
-        and looks[0].presentation_intent == "sequential_read"
-    )
-    intent = str(reframe.editorial_intent) if reframe is not None else "hold"
-    return CameraRoutePolicy(
-        expand_sequential_read=sequential,
-        track_during_stops=intent in {"follow_subject", "push_in", "pull_out"},
-        continuous_read=(
-            sequential
-            and not any(
-                look.presentation_intent == "complete_hold" for look in looks
-            )
-        ),
-        monotonic_route=sequential,
-    )
 
 
 def declared_look_centres(
@@ -991,26 +954,25 @@ def build_look_path(
     # made a conspicuous correction at the cut.  Keep the replan degradation
     # above, but produce a complete reviewable preview instead of silently
     # changing the treatment to a hold.
-    limited, _ = (
-        (keyframes, False)
-        if hurried else _limit_speed(keyframes, ENERGY_LIMITS[energy])
-    )
+    limited, _ = _limit_speed(keyframes, ENERGY_LIMITS[energy])
+    designed = CropPath(_dedupe(keyframes))
     delivered = CropPath(_dedupe(limited))
-    missed = (
-        _crop_distance(delivered.keyframes[-1].crop, boxes[-1])
-        if delivered.keyframes else 0.0
+    # Tracking changes the crop centre while a look is being held.  The old
+    # check compared that tracked destination with the static, pre-track look
+    # box, so every moving subject looked like a missed endpoint.  The route we
+    # actually designed is the only valid endpoint authority here.
+    intended_endpoint = (
+        designed.keyframes[-1].crop if designed.keyframes else boxes[-1]
     )
     _record_missed_endpoint(
-        intended=boxes[-1],
+        intended=intended_endpoint,
         delivered=delivered,
         clip_id=clip_id,
         degradations=degradations,
     )
-    if missed > 1e-4:
-        # Do not show the limiter's unfinished journey.  Preserve the
-        # designed route for a reviewable preview; the endpoint degradation
-        # keeps it from being called final-ready.
-        return CropPath(_dedupe(keyframes))
+    # Always render the speed-limited route.  Returning the unlimited path on
+    # the very condition that reported a speed shortfall made the degradation
+    # describe a path that was not rendered and bypassed the camera budget.
     return delivered
 
 

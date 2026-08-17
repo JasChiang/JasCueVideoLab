@@ -187,6 +187,41 @@ def test_a_transient_500_retries_once_under_one_reservation(monkeypatch):
     assert not ledger.reservations
 
 
+def test_an_expired_file_uri_is_refreshed_once_before_stage_failure():
+    class PermissionDenied(RuntimeError):
+        code = 403
+
+    class Cache:
+        calls = 0
+
+        def refresh_request_uris(self, value, client):
+            self.calls += 1
+            refreshed = [dict(value[0], uri="files/fresh")]
+            return refreshed, 1
+
+    client = _Client(tokens=100)
+    original = client.interactions.create
+    seen = []
+
+    def expired_once(**request):
+        seen.append(request["input"][0]["uri"])
+        if len(seen) == 1:
+            raise PermissionDenied("403 File expired: permission denied")
+        return original(**request)
+
+    client.interactions.create = expired_once
+    cache = Cache()
+    ask(
+        client,
+        model="gemini-3.7-flash",
+        input=[{"type": "video", "uri": "files/expired"}],
+        generation_config={"max_output_tokens": 1_000},
+        upload_cache=cache,
+    )
+
+    assert seen == ["files/expired", "files/fresh"]
+    assert cache.calls == 1
+
 def test_an_uncertain_retry_survives_in_cumulative_cost_without_becoming_a_call(
     tmp_path,
 ):

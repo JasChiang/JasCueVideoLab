@@ -195,13 +195,6 @@ def _variants_from_note(
     compact = re.search(r"\b\d+(?:\.\d+)?m\b", note, re.IGNORECASE)
     if compact:
         variants.append(CandidateVariant("短版", primary, compact.group(0)))
-    alternatives = re.findall(
-        r"SAMSUNG\s+Galaxy(?:\s+[A-Za-z0-9| ]+|\s*系列)", note
-    )
-    for index, text in enumerate(dict.fromkeys(one.strip() for one in alternatives)):
-        variants.append(CandidateVariant(
-            "替代版" if index == 0 else f"替代版 {index + 1}", text, ""
-        ))
     return tuple(variants)
 
 
@@ -266,12 +259,10 @@ def extract_brief_candidates(
             )
             continue
         is_first_card = not candidates
-        if first.startswith("就在") or first == "SAMSUNG":
+        if first.startswith(("立即", "現在", "就在", "歡迎", "了解更多")):
             kind, template, position = "end_card", "end_roster", "center"
-        elif "Galaxy" in first and rest and not SPECISH.search(rest[0]):
-            kind = "opening_title" if is_first_card else "product_name"
-            template = "hero_center" if is_first_card else "product_plate"
-            position = "center" if is_first_card else "auto"
+        elif is_first_card and rest and not SPECISH.search(rest[0]):
+            kind, template, position = "opening_title", "hero_center", "center"
         elif len(body) >= 3:
             kind, template, position = "feature", "center_stack", "center"
         elif len(body) == 2 and (SPECISH.search(first) or SPECISH.search(rest[0])):

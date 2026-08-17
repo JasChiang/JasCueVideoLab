@@ -333,8 +333,21 @@ def _digital_motion_of(path: CropPath | None) -> str:
     travel_y = sum(abs(delta) for delta in legs_y)
     scale = first.width / max(last.width, 1e-9)
     parts: list[str] = []
-    reverses = any(a * b < 0 for a, b in zip(legs_x, legs_x[1:])) or any(
-        a * b < 0 for a, b in zip(legs_y, legs_y[1:])
+    # Tracking and easing routinely produce sub-pixel sign changes.  Calling
+    # those a multi-stop move made a 0.0005 viewport-width correction look the
+    # same as a real pan-and-rebound.  Use the same visible-motion deadband as
+    # the rest of this classifier before considering direction changes.
+    reversal_deadband = 0.02
+    meaningful_x = [
+        delta for delta in legs_x if abs(delta) >= reversal_deadband
+    ]
+    meaningful_y = [
+        delta for delta in legs_y if abs(delta) >= reversal_deadband
+    ]
+    reverses = any(
+        a * b < 0 for a, b in zip(meaningful_x, meaningful_x[1:])
+    ) or any(
+        a * b < 0 for a, b in zip(meaningful_y, meaningful_y[1:])
     )
     if reverses:
         parts.append("multi_stop")
@@ -367,7 +380,7 @@ def _audit_static_holds(
         seconds = clip.approx_out_seconds - clip.approx_in_seconds
         visually_static = (
             reframe is not None
-            and reframe.camera_move == "hold"
+            and reframe.editorial_intent in {"hold", "use_source_motion"}
             and reframe.source_motion_role == "locked"
         )
         exempt = bool(
@@ -2287,7 +2300,7 @@ def follow_subjects(
                         len(reframe.looks) >= 2
                         or (
                             route_policy.expand_sequential_read
-                            and move != "use_source_motion"
+                            and reframe.editorial_intent != "use_source_motion"
                         )
                     )
                     and _may_ask(client)

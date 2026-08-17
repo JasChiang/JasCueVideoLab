@@ -1040,7 +1040,8 @@ def test_motion_contract_normalizes_authored_reveal_without_inventing_a_move() -
     repairs = repair_selection_motion_contracts(chosen, [])
 
     assert repairs
-    assert chosen["shots"][0]["camera_intent"] == "use_source_motion"
+    assert chosen["shots"][0]["camera_intent"] == "hold"
+    assert chosen["shots"][0]["delivered_camera_intent"] == "use_source_motion"
 
 
 def test_motion_contract_translates_two_stop_multistop_to_reveal() -> None:
@@ -1060,7 +1061,8 @@ def test_motion_contract_translates_two_stop_multistop_to_reveal() -> None:
 
     repair_selection_motion_contracts(chosen, [])
 
-    assert chosen["shots"][0]["camera_intent"] == "reveal"
+    assert chosen["shots"][0]["camera_intent"] == "multi_stop"
+    assert chosen["shots"][0]["delivered_camera_intent"] == "reveal"
     assert chosen["shots"][0]["frame"] == "travels"
 
 
@@ -1109,7 +1111,8 @@ def test_source_motion_endpoint_carries_the_ordered_visual_evidence() -> None:
     repair_selection_motion_contracts(chosen, [])
 
     shot = chosen["shots"][0]
-    assert shot["camera_intent"] == "use_source_motion"
+    assert shot["camera_intent"] == "hold"
+    assert shot["delivered_camera_intent"] == "use_source_motion"
     assert shot["looks"][0]["includes"] == ["v01", "v02"]
 
 

@@ -13,89 +13,11 @@ two cannot drift apart.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 # The shortest rest that reads as the frame having stopped rather than
 # slowed. Mirrors reframe.SETTLE_SECONDS, stated here because this is what
 # the planner is told and the two must not drift.
 SETTLE_SECONDS = 0.35
 
-
-@dataclass(frozen=True)
-class Capability:
-    name: str
-    when: str
-    needs_subject: bool
-    # The shortest this move can be and still register as a move at all --
-    # a technical floor, not an answer to "how long should this shot be".
-    # How long a sweep needs depends on how far it travels and how much has
-    # to be taken in on the way, and that is visible in the material: the
-    # same 2.5 seconds that reads a two-word logo is not enough for three
-    # handsets, and is twice what a short push needs. The planner watches the
-    # shot, so the planner sets the length; this is what the executor reports
-    # against when the length it was given cannot contain the move.
-    min_seconds: float = 0.0
-
-
-CAMERA_MOVES: tuple[Capability, ...] = (
-    Capability(
-        name="hold",
-        when=(
-            "畫面本身已經成立，或主體靜止且資訊集中。"
-            "素材本身已經有攝影機運動時也用這個——讓它自己的推軌或搖攝演完，"
-            "再疊一層數位運鏡兩者會打架。不動是一個決定，不是沒有決定。"
-        ),
-        needs_subject=True,
-        min_seconds=0.8,
-    ),
-    Capability(
-        name="pan",
-        when=(
-            "水平帶過去。指定一個主體就跟著它走；指定兩個就從第一個帶到"
-            "第二個；一排東西（三台手機、一列手錶）就從頭掃到尾。"
-            "主體不動又只有一個時會變成 hold，因為沒有東西可跟。"
-        ),
-        needs_subject=True,
-        min_seconds=2.5,
-    ),
-    Capability(
-        name="tilt",
-        when=(
-            "垂直帶過去。主體上下移動時用——放進水裡、從桌面拿起、"
-            "沿著機身從上往下看。橫式素材出直式時上下沒有空間可移，"
-            "本機會照實回報做不到。"
-        ),
-        needs_subject=True,
-        min_seconds=2.5,
-    ),
-    Capability(
-        name="push_in",
-        when=(
-            "收緊到一個細節上——鏡頭模組、螢幕上的數值、一個材質。"
-            "本機依來源解析度決定收多緊，不會為了框滿而放大到糊。"
-        ),
-        needs_subject=True,
-        min_seconds=2.5,
-    ),
-    Capability(
-        name="pull_out",
-        when="從細節退開，交代它在什麼脈絡裡，通常用在一段的收尾。",
-        needs_subject=True,
-        min_seconds=2.5,
-    ),
-)
-
-# These name what a crop can do, not what a camera can do. A dolly, a crane or
-# a true track all change viewpoint, which produces parallax -- foreground and
-# background moving at different rates -- and no amount of moving a window
-# over an already-shot frame produces that. Offering `dolly_zoom` would get it
-# chosen for an effect the executor cannot deliver, which is the same failure
-# as any other capability declared and not built.
-
-MOVE_NAMES: tuple[str, ...] = tuple(move.name for move in CAMERA_MOVES)
-MOVE_FLOORS: dict[str, float] = {
-    move.name: move.min_seconds for move in CAMERA_MOVES
-}
 
 # The editorial question is richer than the five physical crop labels above.
 # A source pan and a digital pan can look alike to the viewer while asking the
@@ -138,6 +60,11 @@ CAMERA_INTENTS: tuple[tuple[str, str], ...] = (
 CAMERA_INTENT_NAMES: tuple[str, ...] = tuple(
     name for name, _ in CAMERA_INTENTS
 )
+
+# Compatibility for legacy cached answers and the renderer dispatch table.
+# New planning code must use CAMERA_INTENT_NAMES; unlike the removed
+# CAMERA_MOVES/MOVE_FLOORS table this carries no timing authority.
+MOVE_NAMES: tuple[str, ...] = ("hold", "pan", "tilt", "push_in", "pull_out")
 
 # Where the subject sits when it does not fill the output ratio.
 #

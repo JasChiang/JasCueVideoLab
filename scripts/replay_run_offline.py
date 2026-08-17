@@ -68,7 +68,7 @@ def _endpoint_overrides(values: list[str]) -> dict[str, float]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("run", type=Path, help="web run directory containing run.json/out")
-    parser.add_argument("destination", type=Path)
+    parser.add_argument("destination", type=Path, nargs="?")
     parser.add_argument(
         "--endpoint", action="append", default=[], metavar="KXX=X",
         help="human-confirmed final crop centre for one shot",
@@ -82,11 +82,21 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--dry-run-faults",
+        action="store_true",
+        help=(
+            "collect release and camera faults from durable artifacts, print "
+            "how many would previously terminate the process, and do not render"
+        ),
+    )
+    parser.add_argument(
         "--mobile",
         action="store_true",
         help="also write a compact 960px-high H.264 preview",
     )
     args = parser.parse_args()
+    if args.destination is None and not args.dry_run_faults:
+        parser.error("destination is required unless --dry-run-faults is used")
 
     run_root = args.run.resolve()
     output = run_root / "out"
@@ -116,7 +126,8 @@ def main() -> int:
     for index, entry in enumerate(current["shots"]):
         shot = entry.get("manual_plan") or selection[int(entry["selection_index"])]
         source_id = str(shot["source_id"])
-        source_for(source_id)
+        if not args.dry_run_faults:
+            source_for(source_id)
         start = float(entry["in_seconds"])
         clips.append(Clip(
             clip_id=f"k{index:02d}",
@@ -176,6 +187,36 @@ def main() -> int:
                 clips[index].approx_out_seconds - clips[index].approx_in_seconds
             ),
         )
+
+    if args.dry_run_faults:
+        from montagewright.planning_release import (
+            audio_timeline_faults,
+            resolved_source_contract_faults,
+        )
+        from montagewright.reframe import camera_delivery_faults
+
+        blocking = [
+            *resolved_source_contract_faults(edl),
+            *audio_timeline_faults(edl),
+        ]
+        advisories = []
+        for clip in edl.clips:
+            advisories.extend(
+                f"{clip.clip_id}: {fault}"
+                for fault in camera_delivery_faults(
+                    clip.reframe,
+                    paths.get(clip.clip_id),
+                    duration_seconds=(
+                        clip.approx_out_seconds - clip.approx_in_seconds
+                    ),
+                )
+            )
+        print(json.dumps({
+            "would_terminate_process": len(blocking),
+            "blocking_shot_faults": blocking,
+            "camera_advisories": advisories,
+        }, ensure_ascii=False, indent=2))
+        return 0
 
     if args.safe_one_shot:
         for index, clip in enumerate(edl.clips):

@@ -8646,7 +8646,7 @@ def test_an_unreachable_look_is_dropped_rather_than_ending_the_pass():
         "a shot with nothing left to name still ends the pass"
     )
     assert salvage.index("plan_disagreements") < salvage.index(
-        "raise SelectionUnrenderable"
+        "degrade_selection(chosen, faults)"
     ), "and what was given up is reported, not swallowed"
 
 

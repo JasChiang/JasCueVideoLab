@@ -847,14 +847,13 @@ def test_screen_negative_promotion_requires_exact_confirmation():
     option = resolved.options[0]
     pair = ("C1", option.target_id)
 
-    with pytest.raises(
-        CommitmentError, match="rejected every candidate commitment"
-    ):
-        _commitments_without_exact_hard_negatives(
-            resolved,
-            {pair: {"status": "uncertain", "reason": "blurred exact seed"}},
-            require_confirmation={pair},
-        )
+    degraded = _commitments_without_exact_hard_negatives(
+        resolved,
+        {pair: {"status": "uncertain", "reason": "blurred exact seed"}},
+        require_confirmation={pair},
+    )
+    assert degraded.options[0].target_id == "none"
+    assert any("ungrounded" in warning for warning in degraded.warnings)
 
     confirmed = _commitments_without_exact_hard_negatives(
         resolved,

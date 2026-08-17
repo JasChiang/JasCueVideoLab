@@ -771,18 +771,21 @@ def resolve_candidate_commitments(
             ))
         except Exception as error:
             faults.append(f"option {index} is invalid: {error}")
-    if faults:
+    if faults and not options:
         raise CommitmentError("; ".join(faults))
     offered = {one.span_id for one in options}
     deferred = tuple(sorted(set(span_index) - offered))
     grouped: dict[str, list[CandidateOption]] = {}
     for option in options:
         grouped.setdefault(option.commitment_id, []).append(option)
-    warnings = tuple(
-        f"{commitment_id} has a single point of failure"
-        for commitment_id, group in grouped.items()
-        if group[0].required and len(group) == 1
-    )
+    warnings = tuple(dict.fromkeys([
+        *faults,
+        *(
+            f"{commitment_id} has a single point of failure"
+            for commitment_id, group in grouped.items()
+            if group[0].required and len(group) == 1
+        ),
+    ]))
     try:
         return CandidateCommitments(
             contract_version=COMMITMENT_VERSION,

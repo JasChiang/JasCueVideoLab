@@ -58,6 +58,7 @@ from montagewright.planning_artifacts import (
     planning_contract as _planning_contract,
 )
 from montagewright.candidate_commitments import (
+    CandidateCommitments,
     CommitmentError,
     resolve_candidate_commitments,
 )
@@ -86,6 +87,7 @@ from montagewright.planner import (
     replan_shots,
     repair_selection_motion_contracts,
     repair_selection_source_windows,
+    normalize_selection,
     repair_single_look_hold_overflow,
     sequence_disagreements,
     select_shots,
@@ -648,17 +650,16 @@ def _commitments_without_exact_hard_negatives(
             surviving.append(option)
         if not surviving:
             warnings.append(
-                f"{commitment_id} has no exact-eligible option; omitted from "
-                "Selection rather than substituting a known wrong identity"
+                f"{commitment_id} has no exact-eligible identity option; kept "
+                "as ungrounded and marked for review rather than ending the run"
             )
-            continue
+            surviving = [
+                option.model_copy(update={"target_id": "none"})
+                for option in original
+            ]
         if not any(option.tier == "primary" for option in surviving):
             surviving[0] = surviving[0].model_copy(update={"tier": "primary"})
         kept.extend(surviving)
-    if not kept:
-        raise CommitmentError(
-            "exact identity confirmation rejected every candidate commitment"
-        )
     payload = commitments.model_dump(mode="python")
     payload.update({"options": tuple(kept), "warnings": tuple(dict.fromkeys(warnings))})
     return CandidateCommitments.model_validate(payload)
@@ -734,6 +735,7 @@ def _annotate_selection_direction_motion(
         (option.commitment_id, option.span_id): option
         for option in commitments.options
     }
+    notes = selection.setdefault("plan_disagreements", [])
     for shot in selection.get("shots") or []:
         option = by_pair.get((
             str(shot.get("commitment_id") or ""),
@@ -749,6 +751,25 @@ def _annotate_selection_direction_motion(
             "fallback": option.direction_fallback_treatment,
             "locally_feasible": list(option.feasible_treatments),
         }
+        selected = str(shot.get("camera_intent") or "hold")
+        agrees = selected == option.direction_treatment
+        shot["agrees_with_direction"] = agrees
+        if agrees:
+            shot.setdefault("direction_disagreement_reason", "")
+            continue
+        reason = str(shot.get("direction_disagreement_reason") or "").strip()
+        if not reason:
+            reason = str(shot.get("why") or "Selection chose after viewing")
+            shot["direction_disagreement_reason"] = reason
+        from montagewright.camera import shot_key
+
+        note = (
+            f"{shot_key(shot)[:12]}: Direction advised "
+            f"{option.direction_treatment}, Selection requested {selected}: "
+            f"{reason}"
+        )
+        if note not in notes:
+            notes.append(note)
 
 
 def _project_track_confirmed(selection: dict[str, Any], report: Any) -> None:
@@ -1977,8 +1998,8 @@ def command_render(args: argparse.Namespace) -> int:
             # array is called candidate_options, so adding an option looks
             # like adding a commitment unless the difference is spelled
             # out.
-            raise CommitmentError(
-                f"the pacing needs at least {needed} shots, so it needs at "
+            warning = (
+                f"the pacing prefers at least {needed} shots, so it prefers at "
                 f"least {needed} different commitment_id values, and there "
                 f"are {unique}: "
                 + ", ".join(sorted({
@@ -1989,9 +2010,14 @@ def command_render(args: argparse.Namespace) -> int:
                 "shot slots with their own purpose, each with exactly one "
                 "primary. Adding another option to a commitment_id that "
                 "already exists is an alternate for that same shot and does "
-                "not raise this count, and no existing commitment_id may be "
-                "removed to make room."
+                "not raise this count. Delivering the available commitments "
+                "with an explicit duration advisory."
             )
+            payload = resolved_commitments.model_dump(mode="python")
+            payload["warnings"] = tuple(dict.fromkeys([
+                *resolved_commitments.warnings, warning,
+            ]))
+            resolved_commitments = CandidateCommitments.model_validate(payload)
         return resolved_commitments
 
     # Provider-valid JSON can still make a claim the local material cannot
@@ -2173,41 +2199,9 @@ def command_render(args: argparse.Namespace) -> int:
         # older provider artifact; project them before the source-window
         # solver runs or resume will repeat an EDL failure that fresh planning
         # already knows how to avoid.
-        from montagewright.candidate_commitments import (
-            bind_selection_content_contracts,
+        cached_repairs = normalize_selection(
+            executable_cached_selection, material, commitments=commitments
         )
-
-        bind_selection_content_contracts(
-            executable_cached_selection.get("shots") or [], commitments, material
-        )
-        cached_hold_repairs = repair_single_look_hold_overflow(
-            executable_cached_selection
-        )
-        if cached_hold_repairs:
-            executable_cached_selection.setdefault(
-                "duration_repairs", []
-            ).extend(cached_hold_repairs)
-        from montagewright.planner import repair_camera_rests_to_duration
-
-        cached_camera_repairs = repair_camera_rests_to_duration(
-            executable_cached_selection, material
-        )
-        if cached_camera_repairs:
-            executable_cached_selection.setdefault(
-                "duration_repairs", []
-            ).extend(cached_camera_repairs)
-        cached_contract_repairs = (
-            *repair_selection_motion_contracts(
-                executable_cached_selection, material
-            ),
-            *repair_selection_source_windows(
-                executable_cached_selection, material
-            ),
-        )
-        if cached_contract_repairs:
-            executable_cached_selection.setdefault(
-                "duration_repairs", []
-            ).extend(cached_contract_repairs)
         cached_selection_faults = audit_cached_selection(
             executable_cached_selection,
             material,
@@ -2227,11 +2221,7 @@ def command_render(args: argparse.Namespace) -> int:
             provider_selection = None
         else:
             provider_selection = executable_cached_selection
-            if (
-                cached_hold_repairs
-                or cached_camera_repairs
-                or cached_contract_repairs
-            ):
+            if cached_repairs:
                 print(
                     "selection: fitted executable shot timing locally; "
                     "all shots and commitments are unchanged",
@@ -2268,26 +2258,7 @@ def command_render(args: argparse.Namespace) -> int:
                 "invalid_selection_faults", "delivery_status", "draft_only",
             ):
                 recovered.pop(local_only, None)
-            from montagewright.candidate_commitments import (
-                bind_selection_content_contracts,
-            )
-            from montagewright.planner import repair_camera_rests_to_duration
-
-            bind_selection_content_contracts(
-                recovered.get("shots") or [], commitments, material
-            )
-            recovered.setdefault("duration_repairs", []).extend(
-                repair_single_look_hold_overflow(recovered)
-            )
-            recovered.setdefault("duration_repairs", []).extend(
-                repair_camera_rests_to_duration(recovered, material)
-            )
-            recovered.setdefault("duration_repairs", []).extend(
-                repair_selection_motion_contracts(recovered, material)
-            )
-            recovered.setdefault("duration_repairs", []).extend(
-                repair_selection_source_windows(recovered, material)
-            )
+            normalize_selection(recovered, material, commitments=commitments)
             recovered_faults = audit_cached_selection(
                 recovered,
                 material,

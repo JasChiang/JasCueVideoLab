@@ -1683,15 +1683,14 @@ def test_the_planner_is_shown_each_shot_s_measured_floor():
     )
 
     assert _needs_at_least(clip) > 0.0
-    # Unknown geometry uses the same conservative move fallback that release
-    # will enforce; telling Rhythm zero here only postpones a deterministic
-    # refusal until after the paid answer.
+    # Unknown geometry cannot justify the removed flat MOVE_FLOORS fallback;
+    # only measured travel or declared rests may create a camera floor.
     bare = Clip(
         clip_id="k01", source_id="s", approx_in_seconds=0.0,
         approx_out_seconds=3.0,
         reframe=reframe_of({"looks": [{"at": "A"}, {"at": "B"}], "why": "x"}),
     )
-    assert _needs_at_least(bare) == 2.5
+    assert _needs_at_least(bare) == 0.0
 
 
 def test_no_prompt_teaches_a_field_the_schema_does_not_have():

@@ -338,6 +338,55 @@ class UploadCache:
         self.save()
         return uploaded.uri, False
 
+    def refresh_request_uris(
+        self, value: Any, client: Any,
+    ) -> tuple[Any, int]:
+        """Replace cached File URIs after the provider says they are unusable.
+
+        A File may expire between the cache's liveness check and an Interaction
+        consuming it.  Refresh only URIs this cache can map back to immutable
+        local bytes; arbitrary URLs and text are left untouched.
+        """
+
+        refreshed = 0
+
+        def visit(one: Any) -> Any:
+            nonlocal refreshed
+            if isinstance(one, list):
+                return [visit(item) for item in one]
+            if not isinstance(one, dict):
+                return one
+            result = {key: visit(item) for key, item in one.items()}
+            uri = str(one.get("uri") or "")
+            if not uri:
+                return result
+            found = next(
+                (
+                    (key, entry) for key, entry in self.entries.items()
+                    if str(entry.get("uri") or "") == uri
+                    and entry.get("source")
+                ),
+                None,
+            )
+            if found is None:
+                return result
+            key, entry = found
+            source = Path(str(entry["source"]))
+            if not source.is_file():
+                return result
+            mime_type = str(
+                one.get("mime_type") or entry.get("mime_type")
+                or "application/octet-stream"
+            )
+            self.entries.pop(key, None)
+            self.save()
+            new_uri, _ = self.uri_for(source, client, mime_type=mime_type)
+            result["uri"] = new_uri
+            refreshed += 1
+            return result
+
+        return visit(value), refreshed
+
 
 @contextmanager
 def _ascii_named(path: Path):

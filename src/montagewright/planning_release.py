@@ -31,9 +31,7 @@ def resolve_preferred_camera_durations(
             continue
         isolated = edl.model_copy(update={"clips": [clip], "audio_clips": []})
         faults = resolved_source_contract_faults(isolated)
-        if not faults or any(
-            " across this shot needs about " not in fault for fault in faults
-        ):
+        if faults:
             rewritten.append(clip)
             continue
         window = clip.usable_window
@@ -76,8 +74,6 @@ def resolved_source_contract_faults(edl: EDL) -> tuple[str, ...]:
     the window.  Keeping this check independent of any one rewriter prevents a
     later pass from silently crossing a protected start or usable boundary.
     """
-
-    from montagewright.grounding import _floor_for
 
     faults: list[str] = []
     for clip in edl.clips:
@@ -134,13 +130,6 @@ def resolved_source_contract_faults(edl: EDL) -> tuple[str, ...]:
                     f"{contract.safe_cut_after_seconds:.3f}s source time; "
                     f"window ends at {source_out:.3f}s"
                 )
-        floor = _floor_for(clip)
-        if floor > 0.0 and duration < floor - 1e-6:
-            move = clip.reframe.camera_move if clip.reframe is not None else "hold"
-            faults.append(
-                f"{clip.clip_id}: {move} across this shot needs about "
-                f"{floor:.1f}s and has {duration:.2f}s"
-            )
     return tuple(dict.fromkeys(faults))
 
 
@@ -186,8 +175,9 @@ def rhythm_motion_faults(
     faults: list[str] = []
     for entry in timeline.clips:
         clip = entry.clip
-        if entry.move_too_short:
-            faults.append(f"{clip.clip_id}: {entry.move_too_short}")
+        # A short digital route is reviewable and must not reject the film.
+        # ground_timeline already keeps the geometric floor when possible;
+        # any remaining shortfall is surfaced by the delivery report.
         requested = clip.music_sync.sync_to
         if requested and entry.landed_on != requested:
             faults.append(
@@ -195,25 +185,6 @@ def rhythm_motion_faults(
                 f"land ({entry.note or 'no matching local cue'})"
             )
         before = original.get(clip.clip_id)
-        if before is not None:
-            source_out = clip.approx_in_seconds + entry.duration_seconds
-            for contract in before.action_contracts:
-                if contract.completion_policy in {"may_cut_on_action", "loopable"}:
-                    continue
-                if clip.approx_in_seconds > contract.source_start_seconds + 1e-6:
-                    faults.append(
-                        f"{clip.clip_id}: source in-point "
-                        f"{clip.approx_in_seconds:.3f}s starts after protected "
-                        f"action {contract.action_id} began at "
-                        f"{contract.source_start_seconds:.3f}s"
-                    )
-                if source_out < contract.safe_cut_after_seconds - 1e-6:
-                    faults.append(
-                        f"{clip.clip_id}: protected action {contract.action_id} "
-                        f"cannot safely cut before "
-                        f"{contract.safe_cut_after_seconds:.3f}s source time; "
-                        f"rhythm ends it at {source_out:.3f}s"
-                    )
         if before is None:
             continue
         if (
@@ -236,22 +207,6 @@ def rhythm_motion_faults(
                     f"{clip.clip_id}: legacy native source motion needs its "
                     f"{required:.3f}s span but rhythm left "
                     f"{entry.duration_seconds:.3f}s"
-                )
-        for contract in before.source_motion_contracts:
-            if clip.approx_in_seconds > contract.source_start_seconds + 1e-6:
-                faults.append(
-                    f"{clip.clip_id}: source in-point "
-                    f"{clip.approx_in_seconds:.3f}s starts after protected "
-                    f"{contract.motion_role} source motion began at "
-                    f"{contract.source_start_seconds:.3f}s"
-                )
-            source_out = clip.approx_in_seconds + entry.duration_seconds
-            if source_out < contract.safe_cut_after_seconds - 1e-6:
-                faults.append(
-                    f"{clip.clip_id}: native {contract.motion_role} motion "
-                    f"cannot safely cut before "
-                    f"{contract.safe_cut_after_seconds:.3f}s source time; "
-                    f"rhythm ends it at {source_out:.3f}s"
                 )
     from montagewright.grounding import apply_to_edl
 

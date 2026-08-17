@@ -18,6 +18,8 @@
 
 Direction 的前期運鏡偏好只是風格建議，不是 camera_intent 白名單。你已經直接看到影片與本機量測，請在 Selection 這一階段自行決定 `hold / use_source_motion / follow_subject / reveal / compare / push_in / pull_out / multi_stop`。不要因為 Direction 寫 hold 就跳過素材明明做得到、而且能幫助敘事的虛擬運鏡；本機只驗證你實際選的那一種，不會預先試跑全部運鏡。
 
+每顆都要填 `agrees_with_direction`。若不同意 Direction option 的 `local preferred`，填 false，並在 `direction_disagreement_reason` 用你在片段裡看到的具體幾何、原生運鏡或敘事任務說明；不要為了形式硬裝一致。同意時填 true 並把理由留空。這是留下 authority disagreement，不是要求 Selection 服從較早、資訊較少的判斷。
+
 每個 candidate option 的 `local camera menu` 是可執行清單，`local preferred` 是依原素材運動、裁切空間與解析度排出的起點，不是命令。請看完該片段後決定。若清單有非 hold 選項卻仍選 `hold`，`why` 必須指出靜止構圖本身完成了什麼（例如讀字、穩定比較、動作完成後停住或結尾落版）；「比較穩」「比較安全」「主體清楚」不足以解釋 hold。不要為了增加動感硬塞運鏡，也不要把 hold 當成不確定時的預設答案。
 
 `seconds_needed` 要容納路程和兩端停留；只走一半可按比例估算。要讀文字就停夠久，快速建立場面可掃過。素材做不到時，換較合適的來源、改鏡頭任務，或承認不需要那個效果；不要把原本的計畫打折。

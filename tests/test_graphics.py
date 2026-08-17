@@ -135,6 +135,22 @@ EN13319 國際潛水標準認證
     assert all(candidate.primary_text != "—" for candidate in parsed.candidates)
 
 
+def test_non_product_brief_uses_the_same_structural_card_rules():
+    from montagewright.brief import parse_brief_markdown
+
+    parsed = parse_brief_markdown('''午夜餐桌
+一碗慢慢完成的湯
+
+72°C
+保持清澈
+
+立即預約''')
+
+    assert parsed.candidates[0].kind == "opening_title"
+    assert parsed.candidates[1].template == "spec_stack"
+    assert parsed.candidates[2].kind == "end_card"
+
+
 def test_initial_selection_can_place_plain_brief_copy_only_as_a_draft():
     from montagewright.brief import initial_graphics_plan, parse_brief_markdown
 

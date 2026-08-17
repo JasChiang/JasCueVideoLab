@@ -1101,7 +1101,13 @@ def reframe_of(shot: dict) -> Reframe:
     looks = looks_of(shot)
 
     first = looks[0] if looks else None
-    editorial_intent = camera_intent_of(shot)
+    requested_intent = camera_intent_of(shot)
+    # Local normalization may prove that the requested treatment has one
+    # unambiguous executable degradation.  Keep the provider's intent intact
+    # for audit and execute the separately named delivery decision.
+    editorial_intent = str(
+        shot.get("delivered_camera_intent") or requested_intent
+    )
     inferred_move = move_of(looks) if looks else str(
         shot.get("camera_move", "hold") or "hold"
     )
