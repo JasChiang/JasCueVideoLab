@@ -135,12 +135,6 @@ def content_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _remote_name_for(sha256: str) -> str:
-    """A stable File resource name lets a lost upload response be recovered."""
-
-    return f"files/mw-{sha256[:37]}"
-
-
 def _remote_matches(remote: Any, *, sha256: str, size_bytes: int) -> bool:
     """ACTIVE means processed; hash and size prove which complete bytes."""
 
@@ -213,13 +207,13 @@ class UploadCache:
             return False
         try:
             remote = _get_remote_file(client, entry["name"])
-        except Exception as error:
-            if _provider_status_code(error) == 404:
-                return False
-            # Authentication failures and transient provider failures are not
-            # evidence that the bytes disappeared. Propagate rather than
-            # silently uploading a duplicate remote object.
-            raise
+        except Exception:
+            # Reuse is an optimisation, never a requirement. A cached File the
+            # current key cannot read -- expired, or uploaded under a key that
+            # has since been swapped -- is simply not reusable, so fall through
+            # and upload a fresh copy. Raising here turned a stale cache entry
+            # into a dead run the moment the API key changed.
+            return False
         state = getattr(remote.state, "name", str(remote.state))
         if state == "PROCESSING":
             remote = _wait_until_active(
@@ -256,14 +250,13 @@ class UploadCache:
         ):
             return entry["uri"], True
 
-        # A new local file is not evidence that a remote object exists.  Do
-        # not speculatively GET its content-derived name: the Files API uses
-        # PERMISSION_DENIED for a name that is absent *or* not owned, so that
-        # probe cannot distinguish a normal first upload from an auth error.
-        # The stable name exists only to recover after this upload was
-        # actually attempted and its response was lost.
-        remote_name = _remote_name_for(key)
-
+        # Upload with a server-assigned name. Pinning a content-derived name
+        # was meant to recover an upload whose response was lost, but the same
+        # name is what a previous key leaves orphaned: the Files API then
+        # refuses to overwrite it (ALREADY_EXISTS) and refuses to read it
+        # (PERMISSION_DENIED), which is a dead end no local logic escapes. A
+        # server name cannot collide, and a genuinely lost response costs one
+        # duplicate File that expires on its own -- never a stopped run.
         def remember_pending(remote: Any) -> None:
             self.entries[key] = {
                 "uri": remote.uri,
@@ -275,39 +268,7 @@ class UploadCache:
             }
             self.save()
 
-        try:
-            uploaded = upload_now(
-                path, client, on_uploaded=remember_pending,
-                remote_name=remote_name,
-            )
-        except Exception as upload_error:
-            # Only an upload that was genuinely dispatched earns a recovery
-            # lookup.  A 5xx may mean the bytes committed but the response was
-            # lost; 409 means the stable name already committed.  Never issue
-            # a second upload here.  If recovery itself is inconclusive, keep
-            # the original provider error and let the run stop.
-            if _provider_status_code(upload_error) not in {
-                409, 500, 502, 503, 504,
-            }:
-                raise
-            try:
-                uploaded = _get_remote_file(client, remote_name)
-                if getattr(
-                    uploaded.state, "name", str(uploaded.state)
-                ) == "PROCESSING":
-                    uploaded = _wait_until_active(
-                        uploaded,
-                        path,
-                        client,
-                        processing_timeout_seconds=(
-                            UPLOAD_PROCESSING_TIMEOUT_SECONDS
-                        ),
-                        poll_seconds=UPLOAD_POLL_SECONDS,
-                        clock=time.monotonic,
-                        sleep=time.sleep,
-                    )
-            except Exception:
-                raise upload_error
+        uploaded = upload_now(path, client, on_uploaded=remember_pending)
         verified = _get_remote_file(client, uploaded.name)
         verified_state = getattr(
             verified.state, "name", str(verified.state)
@@ -443,7 +404,6 @@ def upload_now(
     clock: Any = time.monotonic,
     sleep: Any = time.sleep,
     on_uploaded: Any | None = None,
-    remote_name: str | None = None,
 ) -> Any:
     """Upload and wait until the file can actually be used.
 
@@ -464,10 +424,7 @@ def upload_now(
     path = Path(path)
     try:
         with _ascii_named(path) as sendable:
-            uploaded = client.files.upload(
-                file=str(sendable),
-                config=({"name": remote_name} if remote_name else None),
-            )
+            uploaded = client.files.upload(file=str(sendable))
     except Exception as error:
         # The same 429, on the other API surface. `ask` has translated this
         # since the first time it happened, and uploads went straight past

@@ -1340,10 +1340,9 @@ def test_a_processing_upload_is_remembered_before_status_polling_fails(
         def upload(cls, **kwargs):
             cls.uploads += 1
             cls.uploaded = True
-            remote = Remote("PROCESSING")
-            remote.name = kwargs["config"]["name"]
-            remote.uri = f"gemini://{remote.name}"
-            return remote
+            # The server assigns the name; no content-derived name is sent.
+            assert "config" not in kwargs or kwargs.get("config") is None
+            return Remote("PROCESSING")
 
         @classmethod
         def get(cls, **kwargs):
@@ -1365,25 +1364,29 @@ def test_a_processing_upload_is_remembered_before_status_polling_fails(
 
     remembered = UploadCache.load(cache_path)
     remote_name = next(iter(remembered.entries.values()))["name"]
-    assert remote_name.startswith("files/mw-")
+    # The name is whatever the server assigned, not a content-derived one:
+    # pinning a content name is what a swapped key leaves orphaned.
+    assert remote_name == "files/pending"
     Files.active = True
     uri, hit = remembered.uri_for(source, client, mime_type="video/mp4")
-    assert (uri, hit) == (f"gemini://{remote_name}", True)
+    assert (uri, hit) == (Remote.uri, True)
     assert Files.uploads == 1
 
 
-def test_a_lost_upload_500_is_recovered_by_name_hash_and_size(
+def test_a_lost_upload_error_propagates_without_a_name_probe(
     tmp_path, monkeypatch,
 ) -> None:
-    """The service may commit bytes before its upload response is lost."""
+    """A server name cannot be recovered, and must not be guessed.
 
-    import base64
+    Pinning a content-derived name once let a lost 500 be found again, but the
+    same fixed name is what a previous key orphans, dead-ending every later
+    run. A lost upload now simply raises; the next run re-uploads a fresh copy,
+    which costs a duplicate File that expires on its own -- never a stopped
+    run. Nothing here may issue a speculative GET before an upload succeeds.
+    """
 
     from montagewright import uploads
     from montagewright.uploads import UploadCache, content_hash
-
-    class State:
-        name = "ACTIVE"
 
     class ServerError(RuntimeError):
         code = 500
@@ -1391,140 +1394,104 @@ def test_a_lost_upload_500_is_recovered_by_name_hash_and_size(
     source = tmp_path / "committed.mp4"
     source.write_bytes(b"the complete file")
     digest = content_hash(source)
-    expected_hash = base64.b64encode(
-        bytes.fromhex(digest)
-    ).decode("ascii")
 
     class Files:
         uploads = 0
-        committed_name = None
+        gets = 0
 
         @classmethod
         def get(cls, *, name):
-            assert cls.uploads == 1, "recovery GET must follow an upload"
-            assert name == cls.committed_name
-            return type("Remote", (), {
-                "name": name,
-                "uri": f"gemini://{name}",
-                "state": State(),
-                "sha256_hash": expected_hash,
-                "size_bytes": source.stat().st_size,
-            })()
+            cls.gets += 1
+            raise AssertionError("no GET may precede a successful upload")
 
         @classmethod
         def upload(cls, **kwargs):
             cls.uploads += 1
-            cls.committed_name = kwargs["config"]["name"]
+            assert "config" not in kwargs or kwargs.get("config") is None
             raise ServerError("500 response lost after commit")
 
     client = type("Client", (), {"files": Files})()
     monkeypatch.setattr(uploads.time, "sleep", lambda _: None)
     cache = UploadCache.load(tmp_path / "uploads.json")
 
-    uri, hit = cache.uri_for(source, client, mime_type="video/mp4")
+    with pytest.raises(ServerError):
+        cache.uri_for(source, client, mime_type="video/mp4")
     assert Files.uploads == 1
-    assert Files.committed_name == f"files/mw-{digest[:37]}"
-    assert (uri, hit) == (f"gemini://{Files.committed_name}", False)
-    assert Files.uploads == 1
+    assert Files.gets == 0
+    assert digest not in UploadCache.load(tmp_path / "uploads.json").entries
 
 
-def test_a_failed_recovered_upload_is_never_cached_as_active(
+def test_a_cached_file_the_current_key_cannot_read_is_re_uploaded(
     tmp_path, monkeypatch,
 ) -> None:
-    """A matching hash cannot make a terminal provider object usable."""
+    """Reuse is an optimisation, never a requirement.
+
+    A File cached under a key that has since been swapped answers its status
+    GET with a permission error, not a 404. Treating that as fatal turned a
+    stale cache entry into a dead run the moment the key changed; it must fall
+    through and upload a fresh copy instead.
+    """
 
     import base64
 
     from montagewright import uploads
     from montagewright.uploads import UploadCache, content_hash
 
-    class Conflict(RuntimeError):
-        code = 409
-
-    class State:
-        name = "FAILED"
-
-    source = tmp_path / "failed.mp4"
-    source.write_bytes(b"complete but unusable bytes")
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"the same bytes, a different key")
     digest = content_hash(source)
-    encoded_hash = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
-
-    class Files:
-        @staticmethod
-        def upload(**_):
-            raise Conflict("409 name already exists")
-
-        @staticmethod
-        def get(*, name):
-            return type("Remote", (), {
-                "name": name,
-                "uri": f"gemini://{name}",
-                "state": State(),
-                "sha256_hash": encoded_hash,
-                "size_bytes": source.stat().st_size,
-            })()
-
+    expected_hash = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
     cache_path = tmp_path / "uploads.json"
-    cache = UploadCache.load(cache_path)
-    monkeypatch.setattr(uploads.time, "sleep", lambda _: None)
 
-    with pytest.raises(RuntimeError, match="FAILED.*refusing to cache"):
-        cache.uri_for(
-            source,
-            type("Client", (), {"files": Files})(),
-            mime_type="video/mp4",
-        )
+    # A cache entry left by a previous key.
+    stale = UploadCache.load(cache_path)
+    stale.entries[digest] = {
+        "uri": "gemini://files/old-key-file",
+        "name": "files/old-key-file",
+        "mime_type": "video/mp4",
+        "source": str(source),
+        "uploaded_at": uploads.time.time(),
+        "state": "ACTIVE",
+    }
+    stale.save()
 
-    assert digest not in UploadCache.load(cache_path).entries
-
-
-def test_a_fresh_cached_file_uploads_before_its_first_status_get(
-    tmp_path,
-) -> None:
-    """A fabricated remote name must never be probed before creation."""
-
-    import base64
-
-    from montagewright.uploads import UploadCache, content_hash
-
-    source = tmp_path / "fresh.mp4"
-    source.write_bytes(b"fresh bytes")
-    digest = content_hash(source)
-    expected_hash = base64.b64encode(
-        bytes.fromhex(digest)
-    ).decode("ascii")
-    events = []
+    class Forbidden(RuntimeError):
+        code = 403
 
     class State:
         name = "ACTIVE"
 
-    class Remote:
-        name = f"files/mw-{digest[:37]}"
-        uri = f"gemini://{name}"
-        state = State()
-        sha256_hash = expected_hash
-        size_bytes = source.stat().st_size
-
     class Files:
-        @staticmethod
-        def upload(**kwargs):
-            events.append(("upload", kwargs["config"]["name"]))
-            return Remote()
+        uploads = 0
 
-        @staticmethod
-        def get(*, name):
-            events.append(("get", name))
-            return Remote()
+        @classmethod
+        def get(cls, *, name):
+            if name == "files/old-key-file":
+                raise Forbidden("403 you do not have permission or it may not exist")
+            return type("Remote", (), {
+                "name": name, "uri": f"gemini://{name}",
+                "state": State(), "sha256_hash": expected_hash,
+                "size_bytes": source.stat().st_size,
+            })()
 
-    cache = UploadCache.load(tmp_path / "uploads.json")
+        @classmethod
+        def upload(cls, **kwargs):
+            cls.uploads += 1
+            return type("Remote", (), {
+                "name": "files/fresh-key-file",
+                "uri": "gemini://files/fresh-key-file",
+                "state": State(),
+            })()
+
+    monkeypatch.setattr(uploads.time, "sleep", lambda _: None)
+    cache = UploadCache.load(cache_path)
     uri, hit = cache.uri_for(
-        source,
-        type("Client", (), {"files": Files})(),
-        mime_type="video/mp4",
+        source, type("Client", (), {"files": Files})(), mime_type="video/mp4",
     )
 
-    assert (uri, hit) == (Remote.uri, False)
-    assert events == [("upload", Remote.name), ("get", Remote.name)]
+    # The unreadable cached File was abandoned and a fresh one uploaded.
+    assert (uri, hit) == ("gemini://files/fresh-key-file", False)
+    assert Files.uploads == 1
 
 
 def test_remote_hash_accepts_the_live_files_api_hex_encoding(tmp_path) -> None:
