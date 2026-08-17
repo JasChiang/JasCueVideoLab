@@ -780,14 +780,6 @@ def build_look_path(
             )
         )
 
-    rests = [_rest_for_stop(one[0]) for one in stops]
-    # Never let resting eat the whole shot; leave at least as much for
-    # travelling as for standing still.
-    if sum(rests) > duration_seconds * (1.0 - SETTLE_SHARE * 2):
-        room = duration_seconds * (1.0 - SETTLE_SHARE * 2)
-        scale = room / sum(rests) if sum(rests) > 0 else 0.0
-        rests = [one * scale for one in rests]
-
     spans = [
         max(
             abs((b.x + b.width / 2) - (a.x + a.width / 2)),
@@ -796,6 +788,70 @@ def build_look_path(
         )
         for a, b in zip(boxes, boxes[1:])
     ]
+
+    rests = [_rest_for_stop(one[0]) for one in stops]
+    # Between discrete landings the travel is a connective, not the content:
+    # the shot is about the two ends, and the frame crossing the gap between
+    # a Before panel and an After panel shows half of each and neither whole.
+    # Reading across one continuous thing is the opposite case -- there the
+    # travel is the whole point -- and it never reaches here, because
+    # `continuous_read` returns above.
+    #
+    # This used to hand travel at least half the shot whatever it was for, so
+    # a plan of 1.5s on each of two panels in a three-second shot became 0.75
+    # and 0.75 with the frame straddling the divider for the middle 1.5s. The
+    # planner had answered the question correctly; a constant overruled it.
+    # Every multi-landing shot in both delivered films was cut this way.
+    #
+    # Energy already says how fast the frame may travel, and dwell already
+    # says how long each landing is worth looking at. So give the crossing
+    # the least time the measured distance needs at the chosen energy, and
+    # leave the remainder where the plan put it.
+    ceiling = ENERGY_LIMITS[energy]["max_speed"]
+    minimum_travel = sum(one / ceiling for one in spans) if ceiling > 0 else 0.0
+    # A route too long for its shot must not take every landing's stillness
+    # with it. Moving in every frame of a shot is not a pan -- it is a pan
+    # with both ends cut off -- so each landing keeps a readable settle, and
+    # the resulting overrun is reported by the speed checks below rather than
+    # absorbed by never stopping.
+    floor_rest = min(SETTLE_SECONDS, duration_seconds / (2.0 * len(rests)))
+    room = max(floor_rest * len(rests), duration_seconds - minimum_travel)
+    if sum(rests) > room:
+        # Even at the fastest this energy allows, the landings cannot all be
+        # held for as long as they asked. Scale them together rather than
+        # dropping the last -- and say so, because it is the plan's number
+        # being changed, not the executor's.
+        asked = list(rests)
+        scale = room / sum(rests) if sum(rests) > 0 else 0.0
+        rests = [one * scale for one in rests]
+        # A shot whose landings lose a twentieth of their dwell is a shot
+        # that fits. Reporting that is noise in the one list a reviewer has
+        # to read, so this speaks when the plan's number has actually been
+        # changed by an amount anyone would see.
+        if degradations is not None and (
+            sum(asked) - sum(rests) >= max(0.1, sum(asked) * 0.05)
+        ):
+            degradations.append(
+                DegradationStep(
+                    clip_id=clip_id,
+                    ladder="other",
+                    ladder_other="declared_dwell_shortened_to_fit",
+                    trigger=(
+                        f"this shot asks to rest {'+'.join(f'{one:.2f}' for one in asked)}s "
+                        f"on its landings and to cross {sum(spans):.2f} of frame "
+                        f"between them, which needs {minimum_travel:.2f}s at "
+                        f"{energy} energy; in {duration_seconds:.2f}s the rests "
+                        f"were shortened together to fit"
+                    ),
+                    measured={
+                        "asked_rest_seconds": round(sum(asked), 3),
+                        "delivered_rest_seconds": round(sum(rests), 3),
+                        "minimum_travel_seconds": round(minimum_travel, 3),
+                        "seconds": round(duration_seconds, 3),
+                    },
+                    severity="advisory",
+                )
+            )
     left = max(duration_seconds - sum(rests), 1e-6)
     total = sum(spans)
     legs = [

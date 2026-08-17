@@ -982,12 +982,12 @@ def test_a_push_rests_too():
 WIDE, TIGHT = 0.3164, 0.20
 
 
-def _looks(stops, seconds=4.0, degradations=None):
+def _looks(stops, seconds=4.0, degradations=None, energy="active"):
     from montagewright.reframe import build_look_path
 
     return build_look_path(
         stops, source_aspect=16 / 9, target_aspect=1080 / 1920,
-        duration_seconds=seconds, energy="active", clip_id="k00",
+        duration_seconds=seconds, energy=energy, clip_id="k00",
         degradations=degradations,
     )
 
@@ -1048,10 +1048,17 @@ def test_too_many_looks_for_the_time_is_reported():
         seconds=2.0, degradations=degradations,
     )
 
-    assert [one.ladder_other for one in degradations] == [
-        "looks_do_not_fit_the_time"
-    ]
-    measured = degradations[0].measured
+    ladders = [one.ladder_other for one in degradations]
+    assert "looks_do_not_fit_the_time" in ladders
+    # Asking to rest 2.0s in a 2.0s shot and also cross the frame changes the
+    # plan's own dwell, which is said separately: one note is the executor
+    # reporting a speed it cannot reach, the other is the planner's number
+    # being altered.
+    assert "declared_dwell_shortened_to_fit" in ladders
+    measured = next(
+        one.measured for one in degradations
+        if one.ladder_other == "looks_do_not_fit_the_time"
+    )
     assert measured["needed_speed_vw_s"] > measured["max_speed_vw_s"]
 
 
@@ -2382,3 +2389,76 @@ def test_old_transcript_with_apple_word_clock_migrates_without_retranscribing(
     assert migrated["lines"][0]["starts_seconds"] == 2.0
     assert migrated["lines"][0]["ends_seconds"] == 4.0
     assert migrated["lines"][0]["timed_text"]
+
+
+def test_travel_between_landings_takes_only_the_time_it_needs():
+    """The crossing is a connective; the landings are the content.
+
+    A Before panel and an After panel are two things worth looking at, and
+    the frame between them shows half of each and neither whole. Handing
+    travel a fixed share of the shot whatever it was for turned a plan of
+    1.5s on each panel into 0.75s and 0.75s with the frame straddling the
+    divider for the middle half of a three-second shot -- the planner had
+    answered correctly and a constant overruled it. Energy already says how
+    fast the frame may move; dwell already says how long each end is worth.
+    """
+
+    degradations = []
+    path = _looks(
+        [(1.5, 0.395, 0.5, WIDE), (1.5, 0.715, 0.5, WIDE)],
+        seconds=3.0, degradations=degradations,
+    )
+    rests = [
+        round(later.seconds - earlier.seconds, 2)
+        for earlier, later in zip(path.keyframes, path.keyframes[1:])
+        if abs(earlier.crop.x - later.crop.x) < 1e-4
+    ]
+
+    assert rests == [1.26, 1.26]
+    moving = 3.0 - sum(rests)
+    assert moving < 0.6
+    # The plan's number did change, so it is said rather than absorbed.
+    assert [one.ladder_other for one in degradations] == [
+        "declared_dwell_shortened_to_fit"
+    ]
+
+
+def test_dwell_that_already_fits_is_left_exactly_alone():
+    degradations = []
+    path = _looks(
+        [(0.5, 0.30, 0.5, WIDE), (0.5, 0.70, 0.5, WIDE)],
+        seconds=3.0, degradations=degradations,
+    )
+    rests = [
+        round(later.seconds - earlier.seconds, 2)
+        for earlier, later in zip(path.keyframes, path.keyframes[1:])
+        if abs(earlier.crop.x - later.crop.x) < 1e-4
+    ]
+
+    assert rests == [0.5, 0.5]
+    assert not degradations
+
+
+def test_a_route_too_long_for_its_shot_still_stops_at_both_ends():
+    """Moving in every frame is a pan with both ends cut off.
+
+    When the crossing cannot fit at all, the landings keep a readable settle
+    and the overrun is reported by the speed checks, rather than the shot
+    never stopping.
+    """
+
+    degradations = []
+    path = _looks(
+        [(2.0, 0.05, 0.5, WIDE), (2.0, 0.95, 0.5, WIDE)],
+        seconds=2.5, energy="calm", degradations=degradations,
+    )
+    rests = [
+        later.seconds - earlier.seconds
+        for earlier, later in zip(path.keyframes, path.keyframes[1:])
+        if abs(earlier.crop.x - later.crop.x) < 1e-4
+    ]
+
+    assert rests and min(rests) >= 0.34
+    assert "looks_do_not_fit_the_time" in [
+        one.ladder_other for one in degradations
+    ]
