@@ -1251,6 +1251,7 @@ def describe(
     # cache already holds this proxy from the card pass.
     listening = ask(
         client,
+        upload_cache=cache,
         model=model_id or MODEL_ID,
         store=False,
         input=[
@@ -1325,6 +1326,7 @@ def describe(
     instruction = (PROMPTS / "transcript_zh-TW.txt").read_text(encoding="utf-8")
     interaction = ask(
         client,
+        upload_cache=cache,
         model=model_id or MODEL_ID,
         store=False,
         input=[{

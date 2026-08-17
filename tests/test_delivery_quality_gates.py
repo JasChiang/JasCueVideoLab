@@ -198,6 +198,7 @@ def test_replan_degradation_cannot_be_reported_ready():
         clip_id="k00", ladder="other", ladder_other="camera_failed",
         trigger="camera missed its endpoint", adjudication="replan",
         adjudication_reason="choose another treatment",
+        severity="blocking_shot",
     )
 
     delivered, status = _delivery_selection(
@@ -214,6 +215,7 @@ def test_unreviewed_degradation_cannot_be_reported_ready() -> None:
         clip_id="k00",
         ladder="slower_follow",
         trigger="the compiled follow exceeded its camera budget",
+        severity="blocking_shot",
     )
 
     delivered, status = _delivery_selection(
@@ -223,6 +225,22 @@ def test_unreviewed_degradation_cannot_be_reported_ready() -> None:
     assert status == "needs_review"
     assert delivered["shots"][0]["delivery_status"] == "needs_review"
     assert "尚未逐顆驗收" in delivered["shots"][0]["delivery_issue"]
+
+
+def test_advisory_degradation_does_not_block_delivery() -> None:
+    degradation = DegradationStep(
+        clip_id="k00",
+        ladder="slower_follow",
+        trigger="the compiled follow was reduced within its safe budget",
+        severity="advisory",
+    )
+
+    delivered, status = _delivery_selection(
+        {"shots": [{"identity_status": "not_applicable"}]}, {}, [degradation]
+    )
+
+    assert status == "ready"
+    assert "delivery_status" not in delivered["shots"][0]
 
 
 def test_locally_accepted_degradation_can_still_be_ready() -> None:

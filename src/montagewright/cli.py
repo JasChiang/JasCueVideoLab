@@ -96,6 +96,7 @@ from montagewright.schema import (
     EDL,
     Clip,
     ContentContract,
+    delivered_camera_intent_of,
     looks_of,
     move_of_shot,
     reframe_of,
@@ -370,12 +371,16 @@ def _confirm_material_identity_for_target(
         confirm_source_identity,
         confirmed_frame_from_validated_seed,
         decide_cross_asset_exact_frame_bboxes,
+        identity_box_ratio_disagreement,
         prepare_source_identity_seed,
         read_source_confirmation_cache,
         read_source_confirmation_status,
         source_confirmation_cache_path,
         write_source_confirmation_cache,
     )
+
+    def ratio_warning(frames: Sequence[Any]) -> str | None:
+        return identity_box_ratio_disagreement(spec, target, frames)
 
     confirmed: dict[str, tuple[Any, ...]] = {}
     paid_before = float(getattr(ledger, "spent_usd", 0.0))
@@ -405,6 +410,9 @@ def _confirm_material_identity_for_target(
                     or ("confirmed" if remembered else "uncertain"),
                     "reason": "source confirmation cache",
                 }
+                warning = ratio_warning(remembered)
+                if warning:
+                    outcomes[(item.source_id, target)]["ratio_disagreement"] = warning
             if remembered:
                 confirmed[item.source_id] = remembered
             continue
@@ -479,6 +487,11 @@ def _confirm_material_identity_for_target(
                         outcomes[(item.source_id, target)] = {
                             "status": "confirmed", "reason": "clean exact seed",
                         }
+                        warning = ratio_warning(found)
+                        if warning:
+                            outcomes[(item.source_id, target)][
+                                "ratio_disagreement"
+                            ] = warning
                     confirmed[item.source_id] = found
                     write_source_confirmation_cache(
                         cache_path,
@@ -537,6 +550,9 @@ def _confirm_material_identity_for_target(
             outcomes[(item.source_id, target)] = detail or {
                 "status": "uncertain", "reason": "no confirmed source frame",
             }
+            warning = ratio_warning(found)
+            if warning:
+                outcomes[(item.source_id, target)]["ratio_disagreement"] = warning
         if found:
             confirmed[item.source_id] = found
 
@@ -654,7 +670,14 @@ def _commitments_without_exact_hard_negatives(
                 "as ungrounded and marked for review rather than ending the run"
             )
             surviving = [
-                option.model_copy(update={"target_id": "none"})
+                option.model_copy(update={
+                    "target_id": "none",
+                    "identity_status": "needs_review",
+                    "identity_issue": (
+                        "所有 exact-frame 候選均為 hard negative；保留未接地草稿，"
+                        "必須人工替換或確認。"
+                    ),
+                })
                 for option in original
             ]
         if not any(option.tier == "primary" for option in surviving):
@@ -666,7 +689,8 @@ def _commitments_without_exact_hard_negatives(
 
 
 def _annotate_selection_identity_evidence(
-    selection: dict[str, Any], confirmed: dict[str, Any]
+    selection: dict[str, Any], confirmed: dict[str, Any],
+    outcomes: dict[tuple[str, str], dict[str, str]] | None = None,
 ) -> None:
     """Say what identity evidence exists before final-window tracking.
 
@@ -690,6 +714,13 @@ def _annotate_selection_identity_evidence(
         shot["identity_target_id"] = targets[0]
         shot["identity_target_ids"] = list(targets)
         source_confirmed = confirmed.get(source_id) or {}
+        ratio_warnings = [
+            str((outcomes or {}).get((source_id, target), {}).get(
+                "ratio_disagreement", ""
+            )).strip()
+            for target in targets
+        ]
+        ratio_warnings = [one for one in ratio_warnings if one]
         if isinstance(source_confirmed, dict):
             missing = [
                 target for target in targets
@@ -724,6 +755,17 @@ def _annotate_selection_identity_evidence(
             )
             if note not in notes:
                 notes.append(note)
+        for warning in ratio_warnings:
+            advisories = shot.setdefault("identity_advisories", [])
+            if warning not in advisories:
+                advisories.append(warning)
+            shot["identity_issue"] = "; ".join(
+                one for one in (str(shot.get("identity_issue") or ""), warning)
+                if one
+            )
+            note = f"k{index:02d} {source_id}: {warning}"
+            if note not in notes:
+                notes.append(note)
 
 
 def _annotate_selection_direction_motion(
@@ -736,7 +778,7 @@ def _annotate_selection_direction_motion(
         for option in commitments.options
     }
     notes = selection.setdefault("plan_disagreements", [])
-    for shot in selection.get("shots") or []:
+    for index, shot in enumerate(selection.get("shots") or []):
         option = by_pair.get((
             str(shot.get("commitment_id") or ""),
             str(shot.get("span_id") or ""),
@@ -761,10 +803,8 @@ def _annotate_selection_direction_motion(
         if not reason:
             reason = str(shot.get("why") or "Selection chose after viewing")
             shot["direction_disagreement_reason"] = reason
-        from montagewright.camera import shot_key
-
         note = (
-            f"{shot_key(shot)[:12]}: Direction advised "
+            f"k{index:02d}: Direction advised "
             f"{option.direction_treatment}, Selection requested {selected}: "
             f"{reason}"
         )
@@ -2311,7 +2351,9 @@ def command_render(args: argparse.Namespace) -> int:
             # with the executable Selection cache. Resume must still repair
             # it, while Web can show exactly where this run stopped.
             draft = copy.deepcopy(error.draft)
-            _annotate_selection_identity_evidence(draft, confirmed_identities)
+            _annotate_selection_identity_evidence(
+                draft, confirmed_identities, identity_confirmation_outcomes
+            )
             _annotate_selection_direction_motion(draft, commitments)
             draft["invalid_selection_faults"] = list(error.faults)
             draft["delivery_status"] = "release_blocked"
@@ -2319,13 +2361,13 @@ def command_render(args: argparse.Namespace) -> int:
             _decide(work, "invalid-selection-draft", chose, draft)
             raise
         _annotate_selection_identity_evidence(
-            provider_selection, confirmed_identities
+            provider_selection, confirmed_identities, identity_confirmation_outcomes
         )
         _decide(work, "selection", chose, provider_selection)
     else:
         print("selection: reused from the last attempt", flush=True)
         _annotate_selection_identity_evidence(
-            provider_selection, confirmed_identities
+            provider_selection, confirmed_identities, identity_confirmation_outcomes
         )
     _annotate_selection_direction_motion(provider_selection, commitments)
     resolved_selection_key = _asked(
@@ -2354,11 +2396,11 @@ def command_render(args: argparse.Namespace) -> int:
     )
     source_motion = sum(
         1 for shot in selection["shots"]
-        if str(shot.get("camera_intent") or "") == "use_source_motion"
+        if delivered_camera_intent_of(shot) == "use_source_motion"
     )
     deliberate_holds = sum(
         1 for shot in selection["shots"]
-        if str(shot.get("camera_intent") or "hold") == "hold"
+        if delivered_camera_intent_of(shot) == "hold"
     )
     print(
         f"selection: {len(selection['shots'])} shots; {travelling} digital "
@@ -2526,7 +2568,7 @@ def command_render(args: argparse.Namespace) -> int:
                 shot["identity_issue"] = "; ".join(
                     one for one in (prior_issue, issue) if one
                 )
-                shot["camera_intent"] = "hold"
+                shot["delivered_camera_intent"] = "hold"
                 shot["frame"] = "settles"
                 for look in failed_looks:
                     look["entity_id"] = "none"
@@ -3764,8 +3806,8 @@ def _edl_from_selection(
                 available_seconds=wanted,
                 motion_role=(
                     str(shot.get("source_motion_role") or "")
-                    if str(shot.get("camera_intent") or "")
-                    == "use_source_motion" else ""
+                    if delivered_camera_intent_of(shot) == "use_source_motion"
+                    else ""
                 ),
                 presentation_intent=next((
                     str(look.get("presentation_intent") or "")
@@ -3778,7 +3820,7 @@ def _edl_from_selection(
                     if str(look.get("entity_id") or "none") != "none"
                 ), "none"),
             )
-            if str(shot.get("camera_intent") or "") == "use_source_motion":
+            if delivered_camera_intent_of(shot) == "use_source_motion":
                 source_motion_contract = source_motion_contract_for(
                     item,
                     source_start=start,
@@ -3922,6 +3964,8 @@ def _delivery_selection(
     delivery_selection = copy.deepcopy(selection)
     unresolved_by_clip: dict[str, list[str]] = {}
     for step in degradations:
+        if getattr(step, "severity", "advisory") != "blocking_shot":
+            continue
         adjudication = getattr(step, "adjudication", "unadjudicated")
         if adjudication == "accept":
             continue
@@ -3941,7 +3985,10 @@ def _delivery_selection(
             == "sam_geometry_validated"
         ):
             shot["identity_status"] = "track_validated"
-            shot["identity_issue"] = ""
+            shot["identity_issue"] = "; ".join(
+                str(one) for one in shot.get("identity_advisories") or []
+                if str(one)
+            )
         clip_id = f"k{index:02d}"
         if clip_id in unresolved_by_clip:
             shot["delivery_status"] = "needs_review"
@@ -4013,6 +4060,24 @@ def _write_report(output: Path, **parts) -> None:
                     and int(clip_id[1:]) < len(parts["selection"]["shots"])
                     else "hold"
                 ),
+                "requested_camera_intent": (
+                    parts["selection"]["shots"][int(clip_id[1:])].get(
+                        "camera_intent", "hold"
+                    )
+                    if clip_id.startswith("k")
+                    and clip_id[1:].isdigit()
+                    and int(clip_id[1:]) < len(parts["selection"]["shots"])
+                    else "hold"
+                ),
+                "delivered_camera_intent": (
+                    delivered_camera_intent_of(
+                        parts["selection"]["shots"][int(clip_id[1:])]
+                    )
+                    if clip_id.startswith("k")
+                    and clip_id[1:].isdigit()
+                    and int(clip_id[1:]) < len(parts["selection"]["shots"])
+                    else "hold"
+                ),
             }
             for clip_id in sorted(
                 set(report.source_motion) | set(report.digital_motion)
@@ -4030,6 +4095,8 @@ def _write_report(output: Path, **parts) -> None:
                 "trigger": step.trigger,
                 "measured": step.measured,
                 "adjudication": step.adjudication,
+                "severity": step.severity,
+                "attempt_id": step.attempt_id,
                 # Who settled it and on what grounds. Without this the report
                 # says "replan" and nothing about why, which is the same
                 # position the reviewer was in before they could see the shot.

@@ -48,8 +48,6 @@ def shot_key(shot: dict[str, Any]) -> str:
         "start_offset": shot.get(
             "start_offset_seconds", shot.get("start_seconds", 0.0)
         ),
-        "camera_intent": str(shot.get("camera_intent") or "hold"),
-        "looks": shot.get("looks") or [],
     }
     encoded = json.dumps(
         identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -110,18 +108,22 @@ def compile_camera(
         Fault(
             shot_key=stable_key,
             kind="camera_delivery",
-            severity="advisory",
+            severity=(
+                "advisory" if "crop path ends at" in message
+                else "blocking_shot"
+            ),
             message=message,
             remedy="review the achieved crop or choose a feasible alternate",
             attempt_id=attempt_id,
         )
         for message in messages
     )
+    blocking = any(fault.severity == "blocking_shot" for fault in faults)
     return CameraPlan(
         requested_intent=requested,
-        delivered_intent=requested if not messages else "degraded",
+        delivered_intent=requested if not blocking else "degraded",
         route=camera_route_policy(reframe),
         floor_seconds=camera_floor_for(reframe),
-        feasible=not messages,
+        feasible=not blocking,
         faults=faults,
     )

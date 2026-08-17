@@ -33,6 +33,7 @@ from montagewright.executor import (
 )
 from montagewright.grounding import BeatGrid, apply_to_edl, ground_timeline
 from montagewright.planner import Usage, decide_rhythm, locate_subject
+from montagewright.camera import compile_camera
 from montagewright.reframe import (
     CropPath,
     DEADBAND,
@@ -47,7 +48,6 @@ from montagewright.reframe import (
     build_tilt_path,
     build_zoom_path,
     camera_route_policy,
-    camera_delivery_faults,
     declared_look_centres,
     observations_from_sam,
 )
@@ -2863,25 +2863,30 @@ def follow_subjects(
                 unusable_shots.append(unusable)
                 continue
     for clip in edl.clips:
-        for fault in camera_delivery_faults(
+        camera_plan = compile_camera(
             clip.reframe,
-            paths.get(clip.clip_id),
+            path=paths.get(clip.clip_id),
             duration_seconds=(
                 clip.approx_out_seconds - clip.approx_in_seconds
             ),
-        ):
+            stable_key=clip.clip_id,
+            attempt_id="camera-compile-1",
+        )
+        for fault in camera_plan.faults:
             report.degradations.append(
                 DegradationStep(
                     clip_id=clip.clip_id,
                     ladder="other",
                     ladder_other="camera_intent_not_delivered",
-                    trigger=fault,
+                    trigger=fault.message,
                     measured={},
                     adjudication="replan",
                     adjudication_reason=(
                         "keep the editorial intent, then extend the shot, "
                         "recompile its geometry, or choose another treatment"
                     ),
+                    severity=fault.severity,
+                    attempt_id=fault.attempt_id,
                 )
             )
     if unusable_shots:
@@ -3008,6 +3013,10 @@ def run(
             artifact_dir=output_dir / "work",
         )
         _charge(report, "rhythm", usage)
+        report.plan_disagreements.extend(
+            note for note in edl.plan_disagreements
+            if note not in report.plan_disagreements
+        )
 
     # Music grounding and dialogue boundaries both move cuts.  Neither may
     # silently invalidate the other, so converge them before rendering and

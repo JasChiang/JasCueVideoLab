@@ -97,6 +97,8 @@ class CandidateOption(StrictFrozen):
     preferred_treatment: CameraTreatment = "hold"
     minimum_camera_seconds: float = Field(default=0.0, ge=0.0)
     feasibility_reason: str = "local fallback: hold"
+    identity_status: Literal["eligible", "needs_review"] = "eligible"
+    identity_issue: str = ""
 
 
 def _camera_treatments(
@@ -1219,6 +1221,9 @@ def bind_selection_content_contracts(
             "fallback": option.direction_fallback_treatment,
             "locally_feasible": list(option.feasible_treatments),
         }
+        if option.identity_status == "needs_review":
+            shot["identity_status"] = "needs_review"
+            shot["identity_issue"] = option.identity_issue
         # Direction owns how this commitment is meant to be read. Selection
         # chooses the source window and executable treatment; asking it to
         # copy the same presentation enum into a nested look created paid

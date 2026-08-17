@@ -474,6 +474,8 @@ def test_direction_motion_advice_is_carried_to_the_reviewable_shot():
     assert advice["move"] == "pan"
     assert advice["route"] == "left logo to right product"
     assert "use_source_motion" in advice["locally_feasible"]
+    assert selection["shots"][0]["agrees_with_direction"] is False
+    assert selection["plan_disagreements"][0].startswith("k00:")
 
 
 @pytest.mark.parametrize("change, message", [
@@ -853,6 +855,8 @@ def test_screen_negative_promotion_requires_exact_confirmation():
         require_confirmation={pair},
     )
     assert degraded.options[0].target_id == "none"
+    assert degraded.options[0].identity_status == "needs_review"
+    assert degraded.options[0].identity_issue
     assert any("ungrounded" in warning for warning in degraded.warnings)
 
     confirmed = _commitments_without_exact_hard_negatives(

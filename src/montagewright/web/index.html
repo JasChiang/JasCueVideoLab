@@ -2250,6 +2250,10 @@ function inspect(i) {
   const allDisagreements = lastReport.plan_disagreements || [];
   const moved = Math.abs(b.in_seconds - (plan.start_seconds ?? b.in_seconds)) > 0.01
     || Math.abs(b.seconds - (rhythm.seconds ?? b.seconds)) > 0.01;
+  const requestedIntent = b.motion?.requested_camera_intent
+    || b.motion?.camera_intent || plan.camera_intent || 'hold';
+  const deliveredIntent = b.motion?.delivered_camera_intent
+    || plan.delivered_camera_intent || requestedIntent;
 
   // The frame first. An inspector that opens with a filename makes you
   // hold in your head which shot it is talking about while you read.
@@ -2293,6 +2297,7 @@ function inspect(i) {
         <span>原素材語意角色</span><span>${esc(motionLabel(b.motion?.source, 'source'))}</span>
         <span>數位裁切</span><span>${esc(motionLabel(b.motion?.digital, 'digital'))}</span>
         <span>最終組合</span><span>${esc(compositeLabel(b.motion?.composite))}</span>
+        <span>實際剪輯意圖</span><span>${esc(intentLabel(deliveredIntent))}</span>
         ${b.source_motion_details?.description
           ? `<span>素材運鏡說明</span><span>${esc(b.source_motion_details.description)}</span>` : ''}
       </div>
@@ -2308,9 +2313,10 @@ function inspect(i) {
     <section class="ins-part plan">
       <h4>原計畫</h4>
       <div class="pairs">
-        <span>剪輯意圖</span><span>${esc(intentLabel(
-          b.motion?.camera_intent || plan.camera_intent
-        ))}</span>
+        <span>計畫剪輯意圖</span><span>${esc(intentLabel(requestedIntent))}${
+          deliveredIntent !== requestedIntent
+            ? `<br><i class="why">實際：${esc(intentLabel(deliveredIntent))}</i>` : ''
+        }</span>
         ${plan.direction_motion_advice ? `
           <span>Direction 建議</span><span>${esc(
             intentLabel(plan.direction_motion_advice.treatment)
@@ -2321,7 +2327,13 @@ function inspect(i) {
             plan.direction_motion_advice.reason || '—'
           )}<br><i class="why">不可行時：${esc(intentLabel(
             plan.direction_motion_advice.fallback
-          ))}</i></span>` : ''}
+          ))}</i></span>
+          <span>與 Direction 一致</span><span>${
+            plan.agrees_with_direction === true ? '是' :
+            plan.agrees_with_direction === false ? `否<br><i class="why">${esc(
+              plan.direction_disagreement_reason || 'Selection 選擇不同處理'
+            )}</i>` : '—'
+          }</span>` : ''}
         <span>運鏡</span><span>${esc(MOVES[b.camera_move] || b.camera_move || '—')}${
           plan.frame ? `<i class="why">　宣告${plan.frame === 'travels' ? '會動' : '不動'}</i>` : ''}</span>
         <span>畫面停在</span><span>${
@@ -5421,6 +5433,11 @@ const SETTLED = {
   unadjudicated: ['沒有人看過',
                   '這一輪沒跑到驗收——沒開自審，或提前停了'],
 };
+const DEGRADATION_SEVERITY = {
+  blocking_shot: ['阻擋此顆', '這個 fault 必須處理後才能把鏡頭標成 ready'],
+  advisory: ['提醒', '不阻擋交付，但應在 review 時確認'],
+  note: ['記錄', '純資訊，不改變交付狀態'],
+};
 
 // Move the highlight without rebuilding the blocks under it.
 function markPicked() {
@@ -5439,6 +5456,8 @@ function markShot(i) {
 function tellDegradation(d) {
   const [what, why] = LADDERS[d.ladder] || [d.ladder, ''];
   const [verdict, meaning] = SETTLED[d.adjudication] || [d.adjudication || '', ''];
+  const [severity, severityMeaning] = DEGRADATION_SEVERITY[d.severity]
+    || [d.severity || '提醒', ''];
   const numbers = Object.entries(d.measured || {})
     .map(([k, v]) => `${k} ${typeof v === 'number' ? +v.toFixed(3) : v}`)
     .join('　');
@@ -5447,10 +5466,14 @@ function tellDegradation(d) {
   // sentence every time, already sitting in the tag's tooltip. Three
   // degradations on one shot filled the screen.
   return `<div class="deg">
-    <span>${esc(what)}</span>${
+    <span>${esc(what)}</span>
+    <span class="tag ${d.severity === 'blocking_shot' ? 'no' : ''}"
+      title="${esc(severityMeaning)}">${esc(severity)}</span>${
       verdict ? ` <span class="tag" title="${esc(meaning)}">${esc(verdict)}</span>` : ''}
     ${why ? `<span class="why">${esc(why)}</span>` : ''}
-    ${numbers ? `<details class="figures"><summary>數字</summary><div class="why mono">${esc(numbers)}</div></details>` : ''}
+    ${(numbers || d.attempt_id) ? `<details class="figures"><summary>數字</summary><div class="why mono">${
+      esc([numbers, d.attempt_id ? `attempt ${d.attempt_id}` : ''].filter(Boolean).join('　'))
+    }</div></details>` : ''}
   </div>`;
 }
 
@@ -5653,6 +5676,10 @@ function render(report) {
     const r = rhythm[k] || {}, v = verdicts[k] || {};
     const degs = degByClip[k] || [];
     const motion = report.motion?.[k] || {};
+    const requestedIntent = motion.requested_camera_intent
+      || motion.camera_intent || s.camera_intent || 'hold';
+    const deliveredIntent = motion.delivered_camera_intent
+      || s.delivered_camera_intent || requestedIntent;
     const sourceFact = sourceMovementFact(i);
     const disagreements = disagreementsForShot(report, i, s.source_id);
     const ok = v.delivered === undefined ? '' :
@@ -5673,7 +5700,9 @@ function render(report) {
             <a class="mono shot" href="/api/runs/${runId}/shot/${i}" target="_blank">${esc(s.source_id)}</a>
             <span class="mono">${Number(s.start_seconds ?? 0).toFixed(1)}s ＋${Number(r.seconds ?? 0).toFixed(1)}s</span>
             <span class="move"><span data-source-motion="${i}">${esc(sourceFact)}</span> · ${esc(
-              intentLabel(motion.camera_intent || s.camera_intent)
+              intentLabel(requestedIntent)
+              + (deliveredIntent !== requestedIntent
+                ? ` → ${intentLabel(deliveredIntent)}` : '')
             )} · ${esc(compositeLabel(motion.composite))}</span>
           </div>
         </div>

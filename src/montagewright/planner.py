@@ -919,6 +919,16 @@ def decide_rhythm(
         + "; ".join((*coverage_faults, *release_faults)),
         flush=True,
     )
+    advisories = [
+        f"rhythm advisory: {fault}"
+        for fault in (*coverage_faults, *release_faults)
+    ]
+    candidate = candidate.model_copy(update={
+        "plan_disagreements": list(dict.fromkeys([
+            *candidate.plan_disagreements,
+            *advisories,
+        ])),
+    })
     return candidate, usage_total
 
 

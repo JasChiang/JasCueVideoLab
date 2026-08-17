@@ -83,8 +83,53 @@ def test_shot_key_is_stable_when_neighbour_positions_change() -> None:
         "looks": [{"at": "the lens", "framing": "fill"}],
     }
     moved_in_list = {"clip_id": "k12", **shot}
+    locally_normalized = {
+        **shot,
+        "camera_intent": "hold",
+        "delivered_camera_intent": "hold",
+        "looks": [{"at": "the lens", "framing": "thirds"}],
+    }
 
     assert shot_key(shot) == shot_key(moved_in_list)
+    assert shot_key(shot) == shot_key(locally_normalized)
+
+
+def test_camera_compiler_only_blocks_semantic_delivery_failures() -> None:
+    from montagewright.camera import compile_camera
+    from montagewright.reframe import CropBox, CropPath, Keyframe
+    from montagewright.schema import Look, Reframe
+
+    endpoint_only = compile_camera(
+        Reframe(
+            camera_move="push_in", editorial_intent="push_in",
+            intent="tighten on the product",
+        ),
+        path=CropPath([
+            Keyframe(0.0, CropBox(x=0.0, y=0.0, width=0.8, height=1.0)),
+            Keyframe(0.97, CropBox(x=0.1, y=0.0, width=0.6, height=1.0)),
+        ]),
+        duration_seconds=1.0,
+        stable_key="shot",
+        attempt_id="attempt-1",
+    )
+    assert endpoint_only.feasible
+    assert endpoint_only.faults[0].severity == "advisory"
+    assert endpoint_only.faults[0].attempt_id == "attempt-1"
+
+    static_compare = compile_camera(
+        Reframe(
+            camera_move="pan",
+            editorial_intent="compare",
+            looks=[Look(at="one"), Look(at="two")],
+        ),
+        path=CropPath([
+            Keyframe(0.0, CropBox(x=0.0, y=0.0, width=0.8, height=1.0)),
+        ]),
+        duration_seconds=1.0,
+        stable_key="shot",
+    )
+    assert not static_compare.feasible
+    assert static_compare.faults[0].severity == "blocking_shot"
 
 
 def test_tracked_push_compares_against_its_tracked_endpoint() -> None:

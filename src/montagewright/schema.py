@@ -803,6 +803,7 @@ class EDL(ModelFacing):
     audio_clips: list[AudioClip] = Field(default_factory=list)
     brief_coverage: BriefCoverage = Field(default_factory=BriefCoverage)
     named_facts: list[NamedFact] = Field(default_factory=list)
+    plan_disagreements: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def clip_ids_are_unique(self) -> "EDL":
@@ -860,6 +861,8 @@ class DegradationStep(Local):
     )
     adjudication: Literal["accept", "replan", "unadjudicated"] = "unadjudicated"
     adjudication_reason: str | None = None
+    severity: Literal["blocking_shot", "advisory", "note"] = "advisory"
+    attempt_id: str | None = None
 
 
 class Issue(ModelFacing):
@@ -1035,6 +1038,12 @@ def camera_intent_of(shot: dict) -> str:
     )
 
 
+def delivered_camera_intent_of(shot: dict) -> str:
+    """The locally compiled intent, preserving the requested intent for audit."""
+
+    return str(shot.get("delivered_camera_intent") or camera_intent_of(shot))
+
+
 def move_of(looks: "list[Look]") -> str:
     """What a list of looks turns out to be, in the old vocabulary.
 
@@ -1101,13 +1110,10 @@ def reframe_of(shot: dict) -> Reframe:
     looks = looks_of(shot)
 
     first = looks[0] if looks else None
-    requested_intent = camera_intent_of(shot)
     # Local normalization may prove that the requested treatment has one
     # unambiguous executable degradation.  Keep the provider's intent intact
     # for audit and execute the separately named delivery decision.
-    editorial_intent = str(
-        shot.get("delivered_camera_intent") or requested_intent
-    )
+    editorial_intent = delivered_camera_intent_of(shot)
     inferred_move = move_of(looks) if looks else str(
         shot.get("camera_move", "hold") or "hold"
     )

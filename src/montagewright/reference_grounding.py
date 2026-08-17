@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -239,6 +240,7 @@ class ReferenceGroundingSpec(FrozenStrictModel):
                 )
         return self
 
+
     def canonical_definition_json(self) -> str:
         return _canonical_json(self)
 
@@ -263,6 +265,63 @@ class ReferenceGroundingSpec(FrozenStrictModel):
             for reference in self.reference_images
             if reference.target_id in selected
         )
+
+
+def declared_identity_box_ratios(
+    spec: ReferenceGroundingSpec, target_id: str,
+) -> tuple[float, ...]:
+    """Read repeated short/long ratios from identity cues, excluding lookalikes."""
+
+    target = next((
+        one for one in spec.identity_lock.identity.targets
+        if one.target_id == target_id
+    ), None)
+    if target is None:
+        return ()
+    number = re.compile(r"(?<!\d)(0\.\d{1,3}|1\.0+)(?!\d)")
+    excluded = {
+        round(float(value), 3)
+        for cue in target.stable_exclusions
+        for value in number.findall(cue)
+    }
+    counts: dict[float, int] = {}
+    for cue in target.identity_cues:
+        for ratio in {round(float(value), 3) for value in number.findall(cue)}:
+            if 0.1 <= ratio <= 1.0 and ratio not in excluded:
+                counts[ratio] = counts.get(ratio, 0) + 1
+    return tuple(sorted(ratio for ratio, count in counts.items() if count >= 2))
+
+
+def identity_box_ratio_disagreement(
+    spec: ReferenceGroundingSpec,
+    target_id: str,
+    frames: Sequence[Any],
+    *,
+    tolerance: float = 0.10,
+) -> str | None:
+    """Return a non-blocking identity warning when exact boxes contradict spec."""
+
+    expected = declared_identity_box_ratios(spec, target_id)
+    if not expected:
+        return None
+    measured: list[float] = []
+    for frame in frames:
+        x0, y0, x1, y1 = frame.box
+        width, height = abs(x1 - x0), abs(y1 - y0)
+        if min(width, height) <= 0:
+            continue
+        ratio = min(width, height) / max(width, height)
+        if min(abs(ratio - one) for one in expected) > tolerance:
+            measured.append(ratio)
+    if not measured:
+        return None
+    return (
+        "exact identity bbox short/long ratio "
+        + ", ".join(f"{one:.2f}" for one in measured)
+        + " disagrees with declared target ratio(s) "
+        + ", ".join(f"{one:.2f}" for one in expected)
+        + "; this is advisory because side views can legitimately differ"
+    )
 
 
 def load_grounding_spec(path: Path) -> ReferenceGroundingSpec:
@@ -395,6 +454,7 @@ def draft_identity_from_references(
     })
     interaction = ask(
         client,
+        upload_cache=cache,
         model=model_id,
         store=False,
         input=parts,
@@ -1644,6 +1704,7 @@ def discover_reference_candidates(
     )
     interaction = ask(
         client,
+        upload_cache=cache,
         model=model_id,
         store=False,
         input=parts,
@@ -2376,6 +2437,7 @@ def decide_exact_frame_bbox(
     )
     interaction = ask(
         client,
+        upload_cache=cache,
         model=model_id,
         store=False,
         input=parts,
@@ -2689,6 +2751,7 @@ def decide_exact_frame_bboxes(
         max_output_tokens = exact_frame_output_budget(len(chunk))
         interaction = ask(
             client,
+            upload_cache=cache,
             model=model_id,
             store=False,
             input=parts,
@@ -3456,6 +3519,7 @@ def decide_cross_asset_exact_frame_bboxes(
         try:
             interaction = ask(
                 client,
+                upload_cache=cache,
                 model=model_id,
                 store=False,
                 input=parts,

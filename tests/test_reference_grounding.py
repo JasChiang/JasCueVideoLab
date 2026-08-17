@@ -144,6 +144,34 @@ def _write_spec(
     return load_grounding_spec(spec_path)
 
 
+def test_identity_box_ratio_is_a_non_blocking_spec_disagreement() -> None:
+    spec = SimpleNamespace(identity_lock=SimpleNamespace(
+        identity=SimpleNamespace(targets=(SimpleNamespace(
+            target_id="target.primary",
+            identity_cues=(
+                "target short over long is 0.77",
+                "front view short side divided by long side is 0.77",
+                "lookalike is near 0.93",
+            ),
+            stable_exclusions=("lookalike short over long is 0.93",),
+        ),)),
+    ))
+    correct = SimpleNamespace(box=(0.0, 0.0, 0.78, 1.0))
+    wrong = SimpleNamespace(box=(0.0, 0.0, 0.96, 1.0))
+
+    assert grounding.declared_identity_box_ratios(
+        spec, "target.primary"
+    ) == (0.77,)
+    assert grounding.identity_box_ratio_disagreement(
+        spec, "target.primary", [correct]
+    ) is None
+    warning = grounding.identity_box_ratio_disagreement(
+        spec, "target.primary", [wrong]
+    )
+    assert warning is not None
+    assert "advisory" in warning
+
+
 def _video_lineage(video_hash: str) -> VideoAssetLineage:
     return VideoAssetLineage(
         asset_id=f"sha256:{video_hash}",

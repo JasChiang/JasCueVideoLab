@@ -194,6 +194,7 @@ def review_cut(
 
     interaction = ask(
         client,
+        upload_cache=cache,
         model=model_id,
         store=False,
         input=[
@@ -377,6 +378,7 @@ def review_shots(
 
     interaction = ask(
         client,
+        upload_cache=cache,
         model=model_id,
         store=False,
         input=body,

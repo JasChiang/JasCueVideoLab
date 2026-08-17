@@ -957,6 +957,7 @@ def describe_clip(
 
     interaction = ask(
         client,
+        upload_cache=cache,
         model=model_id or MODEL_ID,
         store=False,
         # The video first, the question after it. Google's own guidance for
