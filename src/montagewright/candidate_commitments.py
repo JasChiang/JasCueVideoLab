@@ -871,8 +871,42 @@ def resolve_candidate_commitments(
     grouped: dict[str, list[CandidateOption]] = {}
     for option in options:
         grouped.setdefault(option.commitment_id, []).append(option)
+
+    # Exactly one primary per commitment is a hard invariant of the model, and
+    # Direction is a model answer that does not always hold it: a commitment
+    # can come back with no primary among its options, or with two. That is a
+    # tier bookkeeping slip, not a reason to throw away a paid direction and
+    # stop the film -- the first option is a fine primary and the rest are its
+    # alternates. Repair it here, deterministically, and say which commitment
+    # was adjusted. `options` is rebuilt from the repaired groups in its
+    # original order so nothing else shifts.
+    primary_repairs: list[str] = []
+    for commitment_id, group in grouped.items():
+        primaries = [one for one in group if one.tier == "primary"]
+        if len(primaries) == 1:
+            continue
+        for position, option in enumerate(group):
+            want = "primary" if position == 0 else "alternate"
+            if option.tier != want:
+                group[position] = option.model_copy(update={"tier": want})
+        primary_repairs.append(
+            f"{commitment_id} had {len(primaries)} primary options; kept one "
+            "primary and made the rest alternates"
+        )
+    if primary_repairs:
+        # Rebuild in the original order, drawing each commitment's repaired
+        # options in sequence, so only the tiers changed.
+        cursors = {commitment_id: 0 for commitment_id in grouped}
+        rebuilt: list[CandidateOption] = []
+        for option in options:
+            group = grouped[option.commitment_id]
+            rebuilt.append(group[cursors[option.commitment_id]])
+            cursors[option.commitment_id] += 1
+        options = rebuilt
+
     warnings = tuple(dict.fromkeys([
         *faults,
+        *primary_repairs,
         *(
             f"{commitment_id} has a single point of failure"
             for commitment_id, group in grouped.items()

@@ -579,11 +579,37 @@ def test_preferred_delivery_never_trims_below_commitment_minimum():
     assert chosen["shots"][0]["seconds_needed"] == 3.0
 
 
-def test_each_commitment_requires_exactly_one_primary():
+def test_a_commitment_left_without_a_primary_is_repaired_not_rejected():
+    """Direction is a model answer that does not always keep one primary.
+
+    A commitment can come back with no primary among its options -- often
+    because the option Direction marked primary was filtered out as invalid,
+    leaving only alternates. That is a tier bookkeeping slip, not a reason to
+    throw away a paid direction and stop the film. The first surviving option
+    becomes the primary, a warning records it, and the pydantic invariant --
+    still enforced as the last line of defence -- now holds by construction.
+    """
     direction = _direction()
     direction["candidate_options"][0]["tier"] = "alternate"
-    with pytest.raises(ValueError, match="exactly one primary"):
-        _resolved(direction)
+
+    resolved = _resolved(direction)
+
+    primaries = [one for one in resolved.options if one.tier == "primary"]
+    assert len(primaries) == 1
+    assert any("primary" in warning for warning in resolved.warnings)
+
+
+def test_two_primaries_in_one_commitment_are_reduced_to_one():
+    direction = _direction()
+    alternate = dict(direction["candidate_options"][0])
+    alternate.update({"span_id": "C1:s01", "tier": "primary",
+                      "min_supported_seconds": "0:03"})
+    direction["candidate_options"].append(alternate)
+
+    resolved = _resolved(direction)
+
+    primaries = [one for one in resolved.options if one.tier == "primary"]
+    assert len(primaries) == 1
 
 
 def test_conflicting_group_flags_are_a_retryable_commitment_error():
