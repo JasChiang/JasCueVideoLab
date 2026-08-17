@@ -90,6 +90,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--recompile-camera",
+        action="store_true",
+        help=(
+            "rebuild every multi-landing crop path with the current motion "
+            "compiler, keeping each landing where this run measured it and "
+            "the dwell the plan asked for; never calls a model"
+        ),
+    )
+    parser.add_argument(
         "--mobile",
         action="store_true",
         help="also write a compact 960px-high H.264 preview",
@@ -187,6 +196,65 @@ def main() -> int:
                 clips[index].approx_out_seconds - clips[index].approx_in_seconds
             ),
         )
+
+    if args.recompile_camera:
+        # The landings this run measured are the expensive part and they are
+        # already right -- SAM found them. What changed is how the time
+        # between them is shared out, so keep every position and recompute the
+        # timing from the dwell the plan actually declared.
+        def rest_total(path) -> float:
+            return sum(
+                later.seconds - earlier.seconds
+                for earlier, later in zip(path.keyframes, path.keyframes[1:])
+                if abs(earlier.crop.x - later.crop.x) < 1e-4
+                and abs(earlier.crop.width - later.crop.width) < 1e-4
+            )
+
+        for index, clip in enumerate(edl.clips):
+            clip_id = f"k{index:02d}"
+            path = paths.get(clip_id)
+            reframe = clip.reframe
+            if path is None or reframe is None or len(path.keyframes) < 3:
+                continue
+            landings = [
+                earlier.crop
+                for earlier, later in zip(path.keyframes, path.keyframes[1:])
+                if abs(earlier.crop.x - later.crop.x) < 1e-4
+                and abs(earlier.crop.width - later.crop.width) < 1e-4
+            ]
+            declared = [float(one.seconds or 0.0) for one in reframe.looks]
+            if len(landings) < 2 or len(declared) != len(landings):
+                continue
+            source = source_for(clip.source_id)
+            duration = clip.approx_out_seconds - clip.approx_in_seconds
+            before = rest_total(path)
+            rebuilt = build_look_path(
+                [
+                    (
+                        rest,
+                        crop.x + crop.width / 2.0,
+                        crop.y + crop.height / 2.0,
+                        crop.width,
+                    )
+                    for rest, crop in zip(declared, landings)
+                ],
+                source_aspect=source.aspect_ratio,
+                target_aspect=target_aspect,
+                duration_seconds=duration,
+                energy=look_energy(clip.energy_intent),
+                source_width=source.width,
+                source_height=source.height,
+                output_width=int(current["output_size"][0]),
+                output_height=int(current["output_size"][1]),
+                clip_id=clip_id,
+            )
+            paths[clip_id] = rebuilt
+            print(
+                f"{clip_id}: {reframe.editorial_intent} asked to rest "
+                f"{'+'.join(f'{one:.2f}' for one in declared)}s; travel was "
+                f"{(duration - before) / duration:.0%} of the shot, now "
+                f"{(duration - rest_total(rebuilt)) / duration:.0%}"
+            )
 
     if args.dry_run_faults:
         from montagewright.planning_release import (
