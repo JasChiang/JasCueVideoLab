@@ -270,7 +270,22 @@ class ReferenceGroundingSpec(FrozenStrictModel):
 def declared_identity_box_ratios(
     spec: ReferenceGroundingSpec, target_id: str,
 ) -> tuple[float, ...]:
-    """Read repeated short/long ratios from identity cues, excluding lookalikes."""
+    """Read every declared short/long ratio from identity cues.
+
+    A target legitimately has one ratio per state it may be filmed in: the
+    Fold8 spec names 0.76 unfolded and 0.63 folded, each stated once in its
+    own cue.  Requiring a ratio to appear in two cues before believing it
+    therefore kept only the folded number, and every correctly identified
+    unfolded frame -- measured at 0.77-0.78 -- was reported as disagreeing
+    with the target it actually matched.  Against the recorded ground truth
+    that scored the same as the Ultra it exists to catch, which is no
+    discrimination at all.
+
+    A cue's decimals are prose, not a declared field, so this stays a
+    permissive reader: any in-range number the spec did not exclude counts as
+    a state this target may be seen in.  Over-collecting only widens the set
+    a measurement may agree with, and the caller is advisory.
+    """
 
     target = next((
         one for one in spec.identity_lock.identity.targets
@@ -284,12 +299,15 @@ def declared_identity_box_ratios(
         for cue in target.stable_exclusions
         for value in number.findall(cue)
     }
-    counts: dict[float, int] = {}
-    for cue in target.identity_cues:
-        for ratio in {round(float(value), 3) for value in number.findall(cue)}:
-            if 0.1 <= ratio <= 1.0 and ratio not in excluded:
-                counts[ratio] = counts.get(ratio, 0) + 1
-    return tuple(sorted(ratio for ratio, count in counts.items() if count >= 2))
+    declared = {
+        round(float(value), 3)
+        for cue in target.identity_cues
+        for value in number.findall(cue)
+    }
+    return tuple(sorted(
+        ratio for ratio in declared
+        if 0.1 <= ratio <= 1.0 and ratio not in excluded
+    ))
 
 
 def identity_box_ratio_disagreement(

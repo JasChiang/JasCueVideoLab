@@ -172,6 +172,47 @@ def test_identity_box_ratio_is_a_non_blocking_spec_disagreement() -> None:
     assert "advisory" in warning
 
 
+def test_identity_box_ratio_reads_one_ratio_per_filmed_state() -> None:
+    """A real target states each state's ratio once, in its own cue.
+
+    The shipped Fold8 spec names 0.76 unfolded and 0.63 folded exactly once
+    each.  An earlier reader kept a ratio only when two cues repeated it, so
+    it collected the folded number alone and reported every correctly
+    identified unfolded frame as a disagreement -- scoring the true target
+    identically to the lookalike this check exists to catch.
+    """
+
+    spec = SimpleNamespace(identity_lock=SimpleNamespace(
+        identity=SimpleNamespace(targets=(SimpleNamespace(
+            target_id="target.primary",
+            identity_cues=(
+                "unfolded, front on: short side about 0.76 of the long side",
+                "folded, front on: short side about 0.63 of the long side",
+            ),
+            stable_exclusions=("the lookalike is nearer 0.93",),
+        ),)),
+    ))
+
+    assert grounding.declared_identity_box_ratios(
+        spec, "target.primary"
+    ) == (0.63, 0.76)
+
+    def ratios(*values: float) -> list[SimpleNamespace]:
+        return [SimpleNamespace(box=(0.0, 0.0, one, 1.0)) for one in values]
+
+    # Both filmed states agree with the target they actually match.
+    assert grounding.identity_box_ratio_disagreement(
+        spec, "target.primary", ratios(0.78, 0.75, 0.78)
+    ) is None
+    assert grounding.identity_box_ratio_disagreement(
+        spec, "target.primary", ratios(0.63, 0.63)
+    ) is None
+    # The excluded lookalike still is not one of them.
+    assert grounding.identity_box_ratio_disagreement(
+        spec, "target.primary", ratios(0.96, 0.92, 0.90)
+    ) is not None
+
+
 def _video_lineage(video_hash: str) -> VideoAssetLineage:
     return VideoAssetLineage(
         asset_id=f"sha256:{video_hash}",
