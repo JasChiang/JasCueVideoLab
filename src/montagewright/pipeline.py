@@ -857,6 +857,33 @@ def _already_explained(report: "Report", clip_id: str) -> bool:
     )
 
 
+def _native_speed_for(
+    clip, reframe, measurements: "Mapping[str, Any] | None",
+) -> float:
+    """How much of the shot's motion budget the take is already spending.
+
+    Only an authored or subject-following take contributes: its move is added
+    to the digital crop's on screen. A locked take contributes nothing, and a
+    handheld texture is jitter, not travel, so neither reduces the budget. The
+    number is the same peak the report records; it is read here, before the
+    crop is compiled, so the crop can be given the speed that is actually left
+    rather than the whole ceiling.
+    """
+
+    if reframe is None or reframe.source_motion_role not in {
+        "authored", "subject_follow",
+    }:
+        return 0.0
+    measured = _source_motion_measurement(
+        (measurements or {}).get(clip.source_id, ()),
+        clip.approx_in_seconds,
+        clip.approx_out_seconds,
+    )
+    if not measured.get("available") or not measured.get("moving"):
+        return 0.0
+    return float(measured.get("peak_frame_widths_per_second") or 0.0)
+
+
 def _card_widths(card: dict[str, Any] | None) -> dict[str, float]:
     """Each subject's width as the card drew it, by the label a look names."""
 
@@ -2222,6 +2249,7 @@ def follow_subjects(
     grounding_memory: Path | None = None,
     confirmed_identities: "dict[str, Any] | None" = None,
     upload_cache: Any | None = None,
+    source_motion_measurements: "Mapping[str, Any] | None" = None,
 ) -> dict[str, CropPath]:
     """Build a crop path per shot that names a subject.
 
@@ -2573,6 +2601,12 @@ def follow_subjects(
                             # planned to follow somebody walking held on a point
                             # halfway along the walk.
                             tracks=tracks,
+                            # What the take is already spending, so the crop is
+                            # given the speed that is left rather than the whole
+                            # ceiling and the two do not sum past it on screen.
+                            native_speed=_native_speed_for(
+                                clip, reframe, source_motion_measurements,
+                            ),
                         )
                         tightest = min(
                             paths[clip.clip_id].keyframes,
@@ -3432,6 +3466,7 @@ def run(
         grounding_memory=grounding_memory,
         confirmed_identities=confirmed_identities,
         upload_cache=upload_cache,
+        source_motion_measurements=source_motion_measurements,
     )
 
     for clip in edl.clips:

@@ -982,13 +982,13 @@ def test_a_push_rests_too():
 WIDE, TIGHT = 0.3164, 0.20
 
 
-def _looks(stops, seconds=4.0, degradations=None, energy="active"):
+def _looks(stops, seconds=4.0, degradations=None, energy="active", native_speed=0.0):
     from montagewright.reframe import build_look_path
 
     return build_look_path(
         stops, source_aspect=16 / 9, target_aspect=1080 / 1920,
         duration_seconds=seconds, energy=energy, clip_id="k00",
-        degradations=degradations,
+        degradations=degradations, native_speed=native_speed,
     )
 
 
@@ -2462,3 +2462,41 @@ def test_a_route_too_long_for_its_shot_still_stops_at_both_ends():
     assert "looks_do_not_fit_the_time" in [
         one.ladder_other for one in degradations
     ]
+
+
+def test_a_digital_move_leaves_room_for_the_takes_own_motion():
+    """What the viewer sees is the sum of the two moves.
+
+    A take panning at 0.08 of frame a second, with the digital crop given the
+    full 0.67 an active shot allows, moves at 0.75 on screen -- past the
+    ceiling the energy names -- and then both stop at once, which reads as a
+    rebound. The crop's budget is the ceiling less what the take already
+    spends, so the composite stays within the limit.
+    """
+
+    native = 0.083
+    fast = _looks(
+        [(1.0, 0.16, 0.5, WIDE), (1.5, 0.69, 0.5, WIDE)],
+        seconds=3.111, native_speed=native,
+    )
+    peak = max(
+        abs((later.crop.x + later.crop.width / 2)
+            - (earlier.crop.x + earlier.crop.width / 2))
+        / max(later.seconds - earlier.seconds, 1e-9)
+        for earlier, later in zip(fast.keyframes, fast.keyframes[1:])
+    )
+
+    assert peak + native <= 0.67 + 1e-3
+    # A locked take spends nothing, so the same shape keeps the full budget
+    # and travels faster.
+    locked = _looks(
+        [(1.0, 0.16, 0.5, WIDE), (1.5, 0.69, 0.5, WIDE)],
+        seconds=3.111, native_speed=0.0,
+    )
+    locked_peak = max(
+        abs((later.crop.x + later.crop.width / 2)
+            - (earlier.crop.x + earlier.crop.width / 2))
+        / max(later.seconds - earlier.seconds, 1e-9)
+        for earlier, later in zip(locked.keyframes, locked.keyframes[1:])
+    )
+    assert locked_peak > peak

@@ -536,6 +536,24 @@ def sequential_read_centres(
     return (left, right)
 
 
+def _digital_budget(energy: CameraEnergy, native_speed: float) -> dict[str, float]:
+    """The speed the digital crop may add on top of the take's own motion.
+
+    What the viewer sees is the sum of the two. When the source already pans
+    at 0.08 of frame a second and the digital crop is allowed the full 0.67
+    an active shot permits, the screen moves at 0.75 -- past the ceiling that
+    energy names -- and then both stop at once, which reads as a rebound. The
+    crop's budget is therefore the ceiling less what the take is already
+    spending, floored so a take that moves fast on its own still leaves the
+    crop something rather than nothing.
+    """
+
+    limits = dict(ENERGY_LIMITS[energy])
+    ceiling = limits["max_speed"]
+    limits["max_speed"] = max(ceiling * 0.15, ceiling - max(0.0, native_speed))
+    return limits
+
+
 def build_look_path(
     stops: list[tuple[float, float, float, float]],
     *,
@@ -553,6 +571,7 @@ def build_look_path(
     track_during_stops: bool = True,
     continuous_read: bool = False,
     monotonic_route: bool = False,
+    native_speed: float = 0.0,
 ) -> CropPath:
     """Walk a shot through the places it looks, resting at each.
 
@@ -807,7 +826,8 @@ def build_look_path(
     # says how long each landing is worth looking at. So give the crossing
     # the least time the measured distance needs at the chosen energy, and
     # leave the remainder where the plan put it.
-    ceiling = ENERGY_LIMITS[energy]["max_speed"]
+    limits = _digital_budget(energy, native_speed)
+    ceiling = limits["max_speed"]
     minimum_travel = sum(one / ceiling for one in spans) if ceiling > 0 else 0.0
     # A route too long for its shot must not take every landing's stillness
     # with it. Moving in every frame of a shot is not a pan -- it is a pan
@@ -890,7 +910,7 @@ def build_look_path(
             )
         )
 
-    ceiling = ENERGY_LIMITS[energy]["max_speed"]
+    ceiling = limits["max_speed"]
     hurried = [
         (index, span, leg)
         for index, (span, leg) in enumerate(zip(spans, legs))
@@ -1010,7 +1030,7 @@ def build_look_path(
     # made a conspicuous correction at the cut.  Keep the replan degradation
     # above, but produce a complete reviewable preview instead of silently
     # changing the treatment to a hold.
-    limited, _ = _limit_speed(keyframes, ENERGY_LIMITS[energy])
+    limited, _ = _limit_speed(keyframes, limits)
     designed = CropPath(_dedupe(keyframes))
     delivered = CropPath(_dedupe(limited))
     # Tracking changes the crop centre while a look is being held.  The old
