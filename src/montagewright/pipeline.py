@@ -23,7 +23,8 @@ import tempfile
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from types import SimpleNamespace
 from typing import Any
 
 from montagewright.clipcard import find_subject, load_card
@@ -710,6 +711,135 @@ def _track_subject(
 TRACKED_SUBJECT = "subject"
 
 
+def premeasure_option_subjects(
+    span_ids: "Iterable[str]",
+    material: "Iterable[Any]",
+    *,
+    cards: "dict[str, Path]",
+    masters: "dict[str, Path]",
+    checkpoint: Path | None,
+    work: Path,
+    say: "Any | None" = None,
+) -> dict[str, int]:
+    """Measure the option pool's subjects before anything prices a move.
+
+    Selection prices a read across the card's box and the compiler crops the
+    tracker's, and for a phone in a hand those are different objects: the
+    description puts the hand inside the box. The asymmetry is not inherent,
+    only ordered -- everything the tracker needs exists once Direction has
+    bound its commitments. The card gives a seed box and the moment it was
+    drawn, the span gives a window, and SAM is local, so measuring the pool
+    here costs no model call at all and lets Selection price the object the
+    crop will follow.
+
+    Idempotent and bounded: a subject already measured for this footage is
+    skipped, so a rerun pays nothing and a cold run pays only wall clock.
+    """
+
+    from montagewright import tracked_geometry
+    from montagewright.clipcard import load_card, subjects_from_card
+
+    measured: dict[str, int] = {"tracked": 0, "skipped": 0, "failed": 0}
+    if checkpoint is None:
+        return measured
+    wanted = {str(one) for one in span_ids}
+    for item in material:
+        source_id = str(getattr(item, "source_id", ""))
+        card_path = cards.get(source_id)
+        if card_path is None:
+            continue
+        spans = [
+            span for span in (getattr(item, "spans", ()) or ())
+            if str(getattr(span, "span_id", "")) in wanted
+        ]
+        if not spans:
+            continue
+        known = tracked_geometry.read(card_path)
+        try:
+            card = load_card(card_path)
+        except Exception:
+            continue
+        boxes = subjects_from_card(card or {})
+        if not boxes:
+            continue
+        original = masters.get(source_id)
+        if original is None:
+            continue
+        try:
+            source = probe(source_id, Path(original))
+        except Exception:
+            continue
+        found: dict[str, list[dict[str, float]]] = {}
+        for box in boxes:
+            if box.label in known:
+                measured["skipped"] += 1
+                continue
+            # The span whose window actually contains the moment the card
+            # drew this box; failing that, the longest one offered. A box
+            # measured outside every window the edit may use is worse than
+            # no measurement, because it would price a different moment.
+            window = next(
+                (
+                    span for span in spans
+                    if span.starts_seconds - 1e-6
+                    <= box.at_seconds
+                    <= span.ends_seconds + 1e-6
+                ),
+                max(spans, key=lambda one: one.seconds),
+            )
+            seed_at = min(
+                max(box.at_seconds, window.starts_seconds + 0.05),
+                max(window.starts_seconds + 0.05, window.ends_seconds - 0.05),
+            )
+            clip = SimpleNamespace(
+                clip_id=f"pre-{source_id}-{len(found):02d}",
+                approx_in_seconds=float(window.starts_seconds),
+                approx_out_seconds=float(window.ends_seconds),
+            )
+            try:
+                tracked, states = _track_subject(
+                    source, clip, box.label,
+                    _seed_box({
+                        "centre_x": box.centre_x, "centre_y": box.centre_y,
+                        "width": box.width, "height": box.height,
+                    }),
+                    checkpoint, work, seed_time_seconds=seed_at,
+                )
+            except Exception:
+                measured["failed"] += 1
+                continue
+            total = sum(states.values()) or 1
+            if states.get("tracked", 0) / total < TRACK_QUORUM or not tracked:
+                measured["failed"] += 1
+                continue
+            found[box.label] = [
+                {"width": one.width, "height": one.height} for one in tracked
+            ]
+            measured["tracked"] += 1
+        if found:
+            tracked_geometry.remember(card_path, found)
+    if say is not None and (measured["tracked"] or measured["failed"]):
+        say(
+            f"subject geometry: measured {measured['tracked']}, "
+            f"reused {measured['skipped']}, could not track "
+            f"{measured['failed']} before selection prices any move"
+        )
+    return measured
+
+
+READ_PRICED_ON_A_WIDER_CARD_BOX = "read_priced_on_a_wider_card_box"
+
+
+def _already_explained(report: "Report", clip_id: str) -> bool:
+    """Whether this shot's held frame already has its measured reason."""
+
+    return any(
+        step.clip_id == clip_id
+        and step.ladder_other == READ_PRICED_ON_A_WIDER_CARD_BOX
+        for step in report.degradations
+    )
+
+
 def _card_widths(card: dict[str, Any] | None) -> dict[str, float]:
     """Each subject's width as the card drew it, by the label a look names."""
 
@@ -1007,7 +1137,7 @@ def _measure_looks(
                     DegradationStep(
                         clip_id=clip.clip_id,
                         ladder="other",
-                        ladder_other="read_priced_on_a_wider_card_box",
+                        ladder_other=READ_PRICED_ON_A_WIDER_CARD_BOX,
                         trigger=(
                             f"the card puts {look.at!r} at {declared:.2f} of "
                             f"frame, which a {width:.2f} crop must be carried "
@@ -1023,6 +1153,12 @@ def _measure_looks(
                                 declared / max(subject_width, 1e-6), 2
                             ),
                         },
+                        # Diagnostic, not a review item. Nothing here is the
+                        # editor's to decide: the crop already did the right
+                        # thing, and pre-measuring the pool is what stops it
+                        # happening. This is how that is checked, and how a
+                        # cold run explains itself.
+                        severity="note",
                     )
                 )
         if len(centres) > 1:
@@ -2930,6 +3066,13 @@ def follow_subjects(
                         clip_id=clip.clip_id,
                         min_visible=reframe.subject.min_visible,
                         degradations=report.degradations,
+                        # "the subject does not move" is the wrong sentence
+                        # when the read collapsed because the card measured a
+                        # hand and the crop follows a phone. That has already
+                        # been said, accurately, with both numbers in it.
+                        planned_to_move=not _already_explained(
+                            report, clip.clip_id
+                        ),
                     )
                 paths[clip.clip_id] = path
                 if path.is_static:

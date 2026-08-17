@@ -28,6 +28,7 @@ from montagewright.clipcard import (
     CARD_VERSION,
     action_beats,
     build_library,
+    SubjectBox,
     find_subject,
     load_card,
     snap_to_action_contract,
@@ -43,6 +44,7 @@ from montagewright.measure.media import sha256_file
 from montagewright.pipeline import (
     ReferenceShotsUnusable,
     _preflight_sam_checkpoint,
+    premeasure_option_subjects,
     probe,
     run,
 )
@@ -620,6 +622,41 @@ def _identity_commitment_sources(commitments: Any) -> set[str]:
         for option in commitments.options
         if option.target_id != "none"
     }
+
+
+def _rebuilt_material_geometry(
+    material: list[Any], cards: dict[str, Path],
+) -> list[Any]:
+    """Re-read each item's subject boxes now that the pool has been measured.
+
+    The material list was built before anything was tracked, so it still
+    carries the widths the card was drawn with. Rebuilding only the geometry
+    keeps every other fact -- spans, speech, motion, focus, identity -- exactly
+    as the earlier passes decided it.
+    """
+
+    from dataclasses import replace as _replace
+
+    rebuilt = []
+    for item in material:
+        boxes = tracked_geometry.applied(
+            [
+                SubjectBox(
+                    label=one[0], entity_id=one[1], centre_x=one[2],
+                    centre_y=one[3], width=one[4], height=one[5], moves=False,
+                )
+                for one in (item.subject_geometry or ())
+            ],
+            cards.get(item.source_id),
+        )
+        rebuilt.append(_replace(item, subject_geometry=tuple(
+            (
+                one.label, one.entity_id, one.centre_x, one.centre_y,
+                one.width, one.height,
+            )
+            for one in boxes
+        )))
+    return rebuilt
 
 
 def _commitments_without_exact_hard_negatives(
@@ -2149,6 +2186,20 @@ def command_render(args: argparse.Namespace) -> int:
             commitments, identity_confirmation_outcomes,
             require_confirmation=promoted_pairs,
         )
+    # Everything the tracker needs now exists, and Selection has not yet been
+    # asked to price a move. Measure the pool's subjects here so the number
+    # Selection budgets against is the number the crop compiler will find --
+    # local SAM seeded from the card's own box, so this buys no model call.
+    premeasure_option_subjects(
+        {option.span_id for option in commitments.options},
+        material,
+        cards=cards,
+        masters=originals,
+        checkpoint=args.sam_checkpoint,
+        work=work,
+        say=lambda line: print(line, flush=True),
+    )
+    material = _rebuilt_material_geometry(material, cards)
     # Keep the paid full Direction immutable. Candidate corrections have
     # their own content-addressed artifacts above and are never allowed to
     # overwrite the decision that watched all rushes and heard the music.
