@@ -3708,6 +3708,17 @@ def _edl_from_selection(
             shot.get("action_treatment")
             or ("complete_here" if selected_action != "none" else "none")
         )
+        # A shot may name an action for context and then choose not to treat
+        # it -- Selection returned action_id a01 with treatment "none". That
+        # is not an obligation, so there is nothing to honour: drop the stray
+        # id rather than crashing the whole film on a mismatch. Treatment is
+        # the authority on whether an action shapes the cut; a bare id is not.
+        if action_treatment == "none" and selected_action != "none":
+            snaps[clip_id] = (
+                f"named action {selected_action} but treated it as none; "
+                "no action contract applied"
+            )
+            selected_action = "none"
         window = _usable_window(shot)
         if item is not None:
             from montagewright.planner import resolve_named_span

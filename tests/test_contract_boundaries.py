@@ -1581,3 +1581,55 @@ def test_sequential_read_is_a_move_not_a_whole_frame_promise() -> None:
 
     shot["camera_intent"] = "hold"
     assert "sequential_read needs reveal" in frame_disagreements([shot])[0]
+
+
+def test_a_named_action_treated_as_none_drops_the_id_and_does_not_crash(tmp_path):
+    """Treatment is the authority on whether an action shapes the cut.
+
+    Selection returned action_id a01 with action_treatment "none" -- an action
+    named for context and then deliberately not treated. That is no obligation,
+    so there is nothing to honour; the EDL builder used to raise "inconsistent
+    action_id/action_treatment" and take the whole film down over it. It now
+    drops the stray id, records why, and carries no action contract.
+    """
+    from montagewright.cli import _edl_from_selection
+    from montagewright.clipcard import CARD_VERSION
+    from montagewright.planner import MaterialItem
+
+    card_path = tmp_path / "C1.json"
+    card_path.write_text(json.dumps({
+        "version": CARD_VERSION,
+        "action": [{
+            "id": "a01", "what": "phone unfolds",
+            "from": "0:05", "to": "0:09",
+        }],
+    }), encoding="utf-8")
+    shot = {
+        "source_id": "C1", "span_id": "C1:s00",
+        "start_seconds": 1.0, "seconds_needed": 3.0,
+        "usable_from_seconds": 0.0, "usable_to_seconds": 12.0,
+        "action_id": "a01", "action_treatment": "none",
+        "camera_intent": "reveal",
+        "source_motion_role": "locked", "frame": "travels",
+        "energy": "medium", "why": "a wide read, no action obligation",
+        "audio_role": "discard", "audio_completion": "none",
+        "picture_role": "establishing", "coverage_claim_seconds": 3.0,
+        "looks": [
+            {"at": "left phone", "seconds": 0.0, "framing": "thirds"},
+            {"at": "right phone", "seconds": 0.0, "framing": "thirds"},
+        ],
+    }
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=12.0, summary="two phones",
+        action=("`a01` phone unfolds 5.0-9.0s",),
+        action_ids=("a01",),
+        action_windows=(("a01", 5.0, 9.0),),
+    )]
+
+    edl, snaps = _edl_from_selection(
+        {"shots": [shot]}, tmp_path, {"C1": card_path}, material=material,
+    )
+
+    clip = edl.clips[0]
+    assert clip.action_contracts == []
+    assert "treated it as none" in snaps["k00"]
