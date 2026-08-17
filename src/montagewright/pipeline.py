@@ -711,8 +711,8 @@ def _track_subject(
 TRACKED_SUBJECT = "subject"
 
 
-def premeasure_option_subjects(
-    span_ids: "Iterable[str]",
+def resolve_named_subject_geometry(
+    selection: "dict[str, Any]",
     material: "Iterable[Any]",
     *,
     cards: "dict[str, Path]",
@@ -721,19 +721,23 @@ def premeasure_option_subjects(
     work: Path,
     say: "Any | None" = None,
 ) -> dict[str, int]:
-    """Measure the option pool's subjects before anything prices a move.
+    """Measure the subjects this film looks at, before anything prices them.
 
-    Selection prices a read across the card's box and the compiler crops the
-    tracker's, and for a phone in a hand those are different objects: the
-    description puts the hand inside the box. The asymmetry is not inherent,
-    only ordered -- everything the tracker needs exists once Direction has
-    bound its commitments. The card gives a seed box and the moment it was
-    drawn, the span gives a window, and SAM is local, so measuring the pool
-    here costs no model call at all and lets Selection price the object the
-    crop will follow.
+    A model's box grounds the phrase it was given, so "the smartphone held in
+    hands" contains the hands and is a different object from the one a mask
+    follows. Extent is therefore not something a card knows; it is what
+    measuring the card's pointer returns. Time is already built this way --
+    MM:SS is a pointer and decoded PTS is the authority -- and this is the
+    same resolution step for space.
 
-    Idempotent and bounded: a subject already measured for this footage is
-    skipped, so a rerun pays nothing and a cold run pays only wall clock.
+    Driven by what the film names rather than by what the pool offers. Every
+    subject in the pool would be most of them measured for nothing, while the
+    looks Selection wrote are exactly the ones about to be priced and
+    cropped. The card gives a seed box and the moment it was drawn, the span
+    gives a window, and SAM is local, so this buys no model call.
+
+    Idempotent: a subject already measured for this footage is skipped, so a
+    rerun and every repair round pay nothing.
     """
 
     from montagewright import tracked_geometry
@@ -742,7 +746,17 @@ def premeasure_option_subjects(
     measured: dict[str, int] = {"tracked": 0, "skipped": 0, "failed": 0}
     if checkpoint is None:
         return measured
-    wanted = {str(one) for one in span_ids}
+    shots = list(selection.get("shots") or [])
+    wanted = {str(one.get("span_id") or "") for one in shots}
+    # Only the labels a look names. A card subject nothing looks at is not
+    # about to be priced, and measuring it would be the pool pass again.
+    named: dict[str, set[str]] = {}
+    for shot in shots:
+        source_id = str(shot.get("source_id") or "")
+        for look in shot.get("looks") or []:
+            at = str(look.get("at") or "").strip()
+            if at:
+                named.setdefault(source_id, set()).add(at)
     for item in material:
         source_id = str(getattr(item, "source_id", ""))
         card_path = cards.get(source_id)
@@ -759,7 +773,10 @@ def premeasure_option_subjects(
             card = load_card(card_path)
         except Exception:
             continue
-        boxes = subjects_from_card(card or {})
+        boxes = [
+            one for one in subjects_from_card(card or {})
+            if one.label in named.get(source_id, set())
+        ]
         if not boxes:
             continue
         original = masters.get(source_id)
@@ -822,7 +839,7 @@ def premeasure_option_subjects(
         say(
             f"subject geometry: measured {measured['tracked']}, "
             f"reused {measured['skipped']}, could not track "
-            f"{measured['failed']} before selection prices any move"
+            f"{measured['failed']} of the subjects this cut looks at"
         )
     return measured
 

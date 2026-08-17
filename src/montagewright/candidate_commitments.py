@@ -13,6 +13,10 @@ from typing import Any, Literal, Sequence, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from montagewright.clipcard import (
+    GEOMETRY_BASIS_REFERRING,
+    GEOMETRY_BASIS_TRACKED,
+)
 from montagewright.planning_state import canonical_json
 from montagewright.spans import seconds_of
 
@@ -138,6 +142,27 @@ def readable_extent(
     return max(0.0, right - left)
 
 
+def extent_basis(geometry: Any, required_visuals: "Sequence[str]") -> str:
+    """Tracked only when every named visual has been measured.
+
+    One unmeasured landing makes the whole span an estimate: the distance a
+    read is priced on is between its ends, and an end that is still a phrase
+    moves once something measures it.
+    """
+
+    entries = tuple(geometry or ())
+    wanted = set(required_visuals or ())
+    rows = [
+        entry for at, entry in enumerate(entries, start=1)
+        if f"v{at:02d}" in wanted
+    ]
+    if not rows or len(rows) != len(wanted):
+        return GEOMETRY_BASIS_REFERRING
+    if all(len(one) > 6 and one[6] == GEOMETRY_BASIS_TRACKED for one in rows):
+        return GEOMETRY_BASIS_TRACKED
+    return GEOMETRY_BASIS_REFERRING
+
+
 def _camera_treatments(
     item: Any,
     span: Any,
@@ -145,6 +170,7 @@ def _camera_treatments(
     preference: MotionPreference,
     target_id: str,
     content_extent: float | None = None,
+    content_basis: str = GEOMETRY_BASIS_REFERRING,
 ) -> tuple[tuple[CameraTreatment, ...], CameraTreatment, float, str]:
     """Rank treatments using facts that exist before the camera is planned."""
 
@@ -185,12 +211,17 @@ def _camera_treatments(
         minimum = max(minimum, 1.0)
         reasons.append(f"resolution permits up to {push_room:.2f}x push")
     if content_extent is not None:
-        # Stated, not enforced: the listing carries this to Selection so a
-        # read across content one crop already holds is not chosen in the
-        # first place.
+        # Stated with its provenance, never enforced. An extent still made of
+        # referring boxes describes the phrases, not the objects a crop will
+        # follow, and the two differ on exactly the axis a read is measured
+        # along -- so the number is offered and its standing is offered with
+        # it, rather than one being quietly used as the other.
         reasons.append(
             f"named content spans {content_extent:.0%} against a "
-            f"{crop_width:.0%} crop"
+            f"{crop_width:.0%} crop ("
+            + ("measured" if content_basis == GEOMETRY_BASIS_TRACKED
+               else "estimated from referring boxes")
+            + ")"
         )
     if travel_room > 0.02 and seconds >= 1.8:
         treatments.append("multi_stop")
@@ -697,6 +728,7 @@ def resolve_candidate_commitments(
             content_extent = readable_extent(
                 local_item, geometry, required_visuals
             )
+            content_basis = extent_basis(geometry, required_visuals)
             treatments, preferred, camera_floor, feasibility_reason = (
                 _camera_treatments(
                     item_index.get(str(span.source_id)),
@@ -704,6 +736,7 @@ def resolve_candidate_commitments(
                     preference=preference,
                     target_id=target_id,
                     content_extent=content_extent,
+                    content_basis=content_basis,
                 )
             )
             direction_treatment = cast(CameraTreatment, str(

@@ -1453,8 +1453,13 @@ class MaterialItem:
     # requested move fits its requested seconds before the answer is saved.
     # Prompt copy remains in ``subjects``; these numbers are never model
     # authority and never confirm identity.
+    # label, entity_id, centre_x, centre_y, width, height, and where the
+    # extent came from. The last is what stops a phrase being priced as an
+    # object: see clipcard.GEOMETRY_BASIS_REFERRING. Older cached items are
+    # six-wide and read as referring, which is what they were.
     subject_geometry: tuple[
-        tuple[str, str | None, float, float, float, float], ...
+        tuple[str, str | None, float, float, float, float]
+        | tuple[str, str | None, float, float, float, float, str], ...
     ] = ()
     # When each named subject was actually seen, and what the frame did over
     # the take. Separately these are two facts already on record; together
@@ -1984,53 +1989,11 @@ def _describe_material(material: list[MaterialItem]) -> str:
             head += "\n    說了什麼：\n      " + "\n      ".join(item.speech)
         if item.subjects:
             head += "\n    可框住的主體（Direction 只能回傳 v-id）：" + "；".join(
-                f"v{at:02d}={subject}{_fit_note(item, at)}"
+                f"v{at:02d}={subject}"
                 for at, subject in enumerate(item.subjects, start=1)
             )
-            spread = _subject_spread(item)
-            if spread is not None:
-                head += (
-                    f"\n    這些主體橫向合計佔 {spread:.0%} 畫面寬，"
-                    f"交付裁切寬 {item.crop_width:.0%}"
-                    + ("：讀過去有東西可讀。" if spread > item.crop_width + 0.02
-                       else "：一個裁切框就裝得下全部，沒有東西可以「讀過去」。")
-                )
         lines.append(head)
     return "\n".join(lines)
-
-
-def _fit_note(item: "MaterialItem", at: int) -> str:
-    """Say whether the delivery crop already holds this subject whole.
-
-    Stated rather than enforced. Which subject a shot ends up looking at is
-    Selection's decision and it may name something this card never listed, so
-    the only honest place to withhold a treatment is the compiler, once the
-    looks exist and have been measured. What belongs here is the measurement
-    itself: a read across something one crop already contains is a move with
-    nowhere to go, and nothing in the listing used to say so.
-    """
-
-    geometry = tuple(getattr(item, "subject_geometry", ()) or ())
-    if not 0 < at <= len(geometry):
-        return ""
-    width = float(geometry[at - 1][4])
-    if width <= 0.0:
-        return ""
-    crop = float(getattr(item, "crop_width", 1.0) or 1.0)
-    contained = "，裁切已完整容納" if width <= crop else "，比裁切寬"
-    return f"（寬 {width:.0%}{contained}）"
-
-
-def _subject_spread(item: "MaterialItem") -> float | None:
-    """Edge to edge across every subject the card placed, in frame widths."""
-
-    geometry = tuple(getattr(item, "subject_geometry", ()) or ())
-    placed = [one for one in geometry if float(one[4]) > 0.0]
-    if len(placed) < 2:
-        return None
-    left = min(float(one[2]) - float(one[4]) / 2.0 for one in placed)
-    right = max(float(one[2]) + float(one[4]) / 2.0 for one in placed)
-    return max(0.0, right - left)
 
 
 def _attach_material(
@@ -3122,6 +3085,50 @@ def _beaten_and_broken(
     return beaten, broken
 
 
+def geometry_basis_of(entry: "tuple[Any, ...]") -> str:
+    """Where a subject_geometry row's extent came from.
+
+    Rows written before space had a provenance are six wide, and what they
+    hold is a referring box, so that is what they report.
+    """
+
+    from montagewright.clipcard import GEOMETRY_BASIS_REFERRING
+
+    return str(entry[6]) if len(entry) > 6 else GEOMETRY_BASIS_REFERRING
+
+
+def look_geometry_basis(item: "MaterialItem", reframe: Any) -> str:
+    """Whether every subject this shot looks at has been measured.
+
+    One unresolved look is enough to make the whole route an estimate: a
+    read is priced on the distance between its landings, and a landing that
+    is still a phrase can move once something measures it.
+    """
+
+    from montagewright.clipcard import (
+        GEOMETRY_BASIS_REFERRING, GEOMETRY_BASIS_TRACKED, find_subject,
+    )
+
+    card = {
+        "subjects": [
+            {
+                "label": entry[0], "entity_id": entry[1],
+                "centre_x": entry[2], "centre_y": entry[3],
+                "width": entry[4], "height": entry[5], "moves": False,
+                "basis": geometry_basis_of(entry),
+            }
+            for entry in item.subject_geometry
+        ]
+    }
+    for look in getattr(reframe, "looks", ()) or ():
+        found = find_subject(
+            card, look.at, entity_id=getattr(look, "entity_id", None),
+        )
+        if found is None or not found.is_measured:
+            return GEOMETRY_BASIS_REFERRING
+    return GEOMETRY_BASIS_TRACKED
+
+
 def material_look_boxes(
     item: MaterialItem, reframe: Any,
 ) -> list[tuple[float, float, float]]:
@@ -3133,17 +3140,16 @@ def material_look_boxes(
     card = {
         "subjects": [
             {
-                "label": label,
-                "entity_id": entity_id,
-                "centre_x": centre_x,
-                "centre_y": centre_y,
-                "width": width,
-                "height": height,
+                "label": entry[0],
+                "entity_id": entry[1],
+                "centre_x": entry[2],
+                "centre_y": entry[3],
+                "width": entry[4],
+                "height": entry[5],
                 "moves": False,
+                "basis": geometry_basis_of(entry),
             }
-            for (
-                label, entity_id, centre_x, centre_y, width, height
-            ) in item.subject_geometry
+            for entry in item.subject_geometry
         ]
     }
     measured: list[tuple[float, float, float]] = []
@@ -3208,6 +3214,7 @@ def camera_duration_disagreements(
     prevents an impossible answer from becoming the cached EDL.
     """
 
+    from montagewright.clipcard import GEOMETRY_BASIS_TRACKED
     from montagewright.grounding import camera_floor_for
     from montagewright.schema import reframe_of
 
@@ -3284,11 +3291,23 @@ def camera_duration_disagreements(
         seconds = float(shot.get("seconds_needed") or 0.0)
         if seconds + 1e-6 >= floor:
             continue
-        evidence = (
-            "measured card positions"
-            if measured and len(measured) == len(reframe.looks)
-            else "conservative estimate because one or more look positions are unknown"
-        )
+        # "measured card positions" was never true of a card: the card holds
+        # a model's referring box, and a phrase can be a different object
+        # from the one the crop follows. Say which of the two priced this,
+        # so a floor argued over on screen can be traced to the number that
+        # produced it.
+        if not measured or len(measured) != len(reframe.looks):
+            evidence = (
+                "a conservative estimate, because one or more look positions "
+                "are unknown"
+            )
+        elif look_geometry_basis(item, reframe) == GEOMETRY_BASIS_TRACKED:
+            evidence = "positions measured by the tracker"
+        else:
+            evidence = (
+                "the card's referring boxes, which have not been measured "
+                "against what the crop will follow"
+            )
         faults.append(
             f"k{index:02d}: {reframe.camera_move} needs at least "
             f"{floor:.3f}s from {evidence}, but Selection gave "

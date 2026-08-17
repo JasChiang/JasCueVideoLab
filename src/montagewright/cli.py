@@ -28,6 +28,7 @@ from montagewright.clipcard import (
     CARD_VERSION,
     action_beats,
     build_library,
+    GEOMETRY_BASIS_REFERRING,
     SubjectBox,
     find_subject,
     load_card,
@@ -44,7 +45,7 @@ from montagewright.measure.media import sha256_file
 from montagewright.pipeline import (
     ReferenceShotsUnusable,
     _preflight_sam_checkpoint,
-    premeasure_option_subjects,
+    resolve_named_subject_geometry,
     probe,
     run,
 )
@@ -644,6 +645,7 @@ def _rebuilt_material_geometry(
                 SubjectBox(
                     label=one[0], entity_id=one[1], centre_x=one[2],
                     centre_y=one[3], width=one[4], height=one[5], moves=False,
+                    basis=one[6] if len(one) > 6 else GEOMETRY_BASIS_REFERRING,
                 )
                 for one in (item.subject_geometry or ())
             ],
@@ -652,7 +654,7 @@ def _rebuilt_material_geometry(
         rebuilt.append(_replace(item, subject_geometry=tuple(
             (
                 one.label, one.entity_id, one.centre_x, one.centre_y,
-                one.width, one.height,
+                one.width, one.height, one.basis,
             )
             for one in boxes
         )))
@@ -1705,7 +1707,7 @@ def command_render(args: argparse.Namespace) -> int:
                 subject_geometry=tuple(
                     (
                         box.label, box.entity_id, box.centre_x, box.centre_y,
-                        box.width, box.height,
+                        box.width, box.height, box.basis,
                     )
                     for box in subject_boxes
                 ),
@@ -2186,20 +2188,6 @@ def command_render(args: argparse.Namespace) -> int:
             commitments, identity_confirmation_outcomes,
             require_confirmation=promoted_pairs,
         )
-    # Everything the tracker needs now exists, and Selection has not yet been
-    # asked to price a move. Measure the pool's subjects here so the number
-    # Selection budgets against is the number the crop compiler will find --
-    # local SAM seeded from the card's own box, so this buys no model call.
-    premeasure_option_subjects(
-        {option.span_id for option in commitments.options},
-        material,
-        cards=cards,
-        masters=originals,
-        checkpoint=args.sam_checkpoint,
-        work=work,
-        say=lambda line: print(line, flush=True),
-    )
-    material = _rebuilt_material_geometry(material, cards)
     # Keep the paid full Direction immutable. Candidate corrections have
     # their own content-addressed artifacts above and are never allowed to
     # overwrite the decision that watched all rushes and heard the music.
@@ -2427,21 +2415,41 @@ def command_render(args: argparse.Namespace) -> int:
         _annotate_selection_identity_evidence(
             provider_selection, confirmed_identities, identity_confirmation_outcomes
         )
+    # Selection has now named the subjects this film will actually look at,
+    # which is far fewer than the pool and is the only set worth measuring.
+    # Resolve those referring boxes into extents before anything local prices
+    # a move on them, so the floor Selection is held to and the crop the
+    # compiler builds come from one number.
+    resolve_named_subject_geometry(
+        provider_selection, material,
+        cards=cards,
+        masters=originals,
+        checkpoint=args.sam_checkpoint,
+        work=work,
+        say=lambda line: print(line, flush=True),
+    )
+    material = _rebuilt_material_geometry(material, cards)
     _annotate_selection_direction_motion(provider_selection, commitments)
     resolved_selection_key = _asked(
         chose,
         json.dumps(provider_selection, sort_keys=True, ensure_ascii=False),
         "resolved-selection-v2-camera-rest-fit-identity-needs-review-hold",
     )
-    selection = _decided(
+    # Annotated because the invariant is not local: by here the provider
+    # answer exists -- it was cached, recovered, or paid for above -- so the
+    # only question this branch settles is whether local resolution of it was
+    # cached too.
+    selection: dict[str, Any]
+    resolved = _decided(
         work, "resolved-selection", resolved_selection_key
     )
-    if selection is None:
+    if resolved is None:
         # The provider answer is an audit record.  Local execution repairs
         # live in their own artifact so they can resume without rewriting or
         # pretending the paid answer said something it did not.
         selection = copy.deepcopy(provider_selection)
     else:
+        selection = resolved
         print("selection: reused locally resolved execution plan", flush=True)
     cached_sequence_faults = sequence_disagreements(selection.get("shots") or [])
     if cached_sequence_faults:
@@ -2577,7 +2585,7 @@ def command_render(args: argparse.Namespace) -> int:
             # to see the shots. They are the material items selection chose,
             # in the order it chose them.
             rhythm_shots=[
-                item for shot in selection["shots"]
+                item for shot in (selection.get("shots") or [])
                 for item in material
                 if item.source_id == shot.get("source_id")
             ],

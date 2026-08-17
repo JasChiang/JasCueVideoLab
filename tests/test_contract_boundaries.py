@@ -806,7 +806,10 @@ def test_selection_prices_camera_time_from_legacy_card_geometry() -> None:
 
     assert len(faults) == 1
     assert "2.840s" in faults[0]
-    assert "measured card positions" in faults[0]
+    # Six-wide rows predate space having a provenance, and what they hold is
+    # a referring box. Saying "measured" of one was the claim that let a
+    # phrase be priced as the object a crop follows.
+    assert "referring boxes" in faults[0]
 
 
 def test_grounding_id_does_not_hide_geometry_on_pre_identity_cards() -> None:

@@ -117,6 +117,8 @@ def applied(boxes: list[Any], card_path: Path | None) -> list[Any]:
         return boxes
     from dataclasses import replace
 
+    from montagewright.clipcard import GEOMETRY_BASIS_TRACKED
+
     corrected = []
     for box in boxes:
         entry = tracked.get(getattr(box, "label", ""))
@@ -130,5 +132,6 @@ def applied(boxes: list[Any], card_path: Path | None) -> list[Any]:
             continue
         corrected.append(replace(
             box, width=width, height=height if height > 0.0 else box.height,
+            basis=GEOMETRY_BASIS_TRACKED,
         ))
     return corrected

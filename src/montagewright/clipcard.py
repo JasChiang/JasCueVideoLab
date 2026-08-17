@@ -238,6 +238,24 @@ def snap_to_action_contract(
     )
 
 
+# Where a box came from, and therefore what it may be used for.
+#
+# A model asked to box "the smartphone held in hands" grounds the phrase, and
+# the phrase contains the hands. That is not an error -- it is what referring
+# grounding is -- but it makes the box a different object from the one a mask
+# will follow, and the two disagree on exactly the axis the phrase widened.
+# The same holds for "the runner" against a body, or a sign against the panel
+# with the words on it.
+#
+# So a model's box is a pointer: it says which thing and roughly where, well
+# enough to seed a tracker. Extent is what measuring that pointer returns.
+# Time already works this way -- Gemini answers in MM:SS, ActionContract
+# carries `timing_basis="coarse_mmss"`, and decoded PTS is the authority --
+# and this is the same field for space, which did not have one.
+GEOMETRY_BASIS_REFERRING = "gemini_referring_box"
+GEOMETRY_BASIS_TRACKED = "sam2.1"
+
+
 @dataclass(frozen=True)
 class SubjectBox:
     """One nameable thing in the frame, with where it sits."""
@@ -252,10 +270,18 @@ class SubjectBox:
     # When this position was true. A box is a moment, and a moment is the
     # whole answer only for a locked-off frame.
     at_seconds: float = 0.0
+    # Which question this extent answers. See the note above the class: a
+    # referring box may seed a tracker, and anything that prices a move on it
+    # is pricing a phrase rather than an object and has to say so.
+    basis: str = GEOMETRY_BASIS_REFERRING
 
     @property
     def is_horizontal(self) -> bool:
         return self.width > self.height
+
+    @property
+    def is_measured(self) -> bool:
+        return self.basis == GEOMETRY_BASIS_TRACKED
 
 
 def card_schema() -> dict[str, Any]:
@@ -625,6 +651,12 @@ def subjects_from_card(card: dict[str, Any]) -> list[SubjectBox]:
                     height=float(entry["height"]),
                     moves=bool(entry.get("moves", False)),
                     at_seconds=seconds_of(entry.get("seen_at")) or 0.0,
+                    # A card written by the model never carries this; the
+                    # only writer is a local measurement projecting a row
+                    # back through here. Absent means what the card is.
+                    basis=str(
+                        entry.get("basis") or GEOMETRY_BASIS_REFERRING
+                    ),
                 )
             )
         except (KeyError, TypeError, ValueError):

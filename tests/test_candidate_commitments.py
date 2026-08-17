@@ -997,37 +997,6 @@ def test_a_read_with_no_travel_room_becomes_a_hold_not_a_lost_option():
     assert "held composition" in option.feasibility_reason
 
 
-def test_the_material_listing_states_what_the_crop_already_contains():
-    """Selection cannot weigh a fact the listing never gave it."""
-
-    from montagewright.planner import _describe_material
-
-    narrow = MaterialItem(
-        source_id="C1", duration_seconds=8.0, summary="one handset, centred",
-        spans=_material()[0].spans, crop_width=VERTICAL_CROP,
-        subjects=("the handset", "the charger"),
-        subject_geometry=(
-            ("the handset", None, 0.50, 0.5, 0.19, 0.55),
-            ("the charger", None, 0.56, 0.5, 0.08, 0.20),
-        ),
-    )
-    wide = replace(
-        narrow,
-        subjects=("left handset", "right handset"),
-        subject_geometry=(
-            ("left handset", None, 0.20, 0.5, 0.12, 0.5),
-            ("right handset", None, 0.80, 0.5, 0.12, 0.5),
-        ),
-    )
-
-    said = _describe_material([narrow])
-    assert "v01=the handset（寬 19%，裁切已完整容納）" in said
-    assert "一個裁切框就裝得下全部" in said
-
-    said = _describe_material([wide])
-    assert "讀過去有東西可讀" in said
-
-
 def test_a_read_across_wide_content_keeps_its_reader():
     wide = [MaterialItem(
         source_id="C1", duration_seconds=8.0, summary="a row of handsets",
