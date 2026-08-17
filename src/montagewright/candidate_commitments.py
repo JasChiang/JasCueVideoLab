@@ -167,23 +167,16 @@ def _camera_treatments(
     # every pan/push treatment from the schema, so Gemini could never choose
     # the movement the footage clearly supported.
     travel_room = max(pan_room, tilt_room)
-    # Room in the frame and something to cross it for are different facts, and
-    # only the first was being asked. A 16:9 source delivered 9:16 has about
-    # 68% travel room on every clip ever, so reveal and compare were offered
-    # for every shot -- including a phone measuring 0.19 wide inside a 0.32
-    # crop, which the crop already contains whole. Selection reasonably chose
-    # the reveal it was offered, the compiler correctly held, and the film
-    # carried a review note for a move that never had anywhere to go.
-    contained = (
-        content_extent is not None
-        and content_extent <= crop_width + READABLE_MARGIN
-    )
-    if contained:
-        reasons.append(
-            f"content spans {content_extent:.0%} of frame inside a "
-            f"{crop_width:.0%} crop, so there is nothing to travel across"
-        )
-    if travel_room > 0.02 and seconds >= 1.0 and not contained:
+    # Frame room is the only thing this layer can honestly rank on. Whether
+    # there is anything worth crossing it for depends on what the shot ends
+    # up looking at, and Selection is free to name landings this contract
+    # never listed -- 7 of 28 looks in one delivered film, 26 of 26 in
+    # another. Withholding a treatment here on the content contract's own
+    # span therefore removes moves from shots that were going to look
+    # somewhere else. The narrow case is real, but it is exact only once the
+    # looks are written and measured; it is answered by the compiler, which
+    # already reports landings that resolve to one place.
+    if travel_room > 0.02 and seconds >= 1.0:
         treatments.extend(("reveal", "compare"))
         minimum = max(minimum, 1.0)
         reasons.append(f"crop has {travel_room:.0%} measured travel room")
@@ -191,7 +184,15 @@ def _camera_treatments(
         treatments.extend(("push_in", "pull_out"))
         minimum = max(minimum, 1.0)
         reasons.append(f"resolution permits up to {push_room:.2f}x push")
-    if travel_room > 0.02 and seconds >= 1.8 and not contained:
+    if content_extent is not None:
+        # Stated, not enforced: the listing carries this to Selection so a
+        # read across content one crop already holds is not chosen in the
+        # first place.
+        reasons.append(
+            f"named content spans {content_extent:.0%} against a "
+            f"{crop_width:.0%} crop"
+        )
+    if travel_room > 0.02 and seconds >= 1.8:
         treatments.append("multi_stop")
         minimum = max(minimum, 1.8)
     # A named target makes following possible, not necessarily useful. Put
@@ -743,24 +744,18 @@ def resolve_candidate_commitments(
                     )
                     if treatment in treatments
                 )
-                if not readable and content_extent is not None:
-                    # Direction promised a read across content the delivery
-                    # crop already contains whole. The promise cannot be kept,
-                    # but the shot can: dropping the option would shrink the
-                    # pool over a framing detail and cost a commitment its
-                    # only take. Keep it as the composition it actually is.
+                if not readable:
+                    # Direction promised a read this crop has no room to
+                    # perform. The promise cannot be kept, but the shot can:
+                    # dropping the option would shrink the pool over a framing
+                    # detail and can cost a commitment its only take. Keep it
+                    # as the composition it actually is.
                     presentation_intent = "centered_hold"
                     feasibility_reason = (
                         f"{feasibility_reason}; Direction asked for a "
-                        f"sequential read, and the crop already contains the "
-                        f"content whole, so this is a held composition"
+                        f"sequential read and this crop has no travel room, "
+                        f"so this is a held composition"
                     )
-                elif not readable:
-                    faults.append(
-                        f"option {index} uses sequential_read on {span_id}, but "
-                        "local crop geometry has no readable travel treatment"
-                    )
-                    continue
             if presentation_intent == "sequential_read":
                 if direction_treatment in readable:
                     preferred = direction_treatment

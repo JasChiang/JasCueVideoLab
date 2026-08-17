@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from types import SimpleNamespace
 
@@ -894,13 +894,17 @@ def _travel_span(seconds: float = 4.0):
     return Span("C1:s00", "C1", 0.0, seconds, "detail", "locked")
 
 
-def test_a_subject_the_crop_already_contains_is_offered_no_travel():
-    """Frame room and something to cross it for are different facts.
+def test_contained_content_is_reported_and_still_keeps_every_treatment():
+    """The content contract does not decide what the shot will look at.
 
-    A phone measuring 0.19 of the frame sits whole inside a 0.32 crop. A
-    reveal across it has nowhere to go, so the compiler holds -- correctly --
-    and the film carries a review note for a move that was never possible.
-    Withhold it from the menu instead, before Selection is paid to choose it.
+    A phone measuring 0.19 of the frame sits whole inside a 0.32 crop, so a
+    read across that phone has nowhere to go. It does not follow that this
+    shot cannot travel: Selection routinely names landings the contract never
+    listed -- 7 of 28 looks in one delivered film and 26 of 26 in another --
+    and a reveal from the empty table onto the phone is a move this footage
+    fully supports. Withholding the treatment here would remove it from shots
+    that were going to look somewhere else. State the measurement; let the
+    compiler, which sees the looks that were actually written, decide.
     """
 
     treatments, _, _, reason = _camera_treatments(
@@ -909,14 +913,8 @@ def test_a_subject_the_crop_already_contains_is_offered_no_travel():
         content_extent=0.19,
     )
 
-    assert "reveal" not in treatments
-    assert "compare" not in treatments
-    assert "multi_stop" not in treatments
-    assert "nothing to travel across" in reason
-    # A push is about resolution, not width, and a contained subject is
-    # exactly what a push in is for.
-    assert "push_in" in treatments
-    assert "hold" in treatments
+    assert {"reveal", "compare", "multi_stop", "push_in"} <= set(treatments)
+    assert "19% against a 32% crop" in reason
 
 
 def test_content_wider_than_the_crop_keeps_every_travel_treatment():
@@ -964,20 +962,18 @@ def test_readable_extent_spans_every_named_visual_or_declines():
     assert readable_extent(object(), geometry, []) is None
 
 
-def test_a_read_across_contained_content_becomes_a_hold_not_a_lost_option():
-    """Direction may promise a read the delivery crop cannot need.
+def test_a_read_with_no_travel_room_becomes_a_hold_not_a_lost_option():
+    """A crop with nowhere to move cannot perform a read Direction asked for.
 
-    Withholding travel for contained content has a second effect: an option
-    Direction marked `sequential_read` then has no readable treatment left.
-    Dropping it would shrink the pool over a framing detail and can cost a
-    commitment its only take, so the option survives as the composition it
-    actually is.
+    Dropping the option would shrink the pool over a framing detail and can
+    cost a commitment its only take, so it survives as the composition it
+    actually is, saying why.
     """
 
-    narrow = [MaterialItem(
-        source_id="C1", duration_seconds=8.0, summary="one handset, centred",
-        spans=_material()[0].spans, pan_room=0.6836, tilt_room=0.0,
-        push_room=1.4, crop_width=VERTICAL_CROP,
+    boxed_in = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="already full frame",
+        spans=_material()[0].spans, pan_room=0.0, tilt_room=0.0,
+        push_room=1.0, crop_width=1.0,
         subject_geometry=(("the handset", None, 0.5, 0.5, 0.19, 0.55),),
     )]
     resolved = resolve_candidate_commitments(
@@ -987,7 +983,7 @@ def test_a_read_across_contained_content_becomes_a_hold_not_a_lost_option():
             recommended_treatment="reveal",
             required_visuals=["v01"],
             visual_relationship="single",
-        ), narrow,
+        ), boxed_in,
         material_digest="a" * 64, aspect="9:16", target_seconds=20.0,
         grounding_target_ids=("device.fold",), grounding_sha256="b" * 64,
     )
@@ -998,8 +994,38 @@ def test_a_read_across_contained_content_becomes_a_hold_not_a_lost_option():
     assert not {"reveal", "compare", "multi_stop"} & set(
         option.feasible_treatments
     )
-    assert "nothing to travel across" in option.feasibility_reason
     assert "held composition" in option.feasibility_reason
+
+
+def test_the_material_listing_states_what_the_crop_already_contains():
+    """Selection cannot weigh a fact the listing never gave it."""
+
+    from montagewright.planner import _describe_material
+
+    narrow = MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="one handset, centred",
+        spans=_material()[0].spans, crop_width=VERTICAL_CROP,
+        subjects=("the handset", "the charger"),
+        subject_geometry=(
+            ("the handset", None, 0.50, 0.5, 0.19, 0.55),
+            ("the charger", None, 0.56, 0.5, 0.08, 0.20),
+        ),
+    )
+    wide = replace(
+        narrow,
+        subjects=("left handset", "right handset"),
+        subject_geometry=(
+            ("left handset", None, 0.20, 0.5, 0.12, 0.5),
+            ("right handset", None, 0.80, 0.5, 0.12, 0.5),
+        ),
+    )
+
+    said = _describe_material([narrow])
+    assert "v01=the handset（寬 19%，裁切已完整容納）" in said
+    assert "一個裁切框就裝得下全部" in said
+
+    said = _describe_material([wide])
+    assert "讀過去有東西可讀" in said
 
 
 def test_a_read_across_wide_content_keeps_its_reader():

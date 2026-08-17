@@ -1984,11 +1984,53 @@ def _describe_material(material: list[MaterialItem]) -> str:
             head += "\n    說了什麼：\n      " + "\n      ".join(item.speech)
         if item.subjects:
             head += "\n    可框住的主體（Direction 只能回傳 v-id）：" + "；".join(
-                f"v{at:02d}={subject}"
+                f"v{at:02d}={subject}{_fit_note(item, at)}"
                 for at, subject in enumerate(item.subjects, start=1)
             )
+            spread = _subject_spread(item)
+            if spread is not None:
+                head += (
+                    f"\n    這些主體橫向合計佔 {spread:.0%} 畫面寬，"
+                    f"交付裁切寬 {item.crop_width:.0%}"
+                    + ("：讀過去有東西可讀。" if spread > item.crop_width + 0.02
+                       else "：一個裁切框就裝得下全部，沒有東西可以「讀過去」。")
+                )
         lines.append(head)
     return "\n".join(lines)
+
+
+def _fit_note(item: "MaterialItem", at: int) -> str:
+    """Say whether the delivery crop already holds this subject whole.
+
+    Stated rather than enforced. Which subject a shot ends up looking at is
+    Selection's decision and it may name something this card never listed, so
+    the only honest place to withhold a treatment is the compiler, once the
+    looks exist and have been measured. What belongs here is the measurement
+    itself: a read across something one crop already contains is a move with
+    nowhere to go, and nothing in the listing used to say so.
+    """
+
+    geometry = tuple(getattr(item, "subject_geometry", ()) or ())
+    if not 0 < at <= len(geometry):
+        return ""
+    width = float(geometry[at - 1][4])
+    if width <= 0.0:
+        return ""
+    crop = float(getattr(item, "crop_width", 1.0) or 1.0)
+    contained = "，裁切已完整容納" if width <= crop else "，比裁切寬"
+    return f"（寬 {width:.0%}{contained}）"
+
+
+def _subject_spread(item: "MaterialItem") -> float | None:
+    """Edge to edge across every subject the card placed, in frame widths."""
+
+    geometry = tuple(getattr(item, "subject_geometry", ()) or ())
+    placed = [one for one in geometry if float(one[4]) > 0.0]
+    if len(placed) < 2:
+        return None
+    left = min(float(one[2]) - float(one[4]) / 2.0 for one in placed)
+    right = max(float(one[2]) + float(one[4]) / 2.0 for one in placed)
+    return max(0.0, right - left)
 
 
 def _attach_material(
