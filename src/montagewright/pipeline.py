@@ -703,6 +703,27 @@ def _track_subject(
     )
 
 
+# Which subject a track record followed. Named because three places share
+# the shape -- the two that write a track and the one that reads them back --
+# and because "subject" spelled inline reads like a selection shot's removed
+# field, which is a different thing entirely.
+TRACKED_SUBJECT = "subject"
+
+
+def _card_widths(card: dict[str, Any] | None) -> dict[str, float]:
+    """Each subject's width as the card drew it, by the label a look names."""
+
+    from montagewright.clipcard import subjects_from_card
+
+    if not card:
+        return {}
+    return {
+        box.label: float(box.width)
+        for box in subjects_from_card(card)
+        if float(box.width) > 0.0
+    }
+
+
 def _measure_looks(
     looks, source, clip, work: Path, report, client, target_aspect: float,
     checkpoint: Path | None = None,
@@ -714,6 +735,8 @@ def _measure_looks(
             tuple[tuple[float, tuple[float, float, float, float]], ...],
         ],
     ] | None = None,
+    card_widths: Mapping[str, float] | None = None,
+    degradations_for_reads: list[DegradationStep] | None = None,
 ) -> tuple[
     list[tuple[float, float, float, float]],
     str,
@@ -920,7 +943,7 @@ def _measure_looks(
                             "centre_y": round(one.centre_y, 6),
                             "width": round(one.width, 6),
                             "height": round(one.height, 6),
-                            "subject": look.at,
+                            TRACKED_SUBJECT: look.at,
                             "entity_id": look.entity_id,
                             "semantic_identity_status": (
                                 "reference_validated"
@@ -966,6 +989,42 @@ def _measure_looks(
             subject_width=subject_width,
             crop_width=width,
         )
+        if (
+            len(centres) == 1
+            and look.presentation_intent == "sequential_read"
+            and card_widths is not None
+            and degradations_for_reads is not None
+        ):
+            # Selection priced this read on the card's box and the crop follows
+            # the tracker's. For a phone in a hand those are different objects:
+            # the description puts the hand inside the box, so the card is
+            # wider while agreeing on centre and height. A read across 0.35 of
+            # frame has two landings; across the 0.20 actually tracked it has
+            # one, and the reveal became a hold with nothing saying why.
+            declared = card_widths.get(look.at)
+            if declared is not None and declared > width >= subject_width:
+                degradations_for_reads.append(
+                    DegradationStep(
+                        clip_id=clip.clip_id,
+                        ladder="other",
+                        ladder_other="read_priced_on_a_wider_card_box",
+                        trigger=(
+                            f"the card puts {look.at!r} at {declared:.2f} of "
+                            f"frame, which a {width:.2f} crop must be carried "
+                            f"across, but the tracked subject measures "
+                            f"{subject_width:.2f} and the crop already holds "
+                            f"it whole, so the planned read has one landing"
+                        ),
+                        measured={
+                            "card_width_vw": round(declared, 4),
+                            "tracked_width_vw": round(subject_width, 4),
+                            "crop_width_vw": round(width, 4),
+                            "card_over_tracked": round(
+                                declared / max(subject_width, 1e-6), 2
+                            ),
+                        },
+                    )
+                )
         if len(centres) > 1:
             stops.extend((
                 max(0.0, float(look.seconds)),
@@ -2331,6 +2390,8 @@ def follow_subjects(
                     stops, missing, tracks = _measure_looks(
                         reframe.looks, source, clip, work, report, client,
                         target_aspect, checkpoint, reference_samples,
+                        card_widths=_card_widths(card),
+                        degradations_for_reads=report.degradations,
                     )
                     if missing:
                         report.subject_notes[clip.clip_id] = (
@@ -2834,7 +2895,7 @@ def follow_subjects(
                                     "centre_y": round(one.centre_y, 6),
                                     "width": round(one.width, 6),
                                     "height": round(one.height, 6),
-                                    "subject": reframe.subject.description,
+                                    TRACKED_SUBJECT: reframe.subject.description,
                                     "entity_id": reframe.subject.entity_id,
                                     "semantic_identity_status": (
                                         "reference_validated"
@@ -2912,9 +2973,41 @@ def follow_subjects(
                     attempt_id=fault.attempt_id,
                 )
             )
+    _remember_tracked_geometry(edl, report, cards)
     if unusable_shots:
         raise ReferenceShotsUnusable(unusable_shots)
     return paths
+
+
+def _remember_tracked_geometry(
+    edl: EDL, report: Report, cards: "dict[str, Path] | None",
+) -> None:
+    """Keep what the tracker measured beside the card that estimated it.
+
+    Written once, from the tracks the report already holds, rather than at
+    each of the places a subject gets followed: one writer cannot disagree
+    with itself, and this is the only point where every shot has finished.
+    """
+
+    if not cards or not report.subject_tracks:
+        return
+    from montagewright import tracked_geometry
+
+    source_of = {clip.clip_id: clip.source_id for clip in edl.clips}
+    by_source: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for clip_id, samples in report.subject_tracks.items():
+        source_id = source_of.get(clip_id)
+        if source_id is None or source_id not in cards:
+            continue
+        for one in samples:
+            label = str(one.get(TRACKED_SUBJECT) or "")
+            if not label:
+                continue
+            by_source.setdefault(source_id, {}).setdefault(
+                label, []
+            ).append(one)
+    for source_id, measured in by_source.items():
+        tracked_geometry.remember(cards[source_id], measured)
 
 
 def split_handoffs(edl: EDL) -> EDL:

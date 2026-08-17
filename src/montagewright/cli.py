@@ -33,6 +33,7 @@ from montagewright.clipcard import (
     snap_to_action_contract,
     subjects_from_card,
 )
+from montagewright import tracked_geometry
 from montagewright.cost import BudgetSpent, Ledger
 from montagewright.grounding import (
     analyse_track, beat_grid_from_payload, beat_grid_payload, load_beat_grid,
@@ -1606,6 +1607,12 @@ def command_render(args: argparse.Namespace) -> int:
                 card.get("unusable_reason") or "no reason given"
             )
             continue
+        # The card says where each subject is; a previous run's tracker has
+        # measured how wide the thing the crop follows actually is. Price the
+        # object that will be cropped, not the one the description framed.
+        subject_boxes = tracked_geometry.applied(
+            subjects_from_card(card or {}), cards.get(source_id),
+        )
         material.append(
             MaterialItem(
                 source_id=source_id,
@@ -1656,14 +1663,14 @@ def command_render(args: argparse.Namespace) -> int:
                 ),
                 subjects=tuple(
                     _subject_line(box, _aspect(proxy), ASPECTS[args.aspect])
-                    for box in subjects_from_card(card or {})
+                    for box in subject_boxes
                 ),
                 subject_geometry=tuple(
                     (
                         box.label, box.entity_id, box.centre_x, box.centre_y,
                         box.width, box.height,
                     )
-                    for box in subjects_from_card(card or {})
+                    for box in subject_boxes
                 ),
                 # The label a look will name, beside the moment it was seen
                 # and what the camera did over the take. Two facts already
