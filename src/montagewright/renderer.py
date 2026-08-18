@@ -183,6 +183,42 @@ def probe_duration(path: Path) -> float:
     return float(json.loads(completed.stdout)["format"]["duration"])
 
 
+SPEED_EPSILON = 1e-6
+
+
+def _speed_changed(ratio: float) -> bool:
+    """Whether a segment plays at anything other than recorded speed.
+
+    Kept as one predicate so the render path can leave the recorded-speed
+    case byte-for-byte identical: no retime filter is added, no atempo is
+    chained, and the command is the command it always was.
+    """
+
+    return abs(float(ratio) - 1.0) > SPEED_EPSILON
+
+
+def _atempo_chain(ratio: float) -> str:
+    """Retime audio to a speed ratio, keeping pitch, in stable steps.
+
+    A single atempo is only well behaved between half and double speed, so a
+    steeper ratio is composed from factors that each stay in that range: 4x
+    becomes two doublings, quarter speed two halvings. The pieces multiply
+    back to the ratio the picture is playing at, so sound and image stay
+    together across the cut.
+    """
+
+    remaining = float(ratio)
+    factors: list[float] = []
+    while remaining > 2.0 + SPEED_EPSILON:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5 - SPEED_EPSILON:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(remaining)
+    return ",".join(f"atempo={one:.9f}" for one in factors)
+
+
 def _render_segment(
     segment: Segment, destination: Path, *, video_encoder: str,
     output_size: tuple[int, int] = (1080, 1920),
@@ -235,6 +271,20 @@ def _render_segment(
             f"scale={output_size[0]}:{output_size[1]}",
         ])
     handle_filters.append("setsar=1")
+    # Retime the picture when the shot does not play at recorded speed. The
+    # crop motion above was evaluated on the source-time stream, so the pan
+    # slows down or speeds up with everything else, which is what a real
+    # ramp does. setpts rewrites the timestamps; the second fps re-lands the
+    # retimed stream on the delivery grid so the frame-exact trim below still
+    # counts screen frames. The source window read by -ss/-to is already the
+    # right length because the timeline was allocated on screen seconds.
+    if _speed_changed(segment.speed_ratio):
+        retime = [
+            f"setpts=PTS/{segment.speed_ratio:.9f}",
+            f"fps=fps={output_fps}:round=near",
+        ]
+        filters.extend(retime)
+        handle_filters.extend(retime)
     if output_frames is not None:
         filters.extend([
             "tpad=stop_mode=clone:stop_duration=1",
@@ -251,6 +301,14 @@ def _render_segment(
         # Keep a silent audio stream rather than dropping it. Every rendered
         # segment must have the same stream layout for frame-exact concat.
         audio = ["-af", "volume=0"]
+    elif _speed_changed(segment.speed_ratio):
+        # Retimed sound rides with the retimed picture. atempo keeps pitch,
+        # so a sped-up line stays a voice rather than a chirp; the gain, when
+        # there is one, still lands on top.
+        chain = _atempo_chain(segment.speed_ratio)
+        if abs(segment.gain_db) > 0.01:
+            chain = f"{chain},volume={segment.gain_db:.2f}dB"
+        audio = ["-af", chain]
     elif abs(segment.gain_db) > 0.01:
         audio = ["-af", f"volume={segment.gain_db:.2f}dB"]
 

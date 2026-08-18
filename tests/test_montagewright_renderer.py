@@ -397,3 +397,69 @@ def test_dynamic_crop_width_really_pushes_in_at_same_speed_for_mixed_fps(
     assert series[1][-1] > series[1][0] * 1.4
     for widths in series[1:]:
         assert widths == series[0]
+
+
+def test_a_sped_up_segment_lands_its_screen_frames_not_its_source_frames(
+    tmp_path: Path, monkeypatch,
+):
+    import montagewright.renderer as renderer
+
+    # Two seconds of source, read whole, but played at twice speed: the
+    # timeline was allocated on screen seconds, so it must deliver one second
+    # -- thirty frames at 30fps -- not the two seconds the window spans.
+    source_path = tmp_path / "src.mp4"
+    _silent_colour_clip(source_path, seconds=2.0, colour="orange")
+    source = Source("a", source_path, 2.0, 160, 90)
+    plan = RenderPlan(
+        project_id="sped", output_size=(160, 90), output_fps=30,
+        segments=[Segment("k00", source, 0.0, 2.0, speed_ratio=2.0)],
+    )
+    monkeypatch.setattr(renderer, "_encoder", lambda *_: "libx264")
+
+    made = render(plan, tmp_path / "out")
+
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,nb_frames",
+        "-of", "json", str(made.deliverable),
+    ], check=True, capture_output=True, text=True)
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["avg_frame_rate"] == "30/1"
+    assert int(stream["nb_frames"]) == 30
+
+
+def test_a_slowed_segment_stretches_its_source_window_on_the_timeline(
+    tmp_path: Path, monkeypatch,
+):
+    import montagewright.renderer as renderer
+
+    # One second of source at half speed occupies two seconds of screen: the
+    # renderer fills the extra frames rather than running short.
+    source_path = tmp_path / "src.mp4"
+    _silent_colour_clip(source_path, seconds=1.2, colour="teal")
+    source = Source("a", source_path, 1.2, 160, 90)
+    plan = RenderPlan(
+        project_id="slowed", output_size=(160, 90), output_fps=30,
+        segments=[Segment("k00", source, 0.0, 1.0, speed_ratio=0.5)],
+    )
+    monkeypatch.setattr(renderer, "_encoder", lambda *_: "libx264")
+
+    made = render(plan, tmp_path / "out")
+
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames", "-of", "json",
+        str(made.deliverable),
+    ], check=True, capture_output=True, text=True)
+    assert int(json.loads(probe.stdout)["streams"][0]["nb_frames"]) == 60
+
+
+def test_atempo_chains_extreme_ratios_into_stable_steps():
+    from montagewright.renderer import _atempo_chain
+
+    assert _atempo_chain(2.0) == "atempo=2.000000000"
+    assert _atempo_chain(0.5) == "atempo=0.500000000"
+    # 4x is out of one atempo's stable range, so it composes as two doublings.
+    assert _atempo_chain(4.0) == "atempo=2.000000000,atempo=2.000000000"
+    # Quarter speed composes as two halvings.
+    assert _atempo_chain(0.25) == "atempo=0.500000000,atempo=0.500000000"
