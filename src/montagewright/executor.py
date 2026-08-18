@@ -343,11 +343,34 @@ def plan_render(
                 f"was not supplied. Known: {sorted(sources)}"
             )
 
+        path = (crop_paths or {}).get(clip.clip_id)
+        speed = float(getattr(clip, "speed", 1.0) or 1.0)
+        following = path is not None and not path.is_static
+        if following and abs(speed - 1.0) > 1e-6:
+            # A followed subject's crop path is sampled over the source window,
+            # frame by frame from where the subject actually was. Retiming that
+            # window would leave the path describing seconds the shot no longer
+            # reads, so speed and a live follow are not composed yet. Deliver
+            # the shot at recorded speed and record the honest fault rather
+            # than desync the camera from its subject.
+            degradations.append(
+                DegradationStep(
+                    clip_id=clip.clip_id,
+                    ladder="other",
+                    ladder_other="speed_dropped_under_follow",
+                    trigger=(
+                        "the shot both follows a subject and asked to change "
+                        "speed; the tracked crop path cannot be retimed yet, "
+                        "so it plays at recorded speed"
+                    ),
+                    measured={"requested_speed": round(speed, 3)},
+                )
+            )
+            speed = 1.0
         in_seconds, out_seconds = _resolve_times(
-            clip, source, degradations, notes
+            clip, source, degradations, notes, speed=speed
         )
         crop = None
-        path = (crop_paths or {}).get(clip.clip_id)
         if path is not None:
             # A followed subject supersedes the coarse anchor: the path was
             # built from where the subject actually was, not from a nine-box
@@ -364,6 +387,7 @@ def plan_render(
                 source=source,
                 in_seconds=in_seconds,
                 out_seconds=out_seconds,
+                speed_ratio=speed,
                 crop=crop,
                 crop_path=path,
                 audio_role=clip.audio_role,
@@ -502,11 +526,20 @@ def _resolve_times(
     source: Source,
     degradations: list[DegradationStep],
     notes: list[str],
+    *,
+    speed: float = 1.0,
 ) -> tuple[float, float]:
-    """Clamp a clip into its source without ever discarding it."""
+    """Clamp a clip into its source without ever discarding it.
+
+    The clip's in and out are screen time; the source read that fills them is
+    that span times ``speed``. At recorded speed the two are equal and this is
+    the window it always was, so every existing cut resolves unchanged.
+    """
 
     in_seconds = max(0.0, clip.approx_in_seconds)
-    out_seconds = min(source.duration_seconds, clip.approx_out_seconds)
+    screen_span = max(0.0, clip.approx_out_seconds - clip.approx_in_seconds)
+    source_span = screen_span * (speed if speed > 0.0 else 1.0)
+    out_seconds = min(source.duration_seconds, in_seconds + source_span)
 
     # Past the end of what the take is worth using is a different fault from
     # past the end of the file, and it was not being noticed at all -- the

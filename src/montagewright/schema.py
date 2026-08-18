@@ -580,8 +580,26 @@ class Clip(ModelFacing):
 
     clip_id: str
     source_id: str
+    # These bound the shot on the DELIVERED timeline: their difference is how
+    # long the shot is on screen, and the rhythm and grounding passes reason
+    # in exactly this clock. How much source is read to fill that screen time
+    # is `speed` below; at recorded speed the two are the same window, which
+    # is why nothing downstream had to distinguish them until now.
     approx_in_seconds: float = Field(ge=0.0)
     approx_out_seconds: float = Field(gt=0.0)
+    speed: float = Field(
+        default=1.0,
+        ge=0.25,
+        le=4.0,
+        description=(
+            "Source seconds played per screen second. 1.0 is recorded speed. "
+            "Below 1.0 is slow motion, above 1.0 is sped up. The editor sets "
+            "this to place a piece of action in a screen-length it chose -- "
+            "often a beat-length -- so the source read becomes screen time "
+            "times this ratio. Not available while the camera follows a "
+            "subject."
+        ),
+    )
     in_looks_like: str = Field(
         default="",
         description=(

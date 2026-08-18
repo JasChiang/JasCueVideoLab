@@ -223,3 +223,46 @@ def test_speed_ratio_separates_screen_time_from_source_time():
         speed_ratio=0.0,
     )
     assert guarded.screen_duration_seconds == 4.0
+
+
+def test_speed_reads_more_source_than_screen_time_without_moving_the_timeline():
+    # A two second screen window at double speed reads four seconds of source,
+    # yet still occupies two seconds of the delivered timeline: the rhythm and
+    # grounding passes reasoned in screen time and never see the difference.
+    plan = plan_render(_edl(_clip("fast", 1.0, 3.0, speed=2.0)), {"uhd": UHD})
+    segment = plan.segments[0]
+    assert segment.speed_ratio == 2.0
+    assert segment.in_seconds == 1.0
+    assert segment.out_seconds == 5.0          # source read = screen * speed
+    assert segment.duration_seconds == 4.0     # source span
+    assert segment.screen_duration_seconds == 2.0   # timeline length
+
+
+def test_slow_motion_reads_less_source_for_the_same_screen_time():
+    plan = plan_render(_edl(_clip("slow", 2.0, 4.0, speed=0.5)), {"uhd": UHD})
+    segment = plan.segments[0]
+    assert segment.speed_ratio == 0.5
+    assert segment.out_seconds == 3.0          # 2s screen * 0.5 = 1s source
+    assert segment.screen_duration_seconds == 2.0
+
+
+def test_speed_is_dropped_while_the_camera_follows_a_subject():
+    from montagewright.reframe import CropPath, Keyframe
+    from montagewright.executor import CropBox
+
+    following = CropPath(keyframes=[
+        Keyframe(0.0, CropBox(0.2, 0.0, 0.3, 1.0)),
+        Keyframe(2.0, CropBox(0.5, 0.0, 0.3, 1.0)),
+    ])
+    assert not following.is_static
+    plan = plan_render(
+        _edl(_clip("track", 1.0, 3.0, speed=2.0)), {"uhd": UHD},
+        crop_paths={"track": following},
+    )
+    segment = plan.segments[0]
+    # Recorded speed wins so the tracked path still describes the frames shown.
+    assert segment.speed_ratio == 1.0
+    assert segment.out_seconds == 3.0
+    step = next(s for s in plan.degradations if s.clip_id == "track")
+    assert step.ladder_other == "speed_dropped_under_follow"
+    assert step.measured["requested_speed"] == 2.0
