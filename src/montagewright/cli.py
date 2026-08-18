@@ -2453,10 +2453,17 @@ def command_render(args: argparse.Namespace) -> int:
         print("selection: reused locally resolved execution plan", flush=True)
     cached_sequence_faults = sequence_disagreements(selection.get("shots") or [])
     if cached_sequence_faults:
-        raise RuntimeError(
-            "cached selection repeats overlapping adjacent source windows; "
-            "refusing to render: " + "; ".join(cached_sequence_faults)
+        # Two adjacent shots reusing overlapping source is a possible repeated
+        # image a reviewer should see, not a reason to refuse a cut that has
+        # otherwise resolved -- selection already had its repair rounds. Record
+        # it and render the draft; refusing here also blocked re-rendering a cut
+        # that was delivered once, since the same cache reaches this check again.
+        selection.setdefault("plan_disagreements", []).extend(
+            note for note in cached_sequence_faults
+            if note not in selection.get("plan_disagreements", [])
         )
+        for note in cached_sequence_faults:
+            print(f"  possible repeated image: {note}", flush=True)
     travelling = sum(
         1 for shot in selection["shots"] if str(shot.get("frame", "")) == "travels"
     )
