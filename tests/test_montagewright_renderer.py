@@ -501,4 +501,4 @@ def test_music_survives_a_voiceless_cut_even_when_keep_voice_is_set(
         for line in probe.stderr.splitlines() if "mean_volume:" in line
     )
     # Audible, not the -91 dB of a bed multiplied into silence.
-    assert mean > renderer.VOICE_PRESENT_FLOOR_DB
+    assert mean > -40.0

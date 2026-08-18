@@ -51,10 +51,6 @@ VOICE_LEVELLER = "speechnorm=e=12.5:r=0.0001:l=1"
 # around -22 dBFS, which is exactly where "the music minus 12" put the bed --
 # the same level as the speech it was supposed to be under.
 BED_BELOW_VOICE_DB = 14.0
-# Below this mean level a picture carries no voice worth ducking for. A real
-# levelled voice sits near -20 dBFS; a cut that discarded all its audio comes
-# back near -91. Anywhere under -60 there is nothing to sit the bed beneath.
-VOICE_PRESENT_FLOOR_DB = -60.0
 # How the bed gets out of the way. Attack short enough to be down before the
 # first syllable lands, release long enough that it does not pump between
 # words -- a bed that comes back up inside a sentence is more distracting
@@ -474,15 +470,12 @@ def _mux_music(
     """
 
     duration = probe_duration(picture)
-    # keep_voice means there is a voice to keep, and a caller can be wrong
-    # about that: "the material had transcripts" is not "this cut kept any of
-    # them". A pure b-roll cut off footage that happened to contain speech
-    # arrives here with keep_voice set and a silent picture, and the ducking
-    # branch then prices the bed against that silence and multiplies the music
-    # down to nothing. If there is no audible voice to sit under, there is
-    # nothing to duck for: lay the bed at full level.
-    if keep_voice and _level(picture) < VOICE_PRESENT_FLOOR_DB:
-        keep_voice = False
+    # keep_voice arrives already meaning "this cut kept a voice", decided from
+    # the plan by the caller rather than guessed from the picture's level here
+    # -- a film that kept one second of speech still kept it, and its mean
+    # level would not have shown that. All this branch owes that decision is to
+    # honour it: duck only when there is a voice, lay the bed full when there
+    # is not.
     # From wherever the rhythm pass pointed, not from zero. Taking the first
     # thirty seconds of a two-minute track means scoring the film with the
     # intro, which is written to have no energy yet.
@@ -730,14 +723,26 @@ def render(
         )
     kept_paths = [path for path, _, _ in segment_paths]
 
+    # Whether this cut kept any audio to sit the bed beneath -- a laid
+    # narrative track, or a segment that did not discard its source sound.
+    # This is the exact fact, read from the plan rather than guessed from a
+    # level: a cut that kept one second of voice still kept voice, and a cut
+    # that discarded all of it has none however many transcripts the footage
+    # had. Only the latter lays the bed at full; a caller's keep_voice cannot
+    # conjure a voice the edit did not keep.
+    kept_audio = bool(plan.audio_assignments) or any(
+        segment.audio_role != "discard" for segment in plan.segments
+    )
+
     deliverable = output_dir / "deliverable.mp4"
     if music is not None:
         _mux_music(
             mix_picture, music, deliverable,
             video_encoder=video_encoder,
             # An explicit laid track is authoritative. A caller's legacy
-            # keep_voice switch must never discard audio the EDL assigned.
-            keep_voice=keep_voice or bool(plan.audio_assignments),
+            # keep_voice switch must never discard audio the EDL assigned,
+            # and must never claim a voice the cut did not keep.
+            keep_voice=(keep_voice or bool(plan.audio_assignments)) and kept_audio,
             under_speech=under_speech,
             music_from_seconds=plan.music_from_seconds,
             music_spans=plan.music_spans or None,
