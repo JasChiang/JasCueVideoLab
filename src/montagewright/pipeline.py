@@ -3169,16 +3169,15 @@ def follow_subjects(
                 unusable_shots.append(unusable)
                 continue
     for clip in edl.clips:
-        camera_plan = compile_camera(
+        camera_faults = compile_camera(
             clip.reframe,
             path=paths.get(clip.clip_id),
             duration_seconds=(
                 clip.approx_out_seconds - clip.approx_in_seconds
             ),
             stable_key=clip.clip_id,
-            attempt_id="camera-compile-1",
         )
-        if camera_plan.faults and clip.reframe is not None:
+        if camera_faults and clip.reframe is not None:
             # The move did not survive compilation. What the viewer sees is the
             # measured digital motion, so record that as the delivered intent:
             # a travel that produced no travel is a hold.
@@ -3187,7 +3186,7 @@ def follow_subjects(
                 "hold" if path is None or path.is_static
                 else _digital_motion_of(path)
             )
-        for fault in camera_plan.faults:
+        for fault in camera_faults:
             report.degradations.append(
                 DegradationStep(
                     clip_id=clip.clip_id,

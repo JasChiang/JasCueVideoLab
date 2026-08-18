@@ -29,16 +29,6 @@ class CameraRoutePolicy:
     monotonic_route: bool
 
 
-@dataclass(frozen=True)
-class CameraPlan:
-    requested_intent: str
-    delivered_intent: str
-    route: CameraRoutePolicy
-    floor_seconds: float
-    feasible: bool
-    faults: tuple[Fault, ...] = ()
-
-
 def shot_key(shot: dict[str, Any]) -> str:
     """Content-address one commitment without depending on its list index."""
 
@@ -92,15 +82,11 @@ def compile_camera(
     duration_seconds: float = 0.0,
     stable_key: str = "",
     attempt_id: str | None = None,
-) -> CameraPlan:
-    """Return the one camera decision shared by planning, render and review."""
+) -> "tuple[Fault, ...]":
+    """Compile the camera faults this shot's geometry did not deliver."""
 
-    from montagewright.grounding import camera_floor_for
     from montagewright.reframe import camera_delivery_faults
 
-    requested = str(
-        getattr(reframe, "editorial_intent", None) or "hold"
-    )
     messages = camera_delivery_faults(
         reframe, path, duration_seconds=duration_seconds
     ) if path is not None else ()
@@ -118,12 +104,4 @@ def compile_camera(
         )
         for message in messages
     )
-    blocking = any(fault.severity == "blocking_shot" for fault in faults)
-    return CameraPlan(
-        requested_intent=requested,
-        delivered_intent=requested if not blocking else "degraded",
-        route=camera_route_policy(reframe),
-        floor_seconds=camera_floor_for(reframe),
-        feasible=not blocking,
-        faults=faults,
-    )
+    return faults

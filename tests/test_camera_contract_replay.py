@@ -112,9 +112,10 @@ def test_camera_compiler_only_blocks_semantic_delivery_failures() -> None:
         stable_key="shot",
         attempt_id="attempt-1",
     )
-    assert endpoint_only.feasible
-    assert endpoint_only.faults[0].severity == "advisory"
-    assert endpoint_only.faults[0].attempt_id == "attempt-1"
+    # An endpoint that arrives a little short is advisory, not blocking.
+    assert not any(f.severity == "blocking_shot" for f in endpoint_only)
+    assert endpoint_only[0].severity == "advisory"
+    assert endpoint_only[0].attempt_id == "attempt-1"
 
     static_compare = compile_camera(
         Reframe(
@@ -128,8 +129,9 @@ def test_camera_compiler_only_blocks_semantic_delivery_failures() -> None:
         duration_seconds=1.0,
         stable_key="shot",
     )
-    assert not static_compare.feasible
-    assert static_compare.faults[0].severity == "blocking_shot"
+    # A compare that produced no travel did not deliver its move.
+    assert any(f.severity == "blocking_shot" for f in static_compare)
+    assert static_compare[0].severity == "blocking_shot"
 
 
 def test_tracked_push_compares_against_its_tracked_endpoint() -> None:
