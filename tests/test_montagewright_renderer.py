@@ -463,3 +463,42 @@ def test_atempo_chains_extreme_ratios_into_stable_steps():
     assert _atempo_chain(4.0) == "atempo=2.000000000,atempo=2.000000000"
     # Quarter speed composes as two halvings.
     assert _atempo_chain(0.25) == "atempo=0.500000000,atempo=0.500000000"
+
+
+def test_music_survives_a_voiceless_cut_even_when_keep_voice_is_set(
+    tmp_path: Path, monkeypatch,
+):
+    import montagewright.renderer as renderer
+
+    # A pure b-roll cut: every segment discarded its audio, so the picture is
+    # silent. The caller still asks keep_voice (the material had transcripts).
+    # The bed must not be priced against that silence and driven to nothing.
+    source_path = tmp_path / "src.mp4"
+    _silent_colour_clip(source_path, seconds=2.0, colour="navy")
+    source = Source("a", source_path, 2.0, 160, 90)
+    plan = RenderPlan(
+        project_id="broll", output_size=(160, 90), output_fps=30,
+        segments=[Segment("k00", source, 0.0, 2.0, audio_role="discard")],
+    )
+    music = tmp_path / "bed.m4a"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "sine=frequency=220:duration=6",
+        "-c:a", "aac", str(music),
+    ], check=True)
+    monkeypatch.setattr(renderer, "_encoder", lambda *_: "libx264")
+
+    made = renderer.render(
+        plan, tmp_path / "out", music=music, keep_voice=True,
+    )
+
+    probe = subprocess.run([
+        "ffmpeg", "-hide_banner", "-i", str(made.deliverable),
+        "-af", "volumedetect", "-f", "null", "-",
+    ], capture_output=True, text=True)
+    mean = next(
+        float(line.split("mean_volume:")[1].split("dB")[0])
+        for line in probe.stderr.splitlines() if "mean_volume:" in line
+    )
+    # Audible, not the -91 dB of a bed multiplied into silence.
+    assert mean > renderer.VOICE_PRESENT_FLOOR_DB

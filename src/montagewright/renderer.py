@@ -51,6 +51,10 @@ VOICE_LEVELLER = "speechnorm=e=12.5:r=0.0001:l=1"
 # around -22 dBFS, which is exactly where "the music minus 12" put the bed --
 # the same level as the speech it was supposed to be under.
 BED_BELOW_VOICE_DB = 14.0
+# Below this mean level a picture carries no voice worth ducking for. A real
+# levelled voice sits near -20 dBFS; a cut that discarded all its audio comes
+# back near -91. Anywhere under -60 there is nothing to sit the bed beneath.
+VOICE_PRESENT_FLOOR_DB = -60.0
 # How the bed gets out of the way. Attack short enough to be down before the
 # first syllable lands, release long enough that it does not pump between
 # words -- a bed that comes back up inside a sentence is more distracting
@@ -470,6 +474,15 @@ def _mux_music(
     """
 
     duration = probe_duration(picture)
+    # keep_voice means there is a voice to keep, and a caller can be wrong
+    # about that: "the material had transcripts" is not "this cut kept any of
+    # them". A pure b-roll cut off footage that happened to contain speech
+    # arrives here with keep_voice set and a silent picture, and the ducking
+    # branch then prices the bed against that silence and multiplies the music
+    # down to nothing. If there is no audible voice to sit under, there is
+    # nothing to duck for: lay the bed at full level.
+    if keep_voice and _level(picture) < VOICE_PRESENT_FLOOR_DB:
+        keep_voice = False
     # From wherever the rhythm pass pointed, not from zero. Taking the first
     # thirty seconds of a two-minute track means scoring the film with the
     # intro, which is written to have no energy yet.
