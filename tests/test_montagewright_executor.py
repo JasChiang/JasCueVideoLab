@@ -190,3 +190,36 @@ class TestCropBox:
     def test_nonsense_extents_are_rejected(self, kwargs: dict[str, float]) -> None:
         with pytest.raises(ValueError):
             CropBox(**kwargs)
+
+
+def test_speed_ratio_separates_screen_time_from_source_time():
+    from montagewright.executor import Segment
+
+    # Recorded speed: the two clocks agree, which is what keeps every
+    # existing render bit-identical while the field exists but is unused.
+    played = Segment(clip_id="k00", source=UHD, in_seconds=2.0, out_seconds=6.0)
+    assert played.duration_seconds == 4.0
+    assert played.screen_duration_seconds == 4.0
+
+    # Twice source per screen second reads a four second window in two.
+    fast = Segment(
+        clip_id="k01", source=UHD, in_seconds=2.0, out_seconds=6.0,
+        speed_ratio=2.0,
+    )
+    assert fast.duration_seconds == 4.0
+    assert fast.screen_duration_seconds == 2.0
+
+    # Half source per screen second stretches the same window to eight.
+    slow = Segment(
+        clip_id="k02", source=UHD, in_seconds=2.0, out_seconds=6.0,
+        speed_ratio=0.5,
+    )
+    assert slow.duration_seconds == 4.0
+    assert slow.screen_duration_seconds == 8.0
+
+    # A degenerate ratio never divides by zero; it falls back to recorded.
+    guarded = Segment(
+        clip_id="k03", source=UHD, in_seconds=2.0, out_seconds=6.0,
+        speed_ratio=0.0,
+    )
+    assert guarded.screen_duration_seconds == 4.0

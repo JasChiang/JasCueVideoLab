@@ -3074,6 +3074,9 @@ def create_app() -> FastAPI:
             for segment in plan.segments:
                 path = segment.crop_path
                 if path is None and segment.crop is not None:
+                    # Source time on purpose: crop keyframes are read on the
+                    # source-trimmed stream, before any retime, so a static
+                    # box spans the source seconds rather than the screen ones.
                     path = CropPath([
                         Keyframe(0.0, segment.crop),
                         Keyframe(segment.duration_seconds, segment.crop),
@@ -3084,7 +3087,7 @@ def create_app() -> FastAPI:
             from montagewright.executor import allocate_timeline_frames
 
             frame_spans = allocate_timeline_frames(
-                [one.duration_seconds for one in plan.segments],
+                [one.screen_duration_seconds for one in plan.segments],
                 plan.output_fps,
             )
             manifest = {

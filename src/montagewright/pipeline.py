@@ -3600,7 +3600,7 @@ def run(
     from montagewright.executor import allocate_timeline_frames
 
     frame_spans = allocate_timeline_frames(
-        [segment.duration_seconds for segment in plan.segments],
+        [segment.screen_duration_seconds for segment in plan.segments],
         plan.output_fps,
     )
 

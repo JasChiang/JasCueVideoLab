@@ -81,6 +81,9 @@ def _keys(
                 for key in segment.crop_path.keyframes
             ]
             dense = []
+            # Source time on purpose: the crop path is sampled on the
+            # source-trimmed stream before the renderer retimes it, so it
+            # spans the source seconds, not the screen seconds.
             for frame in range(_frames(segment.duration_seconds, fps) + 1):
                 at = frame / fps
                 value = interpolate_crop_keyframes(source, at)
@@ -178,7 +181,7 @@ def to_xmeml(
     items: list[str] = []
     markers: list[str] = []
     boundaries = allocate_timeline_frames(
-        [segment.duration_seconds for segment in plan.segments], fps
+        [segment.screen_duration_seconds for segment in plan.segments], fps
     )
 
     for index, (segment, (start_frame, end_frame)) in enumerate(
@@ -354,7 +357,7 @@ def to_fcpxml(
     assets: dict[str, str] = {}
     clips: list[str] = []
     boundaries = allocate_timeline_frames(
-        [segment.duration_seconds for segment in plan.segments], fps
+        [segment.screen_duration_seconds for segment in plan.segments], fps
     )
     # One format per distinct source geometry, and the sequence's own. An
     # asset with no format leaves Final Cut to guess what shape the media

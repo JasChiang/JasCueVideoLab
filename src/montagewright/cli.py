@@ -3138,7 +3138,7 @@ def command_render(args: argparse.Namespace) -> int:
         initial_graphics = initial_graphics_plan(
             brief_document,
             selection,
-            shot_durations=[segment.duration_seconds for segment in plan.segments],
+            shot_durations=[segment.screen_duration_seconds for segment in plan.segments],
         )
         if initial_graphics.cues:
             graphics_path.write_text(

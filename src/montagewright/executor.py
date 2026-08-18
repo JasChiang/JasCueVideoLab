@@ -161,10 +161,33 @@ class Segment:
     # is there to be trusted.
     usable_from_seconds: float = 0.0
     usable_to_seconds: float = 0.0
+    # How many source seconds pass for one screen second. 1.0 plays the take
+    # at recorded speed; 2.0 reads twice the source per screen second (fast);
+    # 0.5 reads half (slow motion). The renderer retimes the trimmed stream to
+    # honour it. Every stage that measures the delivered timeline reads
+    # `screen_duration_seconds`; only the crop path, which is evaluated on the
+    # source-time stream before that retime, still measures `duration_seconds`.
+    # Nothing sets this away from 1.0 yet: the plumbing is in place so the two
+    # clocks can never be silently fused again once speed is exposed.
+    speed_ratio: float = 1.0
 
     @property
     def duration_seconds(self) -> float:
+        """Source seconds spanned, in - out on the source clock."""
+
         return self.out_seconds - self.in_seconds
+
+    @property
+    def screen_duration_seconds(self) -> float:
+        """Seconds this segment occupies on the delivered timeline.
+
+        Equal to the source span at recorded speed, and shorter or longer
+        once the segment is sped up or slowed down. Timeline allocation,
+        concatenation and any graphic laid over the cut measure here.
+        """
+
+        ratio = self.speed_ratio if self.speed_ratio > 0.0 else 1.0
+        return (self.out_seconds - self.in_seconds) / ratio
 
 
 @dataclass(frozen=True)
@@ -235,7 +258,9 @@ class RenderPlan:
 
     @property
     def duration_seconds(self) -> float:
-        return sum(segment.duration_seconds for segment in self.segments)
+        return sum(
+            segment.screen_duration_seconds for segment in self.segments
+        )
 
     @property
     def degraded_clip_ids(self) -> set[str]:
@@ -352,7 +377,7 @@ def plan_render(
 
     assert len(segments) == len(edl.clips), "the executor never drops a clip"
     frame_spans = allocate_timeline_frames(
-        [segment.duration_seconds for segment in segments], output_fps
+        [segment.screen_duration_seconds for segment in segments], output_fps
     )
     timeline_starts = {
         segment.clip_id: start

@@ -625,7 +625,7 @@ def render(
 
     segment_paths: list[tuple[Path, "Handles", float]] = []
     boundaries = allocate_timeline_frames(
-        [segment.duration_seconds for segment in plan.segments],
+        [segment.screen_duration_seconds for segment in plan.segments],
         plan.output_fps,
     )
     for index, (segment, (start_frame, end_frame)) in enumerate(
@@ -648,7 +648,7 @@ def render(
             output_fps=plan.output_fps,
             output_frames=segment_frames,
         )
-        segment_paths.append((rendered, handles, segment.duration_seconds))
+        segment_paths.append((rendered, handles, segment.screen_duration_seconds))
 
     picture = _concat(segment_paths, output_dir / "picture.mp4", output_dir)
     mix_picture = picture
