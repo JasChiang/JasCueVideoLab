@@ -971,7 +971,28 @@ def resolve_candidate_commitments(
 
 
 def describe_commitments(commitments: CandidateCommitments) -> str:
+    import collections
+
+    # Which distinct sources back each commitment. When a commitment is down
+    # to one take -- often because identity confirmation removed its other
+    # option -- Selection must be told, or it fills the beat by cutting the
+    # same window twice, which reads as a repeated image. The editorial choice
+    # (vary the framing, use a different moment, or spend one shot) is the
+    # model's; the fact is local, and belongs in the brief it reads.
+    sources: dict[str, set[str]] = collections.defaultdict(set)
+    for option in commitments.options:
+        sources[option.commitment_id].add(option.span_id.split(":", 1)[0])
+    single_source = sorted(
+        cid for cid, srcs in sources.items() if len(srcs) == 1
+    )
     lines = []
+    if single_source:
+        lines.append(
+            "只有一支來源的 commitment（若要給它多顆鏡頭，兩顆必須明顯不同："
+            "景別差一級以上、或用拍帶中不重疊的另一時刻；絕不可把同一段源時間"
+            "放兩次，那讀起來是重複畫面。素材真的只夠一顆時，就給一顆）："
+            + "、".join(single_source)
+        )
     for option in commitments.options:
         lines.append(
             f"- {option.commitment_id} [{option.tier}] span={option.span_id}; "

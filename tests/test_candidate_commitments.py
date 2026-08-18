@@ -1066,3 +1066,34 @@ def test_a_read_across_wide_content_keeps_its_reader():
     assert {"reveal", "compare", "multi_stop"} <= set(
         option.feasible_treatments
     )
+
+
+def _plain_option(commitment_id, span_id, tier, required):
+    return CandidateOption(
+        commitment_id=commitment_id, purpose="p", required=required,
+        picture_role="primary_action", target_id="none", span_id=span_id,
+        min_supported_seconds=2.0, tier=tier,
+        presentation_intent="centered_hold",
+        motion_preference="virtual_allowed", why="w",
+    )
+
+
+def test_describe_warns_only_commitments_down_to_one_source():
+    # A commitment whose options all come from one take forces reuse; one
+    # backed by two distinct takes does not. Selection is told which is which
+    # so it does not fill a beat by cutting the same window twice.
+    commitments = CandidateCommitments(
+        contract_version="candidate-commitment-v5-visual-relationships",
+        material_digest="a" * 64, direction_sha256="b" * 64,
+        grounding_sha256=None, target_aspect="9:16", target_seconds=20.0,
+        options=(
+            _plain_option("one_take", "C8374:s00", "primary", True),
+            _plain_option("one_take", "C8374:s01", "alternate", True),
+            _plain_option("two_takes", "C8393:s00", "primary", True),
+            _plain_option("two_takes", "C8402:s00", "alternate", True),
+        ),
+    )
+    header = describe_commitments(commitments).splitlines()[0]
+    assert "只有一支來源" in header
+    assert "one_take" in header
+    assert "two_takes" not in header
