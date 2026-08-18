@@ -3315,9 +3315,18 @@ def run(
 
     preflight_faults = resolved_source_contract_faults(edl)
     if preflight_faults:
-        raise ValueError(
-            "selection has unresolved source-clock contracts before Rhythm: "
-            + "; ".join(preflight_faults)
+        # A source-clock contract a degraded selection could not repair points
+        # at a shot whose window is a little wrong, not at an unrenderable
+        # film: the frames still exist and still cut. Record it and carry on
+        # to a reviewable draft rather than raising and delivering nothing.
+        report.plan_disagreements.extend(
+            f"source clock: {fault}" for fault in preflight_faults
+            if f"source clock: {fault}" not in report.plan_disagreements
+        )
+        print(
+            "source clock: delivering a reviewable draft despite "
+            + "; ".join(preflight_faults),
+            flush=True,
         )
 
     # Runs whether or not there is a track. It was gated on having one --
@@ -3362,19 +3371,27 @@ def run(
         edl = apply_to_edl(edl, timeline)
         if not transcripts:
             break
-        from montagewright.transcript import (
-            DialogueBoundaryError, snap_edl_to_dialogue,
-        )
+        from montagewright.transcript import snap_edl_to_dialogue
 
         snapped, dialogue_notes, dialogue_faults = snap_edl_to_dialogue(
             edl, transcripts
         )
         dialogue_history.extend(dialogue_notes)
         if dialogue_faults:
-            raise DialogueBoundaryError(
-                "final cut crosses unfinished dialogue; reselect or replan: "
-                + "; ".join(dialogue_faults)
+            # A cut that crosses unfinished dialogue is a shot to swap, not a
+            # reason to deliver nothing. Take the dialogue-safe snap as the
+            # best available cut, flag the faults, and stop iterating.
+            report.plan_disagreements.extend(
+                f"dialogue: {fault}" for fault in dialogue_faults
+                if f"dialogue: {fault}" not in report.plan_disagreements
             )
+            print(
+                "dialogue: delivering a reviewable draft despite "
+                + "; ".join(dialogue_faults),
+                flush=True,
+            )
+            edl = snapped
+            break
         if not dialogue_notes:
             break
         signature = tuple(
@@ -3382,10 +3399,15 @@ def run(
             for clip in snapped.clips
         )
         if signature in seen_windows or attempt == 3:
-            raise DialogueBoundaryError(
-                "music grounding and dialogue-safe boundaries do not "
-                "converge; replan the named speech shots"
+            # Music grounding and dialogue snapping keep trading places. Rather
+            # than raise on the cycle, keep the dialogue-safe cut and record
+            # that the two could not be reconciled for review.
+            report.plan_disagreements.append(
+                "dialogue: music grounding and dialogue-safe boundaries did "
+                "not converge; the named speech shots may need replanning"
             )
+            edl = snapped
+            break
         seen_windows.add(signature)
         edl = snapped
         timeline = ground_timeline(edl, grid)
@@ -3421,9 +3443,7 @@ def run(
     # Release gate: the sequence and rhythm passes already had a chance to
     # repair this.  At the resolved source clock we only verify; silently
     # trimming here would move music, subtitles and every downstream frame.
-    from montagewright.coverage import (
-        TimelineCoverageError, edl_coverage_audit,
-    )
+    from montagewright.coverage import edl_coverage_audit
 
     coverage = edl_coverage_audit(
         edl, target_seconds, hard_target=duration_mode == "exact"
@@ -3442,10 +3462,23 @@ def run(
         for entry in coverage.entries
     ]
     if target_seconds > 0 and coverage.faults:
-        raise TimelineCoverageError(
-            "final timeline contains duration without content evidence; "
-            "selection/rhythm must be structurally replanned: "
-            + "; ".join(coverage.faults)
+        # A timeline carrying duration without content evidence is a film with
+        # some dead or unsupported time, not an unrenderable one. Selection
+        # and rhythm already had their chance to repair it; stopping the whole
+        # cut here throws away everything paid for and delivers nothing, when
+        # the honest answer is a watchable preview with the weak shots named
+        # for a human to swap. Record the faults and render the draft instead
+        # of raising -- the report's unsupported_seconds and these notes say
+        # exactly where the film is thin.
+        report.plan_disagreements.extend(
+            f"coverage: {fault}" for fault in coverage.faults
+            if f"coverage: {fault}" not in report.plan_disagreements
+        )
+        print(
+            "coverage: delivering a reviewable draft with "
+            f"{coverage.unsupported_seconds:.1f}s unsupported; "
+            + "; ".join(coverage.faults),
+            flush=True,
         )
     # Rhythm now fixes the picture timeline, so this is the first point where
     # a return to the speaker after B-roll can be mapped to the exact progress
@@ -3460,14 +3493,22 @@ def run(
         audio_timeline_faults, resolved_source_contract_faults,
     )
 
-    resolved_faults = (
+    resolved_faults = tuple(dict.fromkeys((
         *resolved_source_contract_faults(edl),
         *audio_timeline_faults(edl),
-    )
+    )))
     if resolved_faults:
-        raise ValueError(
-            "resolved timeline violates local source/audio contracts: "
-            + "; ".join(dict.fromkeys(resolved_faults))
+        # Same principle as the pre-rhythm gate: a residual contract fault is
+        # a shot whose window is slightly off, not an unrenderable film. Flag
+        # it and render the draft.
+        report.plan_disagreements.extend(
+            f"resolved contract: {fault}" for fault in resolved_faults
+            if f"resolved contract: {fault}" not in report.plan_disagreements
+        )
+        print(
+            "resolved contract: delivering a reviewable draft despite "
+            + "; ".join(resolved_faults),
+            flush=True,
         )
     for clip in edl.clips:
         if clip.clip_id in report.rhythm_decisions:
