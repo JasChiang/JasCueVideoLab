@@ -224,6 +224,12 @@ class Report:
     source_motion: dict[str, str] = field(default_factory=dict)
     source_motion_details: dict[str, dict] = field(default_factory=dict)
     digital_motion: dict[str, str] = field(default_factory=dict)
+    # What the crop compiler actually delivered per clip, when it differs from
+    # what Selection requested -- a reveal whose looks collapsed to one place
+    # renders as a hold, and the interface must show that gap rather than the
+    # request. Only set where the two disagree; absent means delivered as
+    # asked.
+    delivered_intent: dict[str, str] = field(default_factory=dict)
     degradations: list[DegradationStep] = field(default_factory=list)
     subject_notes: dict[str, str] = field(default_factory=dict)
     # Lightweight, durable geometry from reliable SAM tracks. Full masks are
@@ -3172,6 +3178,15 @@ def follow_subjects(
             stable_key=clip.clip_id,
             attempt_id="camera-compile-1",
         )
+        if camera_plan.faults and clip.reframe is not None:
+            # The move did not survive compilation. What the viewer sees is the
+            # measured digital motion, so record that as the delivered intent:
+            # a travel that produced no travel is a hold.
+            path = paths.get(clip.clip_id)
+            report.delivered_intent[clip.clip_id] = (
+                "hold" if path is None or path.is_static
+                else _digital_motion_of(path)
+            )
         for fault in camera_plan.faults:
             report.degradations.append(
                 DegradationStep(

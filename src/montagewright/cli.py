@@ -4183,9 +4183,15 @@ def _write_report(output: Path, **parts) -> None:
                     and int(clip_id[1:]) < len(parts["selection"]["shots"])
                     else "hold"
                 ),
+                # The compiler's delivered intent wins when it recorded one:
+                # a reveal that collapsed to a hold at render time is not
+                # visible in the selection shot, only in the report.
                 "delivered_camera_intent": (
-                    delivered_camera_intent_of(
-                        parts["selection"]["shots"][int(clip_id[1:])]
+                    report.delivered_intent.get(
+                        clip_id,
+                        delivered_camera_intent_of(
+                            parts["selection"]["shots"][int(clip_id[1:])]
+                        ),
                     )
                     if clip_id.startswith("k")
                     and clip_id[1:].isdigit()

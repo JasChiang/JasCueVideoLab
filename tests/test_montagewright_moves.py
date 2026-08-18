@@ -5341,6 +5341,9 @@ def test_every_thing_the_report_records_reaches_the_report():
         "total_cuts": "cuts_on_music",
         "following_shots": "shots_following",
         "static_shots": "shots_held",
+        # Surfaced per clip inside the motion block, as the delivered intent
+        # that the interface shows against the requested one.
+        "delivered_intent": "delivered_camera_intent",
         "rhythm_decisions": "rhythm",
         "delivered_seconds": "duration_seconds",
         "usages": "tokens",
