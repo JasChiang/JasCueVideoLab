@@ -2420,6 +2420,22 @@ def _selection_schema(
                                 "寫成 MM:SS（`0:03`）。"
                             ),
                         },
+                        "speed": {
+                            "type": "number",
+                            "minimum": 0.25,
+                            "maximum": 4.0,
+                            "description": (
+                                "播放速度，原速是 1.0，可省略。小於 1 是慢動作，"
+                                "大於 1 是加速。seconds_needed 是這顆在螢幕上的"
+                                "長度；本機會讀 seconds_needed×speed 秒的素材來"
+                                "填它。所以你可以把一段較長的動作放進你選的"
+                                "螢幕長度（設 speed>1 壓縮），或把一個短瞬間"
+                                "撐滿一個節拍長度（設 speed<1 放慢）——搭不搭"
+                                "節奏、要不要強調，由你依需求決定。只有刻意要"
+                                "變速時才填，其餘省略即原速。跟拍主體的鏡頭"
+                                "暫不支援變速，會自動回原速。"
+                            ),
+                        },
                         "action_id": {
                             "type": "string",
                             "enum": ["none", *(action_ids or [])],

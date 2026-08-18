@@ -1673,3 +1673,37 @@ def test_an_unresolvable_action_degrades_to_a_plain_excerpt(tmp_path):
 
     assert edl.clips[0].action_contracts == []
     assert "plain excerpt" in snaps["k00"]
+
+
+def test_selection_speed_reaches_the_clip_and_out_of_range_is_clamped(tmp_path):
+    from montagewright.cli import _edl_from_selection
+
+    def _shot(speed):
+        return {
+            "source_id": "C1", "start_seconds": 0.0, "seconds_needed": 2.0,
+            "action_id": "none", "camera_intent": "hold", "speed": speed,
+            "energy": "medium", "why": "beat", "audio_role": "discard",
+            "audio_completion": "none", "picture_role": "primary_action",
+            "looks": [{"at": "centre", "seconds": 0.0, "framing": "thirds"}],
+        }
+
+    # A deliberate slow-motion choice travels through untouched.
+    edl, _ = _edl_from_selection(
+        {"shots": [_shot(0.5)]}, tmp_path, {}, material=[],
+    )
+    assert edl.clips[0].speed == 0.5
+
+    # Beyond the supported range the film is not failed; the speed is clamped
+    # to the nearest bound and still points the direction it asked for.
+    edl, _ = _edl_from_selection(
+        {"shots": [_shot(9.0)]}, tmp_path, {}, material=[],
+    )
+    assert edl.clips[0].speed == 4.0
+
+    # Omitting speed is recorded speed, the case every existing cut is in.
+    shot = _shot(1.0)
+    del shot["speed"]
+    edl, _ = _edl_from_selection(
+        {"shots": [shot]}, tmp_path, {}, material=[],
+    )
+    assert edl.clips[0].speed == 1.0

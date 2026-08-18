@@ -985,6 +985,7 @@ def _timeline_blocks(run: Run) -> list[dict]:
                 if len(window) >= 2 else
                 rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)
             )(resolved.get(f"k{index:02d}", {}).get("window") or [])),
+            "speed": float(shot.get("speed", 1.0) or 1.0),
             "gain_db": 0.0,
         }
         for index, shot in enumerate(shots)
@@ -2756,10 +2757,17 @@ def create_app() -> FastAPI:
             source_for(source_id)
             start = float(entry["in_seconds"])
             gains[f"k{index:02d}"] = float(entry.get("gain_db", 0.0) or 0.0)
+            # Screen length is what the timeline holds; speed rides along so a
+            # re-render after a manual edit keeps a slow-motion or sped-up shot
+            # at its speed instead of quietly returning it to recorded.
+            speed = float(entry.get("speed", plan.get("speed", 1.0)) or 1.0)
+            if speed < 0.25 or speed > 4.0:
+                speed = min(4.0, max(0.25, speed))
             clips.append(Clip(
                 clip_id=f"k{index:02d}", source_id=source_id,
                 approx_in_seconds=start,
                 approx_out_seconds=start + float(entry["seconds"]),
+                speed=speed,
                 in_looks_like=subject_of(plan),
                 energy_intent=plan.get("energy", "medium"),
                 audio_role=entry.get("audio_role", plan.get("audio_role", "auto")),
@@ -3104,6 +3112,10 @@ def create_app() -> FastAPI:
                         "start_frame": start,
                         "frame_count": end - start,
                         "seconds": (end - start) / plan.output_fps,
+                        # Screen length is `seconds`; speed says how much source
+                        # was read to fill it, so the timeline can show a shot
+                        # as slow motion or sped up rather than as a plain cut.
+                        "speed": segment.speed_ratio,
                         "gain_db": segment.gain_db,
                         "audio_role": segment.audio_role,
                         "audio_completion": segment.audio_completion,

@@ -2362,8 +2362,8 @@ function inspect(i) {
     <section class="ins-part adjust">
       <h4>可調整</h4>
       <div class="pairs">
-        <span>進出點</span><span class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds).toFixed(2)}s
-          <i class="why">${b.seconds.toFixed(2)}s${moved ? '，已改動' : ''}</i></span>
+        <span>進出點</span><span class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds * ((b.speed && b.speed > 0) ? b.speed : 1)).toFixed(2)}s
+          <i class="why">螢幕 ${b.seconds.toFixed(2)}s${(b.speed && b.speed !== 1) ? `・${b.speed < 1 ? '慢動作' : '加速'} ${b.speed}×（讀 ${(b.seconds * b.speed).toFixed(2)}s 素材）` : ''}${moved ? '，已改動' : ''}</i></span>
       </div>
       <div class="gainrow">
         <span class="why">音量</span>
@@ -4706,6 +4706,8 @@ function paintStrip() {
       <div class="grip l" data-edge="l" data-i="${i}"></div>
       <div class="lab">${b.delivered === false ? '<b class="flag">!</b>' : ''}${esc(b.source_id)}</div>
       <div class="dur">${b.seconds.toFixed(1)}s${
+        (b.speed && b.speed !== 1) ? ` ${b.speed}×` : ''
+      }${
         b.gain_db ? ` ${b.gain_db > 0 ? '+' : ''}${b.gain_db.toFixed(1)}dB` : ''
       }</div>
       ${(b.looks && b.looks.length > 1) ? `<div class="stops">${

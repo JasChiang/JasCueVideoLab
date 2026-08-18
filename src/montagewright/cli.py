@@ -3945,12 +3945,20 @@ def _edl_from_selection(
                 policy=content_policy,
                 minimum_seconds=content_minimum,
             )
+        # The editor may play this shot off recorded speed to fit a piece of
+        # action into the screen length it chose. Out of the supported range
+        # is clamped, not refused: a shot's speed is not worth failing a film
+        # over, and the clamp still honours the direction it asked for.
+        speed = float(shot.get("speed") or 1.0)
+        if speed < 0.25 or speed > 4.0:
+            speed = min(4.0, max(0.25, speed))
         clips.append(
             Clip(
                 clip_id=clip_id,
                 source_id=shot["source_id"],
                 approx_in_seconds=start,
                 approx_out_seconds=start + wanted,
+                speed=speed,
                 in_looks_like=subject_of(shot),
                 energy_intent=shot.get("energy", "medium"),
                 audio_role=shot.get("audio_role", "auto"),
@@ -4423,6 +4431,9 @@ def command_timeline(args: argparse.Namespace) -> int:
                 )
             sources[source_id] = probe(source_id, match)
         start = float(shot.get("start_seconds", 0.0))
+        speed = float(shot.get("speed") or 1.0)
+        if speed < 0.25 or speed > 4.0:
+            speed = min(4.0, max(0.25, speed))
         clips.append(
             Clip(
                 clip_id=f"k{index:02d}", source_id=source_id,
@@ -4431,6 +4442,7 @@ def command_timeline(args: argparse.Namespace) -> int:
                 + float(rhythm.get(f"k{index:02d}", {}).get("seconds", 0.0)),
                 in_looks_like=subject_of(shot),
                 energy_intent=shot.get("energy", "medium"),
+                speed=speed,
                 reframe=reframe_of(shot),
             )
         )
