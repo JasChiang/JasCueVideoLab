@@ -231,6 +231,28 @@ class Report:
     # asked.
     delivered_intent: dict[str, str] = field(default_factory=dict)
     degradations: list[DegradationStep] = field(default_factory=list)
+
+    def note_release_faults(self, category: str, faults: "Iterable[str]") -> None:
+        """Record a release-gate fault as a reviewable disagreement.
+
+        Every gate that used to raise now records under one shape: a
+        category-prefixed note, deduplicated, and a line to stdout. Five copies
+        of that had drifted into pipeline.run(); this is the one writer, so a
+        change to how a degraded gate is reported cannot land in four places
+        and miss a fifth.
+        """
+        faults = [str(one) for one in faults]
+        if not faults:
+            return
+        self.plan_disagreements.extend(
+            f"{category}: {fault}" for fault in faults
+            if f"{category}: {fault}" not in self.plan_disagreements
+        )
+        print(
+            f"{category}: delivering a reviewable draft despite "
+            + "; ".join(faults),
+            flush=True,
+        )
     subject_notes: dict[str, str] = field(default_factory=dict)
     # Lightweight, durable geometry from reliable SAM tracks. Full masks are
     # temporary; downstream layout only needs where the subject was in the
@@ -3333,15 +3355,7 @@ def run(
         # at a shot whose window is a little wrong, not at an unrenderable
         # film: the frames still exist and still cut. Record it and carry on
         # to a reviewable draft rather than raising and delivering nothing.
-        report.plan_disagreements.extend(
-            f"source clock: {fault}" for fault in preflight_faults
-            if f"source clock: {fault}" not in report.plan_disagreements
-        )
-        print(
-            "source clock: delivering a reviewable draft despite "
-            + "; ".join(preflight_faults),
-            flush=True,
-        )
+        report.note_release_faults("source clock", preflight_faults)
 
     # Runs whether or not there is a track. It was gated on having one --
     # the reasoning being that with no music there is nothing to reconcile --
@@ -3395,15 +3409,7 @@ def run(
             # A cut that crosses unfinished dialogue is a shot to swap, not a
             # reason to deliver nothing. Take the dialogue-safe snap as the
             # best available cut, flag the faults, and stop iterating.
-            report.plan_disagreements.extend(
-                f"dialogue: {fault}" for fault in dialogue_faults
-                if f"dialogue: {fault}" not in report.plan_disagreements
-            )
-            print(
-                "dialogue: delivering a reviewable draft despite "
-                + "; ".join(dialogue_faults),
-                flush=True,
-            )
+            report.note_release_faults("dialogue", dialogue_faults)
             edl = snapped
             break
         if not dialogue_notes:
@@ -3484,14 +3490,9 @@ def run(
         # for a human to swap. Record the faults and render the draft instead
         # of raising -- the report's unsupported_seconds and these notes say
         # exactly where the film is thin.
-        report.plan_disagreements.extend(
-            f"coverage: {fault}" for fault in coverage.faults
-            if f"coverage: {fault}" not in report.plan_disagreements
-        )
+        report.note_release_faults("coverage", coverage.faults)
         print(
-            "coverage: delivering a reviewable draft with "
-            f"{coverage.unsupported_seconds:.1f}s unsupported; "
-            + "; ".join(coverage.faults),
+            f"coverage: {coverage.unsupported_seconds:.1f}s unsupported",
             flush=True,
         )
     # Rhythm now fixes the picture timeline, so this is the first point where
@@ -3515,15 +3516,7 @@ def run(
         # Same principle as the pre-rhythm gate: a residual contract fault is
         # a shot whose window is slightly off, not an unrenderable film. Flag
         # it and render the draft.
-        report.plan_disagreements.extend(
-            f"resolved contract: {fault}" for fault in resolved_faults
-            if f"resolved contract: {fault}" not in report.plan_disagreements
-        )
-        print(
-            "resolved contract: delivering a reviewable draft despite "
-            + "; ".join(resolved_faults),
-            flush=True,
-        )
+        report.note_release_faults("resolved contract", resolved_faults)
     for clip in edl.clips:
         if clip.clip_id in report.rhythm_decisions:
             report.rhythm_decisions[clip.clip_id]["seconds"] = round(
