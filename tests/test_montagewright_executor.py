@@ -264,5 +264,5 @@ def test_speed_is_dropped_while_the_camera_follows_a_subject():
     assert segment.speed_ratio == 1.0
     assert segment.out_seconds == 3.0
     step = next(s for s in plan.degradations if s.clip_id == "track")
-    assert step.ladder_other == "speed_dropped_under_follow"
+    assert step.ladder_other == "speed_dropped_under_camera_move"
     assert step.measured["requested_speed"] == 2.0
