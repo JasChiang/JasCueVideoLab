@@ -2415,9 +2415,14 @@ def test_travel_between_landings_takes_only_the_time_it_needs():
         if abs(earlier.crop.x - later.crop.x) < 1e-4
     ]
 
-    assert rests == [1.26, 1.26]
+    # The crossing takes the time its distance needs to stay inside both the
+    # speed and acceleration budgets, and the declared dwell yields to it.
+    import math
+    span = abs(0.715 - 0.395)
+    accel_floor = math.sqrt(6.0 * span / 1.67)  # active max_accel
     moving = 3.0 - sum(rests)
-    assert moving < 0.6
+    assert moving >= accel_floor - 1e-3
+    assert rests[0] == rests[1]
     # The plan's number did change, so it is said rather than absorbed.
     assert [one.ladder_other for one in degradations] == [
         "declared_dwell_shortened_to_fit"
@@ -2500,7 +2505,9 @@ def test_a_digital_move_leaves_room_for_the_takes_own_motion():
         / max(later.seconds - earlier.seconds, 1e-9)
         for earlier, later in zip(locked.keyframes, locked.keyframes[1:])
     )
-    assert locked_peak > peak
+    # With the acceleration budget binding, both are capped by it rather than
+    # by speed, so locked is no slower than native (and never exceeds it).
+    assert locked_peak >= peak
 
 
 def test_a_move_that_drifts_past_the_takes_settle_is_reported():
@@ -2552,3 +2559,32 @@ def test_a_take_that_barely_moved_is_not_a_drift():
         one for one in degradations
         if one.ladder_other == "digital_moves_after_take_settles"
     ]
+
+
+def test_a_move_stays_inside_the_acceleration_budget():
+    """A smoothstep ramp that is eased but then crammed still jerks.
+
+    ENERGY_LIMITS carried a max_accel that only the eased render referenced;
+    the leg's own time was charged for speed alone, so a 0.25-wide move given
+    0.37s peaked near 11 against a 1.67 budget -- the shove-and-stop the pans
+    read as. Each leg now claims enough time that its smoothstep peak, 6d/T^2,
+    stays under the budget.
+    """
+    import math
+    from montagewright.reframe import ENERGY_LIMITS
+
+    accel = ENERGY_LIMITS["active"]["max_accel"]
+    # Two landings far apart, dwell asking for most of a short shot.
+    path = _looks(
+        [(1.2, 0.16, 0.5, WIDE), (1.2, 0.84, 0.5, WIDE)],
+        seconds=3.0,
+    )
+    peak = 0.0
+    for earlier, later in zip(path.keyframes, path.keyframes[1:]):
+        d = abs((later.crop.x + later.crop.width / 2)
+                - (earlier.crop.x + earlier.crop.width / 2))
+        T = later.seconds - earlier.seconds
+        if d > 1e-4 and T > 1e-6:
+            peak = max(peak, 6.0 * d / T ** 2)
+
+    assert peak <= accel + 0.05

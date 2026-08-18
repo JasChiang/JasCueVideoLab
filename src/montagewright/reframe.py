@@ -829,7 +829,20 @@ def build_look_path(
     # leave the remainder where the plan put it.
     limits = _digital_budget(energy, native_speed)
     ceiling = limits["max_speed"]
-    minimum_travel = sum(one / ceiling for one in spans) if ceiling > 0 else 0.0
+    # Each leg needs enough time not to exceed the speed budget -- distance
+    # over the ceiling -- and enough not to exceed the acceleration budget.
+    # A smoothstep ramp over distance d in time T peaks at 6d/T^2, so keeping
+    # that under max_accel needs T >= sqrt(6d/max_accel). Only the speed side
+    # was ever charged, so the eased ramp was applied and then crammed into
+    # whatever time dwell left over -- 0.37s for a 0.25-wide move, an
+    # acceleration peak of 11 against a 1.67 budget, which is the jerk that
+    # reads as a shove-and-stop. Charge both, per leg, and take the greater.
+    accel = float(limits.get("max_accel") or 0.0)
+    def _leg_floor(distance: float) -> float:
+        speed_floor = distance / ceiling if ceiling > 0 else 0.0
+        accel_floor = math.sqrt(6.0 * distance / accel) if accel > 0 else 0.0
+        return max(speed_floor, accel_floor)
+    minimum_travel = sum(_leg_floor(one) for one in spans)
     # A route too long for its shot must not take every landing's stillness
     # with it. Moving in every frame of a shot is not a pan -- it is a pan
     # with both ends cut off -- so each landing keeps a readable settle, and
@@ -875,9 +888,20 @@ def build_look_path(
             )
     left = max(duration_seconds - sum(rests), 1e-6)
     total = sum(spans)
+    # Split the travelling time between legs in proportion to distance, but
+    # never below each leg's own floor: a short leg beside a long one would
+    # otherwise be handed a sliver of time and jerk across it. When the floors
+    # already exceed what is left, they are scaled down together -- the
+    # hurried check below then reports the shortfall rather than it being
+    # absorbed by an unbounded acceleration.
+    floors = [_leg_floor(one) for one in spans]
+    if sum(floors) > left and sum(floors) > 0:
+        squeeze = left / sum(floors)
+        floors = [one * squeeze for one in floors]
+    extra = max(0.0, left - sum(floors))
     legs = [
-        left * (one / total) if total > 1e-9 else left / len(spans)
-        for one in spans
+        floor + (extra * (one / total) if total > 1e-9 else extra / len(spans))
+        for floor, one in zip(floors, spans)
     ]
 
     # Two stops that measured to the same place is a move that goes nowhere.
