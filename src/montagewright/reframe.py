@@ -223,15 +223,30 @@ def _smooth(keyframes: list[Keyframe], strength: float = 0.5) -> list[Keyframe]:
         if same(previous.crop, current.crop) or same(current.crop, following.crop):
             smoothed.append(current)
             continue
-        blended = (
-            previous.crop.x + following.crop.x
-        ) / 2.0 * strength + current.crop.x * (1.0 - strength)
+        # Both axes: a subject tracked up, down or diagonally had its X
+        # de-cornered but its Y left with the raw kink, so a tilt-heavy follow
+        # read less smooth than a pan. And clamp to the same margin inset
+        # crop_at uses, not the wider frame bound, so smoothing cannot push
+        # the crop to the very edge the margin exists to hold it off.
+        def _blend(axis: str) -> float:
+            return (
+                (getattr(previous.crop, axis) + getattr(following.crop, axis))
+                / 2.0 * strength
+                + getattr(current.crop, axis) * (1.0 - strength)
+            )
+
+        def _inset(value: float, extent: float) -> float:
+            free = 1.0 - extent
+            if free <= 0.0:
+                return min(max(value, 0.0), free if free > 0 else 0.0)
+            return min(max(value, free * CROP_MARGIN), free * (1.0 - CROP_MARGIN))
+
         smoothed.append(
             Keyframe(
                 seconds=current.seconds,
                 crop=CropBox(
-                    x=min(max(blended, 0.0), 1.0 - current.crop.width),
-                    y=current.crop.y,
+                    x=_inset(_blend("x"), current.crop.width),
+                    y=_inset(_blend("y"), current.crop.height),
                     width=current.crop.width,
                     height=current.crop.height,
                 ),
