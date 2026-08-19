@@ -2436,6 +2436,24 @@ def _selection_schema(
                                 "（跟拍、揭示、推拉、pan）的那顆暫不支援，會自動回原速。"
                             ),
                         },
+                        "intentional_repeat": {
+                            "type": "boolean",
+                            "description": (
+                                "只有這顆是刻意重複前面某顆（首尾呼應、A/B "
+                                "對比、踩點強調同一畫面）時才填 true，並在 "
+                                "intentional_repeat_reason 說明為什麼要回到同"
+                                "一段畫面。預設留空即 false。素材不夠而被迫"
+                                "重用同一段不是刻意重複，別用它掩蓋——那要"
+                                "換來源或減一顆。"
+                            ),
+                        },
+                        "intentional_repeat_reason": {
+                            "type": "string",
+                            "description": (
+                                "intentional_repeat=true 時填：這次回到同一段"
+                                "畫面的剪輯目的。留空代表不是刻意重複。"
+                            ),
+                        },
                         "action_id": {
                             "type": "string",
                             "enum": ["none", *(action_ids or [])],
@@ -5662,29 +5680,83 @@ def repair_single_look_hold_overflow(
     return tuple(repaired)
 
 
+def _declared_repeat(shot: dict[str, Any]) -> bool:
+    """The editor said this shot repeats on purpose, and said why.
+
+    A bare flag with no reason is not a declaration -- the reason is what a
+    reviewer reads to agree or overrule. Intent lives with the later shot of
+    a pair, which is the one that chose to come back to the take.
+    """
+
+    return bool(shot.get("intentional_repeat")) and bool(
+        str(shot.get("intentional_repeat_reason") or "").strip()
+    )
+
+
 def sequence_disagreements(shots: list[dict[str, Any]]) -> list[str]:
-    """Accidental adjacent reuse that makes a cut appear to stop."""
+    """Reused footage that reads as a stop or as leaning on one take.
+
+    Two things are reported. Same frames shown twice -- overlapping windows
+    of one span -- almost never carries new information, and is now caught
+    wherever it happens rather than only between neighbours: a take used at
+    the head and again near the tail is the same accident as one used twice
+    in a row, and the adjacency test never saw it. And a single take carrying
+    three or more of the film's shots is the cut leaning on its coverage.
+
+    Either can be a real editorial choice -- a bookend, an A/B compare, a beat
+    that repeats for emphasis. A shot that says so in `intentional_repeat`
+    with a reason is trusted and left out of the count; the fault is for the
+    repeats nobody declared.
+    """
 
     notes: list[str] = []
-    for index, (left, right) in enumerate(zip(shots, shots[1:])):
-        same_source = str(left.get("source_id", "")) == str(
-            right.get("source_id", "")
-        )
-        left_start = float(left.get("start_seconds") or 0.0)
-        right_start = float(right.get("start_seconds") or 0.0)
-        left_end = left_start + float(left.get("seconds_needed") or 0.0)
-        right_end = right_start + float(right.get("seconds_needed") or 0.0)
-        overlap = min(left_end, right_end) - max(left_start, right_start)
-        same_span = str(left.get("span_id", "")) == str(
-            right.get("span_id", "")
-        )
-        if same_source and same_span and overlap > 0.25:
+
+    # Same frames, twice, anywhere in the film.
+    for i in range(len(shots)):
+        for j in range(i + 1, len(shots)):
+            left, right = shots[i], shots[j]
+            if str(left.get("source_id", "")) != str(right.get("source_id", "")):
+                continue
+            if str(left.get("span_id", "")) != str(right.get("span_id", "")):
+                continue
+            left_start = float(left.get("start_seconds") or 0.0)
+            right_start = float(right.get("start_seconds") or 0.0)
+            left_end = left_start + float(left.get("seconds_needed") or 0.0)
+            right_end = right_start + float(right.get("seconds_needed") or 0.0)
+            overlap = min(left_end, right_end) - max(left_start, right_start)
+            if overlap <= 0.25:
+                continue
+            if _declared_repeat(right) or _declared_repeat(left):
+                continue
             span = str(left.get("span_id", ""))
-            notes.append(
-                f"k{index:02d} and k{index + 1:02d} repeat overlapping "
-                f"windows of {span} ({overlap:.1f}s overlap); replan or "
-                "state an intentional repetition"
+            gap = (
+                "" if j == i + 1
+                else f" (they sit {j - i} shots apart, so it reads as coming "
+                "back to the same footage)"
             )
+            notes.append(
+                f"k{i:02d} and k{j:02d} repeat overlapping windows of {span} "
+                f"({overlap:.1f}s overlap){gap}; replan or declare "
+                "intentional_repeat with a reason"
+            )
+
+    # One take doing a lot of the cut.
+    by_source: dict[str, list[int]] = {}
+    for index, shot in enumerate(shots):
+        by_source.setdefault(str(shot.get("source_id", "")), []).append(index)
+    for source, indices in by_source.items():
+        if not source or len(indices) < 3:
+            continue
+        undeclared = [k for k in indices if not _declared_repeat(shots[k])]
+        if len(undeclared) < 3:
+            continue
+        where = ", ".join(f"k{k:02d}" for k in indices)
+        notes.append(
+            f"{source} carries {len(indices)} of the film's shots ({where}); "
+            "one take is doing a lot of the cut -- spread the coverage or "
+            "declare the repeats"
+        )
+
     return notes
 
 

@@ -8675,3 +8675,55 @@ def test_a_cut_is_tracked_from_the_frame_that_proved_the_identity():
     assert pipeline.CONFIRMED_REACH_SECONDS <= 10.0, (
         "far enough for a take's own close-up, not far enough to cross a scene"
     )
+
+
+def test_overlapping_windows_are_caught_far_apart_not_only_adjacent():
+    from montagewright.planner import sequence_disagreements
+
+    # The same take at the head and again twelve shots later: the same
+    # accident as two in a row, which the adjacency test never saw.
+    shots = [{"source_id": "C7", "span_id": "C7:s00", "start_seconds": 3.5,
+              "seconds_needed": 3.0}]
+    shots += [{"source_id": f"F{i}", "span_id": f"F{i}:s00",
+               "start_seconds": 0, "seconds_needed": 3.0} for i in range(11)]
+    shots += [{"source_id": "C7", "span_id": "C7:s00", "start_seconds": 5.0,
+               "seconds_needed": 3.0}]
+    notes = sequence_disagreements(shots)
+    assert any("overlapping windows of C7:s00" in n for n in notes)
+    assert any("12 shots apart" in n for n in notes)
+
+
+def test_a_declared_intentional_repeat_is_left_alone():
+    from montagewright.planner import sequence_disagreements
+
+    shots = [
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 0,
+         "seconds_needed": 7},
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 1,
+         "seconds_needed": 5, "intentional_repeat": True,
+         "intentional_repeat_reason": "bookend on the hero shot"},
+    ]
+    assert sequence_disagreements(shots) == []
+    # A flag with no reason is not a declaration.
+    shots[1].pop("intentional_repeat_reason")
+    assert any("overlapping windows" in n for n in sequence_disagreements(shots))
+
+
+def test_one_take_carrying_three_shots_is_flagged_as_over_reliance():
+    from montagewright.planner import sequence_disagreements
+
+    # Three non-overlapping moments of one take: not the same frames, but the
+    # cut leaning on one source.
+    shots = [
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 0,
+         "seconds_needed": 2},
+        {"source_id": "C2", "span_id": "C2:s00", "start_seconds": 0,
+         "seconds_needed": 2},
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 4,
+         "seconds_needed": 2},
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 8,
+         "seconds_needed": 2},
+    ]
+    notes = sequence_disagreements(shots)
+    assert any("carries 3 of the film's shots" in n for n in notes)
+    assert not any("overlapping windows" in n for n in notes)
