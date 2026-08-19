@@ -6526,11 +6526,15 @@ def test_cuts_are_placed_against_the_music_that_is_playing():
     assert min(c.time_seconds for c in heard.cues) >= 0.0
     assert heard.duration_seconds > 0
 
-    # Spliced music maps through the joins in order.
+    # Spliced music maps through the joins in order. The renderer crossfades
+    # the two spans, overlapping them by MUSIC_JOIN_SECONDS, so the delivered
+    # bed -- and the grid that must match it -- is that much shorter, and the
+    # second span sits that much earlier than its raw offset.
+    from montagewright.renderer import MUSIC_JOIN_SECONDS as _join
     joined = grid.as_heard(0.0, [(10.0, 14.0), (40.0, 44.0)])
-    assert joined.duration_seconds == 8.0
-    # The track's 40.0 is the fourth second of the film.
-    assert any(abs(c.time_seconds - 4.0) < 1e-6 for c in joined.cues)
+    assert abs(joined.duration_seconds - (8.0 - _join)) < 1e-6
+    # The track's 40.0 is span two's start, pulled a crossfade earlier.
+    assert any(abs(c.time_seconds - (4.0 - _join)) < 1e-6 for c in joined.cues)
     # And nothing from the discarded middle survives.
     assert not any(14.0 < c.time_seconds < 40.0 for c in joined.cues)
 

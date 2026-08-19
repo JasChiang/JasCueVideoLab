@@ -92,16 +92,29 @@ class BeatGrid:
                 return self
             spans = [(first, first + self.duration_seconds)]
 
+        # The renderer does not butt-join the spans, it crossfades each one
+        # into the next, and a crossfade of duration d overlaps the two by d
+        # seconds -- so the delivered bed is shorter than the raw sum by d for
+        # every join, and each span after the first sits d earlier than its
+        # raw offset. Counting cue times off the raw lengths (played += ends -
+        # begins) placed every cut after a join against a beat the audio had
+        # already passed, drifting by k*d toward the tail. Subtract the join
+        # time so the grid matches the bed the viewer actually hears. A single
+        # span has no join and is unaffected.
+        from montagewright.renderer import MUSIC_JOIN_SECONDS
+
+        join = MUSIC_JOIN_SECONDS if len(spans) > 1 else 0.0
         moved: list[Cue] = []
         played = 0.0
-        for begins, ends in spans:
+        for index, (begins, ends) in enumerate(spans):
+            shift = played - index * join
             for cue in self.cues:
                 if begins - 1e-6 <= cue.time_seconds <= ends + 1e-6:
                     moved.append(
                         Cue(
                             cue_id=cue.cue_id,
                             time_seconds=round(
-                                played + cue.time_seconds - begins, 6
+                                shift + cue.time_seconds - begins, 6
                             ),
                             kind=cue.kind,
                             strength=cue.strength,
@@ -112,7 +125,7 @@ class BeatGrid:
             bpm=self.bpm,
             meter=self.meter,
             cues=tuple(sorted(moved, key=lambda one: one.time_seconds)),
-            duration_seconds=played,
+            duration_seconds=played - max(0, len(spans) - 1) * join,
         )
 
     @property
