@@ -246,23 +246,43 @@ def test_slow_motion_reads_less_source_for_the_same_screen_time():
     assert segment.screen_duration_seconds == 2.0
 
 
-def test_speed_is_dropped_while_the_camera_follows_a_subject():
+def test_speed_composes_with_a_moving_crop_instead_of_being_dropped():
     from montagewright.reframe import CropPath, Keyframe
     from montagewright.executor import CropBox
 
-    following = CropPath(keyframes=[
+    moving = CropPath(keyframes=[
         Keyframe(0.0, CropBox(0.2, 0.0, 0.3, 1.0)),
         Keyframe(2.0, CropBox(0.5, 0.0, 0.3, 1.0)),
     ])
-    assert not following.is_static
+    assert not moving.is_static
     plan = plan_render(
         _edl(_clip("track", 1.0, 3.0, speed=2.0)), {"uhd": UHD},
-        crop_paths={"track": following},
+        crop_paths={"track": moving},
     )
     segment = plan.segments[0]
-    # Recorded speed wins so the tracked path still describes the frames shown.
-    assert segment.speed_ratio == 1.0
-    assert segment.out_seconds == 3.0
-    step = next(s for s in plan.degradations if s.clip_id == "track")
-    assert step.ladder_other == "speed_dropped_under_camera_move"
-    assert step.measured["requested_speed"] == 2.0
+    # The move keeps its speed: the renderer divides the crop clock by it, so
+    # the pan stretches across the source window and comes back retimed.
+    assert segment.speed_ratio == 2.0
+    assert segment.out_seconds == 5.0           # source read = 2s screen * 2
+    assert segment.screen_duration_seconds == 2.0
+    assert not any(
+        s.clip_id == "track"
+        and s.ladder_other == "speed_dropped_under_camera_move"
+        for s in plan.degradations
+    )
+
+
+def test_a_moving_crop_divides_its_clock_by_speed():
+    from montagewright.reframe import CropPath, Keyframe, ffmpeg_crop_filters
+    from montagewright.executor import CropBox
+
+    pan = CropPath(keyframes=[
+        Keyframe(0.0, CropBox(0.2, 0.0, 0.3, 1.0)),
+        Keyframe(3.0, CropBox(0.5, 0.0, 0.3, 1.0)),
+    ])
+    # Recorded speed leaves the clock as the plain stream time.
+    recorded = ffmpeg_crop_filters(pan, 3840, 2160, (1080, 1920), speed=1.0)
+    assert "/2.000000000" not in recorded[0]
+    # Off-speed divides the pan's clock so it plays over the wider window.
+    sped = ffmpeg_crop_filters(pan, 3840, 2160, (1080, 1920), speed=2.0)
+    assert "(t/2.000000000)" in sped[0]

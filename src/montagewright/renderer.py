@@ -244,7 +244,7 @@ def _render_segment(
         # separate command stream.
         filters.extend(ffmpeg_crop_filters(
             segment.crop_path, source.width, source.height, output_size,
-            output_fps=output_fps,
+            output_fps=output_fps, speed=segment.speed_ratio,
         ))
     elif segment.crop is not None:
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)
@@ -263,6 +263,7 @@ def _render_segment(
         handle_filters.extend(ffmpeg_crop_filters(
             segment.crop_path, source.width, source.height, output_size,
             output_fps=output_fps, clock_offset_seconds=head,
+            speed=segment.speed_ratio,
         ))
     elif segment.crop is not None:
         x, y, width, height = segment.crop.to_pixels(source.width, source.height)

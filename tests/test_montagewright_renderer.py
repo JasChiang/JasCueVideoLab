@@ -502,3 +502,41 @@ def test_music_survives_a_voiceless_cut_even_when_keep_voice_is_set(
     )
     # Audible, not the -91 dB of a bed multiplied into silence.
     assert mean > -40.0
+
+
+def test_a_sped_up_pan_renders_and_lands_its_screen_frames(tmp_path, monkeypatch):
+    import montagewright.renderer as renderer
+    from montagewright.reframe import CropPath, Keyframe
+    from montagewright.executor import CropBox
+
+    # A pan at double speed: two screen seconds, four of source read, the crop
+    # clock divided so the move spans the wider window. It must render (a valid
+    # filter chain) and deliver exactly the screen frames.
+    source_path = tmp_path / "src.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=maroon:s=1920x1080:d=5:r=30",
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=5",
+        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", str(source_path),
+    ], check=True)
+    source = Source("a", source_path, 5.0, 1920, 1080)
+    pan = CropPath(keyframes=[
+        Keyframe(0.0, CropBox(0.0, 0.0, 0.5, 1.0)),
+        Keyframe(2.0, CropBox(0.5, 0.0, 0.5, 1.0)),
+    ])
+    plan = RenderPlan(
+        project_id="sped-pan", output_size=(540, 960), output_fps=30,
+        segments=[Segment("k00", source, 0.0, 4.0, speed_ratio=2.0,
+                          crop_path=pan)],
+    )
+    monkeypatch.setattr(renderer, "_encoder", lambda *_: "libx264")
+
+    made = renderer.render(plan, tmp_path / "out")
+
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames", "-of", "json",
+        str(made.deliverable),
+    ], check=True, capture_output=True, text=True)
+    assert int(json.loads(probe.stdout)["streams"][0]["nb_frames"]) == 60

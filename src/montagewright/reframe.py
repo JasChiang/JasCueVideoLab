@@ -2226,6 +2226,7 @@ def ffmpeg_crop_filters(
     path: CropPath, width: int, height: int,
     output_size: tuple[int, int], *, output_fps: int = 30,
     clock_offset_seconds: float = 0.0,
+    speed: float = 1.0,
 ) -> list[str]:
     """Build filters that really execute pan, tilt *and* zoom per frame.
 
@@ -2235,6 +2236,13 @@ def ffmpeg_crop_filters(
     pull-outs at their opening size. For a zoom we map the changing authored
     rectangle to a fixed canvas with the perspective filter; all four
     authored coordinates are consequently evaluated on the same clock.
+
+    The path is authored on the screen clock, so its acceleration is priced
+    for the motion a viewer sees. When the shot plays off recorded speed the
+    filter still runs on the source-time stream, before the retime, so the
+    clock is divided by speed to stretch the same motion across the wider
+    source window; the retime then compresses it back and the perceived move
+    -- easing and all -- is exactly the one that was authored.
     """
 
     output_width, output_height = output_size
@@ -2244,8 +2252,13 @@ def ffmpeg_crop_filters(
         or abs(frame.crop.height - first.height) > 1e-6
         for frame in path.keyframes[1:]
     )
+    speed_changed = abs(float(speed) - 1.0) > 1e-6
+
+    def _retimed(base: str) -> str:
+        return base if not speed_changed else f"({base}/{float(speed):.9f})"
+
     if not zooms:
-        clock = (
+        clock = _retimed(
             "t" if abs(clock_offset_seconds) < 1e-9
             else f"(t-{clock_offset_seconds:.6f})"
         )
@@ -2257,7 +2270,7 @@ def ffmpeg_crop_filters(
             f"scale={output_width}:{output_height}",
         ]
 
-    clock = f"(on/{output_fps}-{clock_offset_seconds:.6f})"
+    clock = _retimed(f"(on/{output_fps}-{clock_offset_seconds:.6f})")
     ease = True if len(path.keyframes) <= 4 else None
     left = _axis_expression(path, lambda crop: crop.x, 1, ease=ease, clock=clock)
     top = _axis_expression(path, lambda crop: crop.y, 1, ease=ease, clock=clock)

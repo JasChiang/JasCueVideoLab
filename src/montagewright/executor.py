@@ -345,29 +345,11 @@ def plan_render(
 
         path = (crop_paths or {}).get(clip.clip_id)
         speed = float(getattr(clip, "speed", 1.0) or 1.0)
-        following = path is not None and not path.is_static
-        if following and abs(speed - 1.0) > 1e-6:
-            # Any moving crop -- a follow, a reveal, a push, a pan -- is a
-            # digital camera move sampled frame by frame over the source
-            # window. Retiming that window would leave the move describing
-            # seconds the shot no longer reads, so speed composes with a fixed
-            # frame, not with a move. Deliver at recorded speed and record the
-            # honest fault rather than desync the move from its footage.
-            degradations.append(
-                DegradationStep(
-                    clip_id=clip.clip_id,
-                    ladder="other",
-                    ladder_other="speed_dropped_under_camera_move",
-                    trigger=(
-                        "the shot has a digital camera move and asked to "
-                        "change speed; a move is timed to the source window "
-                        "and cannot be retimed yet, so it plays at recorded "
-                        "speed"
-                    ),
-                    measured={"requested_speed": round(speed, 3)},
-                )
-            )
-            speed = 1.0
+        # A digital move is authored on the screen clock and the renderer
+        # divides that clock by speed before the retime, so a pan or a push
+        # stretches across the wider source window and comes back as the move
+        # that was authored. Speed and a move compose; no shot is held back
+        # from it here.
         in_seconds, out_seconds = _resolve_times(
             clip, source, degradations, notes, speed=speed
         )

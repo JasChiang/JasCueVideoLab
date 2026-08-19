@@ -596,8 +596,8 @@ class Clip(ModelFacing):
             "Below 1.0 is slow motion, above 1.0 is sped up. The editor sets "
             "this to place a piece of action in a screen-length it chose -- "
             "often a beat-length -- so the source read becomes screen time "
-            "times this ratio. Not available while the camera follows a "
-            "subject."
+            "times this ratio. It composes with a camera move: a slow-motion "
+            "push or a sped-up pan both work."
         ),
     )
     in_looks_like: str = Field(
