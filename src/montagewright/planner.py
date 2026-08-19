@@ -51,13 +51,14 @@ def _http_options(types):
         retry_options=types.HttpRetryOptions(attempts=1),
     )
 MODEL_ID = "gemini-3.7-flash"
-# Gemini 3.7 currently accepts text-only interactions for this project but
-# rejects interactions that attach File API video.  A scoped Selection repair
-# is the only planning call that needs those clips after the first answer, so
-# keep the rest of the pipeline and its caches on 3.7 while using the proven
-# multimodal 3.6 endpoint for this bounded patch.
+# The whole pipeline runs on 3.7. The scoped Selection repair -- the one
+# planning call that re-attaches the File API clips after the first answer --
+# briefly used 3.6 because 3.7 was rejecting video attachments for this
+# project, which turned out to be a transient fault. It is back on 3.7 so the
+# pipeline is one model; the override stays only as an escape hatch if that
+# rejection ever recurs.
 SELECTION_PATCH_MODEL_ID = os.environ.get(
-    "MONTAGEWRIGHT_SELECTION_PATCH_MODEL", "gemini-3.6-flash"
+    "MONTAGEWRIGHT_SELECTION_PATCH_MODEL", MODEL_ID
 )
 
 # 3.7 Flash does not use custom sampling knobs, so consistency comes from the
