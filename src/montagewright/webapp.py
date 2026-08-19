@@ -2573,6 +2573,20 @@ def create_app() -> FastAPI:
                     if current_blocks
                     else shot.get("coverage_claim_seconds")
                 ),
+                # Speed is applied in the render; without it here the timeline
+                # UI could not show a shot as slow motion or sped up, so the
+                # slow-mo/speed-up annotation in the front end stayed dead.
+                "speed": (
+                    float(current_blocks[index].get("speed", 1.0) or 1.0)
+                    if current_blocks
+                    else float(shot.get("speed", 1.0) or 1.0)
+                ),
+                # A declared deliberate repeat, so the reviewer sees the reason
+                # rather than the shot looking like an accidental duplicate.
+                "intentional_repeat": bool(shot.get("intentional_repeat")),
+                "intentional_repeat_reason": str(
+                    shot.get("intentional_repeat_reason") or ""
+                ),
                 "in_seconds": (
                     float(current_blocks[index]["in_seconds"])
                     if current_blocks
@@ -2661,13 +2675,29 @@ def create_app() -> FastAPI:
         })
 
     @app.get("/api/runs/{run_id}/replacement-candidates")
-    def replacement_candidates(run_id: str, needed_seconds: float = 0.0):
-        """List card-approved local spans that preserve this edit slot."""
+    def replacement_candidates(
+        run_id: str, needed_seconds: float = 0.0, clip_index: int = -1
+    ):
+        """List card-approved local spans that preserve this edit slot.
+
+        When the shot being replaced is named (clip_index), a candidate whose
+        source already sits next to it is flagged: swapping in a neighbour's
+        take is the quickest way for a review change to introduce the very
+        repeated image the rest of the system is trying to avoid. Flagged
+        candidates are kept but sorted last so the distinct ones lead.
+        """
+
+        run = _run(run_id)
+        neighbour_sources: set[str] = set()
+        if clip_index >= 0:
+            blocks = _timeline_blocks(run)
+            for near in (clip_index - 1, clip_index + 1):
+                if 0 <= near < len(blocks):
+                    neighbour_sources.add(str(blocks[near].get("source_id", "")))
 
         from montagewright.clipcard import card_map, load_card
         from montagewright.spans import seconds_of
 
-        run = _run(run_id)
         mapped = card_map(
             run.output / "work" / "proxies", _library_of_run(run) / "cards"
         )
@@ -2692,7 +2722,10 @@ def create_app() -> FastAPI:
                     "summary": str(card.get("summary") or source_id),
                     "why": str(span.get("why") or ""),
                     "motion_role": str(span.get("motion_role") or "unknown"),
+                    "repeats_neighbour": source_id in neighbour_sources,
                 })
+        # Distinct takes lead; a neighbour's source is still offered, last.
+        candidates.sort(key=lambda one: one["repeats_neighbour"])
         return JSONResponse({"candidates": candidates})
 
     def _rebuild(

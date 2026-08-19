@@ -2365,6 +2365,7 @@ function inspect(i) {
         <span>進出點</span><span class="mono">${b.in_seconds.toFixed(2)}s → ${(b.in_seconds + b.seconds * ((b.speed && b.speed > 0) ? b.speed : 1)).toFixed(2)}s
           <i class="why">螢幕 ${b.seconds.toFixed(2)}s${(b.speed && b.speed !== 1) ? `・${b.speed < 1 ? '慢動作' : '加速'} ${b.speed}×（讀 ${(b.seconds * b.speed).toFixed(2)}s 素材）` : ''}${moved ? '，已改動' : ''}</i></span>
       </div>
+      ${b.intentional_repeat ? `<div class="pairs"><span>刻意重複</span><span class="why">${esc(b.intentional_repeat_reason || '未說明理由')}</span></div>` : ''}
       <div class="gainrow">
         <span class="why">音量</span>
         <input type="range" id="gain" min="-18" max="12" step="0.5"
@@ -2381,7 +2382,7 @@ function inspect(i) {
 
 async function chooseReplacement(i) {
   const b = blocks[i];
-  const got = await fetch(`/api/runs/${runId}/replacement-candidates?needed_seconds=${b.seconds}`);
+  const got = await fetch(`/api/runs/${runId}/replacement-candidates?needed_seconds=${b.seconds}&clip_index=${i}`);
   if (!got.ok) { alert('讀不到可替換片段'); return; }
   const candidates = (await got.json()).candidates || [];
   if (!candidates.length) { alert('沒有足以容納這個節奏格的可用片段'); return; }
@@ -2400,7 +2401,7 @@ async function chooseReplacement(i) {
     <div style="display:flex;gap:8px;justify-content:flex-end"><button id="replacement-cancel" class="bare">取消</button><button id="replacement-apply">套用片段</button></div>`;
   const choice = $('replacement-choice');
   choice.innerHTML = candidates.map((one, at) =>
-    `<option value="${at}">${esc(one.source_id)} · ${one.in_seconds.toFixed(1)}–${one.out_seconds.toFixed(1)}s · ${esc(one.summary)}</option>`
+    `<option value="${at}">${one.repeats_neighbour ? '⚠ 與鄰顆同來源 · ' : ''}${esc(one.source_id)} · ${one.in_seconds.toFixed(1)}–${one.out_seconds.toFixed(1)}s · ${esc(one.summary)}</option>`
   ).join('');
   const preview = $('replacement-preview');
   const show = () => {
