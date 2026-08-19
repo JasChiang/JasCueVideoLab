@@ -2178,9 +2178,16 @@ def confirm_source_identity(
             seed_risk_flags=exact_seed_risk_flags(evaluation.decision),
         ))
     verdicts = [one.decision.verdict for one in batch.evaluations]
+    # A durable hard_negative drops the source's commitments, so it needs more
+    # than one unlucky frame: a real take caught edge-on or mid-occlusion can
+    # read negative once, and dropping it there loses a valid source for good.
+    # Two independent negatives before condemning; one leaves it uncertain,
+    # which fails open -- the per-shot exact check still runs. A lookalike
+    # still fails repeatedly, so this does not loosen the guard against them.
+    # This matches the cross-asset path, which already refuses a single frame.
     status = (
         "confirmed" if confirmed
-        else "hard_negative" if verdicts and all(
+        else "hard_negative" if len(verdicts) >= 2 and all(
             verdict == "hard_negative" for verdict in verdicts
         )
         else "uncertain"
