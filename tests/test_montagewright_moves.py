@@ -6672,7 +6672,10 @@ def test_direction_owns_shot_density_and_selection_enforces_a_range():
         [f"C{i}:s00" for i in range(74)],
         min_shots=lower, max_shots=upper,
     )["properties"]["shots"]
-    assert "26 to 34" in shots["description"]
+    # The range is stated as a target, not a hard quota: fewer distinct shots
+    # is allowed, padding to a count is not, and the upper cap still stands.
+    assert "26-34" in shots["description"]
+    assert "target" in shots["description"] and "never pad" in shots["description"]
     assert "minItems" not in shots and "maxItems" not in shots
 
 

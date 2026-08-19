@@ -2338,7 +2338,11 @@ def _selection_schema(
                 # 400. State density here and validate it on receipt instead
                 # of compiling the count into the grammar.
                 "description": (
-                    f"Return {min_shots} to {max_shots} shots."
+                    f"Aim for about {min_shots}-{max_shots} shots, but this "
+                    "is a target, not a quota: if the material only supports "
+                    "fewer distinct shots, deliver fewer -- never pad or "
+                    "repeat a take to reach a count. Do not exceed "
+                    f"{max_shots}."
                     if min_shots is not None and max_shots is not None
                     else "The ordered shots in the cut."
                 ),
@@ -3910,12 +3914,15 @@ def select_shots(
         shot_count = len(chosen.get("shots") or [])
         faults = []
         identity_advisories = []
-        if (
-            (min_shots is not None and shot_count < min_shots)
-            or (max_shots is not None and shot_count > max_shots)
-        ):
+        # The count is a target, not a quota. Too many shots is still worth
+        # catching -- it usually means one beat was fragmented -- but too few
+        # is not a fault: when the material only supports a handful of distinct
+        # shots, a shorter cut is the honest answer, and forcing the count up
+        # is exactly what made a take get reused to reach a number.
+        if max_shots is not None and shot_count > max_shots:
             faults.append(
-                f"shot count {shot_count} is outside {min_shots}–{max_shots}"
+                f"shot count {shot_count} is above the {max_shots} the "
+                "direction's density allows; combine or drop, do not fragment"
             )
         faults.extend(selection_clock_disagreements(chosen.get("shots") or []))
         if not validating_previous:
@@ -4299,12 +4306,12 @@ def audit_cached_selection(
                 f"answer: {error}"
             )
 
-    if (
-        (min_shots is not None and len(shots) < min_shots)
-        or (max_shots is not None and len(shots) > max_shots)
-    ):
+    # A soft target: only an over-count (a fragmented beat) is a fault; fewer
+    # distinct shots than the target is the honest answer to thin material.
+    if max_shots is not None and len(shots) > max_shots:
         faults.append(
-            f"shot count {len(shots)} is outside {min_shots}–{max_shots}"
+            f"shot count {len(shots)} is above the {max_shots} the "
+            "direction's density allows; combine or drop, do not fragment"
         )
     check("clock", lambda: selection_clock_disagreements(shots))
     check("span", lambda: span_contract_disagreements(shots, usable))
