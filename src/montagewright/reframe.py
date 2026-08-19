@@ -499,7 +499,10 @@ def seconds_needed_for(
             abs(after[2] - before[2]),
             abs(after[3] - before[3]),
         )
-        travelling += gap / ceiling
+        # Priced against the smoothstep *peak* (1.5x the average), matching
+        # the leg floor the executor uses, so Selection asks for the seconds
+        # the move actually needs instead of one the render then overruns.
+        travelling += 1.5 * gap / ceiling
     return round(resting + travelling, 3)
 
 
@@ -839,7 +842,14 @@ def build_look_path(
     # reads as a shove-and-stop. Charge both, per leg, and take the greater.
     accel = float(limits.get("max_accel") or 0.0)
     def _leg_floor(distance: float) -> float:
-        speed_floor = distance / ceiling if ceiling > 0 else 0.0
+        # The ramp is a smoothstep, whose velocity peaks at 1.5x its average
+        # (d(3u^2-2u^3)/du = 6u(1-u), max 1.5 at u=0.5). Charging the speed
+        # budget against the average d/ceiling let the mid-stroke peak run
+        # 1.5x over max_speed -- the "too fast" a viewer sees even when the
+        # numbers say the shot was clean. Size the leg so the *peak* stays in
+        # budget: 1.5d/ceiling. The acceleration side already charges its own
+        # peak (6d/T^2); take the greater.
+        speed_floor = 1.5 * distance / ceiling if ceiling > 0 else 0.0
         accel_floor = math.sqrt(6.0 * distance / accel) if accel > 0 else 0.0
         return max(speed_floor, accel_floor)
     minimum_travel = sum(_leg_floor(one) for one in spans)

@@ -805,7 +805,7 @@ def test_selection_prices_camera_time_from_legacy_card_geometry() -> None:
     faults = camera_duration_disagreements([shot], material)
 
     assert len(faults) == 1
-    assert "2.840s" in faults[0]
+    assert "3.260s" in faults[0]
     # Six-wide rows predate space having a provenance, and what they hold is
     # a referring box. Saying "measured" of one was the claim that let a
     # phrase be priced as the object a crop follows.
@@ -867,7 +867,7 @@ def test_same_subject_push_uses_measured_zoom_distance_not_move_constant() -> No
     faults = camera_duration_disagreements([shot], material)
 
     assert len(faults) == 1
-    assert "2.045s" in faults[0]
+    assert "2.318s" in faults[0]
     assert "2.500s" not in faults[0]
 
 
@@ -885,8 +885,13 @@ def test_selection_keeps_shot_and_rhythm_when_only_preferred_rests_overflow() ->
         ),
     )]
     chosen = {"shots": [{
+        # medium, not low: at the peak-aware speed budget a low-energy push
+        # across this zoom genuinely does not fit 1.5s (it only "fit" before
+        # because the ramp was allowed to peak 1.5x over the ceiling). The
+        # test is about rests overflowing while the move itself fits, so it
+        # needs an energy where the move honestly fits.
         "source_id": "C8343", "commitment_id": "cmt_model",
-        "camera_intent": "push_in", "energy": "low",
+        "camera_intent": "push_in", "energy": "medium",
         "seconds_needed": 1.5,
         "looks": [
             {
@@ -1390,7 +1395,7 @@ def test_multi_look_rests_fit_locally_when_the_move_itself_still_fits() -> None:
         ),
     )
     edl = EDL(project_id="p", clips=[clip])
-    assert _floor_for(clip) == 3.3
+    assert _floor_for(clip) == 3.7
 
     repairs = _fit_camera_rests_to_shot(selection, edl)
     repaired_reframe = clip.reframe.model_copy(update={
@@ -1398,7 +1403,7 @@ def test_multi_look_rests_fit_locally_when_the_move_itself_still_fits() -> None:
     })
 
     assert repairs and "keeps its travel" in repairs[0]
-    assert sum(one["seconds"] for one in selection["shots"][0]["looks"]) == 2.2
+    assert round(sum(one["seconds"] for one in selection["shots"][0]["looks"]), 3) == 1.8
     assert _floor_for(clip.model_copy(update={"reframe": repaired_reframe})) == 3.0
 
 

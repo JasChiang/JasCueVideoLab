@@ -32,7 +32,11 @@ def _grid():
 def test_preferred_camera_duration_extends_the_same_move_inside_usable_window():
     from montagewright.planning_release import resolve_preferred_camera_durations
 
-    clip = _clip(seconds=2.0, move="reveal", usable_to=6.0).model_copy(update={
+    # usable_to 7.0, not 6.0: the peak-aware move floor for this reveal is now
+    # ~6.6s, so a 6.0s window can no longer hold it and nothing would extend.
+    # The test is about extending INTO the usable window, so the window must
+    # be able to hold the honestly-priced move.
+    clip = _clip(seconds=2.0, move="reveal", usable_to=7.0).model_copy(update={
         "reframe": Reframe(
             looks=[
                 Look(at="left", seconds=1.5, presentation_intent="complete_hold"),

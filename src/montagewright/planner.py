@@ -1709,8 +1709,11 @@ def _travel_seconds(room: float) -> str:
     from montagewright.reframe import ENERGY_LIMITS
     from montagewright.schema import LOOK_ENERGIES
 
+    # 1.5x because the ramp is a smoothstep whose velocity peaks at 1.5x its
+    # average; the executor sizes its legs against that peak, so the price
+    # quoted here has to as well or the two drift apart again.
     return "／".join(
-        f"{label} {max(0.0, room) / ENERGY_LIMITS[energy]['max_speed']:.1f}s"
+        f"{label} {1.5 * max(0.0, room) / ENERGY_LIMITS[energy]['max_speed']:.1f}s"
         for label, energy in LOOK_ENERGIES.items()
     )
 

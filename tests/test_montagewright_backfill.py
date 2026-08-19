@@ -685,7 +685,7 @@ def test_the_planner_is_told_which_moves_have_nowhere_to_go():
     assert "縱向沒有空間" in said
     # And what the room costs in seconds, which is the half that was missing:
     # a distance nobody can price is a move nobody asks for.
-    assert "走完全程" in said and "medium 1.0s" in said
+    assert "走完全程" in said and "medium 1.5s" in said
 
 
 def test_a_source_already_at_the_delivery_aspect_says_neither_move_works():

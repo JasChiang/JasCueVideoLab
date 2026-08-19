@@ -95,9 +95,9 @@ def test_grounding_protects_a_camera_move_floor_off_grid():
     after = ground_timeline(edl, grid)
 
     assert after.clips[0].move_too_short is None
-    assert after.clips[0].duration_seconds == 4.0
+    assert after.clips[0].duration_seconds == 5.0
     assert after.clips[0].landed_on is None
-    assert "planned pan needs 4.00s" in (after.clips[0].note or "")
+    assert "planned pan needs 5.00s" in (after.clips[0].note or "")
 
 
 def test_no_music_uses_the_same_camera_completion_floor():
@@ -116,7 +116,7 @@ def test_no_music_uses_the_same_camera_completion_floor():
 
     grounded = ground_timeline(EDL(project_id="silent", clips=[clip]), None)
 
-    assert grounded.clips[0].duration_seconds == 4.0
+    assert grounded.clips[0].duration_seconds == 5.0
     assert grounded.clips[0].move_too_short is None
 
 
