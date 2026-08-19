@@ -323,8 +323,12 @@ def provider_commitment_schema(
         "description": (
             "先定義每個畫面必須履行的內容承諾，再為同一承諾保留 primary "
             "與可替換的 alternate。這不是最後時間軸；節奏只能在這些能履約的"
-            "候選中選擇。每個 commitment 是一個預計只出現一次的鏡頭 slot，"
-            "恰好一個 primary；需要多顆完成同一故事目的時建立多個 commitment。"
+            "候選中選擇。每個 commitment 是一個「故事點」，可以由一顆或多顆"
+            "鏡頭覆蓋（例如全景＋推近＋細節共同證明同一件事）；恰好一個 "
+            "primary。同一故事點若給多顆，每顆必須明顯不同——不同來源、"
+            "景別差一級以上、或拍帶中不重疊的另一時刻；同一段源時間絕不放兩次。"
+            "primary 與 alternate 若視覺上幾乎一樣（例如同一面招牌的兩個角度），"
+            "別把兩個都當鏡頭用，挑最好的一支。"
         ),
         "items": {
             "type": "object",
@@ -1226,15 +1230,17 @@ def validate_selection_commitments(
         )
         if outcome_fault:
             faults.append(outcome_fault)
+    # A story point may take more than one shot -- that is coverage, the way a
+    # wide, a push and a detail together prove one idea. So a commitment used
+    # by several shots is legal now; what is not is showing the same frames
+    # twice, and that is caught for the whole film by the overlapping-window
+    # audit rather than by a blanket count here. A required point must still be
+    # answered, so it must appear at least once.
     for commitment_id in commitments.required_ids:
-        count = seen.get(commitment_id, 0)
-        if count != 1:
+        if seen.get(commitment_id, 0) < 1:
             faults.append(
-                f"required commitment {commitment_id} appears {count} times"
+                f"required commitment {commitment_id} is never covered"
             )
-    for commitment_id, count in seen.items():
-        if count > 1:
-            faults.append(f"commitment {commitment_id} appears {count} times")
     return faults
 
 

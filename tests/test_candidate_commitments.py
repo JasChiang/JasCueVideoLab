@@ -658,7 +658,10 @@ def test_selection_must_use_an_option_and_fulfil_every_required_commitment():
         [{"commitment_id": "hero", "span_id": "C1:s01"}], commitments
     )
     assert "outside commitment hero" in faults[0]
-    assert "appears 0 times" in validate_selection_commitments([], commitments)[0]
+    # A required story point left uncovered is still a fault; being covered by
+    # more than one distinct shot is now allowed (coverage), so only the
+    # never-covered case is checked here.
+    assert "never covered" in validate_selection_commitments([], commitments)[0]
 
 
 def test_direction_cannot_commit_to_a_source_it_also_ruled_broken():
@@ -1097,3 +1100,35 @@ def test_describe_warns_only_commitments_down_to_one_source():
     assert "只有一支來源" in header
     assert "one_take" in header
     assert "two_takes" not in header
+
+
+def test_a_commitment_may_be_covered_by_several_distinct_shots():
+    # Coverage: one story point proven by two shots of different sources is
+    # legal now; the old rule faulted any commitment used more than once.
+    option = CandidateOption(
+        commitment_id="hero", purpose="prove it", required=True,
+        picture_role="primary_action", target_id="none",
+        span_id="C1:s00", min_supported_seconds=1.0, tier="primary",
+        presentation_intent="centered_hold",
+        motion_preference="virtual_allowed", why="w",
+    )
+    alt = CandidateOption(
+        commitment_id="hero", purpose="prove it", required=True,
+        picture_role="primary_action", target_id="none",
+        span_id="C2:s00", min_supported_seconds=1.0, tier="alternate",
+        presentation_intent="centered_hold",
+        motion_preference="virtual_allowed", why="w",
+    )
+    commitments = CandidateCommitments(
+        contract_version="candidate-commitment-v5-visual-relationships",
+        material_digest="a" * 64, direction_sha256="b" * 64,
+        grounding_sha256=None, target_aspect="9:16", target_seconds=20.0,
+        options=(option, alt),
+    )
+    shots = [
+        {"commitment_id": "hero", "span_id": "C1:s00", "seconds_needed": 2.0,
+         "looks": []},
+        {"commitment_id": "hero", "span_id": "C2:s00", "seconds_needed": 2.0,
+         "looks": []},
+    ]
+    assert validate_selection_commitments(shots, commitments) == []
