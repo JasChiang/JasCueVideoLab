@@ -575,10 +575,18 @@ def _resolve_times(
                 },
             )
         )
-    elif clip.approx_out_seconds > source.duration_seconds:
+    elif in_seconds + source_span > source.duration_seconds + 1e-6:
+        # The source read -- screen span times speed -- ran off the end of the
+        # file, so the out-point was clamped and the shot delivers fewer screen
+        # seconds than planned. Comparing the screen out-point to the source
+        # length missed this whenever speed > 1: the screen out could sit
+        # inside the file while the sped-up source read it needed did not.
+        ratio = speed if speed > 0.0 else 1.0
+        delivered_screen = (out_seconds - in_seconds) / ratio
         notes.append(
             f"{clip.clip_id}: out-point trimmed to the end of "
-            f"{clip.source_id} ({source.duration_seconds:.3f}s)"
+            f"{clip.source_id} ({source.duration_seconds:.3f}s); delivers "
+            f"{delivered_screen:.2f}s of the planned {screen_span:.2f}s"
         )
     return in_seconds, out_seconds
 

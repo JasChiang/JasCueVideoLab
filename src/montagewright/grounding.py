@@ -988,8 +988,15 @@ def _put_anchor_on_the_music(
     if at is None:
         return None, f"no moment called '{wanted}' in this take"
 
-    length = clip.approx_out_seconds - clip.approx_in_seconds
-    shows_at = cursor + (at - clip.approx_in_seconds)
+    # `at` and the in-point are source-clock; (out - in) is screen time. Under
+    # speed the source read is that screen span times speed, and a source
+    # second shows (1/speed) screen seconds after the in-point. Fold speed in
+    # so a slow-motion or sped-up shot lands its anchored moment on the beat
+    # instead of a beat scaled away from it. speed 1.0 leaves this unchanged.
+    speed = float(getattr(clip, "speed", 1.0) or 1.0)
+    screen_length = clip.approx_out_seconds - clip.approx_in_seconds
+    source_length = screen_length * speed
+    shows_at = cursor + (at - clip.approx_in_seconds) / speed
     kind = clip.music_sync.anchor_lands_on
     candidates = [one for one in grid.cues if one.kind == kind]
     if not candidates:
@@ -1003,7 +1010,7 @@ def _put_anchor_on_the_music(
         "after": grid.seconds_per_beat,
     }.get(clip.music_sync.anchor_relation, 0.0)
 
-    begins = at - (aimed - cursor)
+    begins = at - (aimed - cursor) * speed
     # A musical anchor may add pre-roll before protected source content, but
     # it may not move the in-point through the beginning of that content.
     # Doing so made a perfectly valid complete action fail only in the final
@@ -1033,7 +1040,7 @@ def _put_anchor_on_the_music(
         )
     window = clip.usable_window
     if window is not None and not (
-        window[0] - 1e-6 <= begins and begins + length <= window[1] + 1e-6
+        window[0] - 1e-6 <= begins and begins + source_length <= window[1] + 1e-6
     ):
         return None, (
             f"putting '{wanted}' on the {kind} needs this shot to start at "

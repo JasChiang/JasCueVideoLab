@@ -286,3 +286,27 @@ def test_a_moving_crop_divides_its_clock_by_speed():
     # Off-speed divides the pan's clock so it plays over the wider window.
     sped = ffmpeg_crop_filters(pan, 3840, 2160, (1080, 1920), speed=2.0)
     assert "(t/2.000000000)" in sped[0]
+
+
+def test_speed_up_that_runs_off_the_source_reports_the_screen_shortfall():
+    # 10s of screen at 2x needs 20s of source; a 15s file cannot supply it, so
+    # the shot is clamped and delivers 7.5s. Comparing the screen out-point to
+    # the file length missed this under speed>1; the source read is checked now.
+    from montagewright.executor import _resolve_times, Source
+    from montagewright.schema import Clip
+    from pathlib import Path
+
+    notes: list[str] = []
+    clip = Clip(clip_id="k00", source_id="C1", approx_in_seconds=0.0,
+                approx_out_seconds=10.0, speed=2.0)
+    source = Source("C1", Path("x.mp4"), 15.0, 1920, 1080)
+    in_s, out_s = _resolve_times(clip, source, [], notes, speed=2.0)
+    assert out_s == 15.0
+    assert notes and "delivers 7.50s of the planned 10.00s" in notes[0]
+
+    # Recorded speed with room to spare reports nothing.
+    quiet: list[str] = []
+    ok = Clip(clip_id="k", source_id="C1", approx_in_seconds=0.0,
+              approx_out_seconds=8.0)
+    _resolve_times(ok, source, [], quiet, speed=1.0)
+    assert quiet == []
