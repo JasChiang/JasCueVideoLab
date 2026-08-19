@@ -5693,6 +5693,50 @@ def _declared_repeat(shot: dict[str, Any]) -> bool:
     )
 
 
+def _overlapping_repeat_pairs(
+    shots: list[dict[str, Any]],
+) -> "list[tuple[int, int, float, str]]":
+    """Undeclared pairs that show overlapping source windows of one span.
+
+    Overlapping windows of the same take are the same frames on screen twice,
+    which is the one repeat that almost never carries new information. Yielded
+    as (earlier index, later index, overlap seconds, span) for both the notes
+    a reviewer reads and the clips delivery marks. A pair one shot declares an
+    intentional repeat on is left out -- the declaration is the answer.
+    """
+
+    pairs: list[tuple[int, int, float, str]] = []
+    for i in range(len(shots)):
+        for j in range(i + 1, len(shots)):
+            left, right = shots[i], shots[j]
+            if str(left.get("source_id", "")) != str(right.get("source_id", "")):
+                continue
+            if str(left.get("span_id", "")) != str(right.get("span_id", "")):
+                continue
+            left_start = float(left.get("start_seconds") or 0.0)
+            right_start = float(right.get("start_seconds") or 0.0)
+            left_end = left_start + float(left.get("seconds_needed") or 0.0)
+            right_end = right_start + float(right.get("seconds_needed") or 0.0)
+            overlap = min(left_end, right_end) - max(left_start, right_start)
+            if overlap <= 0.25:
+                continue
+            if _declared_repeat(right) or _declared_repeat(left):
+                continue
+            pairs.append((i, j, overlap, str(left.get("span_id", ""))))
+    return pairs
+
+
+def repeated_image_clip_indices(shots: list[dict[str, Any]]) -> set[int]:
+    """The later shot of each undeclared overlapping-window repeat.
+
+    That shot is the one that came back to footage an earlier shot already
+    used, so it is the one delivery marks for review rather than shipping the
+    same frames twice inside a finished cut.
+    """
+
+    return {j for _, j, _, _ in _overlapping_repeat_pairs(shots)}
+
+
 def sequence_disagreements(shots: list[dict[str, Any]]) -> list[str]:
     """Reused footage that reads as a stop or as leaning on one take.
 
@@ -5712,33 +5756,17 @@ def sequence_disagreements(shots: list[dict[str, Any]]) -> list[str]:
     notes: list[str] = []
 
     # Same frames, twice, anywhere in the film.
-    for i in range(len(shots)):
-        for j in range(i + 1, len(shots)):
-            left, right = shots[i], shots[j]
-            if str(left.get("source_id", "")) != str(right.get("source_id", "")):
-                continue
-            if str(left.get("span_id", "")) != str(right.get("span_id", "")):
-                continue
-            left_start = float(left.get("start_seconds") or 0.0)
-            right_start = float(right.get("start_seconds") or 0.0)
-            left_end = left_start + float(left.get("seconds_needed") or 0.0)
-            right_end = right_start + float(right.get("seconds_needed") or 0.0)
-            overlap = min(left_end, right_end) - max(left_start, right_start)
-            if overlap <= 0.25:
-                continue
-            if _declared_repeat(right) or _declared_repeat(left):
-                continue
-            span = str(left.get("span_id", ""))
-            gap = (
-                "" if j == i + 1
-                else f" (they sit {j - i} shots apart, so it reads as coming "
-                "back to the same footage)"
-            )
-            notes.append(
-                f"k{i:02d} and k{j:02d} repeat overlapping windows of {span} "
-                f"({overlap:.1f}s overlap){gap}; replan or declare "
-                "intentional_repeat with a reason"
-            )
+    for i, j, overlap, span in _overlapping_repeat_pairs(shots):
+        gap = (
+            "" if j == i + 1
+            else f" (they sit {j - i} shots apart, so it reads as coming "
+            "back to the same footage)"
+        )
+        notes.append(
+            f"k{i:02d} and k{j:02d} repeat overlapping windows of {span} "
+            f"({overlap:.1f}s overlap){gap}; replan or declare "
+            "intentional_repeat with a reason"
+        )
 
     # One take doing a lot of the cut.
     by_source: dict[str, list[int]] = {}

@@ -8727,3 +8727,23 @@ def test_one_take_carrying_three_shots_is_flagged_as_over_reliance():
     notes = sequence_disagreements(shots)
     assert any("carries 3 of the film's shots" in n for n in notes)
     assert not any("overlapping windows" in n for n in notes)
+
+
+def test_repeated_image_marks_the_returning_shot_unless_declared():
+    from montagewright.planner import repeated_image_clip_indices
+
+    shots = [
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 0,
+         "seconds_needed": 3},
+        {"source_id": "C2", "span_id": "C2:s00", "start_seconds": 0,
+         "seconds_needed": 3},
+        {"source_id": "C1", "span_id": "C1:s00", "start_seconds": 1,
+         "seconds_needed": 3},
+    ]
+    # The later shot (index 2) came back to C1's window; it is the one marked.
+    assert repeated_image_clip_indices(shots) == {2}
+
+    # Declared with a reason, it is left alone.
+    shots[2]["intentional_repeat"] = True
+    shots[2]["intentional_repeat_reason"] = "bookend"
+    assert repeated_image_clip_indices(shots) == set()

@@ -93,6 +93,7 @@ from montagewright.planner import (
     repair_selection_source_windows,
     normalize_selection,
     repair_single_look_hold_overflow,
+    repeated_image_clip_indices,
     sequence_disagreements,
     select_shots,
 )
@@ -2507,6 +2508,13 @@ def command_render(args: argparse.Namespace) -> int:
     # a rendering problem -- both halves came from the same answer, so it
     # says the planner was of two minds and the film will follow the looks.
     disagreed: list[str] = list(selection.get("frame_disagreements") or [])
+    # A repeated image the whole-film check found is something a reviewer must
+    # see in the report, not only in the run log: the earlier path recorded it
+    # on the selection alone, so a far-apart repeat shipped as a finished cut
+    # with nothing in the delivered report saying so.
+    disagreed.extend(
+        note for note in cached_sequence_faults if note not in disagreed
+    )
     for note in disagreed:
         print(f"  {note}", flush=True)
 
@@ -4085,6 +4093,15 @@ def _delivery_selection(
 
     delivery_selection = copy.deepcopy(selection)
     unresolved_by_clip: dict[str, list[str]] = {}
+    # A shot that returns to source another shot already used, without saying
+    # it meant to, shows the same frames twice. That is a review the delivered
+    # status must carry, not a detail buried in the run log: mark the returning
+    # shot so the cut does not ship "ready" while repeating itself.
+    for index in repeated_image_clip_indices(selection.get("shots") or []):
+        unresolved_by_clip.setdefault(f"k{index:02d}", []).append(
+            "重複畫面：這顆回到前一顆已用過的同一段源時間；換素材、"
+            "換時刻，或在 intentional_repeat 說明為什麼刻意重複"
+        )
     for step in degradations:
         if getattr(step, "severity", "advisory") != "blocking_shot":
             continue
