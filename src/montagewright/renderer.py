@@ -401,6 +401,14 @@ def _concat(
     keyframe, which drifted a two-shot test by 124ms -- and every cut in this
     pipeline is placed against a measured beat, so drift that accumulates
     across a timeline is not a rounding detail, it is the alignment gone.
+
+    A residual per-segment AAC priming does leave the copied audio a few
+    milliseconds long over a whole timeline. Measured, it is ~4ms a join --
+    small, and re-encoding it away here either overshoots (the priming is
+    preserved, not removed) or needs -shortest, which trims the video of a
+    slowed segment whose retimed audio is shorter. The clean fix lays all
+    audio on one continuous track rather than per segment, which is part of
+    the audio-track work in the planning merge; until then the copy stands.
     """
 
     listing = work_dir / "concat.txt"
