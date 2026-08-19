@@ -2066,7 +2066,11 @@ def test_the_bed_is_placed_under_the_voice_not_under_the_music() -> None:
     assert not hasattr(renderer, "MUSIC_UNDER_VOICE_DB")
     assert renderer.BED_BELOW_VOICE_DB > 0
     source = inspect.getsource(renderer._mux_music)
-    assert "_level(picture) - _level(music) - BED_BELOW_VOICE_DB" in source
+    # The bed is priced relative to the voice and to the music, not a fixed
+    # level -- and against the voice estimated from the picture's peak (minus
+    # a speech crest), so silence around sparse speech does not drag it down.
+    assert "(_peak(picture) - SPEECH_CREST_DB) - _level(music) - BED_BELOW_VOICE_DB" in source
+    assert renderer.SPEECH_CREST_DB > 0
 
 
 def test_pauses_come_from_the_punctuation_the_recogniser_wrote() -> None:

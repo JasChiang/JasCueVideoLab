@@ -168,6 +168,28 @@ def _level(path: Path) -> float:
     return -20.0
 
 
+# Speech peaks roughly this far above its own long-term average, so a picture's
+# peak minus this is a decent estimate of where the voice actually sits --
+# independent of how much silence surrounds it, which the mean is not.
+SPEECH_CREST_DB = 15.0
+
+
+def _peak(path: Path) -> float:
+    """Peak level of a file's audio, in dBFS."""
+
+    completed = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", str(path),
+            "-af", "volumedetect", "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    for line in completed.stderr.splitlines():
+        if "max_volume:" in line:
+            return float(line.split("max_volume:")[1].split("dB")[0])
+    return -3.0
+
+
 def probe_duration(path: Path) -> float:
     completed = subprocess.run(
         [
@@ -499,8 +521,15 @@ def _mux_music(
         f":d={min(fade_out_seconds, duration):.3f}"
         if fade_out_seconds > 0.0 else ""
     )
+    # Sit the bed under the VOICE, not under the picture's mean level. The
+    # mean is dragged down by silence, so a cut with a little speech over a lot
+    # of quiet b-roll priced the bed against near-silence and drove it
+    # inaudible -- and the voice in the mix is speech-levelled anyway, so the
+    # raw mean was the wrong reference even for continuous speech. Estimate the
+    # voice from the picture's peak minus a speech crest, which the surrounding
+    # silence does not move.
     bed_gain = (
-        _level(picture) - _level(music) - BED_BELOW_VOICE_DB
+        (_peak(picture) - SPEECH_CREST_DB) - _level(music) - BED_BELOW_VOICE_DB
         if keep_voice
         else 0.0
     )
