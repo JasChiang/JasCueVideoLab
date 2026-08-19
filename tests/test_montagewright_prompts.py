@@ -73,7 +73,11 @@ SPOKEN_OF = {
     # after the answer comes back, and the shot review names the ladder rungs
     # the executor records rather than any field of its own.
     "clipcard_zh-TW.txt": set(),
-    "direction_zh-TW.txt": set(),
+    # `candidate_options` is a real direction field, but it is attached to the
+    # schema only when grounding/commitments are enabled (planner ~1675), so
+    # the bare _direction_schema() the lint builds does not list it. It is a
+    # genuine field the prompt must name, so it is allowed here explicitly.
+    "direction_zh-TW.txt": {"candidate_options"},
     # Selection reads the card's vocabulary off the material listing and
     # never writes it: shot size, which way a subject faces, and how the
     # content is laid out are all decided one step earlier. Taken from the
