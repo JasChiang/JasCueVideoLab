@@ -380,9 +380,28 @@ def load_beat_grid(lock_path: Path) -> BeatGrid:
     """
 
     payload = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+    # The lock keeps a readable label for each section ("section_002"), but the
+    # cues it stores are renamed to opaque "locked-cue-00042" ids. named_points
+    # keys section-boundary cues by their id, so on this reviewed-delivery path
+    # a shot asking to land on "the chorus"/"section_002" could never resolve
+    # and was silently placed like any other cut. Restore the label on the
+    # boundary cues by matching sample_index, so sync_to works here too.
+    section_label_by_sample = {
+        int(section["start_sample"]): str(section["label"])
+        for section in payload.get("sections", [])
+        if section.get("label") and section.get("start_sample") is not None
+    }
+
+    def _cue_id(entry: dict) -> str:
+        if entry.get("kind") == "section_boundary":
+            label = section_label_by_sample.get(int(entry.get("sample_index", -1)))
+            if label:
+                return label
+        return str(entry["cue_id"])
+
     cues = tuple(
         Cue(
-            cue_id=str(entry["cue_id"]),
+            cue_id=_cue_id(entry),
             time_seconds=float(entry["time_ms"]) / 1000.0,
             kind=str(entry["kind"]),
             strength=float(entry.get("strength") or 0.0),

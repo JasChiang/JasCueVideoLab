@@ -185,3 +185,38 @@ def test_exact_rhythm_is_not_locally_desynchronised():
         _edl(), _grid(), target_seconds=6.0, duration_mode="exact",
     )
     assert all(clip.music_sync.cut_on_beat for clip in fitted.clips)
+
+
+def test_locked_grid_restores_section_labels_so_sync_to_resolves(tmp_path):
+    # The reviewed-delivery grid stores cues as opaque "locked-cue-00042" ids
+    # but keeps a readable label per section. sync_to("section_001") must
+    # resolve on this path, not only on the quick analyse path.
+    import json
+    from montagewright.grounding import load_beat_grid, resolve_sync_point
+
+    payload = {
+        "bpm": 120.0, "meter": 4, "duration_ms": 60000,
+        "duration_samples": 2646000, "master_sample_rate": 44100,
+        "sections": [
+            {"section_id": "section-000", "label": "section_000",
+             "start_sample": 0, "end_sample": 1323000, "confidence": 0.9},
+            {"section_id": "section-001", "label": "section_001",
+             "start_sample": 1323000, "end_sample": 2646000, "confidence": 0.9},
+        ],
+        "cues": [
+            {"cue_id": "locked-cue-00000", "kind": "section_boundary",
+             "sample_index": 0, "time_ms": 0, "strength": 0.9,
+             "priority": "high"},
+            {"cue_id": "locked-cue-00001", "kind": "section_boundary",
+             "sample_index": 1323000, "time_ms": 30000, "strength": 0.9,
+             "priority": "high"},
+        ],
+    }
+    path = tmp_path / "lock.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    grid = load_beat_grid(path)
+
+    assert set(grid.named_points) == {"section_000", "section_001"}
+    assert resolve_sync_point(grid, "section_001") == 30.0
+    # A substring target ("chorus" vs "section") still matches a section.
+    assert resolve_sync_point(grid, "section") is not None
