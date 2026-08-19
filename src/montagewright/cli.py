@@ -2258,7 +2258,7 @@ def command_render(args: argparse.Namespace) -> int:
         # rules. Bump this when those rules change so a paid answer accepted
         # by an older binary is audited again instead of bypassing the new
         # Selection repair loop on resume.
-        "selection-local-contract-v7-canonical-camera-duration",
+        "selection-local-contract-v8-speed-and-declared-repeat",
     )
     provider_selection = _decided(work, "selection", chose)
     selection_to_repair: dict[str, Any] | None = None
