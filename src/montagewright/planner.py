@@ -2993,6 +2993,193 @@ def _editorial_plan_prompt() -> str:
     return preamble + "\n\n".join(parts)
 
 
+def decide_editorial_plan(
+    material: list[MaterialItem],
+    *,
+    brief: str,
+    aspect: str = "9:16",
+    music: Path | None = None,
+    music_grid: BeatGrid | None = None,
+    seconds: float = 0.0,
+    duration_mode: str = "preferred",
+    cache: UploadCache | None = None,
+    client: Any | None = None,
+    ledger: Any | None = None,
+    grounding_spec: Any | None = None,
+) -> tuple[dict[str, Any], Usage]:
+    """The merged brain: story, shots and rough timing in ONE call.
+
+    Replaces the three sequential calls (direction, selection, rhythm-rough).
+    The footage, the reference pack and the music are attached ONCE here rather
+    than re-sent three times, which is the point of the merge on cost; and
+    because one answer decides tone, coverage and rough timing together, the
+    seams where a later stage contradicted an earlier one do not exist.
+
+    This is opt-in (see command_render). It does not touch grounding or the
+    executor: `editorial_plan_to_legacy` bridges its flat output into the
+    structures those stages already read.
+    """
+
+    if client is None:
+        client = _default_client()
+
+    grounding_target_ids = (
+        [target.target_id for target in grounding_spec.identity_lock.identity.targets]
+        if grounding_spec is not None else []
+    )
+    # target_seconds is a soft target here, and may be omitted for free length.
+    fixed = (
+        f"## 片長\n\n目標長度約 {seconds:g} 秒（軟目標，不是配額）。填 "
+        f"`target_seconds={seconds:g}`。素材只夠較少的不同鏡頭時交較短，不可用"
+        f"重複或空停留補滿。\n\n"
+        if seconds > 0
+        else "## 片長\n\n沒有指定長度：交素材自然能覆蓋的長度，"
+        "`target_seconds` 可留空。\n\n"
+    )
+    request_input: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                f"{_editorial_plan_prompt()}\n\n{fixed}"
+                f"## 交付比例\n\n這支片輸出 {aspect}，是需求規格，不是你的選擇。\n\n"
+                f"## 剪輯 brief\n\n{brief}\n\n"
+                + (
+                    "## 音樂結構（本機量測）\n\n"
+                    + _describe_music(music_grid)
+                    + "\n\n上列 cue/section ID 是與本機對齊的共用座標；"
+                    "從實際聽到的音樂判斷節奏，不要自創時間點。\n\n"
+                    if music_grid is not None
+                    else ""
+                )
+                + f"## 執行層做得到什麼\n\n{describe_for_prompt()}\n\n"
+                f"## 執行層做不到什麼\n\n{describe_limits_for_prompt()}\n\n"
+                f"## 素材\n\n以下 {len(material)} 支，每一支的說明就寫在它自己那段影片前面。\n"
+            ),
+        }
+    ]
+    if grounding_spec is not None:
+        from montagewright.reference_grounding import reference_prompt_parts
+
+        # High-resolution here: unlike direction, this one call also binds an
+        # entity_id to a shot, so the reference pixels have to be able to
+        # affect that decision -- and they are sent once, not again at select.
+        request_input += reference_prompt_parts(
+            grounding_spec, client=client, cache=cache, resolution="high",
+        )
+    request_input += _attach_material(material, cache, client)
+    if music is not None:
+        request_input.append(_attach_music(music, cache, client))
+
+    interaction = ask(
+        client,
+        model=MODEL_ID,
+        store=False,
+        input=request_input,
+        generation_config={
+            "thinking_level": THINKING_HIGH,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        },
+        response_format=structured_json(_editorial_plan_schema(
+            [span.span_id for item in material for span in item.spans],
+            grounding_target_ids=grounding_target_ids,
+            action_ids=_action_ids_for_material(material),
+        )),
+        ledger=ledger,
+        budget_stage="editorial_plan",
+        upload_cache=cache,
+    )
+    plan = _parse(interaction, what="editorial plan")
+    from montagewright.spans import seconds_of
+
+    plan["aspect"] = aspect
+    plan["target_seconds"] = seconds_of(plan.get("target_seconds")) or (
+        seconds if seconds > 0 else 0.0
+    )
+    if seconds > 0:
+        plan["target_seconds"] = seconds
+    return plan, Usage.from_interaction(interaction)
+
+
+def editorial_plan_to_legacy(
+    plan: dict[str, Any], *, aspect: str = "9:16",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bridge the flat plan into the direction+selection dicts still consumed.
+
+    TEMPORARY. The merged call decides the shots directly, but the current
+    downstream (resolve_candidate_commitments, identity grounding, the EDL
+    build) still reads a direction dict with ``candidate_options`` and a
+    selection dict with ``shots``. This synthesises both from the plan -- one
+    commitment per shot, the shot's own source as primary and its
+    ``fallback_source`` as the alternate -- so nothing downstream has to change
+    yet. Milestone 3 has the downstream read the plan directly and deletes
+    this bridge along with the commitment machinery.
+    """
+
+    from montagewright.spans import seconds_of
+
+    shots = [dict(one) for one in (plan.get("shots") or [])]
+    candidate_options: list[dict[str, Any]] = []
+    for index, shot in enumerate(shots):
+        commitment_id = str(shot.get("commitment_id") or f"cmt_{index:02d}")
+        shot["commitment_id"] = commitment_id
+        looks = shot.get("looks") or []
+        need = seconds_of(shot.get("seconds_needed")) or 0.0
+        base_option = {
+            "commitment_id": commitment_id,
+            "purpose": str(shot.get("why") or "shot"),
+            "required": True,
+            "picture_role": str(shot.get("picture_role") or "primary_action"),
+            "tier": "primary",
+            "span_id": str(shot.get("span_id") or ""),
+            "min_supported_seconds": max(0.1, need or 0.1),
+            "presentation_intent": (
+                str((looks[0] or {}).get("presentation_intent"))
+                if looks and (looks[0] or {}).get("presentation_intent")
+                else "centered_hold"
+            ),
+            "target_id": str(
+                shot.get("target_id")
+                or (looks[0] or {}).get("entity_id") if looks else "none"
+            ) or "none",
+            "why": str(shot.get("why") or "shot"),
+        }
+        candidate_options.append(base_option)
+        fallback = shot.get("fallback_source")
+        if fallback:
+            alternate = dict(base_option)
+            alternate.update({
+                "tier": "alternate",
+                "required": False,
+                "span_id": f"{fallback}:s00"
+                if ":" not in str(fallback) else str(fallback),
+            })
+            candidate_options.append(alternate)
+
+    direction = {
+        "reasoning": str(plan.get("reasoning") or ""),
+        "material_assessment": str(plan.get("material_assessment") or ""),
+        "direction": str(plan.get("direction") or ""),
+        "aspect": aspect,
+        "target_seconds": plan.get("target_seconds") or 0.0,
+        "target_shot_count": max(1, len(shots)),
+        "typical_shot_seconds": 0.0,
+        "max_static_seconds": 0.0,
+        "music_under_speech": str(plan.get("music_under_speech") or "duck"),
+        "music_suggestion": plan.get("music_suggestion"),
+        "unusable": plan.get("unusable") or [],
+        "candidate_options": candidate_options,
+    }
+    selection = {
+        "shots": shots,
+        "covered": plan.get("covered") or [],
+        "uncovered": plan.get("uncovered") or [],
+        "audio_assignments": plan.get("audio_assignments") or [],
+        "music_from_seconds": plan.get("music_from_seconds"),
+        "music_spans": plan.get("music_spans"),
+    }
+    return direction, selection
+
+
 def _selection_patch_schema(
     option_ids: list[str], shot_indices: list[int], *,
     camera_treatments: list[str] | None = None,

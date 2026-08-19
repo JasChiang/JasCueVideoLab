@@ -88,6 +88,8 @@ from montagewright.planner import (
     audit_cached_selection,
     correct_candidate_options,
     decide_direction,
+    decide_editorial_plan,
+    editorial_plan_to_legacy,
     replan_shots,
     repair_selection_motion_contracts,
     repair_selection_source_windows,
@@ -1324,6 +1326,18 @@ def _make_findable(output: Path) -> None:
         pass
 
 
+def _editorial_plan_enabled(args: argparse.Namespace) -> bool:
+    """Opt-in switch for the merged one-call editorial plan.
+
+    Off unless asked, so the default render is the three-call path, byte for
+    byte as before. Enabled by `--editorial-plan` or MONTAGEWRIGHT_EDITORIAL_PLAN=1.
+    """
+
+    return bool(getattr(args, "editorial_plan", False)) or (
+        os.environ.get("MONTAGEWRIGHT_EDITORIAL_PLAN", "") not in ("", "0")
+    )
+
+
 def command_render(args: argparse.Namespace) -> int:
     rushes = args.rushes.expanduser().resolve()
     output = args.output.expanduser().resolve()
@@ -1966,7 +1980,27 @@ def command_render(args: argparse.Namespace) -> int:
                 )
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
-    if direction is None:
+    editorial_selection: dict[str, Any] | None = None
+    if direction is None and _editorial_plan_enabled(args):
+        # Experimental one-call path: tone, shots and rough timing together.
+        # The plan is bridged into the same direction+selection shapes the rest
+        # of this function reads, so nothing downstream changes; select_shots is
+        # skipped below because the shots are already decided. Needs a paid run
+        # to validate editorial quality.
+        ledger.check()
+        print("editorial plan: one merged call (experimental)", flush=True)
+        plan, usage_direction = decide_editorial_plan(
+            material, brief=brief, aspect=args.aspect, music=args.music,
+            music_grid=grid, seconds=args.seconds,
+            duration_mode=args.duration_mode,
+            cache=cache, client=client, ledger=ledger,
+            grounding_spec=args.reference_grounding_spec,
+        )
+        direction, editorial_selection = editorial_plan_to_legacy(
+            plan, aspect=args.aspect,
+        )
+        _decide(work, "direction", asked, direction)
+    elif direction is None:
         ledger.check()
         direction, usage_direction = decide_direction(
             material, brief=brief, aspect=args.aspect, music=args.music,
@@ -2370,6 +2404,14 @@ def command_render(args: argparse.Namespace) -> int:
                     + "\n  - ".join(recovered_faults),
                     flush=True,
                 )
+    if editorial_selection is not None and provider_selection is None:
+        # The merged call already chose the shots; do not ask again. It still
+        # passes through the same normalization + audit the three-call path
+        # uses, so a bad merged plan surfaces the same faults rather than
+        # shipping unchecked.
+        provider_selection = editorial_selection
+        _decide(work, "selection", chose, provider_selection)
+        print("selection: from the merged editorial plan (experimental)", flush=True)
     if provider_selection is None:
         ledger.check()
         def record_selection_attempt(
@@ -4713,6 +4755,13 @@ def main(argv: list[str] | None = None) -> int:
     render = sub.add_parser("render", help="Cut a folder of rushes into a film")
     render.add_argument("rushes", type=Path)
     render.add_argument("--brief", type=Path)
+    render.add_argument(
+        "--editorial-plan", action="store_true",
+        help="OPT-IN (experimental): decide tone, shots and rough timing in "
+             "one merged call instead of three sequential ones. Off by "
+             "default; also enabled by MONTAGEWRIGHT_EDITORIAL_PLAN=1. Needs a "
+             "paid run to validate editorial quality.",
+    )
     render.add_argument(
         "--grounding-spec",
         type=Path,
