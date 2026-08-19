@@ -91,15 +91,19 @@ def test_adapter_bridges_the_flat_plan_into_direction_and_selection():
     assert direction["target_shot_count"] == 2
     assert selection["music_from_seconds"] == 16.0
 
-    # One commitment per shot; the shot's own source is the primary, and a
-    # declared fallback_source becomes the ALTERNATE (a fallback, never a
-    # second shot).
+    # One primary option per shot. The declared fallback_source is NOT
+    # synthesised into an alternate option: its real span in the material is
+    # unknown here, so a fabricated "C2:s00" would name a span the resolver
+    # rejects (verified end-to-end). It stays recorded on the shot for
+    # milestone 3 to read directly; the legacy path never spent it anyway.
     options = direction["candidate_options"]
     primaries = [o for o in options if o["tier"] == "primary"]
     alternates = [o for o in options if o["tier"] == "alternate"]
     assert len(primaries) == 2
-    assert len(alternates) == 1  # only the first shot named a fallback
-    assert alternates[0]["span_id"] == "C2:s00"
+    assert alternates == []
+    assert selection["shots"][0].get("fallback_source") == "C2"
+    # Every synthesised option carries a resolver-legal target, never "None".
+    assert all(o["target_id"] and o["target_id"] != "None" for o in options)
     # The commitment machinery the merge deletes is absent from the plan.
     assert "target_shot_count" not in _PLAN
     assert "candidate_options" not in _PLAN
@@ -118,3 +122,45 @@ def test_editorial_plan_is_off_by_default(monkeypatch):
 
     monkeypatch.setenv("MONTAGEWRIGHT_EDITORIAL_PLAN", "1")
     assert _editorial_plan_enabled(argparse.Namespace(editorial_plan=False)) is True
+
+
+def test_adapter_output_survives_resolve_candidate_commitments():
+    # The bridge must not just look right -- its synthesised candidate_options
+    # have to pass the resolver the legacy path feeds them to, or a real
+    # --editorial-plan run would crash there. This caught a "None" target and a
+    # fabricated fallback span before they could waste a paid run.
+    from montagewright.planner import editorial_plan_to_legacy, MaterialItem
+    from montagewright.candidate_commitments import resolve_candidate_commitments
+    from montagewright.spans import Span
+
+    plan = {
+        "reasoning": "r", "material_assessment": "m", "direction": "d",
+        "target_seconds": 20.0, "music_under_speech": "bed", "unusable": [],
+        "shots": [
+            {"source_id": "C1", "span_id": "C1:s00", "camera_intent": "hold",
+             "seconds_needed": 3.0,
+             "looks": [{"at": "phone", "framing": "centre"}],
+             "audio_role": "discard", "picture_role": "primary_action",
+             "energy": "medium", "why": "w", "fallback_source": "C2"},
+            {"source_id": "C3", "span_id": "C3:s00", "camera_intent": "reveal",
+             "seconds_needed": 4.0,
+             "looks": [{"at": "screen", "framing": "thirds",
+                        "entity_id": "device.x"}],
+             "audio_role": "discard", "picture_role": "primary_action",
+             "energy": "medium", "why": "w2"},
+        ],
+    }
+    direction, _ = editorial_plan_to_legacy(plan, aspect="9:16")
+    material = [
+        MaterialItem("C1", 10.0, "a",
+                     spans=(Span("C1:s00", "C1", 0.0, 5.0, "phone", "locked"),)),
+        MaterialItem("C3", 10.0, "b",
+                     spans=(Span("C3:s00", "C3", 0.0, 5.0, "screen", "authored"),)),
+    ]
+    # Must not raise CommitmentError.
+    resolved = resolve_candidate_commitments(
+        direction, material, material_digest="a" * 64, aspect="9:16",
+        target_seconds=20.0, grounding_target_ids=("device.x",),
+        grounding_sha256="b" * 64,
+    )
+    assert len(resolved.options) == 2

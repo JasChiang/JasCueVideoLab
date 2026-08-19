@@ -3139,21 +3139,17 @@ def editorial_plan_to_legacy(
             ),
             "target_id": str(
                 shot.get("target_id")
-                or (looks[0] or {}).get("entity_id") if looks else "none"
-            ) or "none",
+                or ((looks[0] or {}).get("entity_id") if looks else None)
+                or "none"
+            ),
             "why": str(shot.get("why") or "shot"),
         }
         candidate_options.append(base_option)
-        fallback = shot.get("fallback_source")
-        if fallback:
-            alternate = dict(base_option)
-            alternate.update({
-                "tier": "alternate",
-                "required": False,
-                "span_id": f"{fallback}:s00"
-                if ":" not in str(fallback) else str(fallback),
-            })
-            candidate_options.append(alternate)
+        # The fallback_source is recorded on the shot, but it is NOT turned
+        # into a legacy alternate option: its real span in the material is not
+        # known here, so synthesising one (e.g. "C2:s00") names a span the
+        # resolver rejects. The legacy path never spent the alternate as a
+        # second shot anyway; milestone 3 reads fallback_source directly.
 
     direction = {
         "reasoning": str(plan.get("reasoning") or ""),
