@@ -220,3 +220,24 @@ def test_locked_grid_restores_section_labels_so_sync_to_resolves(tmp_path):
     assert resolve_sync_point(grid, "section_001") == 30.0
     # A substring target ("chorus" vs "section") still matches a section.
     assert resolve_sync_point(grid, "section") is not None
+
+
+def test_beats_aligns_up_but_never_shortens_below_the_content_hold():
+    from montagewright.grounding import _requested_duration, BeatGrid, Cue
+    from montagewright.schema import Clip, MusicSync
+
+    grid = BeatGrid(bpm=120.0, meter=4, cues=(), duration_seconds=60.0)
+    # 120 bpm -> 0.5s per beat.
+    def clip(beats):
+        return Clip(
+            clip_id="k00", source_id="C1",
+            approx_in_seconds=0.0, approx_out_seconds=3.0,  # 3s content hold
+            music_sync=MusicSync(beats=beats),
+        )
+
+    # 2 beats = 1.0s, shorter than the 3.0s the picture needs -> content wins.
+    assert _requested_duration(clip(2), grid) == 3.0
+    # 8 beats = 4.0s, longer -> beats aligns the shot up to the musical count.
+    assert _requested_duration(clip(8), grid) == 4.0
+    # No beats -> the content hold, untouched.
+    assert _requested_duration(clip(None), grid) == 3.0

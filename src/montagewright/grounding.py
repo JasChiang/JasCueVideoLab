@@ -467,9 +467,15 @@ def _requested_duration(clip: Clip, grid: BeatGrid | None) -> float:
     with this preference, completing the move off-grid when necessary.
     """
 
+    content = clip.approx_out_seconds - clip.approx_in_seconds
     if grid is not None and clip.music_sync.beats:
-        return clip.music_sync.beats * grid.seconds_per_beat
-    return clip.approx_out_seconds - clip.approx_in_seconds
+        # beats aligns the shot to a whole number of beats, but it must not
+        # shorten it below what the picture needs -- the seconds the earlier
+        # pass chose to read the text, complete the action, or land the move.
+        # A raw beat count that undercut that turned an edit into a metronome.
+        # Align up to the beats, never under the content floor.
+        return max(content, clip.music_sync.beats * grid.seconds_per_beat)
+    return content
 
 
 def camera_floor_for(reframe: object | None) -> float:
