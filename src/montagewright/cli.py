@@ -1987,15 +1987,26 @@ def command_render(args: argparse.Namespace) -> int:
         # of this function reads, so nothing downstream changes; select_shots is
         # skipped below because the shots are already decided. Needs a paid run
         # to validate editorial quality.
-        ledger.check()
-        print("editorial plan: one merged call (experimental)", flush=True)
-        plan, usage_direction = decide_editorial_plan(
-            material, brief=brief, aspect=args.aspect, music=args.music,
-            music_grid=grid, seconds=args.seconds,
-            duration_mode=args.duration_mode,
-            cache=cache, client=client, ledger=ledger,
-            grounding_spec=args.reference_grounding_spec,
-        )
+        # Cache the raw merged plan the way direction/selection cache their
+        # answers -- same key inputs (material, brief, aspect, music, seconds,
+        # grounding) plus an editorial-plan contract tag so a change to the
+        # merged prompt/schema invalidates it -- so a re-run after a downstream
+        # fix does NOT re-pay the one heavy merged call.
+        plan_key = _asked(asked, "editorial-plan-contract-v1")
+        plan = _decided(work, "editorial_plan", plan_key)
+        if plan is None:
+            ledger.check()
+            print("editorial plan: one merged call (experimental)", flush=True)
+            plan, usage_direction = decide_editorial_plan(
+                material, brief=brief, aspect=args.aspect, music=args.music,
+                music_grid=grid, seconds=args.seconds,
+                duration_mode=args.duration_mode,
+                cache=cache, client=client, ledger=ledger,
+                grounding_spec=args.reference_grounding_spec,
+            )
+            _decide(work, "editorial_plan", plan_key, plan)
+        else:
+            print("editorial plan: reused from the last attempt", flush=True)
         direction, editorial_selection = editorial_plan_to_legacy(
             plan, aspect=args.aspect,
         )
@@ -2405,10 +2416,30 @@ def command_render(args: argparse.Namespace) -> int:
                     flush=True,
                 )
     if editorial_selection is not None and provider_selection is None:
-        # The merged call already chose the shots; do not ask again. It still
-        # passes through the same normalization + audit the three-call path
-        # uses, so a bad merged plan surfaces the same faults rather than
-        # shipping unchecked.
+        # The merged call chose the shots but returned them in the model's raw
+        # shape -- MM:SS times, spans not yet resolved -- exactly as
+        # select_shots receives them from the three-call path. So run the same
+        # boundary processing here, or downstream reads a MM:SS string where it
+        # wants a float (looks_of did float("0:02.5") and raised). expand_spans
+        # resolves each span to a source_id/start_seconds and converts the
+        # MM:SS times (start_offset_seconds, seconds_needed, looks[].seconds) to
+        # floats; normalize_selection binds the content contracts. After this
+        # the merged selection reaches the same downstream in the same shape
+        # and passes the same audit, so a bad merged plan surfaces faults
+        # rather than shipping unchecked.
+        from montagewright.planner import expand_spans
+
+        usable = [item for item in material if item.source_id not in broken]
+        offered = [span for item in usable for span in item.spans]
+        expand_spans(
+            editorial_selection, offered,
+            source_motion={
+                item.source_id: item.camera_motion for item in usable
+            },
+        )
+        normalize_selection(
+            editorial_selection, material, commitments=commitments
+        )
         provider_selection = editorial_selection
         _decide(work, "selection", chose, provider_selection)
         print("selection: from the merged editorial plan (experimental)", flush=True)

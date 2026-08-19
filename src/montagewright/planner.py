@@ -2947,6 +2947,26 @@ def _editorial_plan_schema(
         properties["audio_assignments"] = _copy.deepcopy(
             base["properties"]["audio_assignments"]
         )
+    # Gemini video understanding samples at ~1 frame/second and only supports
+    # whole-second MM:SS timestamps; a decimal like 0:02.5 is precision it
+    # cannot perceive at that rate, so allowing `(?:\.\d+)?` in the pattern only
+    # invites the model to hallucinate it. Tighten every observed-time field
+    # (start_offset_seconds, seconds_needed, looks[].seconds) to whole seconds
+    # -- local frame-accurate decode / SAM / grounding supply the sub-second
+    # precision downstream (the coarse_mmss -> decoded_source_pts provenance).
+    # This mutates only the merged copy; the selection schema the default path
+    # uses is untouched.
+    def _tighten_mmss(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("pattern") == r"^\d{1,3}:[0-5]\d(?:\.\d+)?$":
+                node["pattern"] = r"^\d{1,3}:[0-5]\d$"
+            for value in node.values():
+                _tighten_mmss(value)
+        elif isinstance(node, list):
+            for value in node:
+                _tighten_mmss(value)
+
+    _tighten_mmss(properties)
     # target_seconds is optional (omit for free length); covered/uncovered and
     # the shot-count quota are gone. The required scalars are what every cut
     # must state; the rest -- length, music, fallbacks -- are the editor's.
@@ -2981,6 +3001,9 @@ def _editorial_plan_prompt() -> str:
         "故事層的欄位，加上一條有序的 shots。覆蓋＝相鄰幾顆證同一個點；鏡頭數就是 "
         "shots 的長度，不是配額。目標秒數可留空＝自由長度。下面三段是同一位剪輯師的"
         "三個面向，一起讀、一起決定。\n\n"
+        "所有時間欄位一律寫成整秒的 MM:SS（例如 `0:02`，不是 `0:02.5`）：你每秒約只"
+        "看到一格畫面，看不出更細的時間，別自己補出小數精度——本機程式會用逐格解碼把"
+        "時間校準到影格。\n\n"
     )
     parts = [
         header + "\n\n" + (PROMPTS / name).read_text(encoding="utf-8").strip()

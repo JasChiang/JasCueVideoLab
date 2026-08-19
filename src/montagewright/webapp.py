@@ -368,7 +368,8 @@ def _draft_report_for(run: "Run") -> dict | None:
                 or shot.get("source_id") or "未命名鏡頭"
             )
         shot.setdefault("subject", subject)
-        seconds = max(0.1, float(shot.get("seconds_needed") or 0.0))
+        from montagewright.spans import seconds_of
+        seconds = max(0.1, seconds_of(shot.get("seconds_needed")) or 0.0)
         key = f"k{index:02d}"
         rhythm[key] = {
             "seconds": seconds,
@@ -4924,7 +4925,8 @@ def create_app() -> FastAPI:
                 if not proxy.exists():
                     raise HTTPException(404, "no such shot")
                 start = float(shot.get("start_seconds") or 0.0)
-                seconds = float(shot.get("seconds_needed") or 0.0)
+                from montagewright.spans import seconds_of
+                seconds = seconds_of(shot.get("seconds_needed")) or 0.0
                 made.parent.mkdir(parents=True, exist_ok=True)
                 subprocess.run(
                     ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",

@@ -164,3 +164,44 @@ def test_adapter_output_survives_resolve_candidate_commitments():
         grounding_sha256="b" * 64,
     )
     assert len(resolved.options) == 2
+
+
+def test_merged_selection_normalizes_mmss_before_looks_of_reads_it():
+    # The crash: the merged call returns looks[].seconds as MM:SS (the schema
+    # says so), and looks_of does float() on it. The merged path must run the
+    # same expand_spans the three-call path runs, or it raises. This drives the
+    # exact repro: MM:SS in, floats out, looks_of does not raise.
+    from montagewright.planner import editorial_plan_to_legacy, expand_spans
+    from montagewright.schema import looks_of
+    from montagewright.spans import Span
+    from types import SimpleNamespace
+
+    plan = {
+        "reasoning": "r", "material_assessment": "m", "direction": "d",
+        "target_seconds": "1:00", "unusable": [],
+        "shots": [
+            {"span_id": "C1:s00", "start_offset_seconds": "0:00",
+             "seconds_needed": "0:03", "camera_intent": "reveal", "why": "w",
+             "looks": [
+                 {"at": "left", "seconds": "0:01.5", "framing": "thirds"},
+                 {"at": "right", "seconds": "0:02.5", "framing": "centre"},
+             ]},
+        ],
+    }
+    _, selection = editorial_plan_to_legacy(plan, aspect="9:16")
+    # Raw from the model: MM:SS strings, exactly what crashed.
+    assert selection["shots"][0]["looks"][0]["seconds"] == "0:01.5"
+
+    offered = [Span("C1:s00", "C1", 0.0, 10.0, "left", "authored")]
+    expand_spans(
+        selection, offered,
+        source_motion={"C1": SimpleNamespace(kind="authored")},
+    )
+    # After the merged path's normalization: floats, resolved.
+    looks = selection["shots"][0]["looks"]
+    assert looks[0]["seconds"] == 1.5 and looks[1]["seconds"] == 2.5
+    assert isinstance(selection["shots"][0]["seconds_needed"], float)
+    assert selection["shots"][0]["source_id"] == "C1"
+    # And the reader that crashed now succeeds.
+    read = looks_of(selection["shots"][0])
+    assert [round(one.seconds, 3) for one in read] == [1.5, 2.5]

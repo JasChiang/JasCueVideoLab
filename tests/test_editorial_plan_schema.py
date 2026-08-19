@@ -68,6 +68,29 @@ def test_merged_schema_adds_fallback_music_and_optional_length():
         assert sibling in props, sibling
 
 
+def test_merged_schema_forbids_sub_second_timestamps():
+    import re
+
+    selection, plan = _both()
+    shot = plan["properties"]["shots"]["items"]["properties"]
+    tightened = shot["start_offset_seconds"]["pattern"]
+    # Gemini samples video at ~1 fps and cannot perceive sub-second time, so the
+    # merged schema forbids the hallucinated decimal on every observed-time
+    # field. A whole second passes; 0:02.5 is rejected.
+    for field in ("start_offset_seconds", "seconds_needed"):
+        pat = re.compile(shot[field]["pattern"])
+        assert pat.fullmatch("0:02")
+        assert pat.fullmatch("0:02.5") is None, field
+    look_seconds = shot["looks"]["items"]["properties"]["seconds"]["pattern"]
+    assert re.compile(look_seconds).fullmatch("0:01")
+    assert re.compile(look_seconds).fullmatch("0:01.5") is None
+    # The default selection schema is untouched -- it still tolerates a decimal,
+    # so tightening is scoped to the merged copy only (default path byte-stable).
+    sel_shot = selection["properties"]["shots"]["items"]["properties"]
+    assert "(?:\\.\\d+)?" in sel_shot["start_offset_seconds"]["pattern"]
+    assert "(?:\\.\\d+)?" not in tightened
+
+
 def test_merged_prompt_carries_the_coverage_and_fallback_rules():
     text = planner._editorial_plan_prompt()
     # One decision, coverage as distinct shots, alternate as a fallback.
@@ -76,3 +99,5 @@ def test_merged_prompt_carries_the_coverage_and_fallback_rules():
     assert "備胎" in text
     # The three briefs are all present.
     assert "定調" in text and "選鏡" in text and "節奏" in text
+    # And the whole-second timestamp rule (1 fps -> no invented sub-second).
+    assert "0:02.5" in text and "整秒" in text
