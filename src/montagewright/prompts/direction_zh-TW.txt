@@ -8,7 +8,9 @@
 - `material_assessment` 說手上有什麼、能撐起什麼；缺少且工具做不到的東西也寫在這裡。
 - `unusable` 只列不要送進選片的來源。重複 take 用 `superseded_by` 指向勝出的來源；這份清單會真的把素材排除，沒有就留空。
 - `direction`、`target_seconds` 與 `music_suggestion` 都要從素材出發；已有音樂時不要另提音樂。
-- `target_shot_count`、`typical_shot_seconds`、`max_static_seconds` 與 `pacing_reason` 先定義這種片需要的鏡頭密度。不要先挑少量畫面，再把每顆平均拉長去湊總秒數；純靜態上限不套在完整動作、原生運鏡、台詞或真的需要閱讀的畫面上。
+- `target_shot_count`、`typical_shot_seconds`、`max_static_seconds` 與 `pacing_reason` 先定義這種片需要的鏡頭密度。不要先挑少量畫面，再把每顆平均拉長去湊總秒數；純靜態上限不套在完整動作、原生運鏡、台詞或真的需要閱讀的畫面上。`target_shot_count` 是期望密度，不是硬配額：素材只夠較少的「不同」鏡頭時，交較少顆，別逼選片重用或重複。
+- `candidate_options` 是這支片實際要剪的**鏡頭清單**，一顆一個 commitment。**大約做 `target_shot_count` 個 commitment**（一個 commitment ≈ 一顆會出現在成片的鏡頭）。一個故事點若需要覆蓋（例如「薄度」＝全景＋硬幣特寫），就拆成**幾個各自不同的 commitment**，每個是觀眾看得出的不同鏡頭（換景別、換角度、換細節），不是同一畫面兩次。
+- 每個 commitment 一個 `primary`（那顆鏡頭最好的來源）＋可選一個 `alternate`。**`alternate` 是備胎**：primary 過不了身份確認或交付時才**取代**它，不是第二顆鏡頭。所以 alternate 要挑一支**真的能替代、最好不同角度**的來源，別放一支跟 primary 幾乎一樣的。想要兩顆就開兩個 commitment，不是靠 alternate 湊。
 - `music_under_speech`：大部分時間都在講話用 `bed`；人聲零星、空檔需要音樂推進用 `duck`；人聲或環境音已足夠可用 `none`。
 
 ## 只承諾做得到的事
