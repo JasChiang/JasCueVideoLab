@@ -2876,6 +2876,123 @@ def _selection_schema(
     return result
 
 
+def _editorial_plan_schema(
+    span_ids: list[str], *, min_shots: int | None = None,
+    max_shots: int | None = None,
+    graphic_candidate_ids: list[str] | None = None,
+    audio_span_ids: list[str] | None = None,
+    grounding_target_ids: list[str] | None = None,
+    commitment_ids: list[str] | None = None,
+    action_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """One flat editorial plan: story, timing and shots decided in one call.
+
+    The merge of DIRECTION + SELECTION + RHYTHM-rough-timing into a single
+    response, so nothing decided in one stage is renamed or overruled by the
+    next (see artifacts/EDITORIAL_PLAN_MERGE.md). It reuses the selection
+    shots object -- the known-good shape the API already accepts -- and adds
+    the director's scalars, the music fields, a per-shot fallback and the
+    per-shot music sync as SIBLINGS, never new nesting: that is what keeps it
+    under the grammar ceiling the selection schema already clears.
+
+    Coverage is adjacent shots proving one point; the shot count is
+    len(shots), not a quota. target_seconds is optional -- omit it for a
+    free-length cut. This milestone only defines the schema; wiring it into
+    the pipeline and retiring the commitment machinery is a later step, so the
+    reused shot object still carries commitment_id for now.
+    """
+    import copy as _copy
+
+    base = _selection_schema(
+        span_ids, min_shots=min_shots, max_shots=max_shots,
+        graphic_candidate_ids=graphic_candidate_ids,
+        audio_span_ids=audio_span_ids,
+        grounding_target_ids=grounding_target_ids,
+        commitment_ids=commitment_ids, action_ids=action_ids,
+    )
+    direction = _direction_schema()
+    rhythm = _rhythm_schema(["k00"])
+
+    shot = _copy.deepcopy(base["properties"]["shots"])
+    # A fallback substitution (used only if the primary cannot ground or
+    # deliver -- never a second shot) and the per-shot music sync folded in
+    # from the rhythm decision, all as optional shot fields.
+    shot["items"]["properties"]["fallback_source"] = {
+        "type": "string",
+        "description": (
+            "選填。這顆的主來源若過不了身份確認或交付，才用它取代——它是備胎，"
+            "不是第二顆鏡頭。要覆蓋一個點就多開一顆觀眾看得出不同的鏡頭，別靠這個湊。"
+        ),
+    }
+    for name in ("sync_to", "beats", "cut_on_beat"):
+        shot["items"]["properties"][name] = _copy.deepcopy(
+            rhythm["properties"]["decisions"]["items"]["properties"][name]
+        )
+
+    scalars = {
+        name: _copy.deepcopy(direction["properties"][name])
+        for name in (
+            "reasoning", "material_assessment", "direction",
+            "target_seconds", "music_under_speech", "music_suggestion",
+            "unusable",
+        )
+    }
+    music = {
+        name: _copy.deepcopy(rhythm["properties"][name])
+        for name in ("music_from_seconds", "music_spans")
+    }
+
+    properties: dict[str, Any] = {**scalars, **music, "shots": shot}
+    if "audio_assignments" in base["properties"]:
+        properties["audio_assignments"] = _copy.deepcopy(
+            base["properties"]["audio_assignments"]
+        )
+    # target_seconds is optional (omit for free length); covered/uncovered and
+    # the shot-count quota are gone. The required scalars are what every cut
+    # must state; the rest -- length, music, fallbacks -- are the editor's.
+    required = [
+        "reasoning", "material_assessment", "direction",
+        "music_under_speech", "shots",
+    ]
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": required,
+        "properties": properties,
+    }
+
+
+def _editorial_plan_prompt() -> str:
+    """The three planning briefs composed into one editor's brief.
+
+    A builder rather than a new file, so it carries the direction, selection
+    and rhythm rules already written and lint-checked on disk -- including the
+    coverage rules (one point may take several DISTINCT shots, the alternate
+    is a fallback not a second shot, distinct means what the viewer sees, the
+    shot count is a soft target, target_seconds may be omitted for free
+    length) -- with no second copy to drift out of sync. The wiring milestone
+    can distil this into a single authored file; here it keeps one source of
+    truth.
+    """
+
+    preamble = (
+        "你現在一次做完整支片的編輯決定：故事定調、每一顆鏡頭、以及它們的粗略節奏，"
+        "在同一個回答裡決定，不再分成互不通氣的幾關。輸出一份扁平的 editorial plan——"
+        "故事層的欄位，加上一條有序的 shots。覆蓋＝相鄰幾顆證同一個點；鏡頭數就是 "
+        "shots 的長度，不是配額。目標秒數可留空＝自由長度。下面三段是同一位剪輯師的"
+        "三個面向，一起讀、一起決定。\n\n"
+    )
+    parts = [
+        header + "\n\n" + (PROMPTS / name).read_text(encoding="utf-8").strip()
+        for header, name in (
+            ("## 一、定調與覆蓋", "direction_zh-TW.txt"),
+            ("## 二、選鏡與剪輯", "selection_zh-TW.txt"),
+            ("## 三、節奏與音樂", "rhythm_zh-TW.txt"),
+        )
+    ]
+    return preamble + "\n\n".join(parts)
+
+
 def _selection_patch_schema(
     option_ids: list[str], shot_indices: list[int], *,
     camera_treatments: list[str] | None = None,
