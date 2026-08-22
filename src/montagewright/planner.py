@@ -14,13 +14,14 @@ happening in it and what the track is doing underneath.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from montagewright.schema import camera_intent_of, looks_of, move_of_shot
 from montagewright.capabilities import (
@@ -80,6 +81,15 @@ SERVER_ERROR_BACKOFF_SECONDS = float(
 # written, so a pass at thinking_level high is really two claims on one
 # allowance -- and the one that loses is the answer.
 MAX_OUTPUT_TOKENS = 65536
+# A direct all-material reel stays the default. Above thirty minutes, multiple
+# independent takes become a multi-needle planning problem even though the
+# provider's one-million-token window can technically hold more. Every source
+# has already had its own visual ClipCard pass; the large route asks Gemini to
+# bin those visual logs and rank a broad selects pool before another video is
+# uploaded. A single long interview remains direct because splitting one
+# continuous answer by filename would discard its narrative context.
+DIRECT_STRINGOUT_MAX_SECONDS = 30 * 60.0
+PLANNING_SLATE_SECONDS = 1.0
 
 
 class PlannerError(RuntimeError):
@@ -100,6 +110,15 @@ class SelectionUnrenderable(PlannerError):
         super().__init__(message)
         self.draft = copy.deepcopy(draft)
         self.faults = tuple(faults)
+
+
+class EditorialPlanUnrenderable(PlannerError):
+    """A paid merged plan that failed the local executable contract."""
+
+    def __init__(self, message: str, *, draft: dict[str, Any], fault: str) -> None:
+        super().__init__(message)
+        self.draft = copy.deepcopy(draft)
+        self.fault = str(fault)
 
 
 @dataclass(frozen=True)
@@ -663,6 +682,8 @@ def decide_rhythm(
     cache: UploadCache | None = None,
     target_seconds: float = 0.0,
     duration_mode: str = "exact",
+    minimum_seconds: float | None = None,
+    maximum_seconds: float | None = None,
     client: Any | None = None,
     ledger: Any | None = None,
     artifact_dir: Path | None = None,
@@ -701,6 +722,8 @@ def decide_rhythm(
         shots=shots,
         target_seconds=target_seconds,
         duration_mode=duration_mode,
+        minimum_seconds=minimum_seconds,
+        maximum_seconds=maximum_seconds,
         prompt=prompt,
         clip_ids=clip_ids,
     )
@@ -757,9 +780,17 @@ def decide_rhythm(
                     + (
                         "這是精確交付規格，必須在內容證據允許下達成。"
                         if duration_mode == "exact" else
-                        "這是偏好中心，不是精確交付秒數；可在一個小節內"
-                        "自然收尾，不可用停格或無證據停留補滿。"
-                        "素材不足時應回傳自然且較短的版本。"
+                        (
+                            f"這是允許 {minimum_seconds:g}–{maximum_seconds:g} 秒的"
+                            "硬範圍；在範圍內選最自然的結尾，不要硬湊中心。"
+                            if duration_mode == "range"
+                            and minimum_seconds is not None
+                            and maximum_seconds is not None
+                            else
+                            "這是偏好中心，不是精確交付秒數；可在一個小節內"
+                            "自然收尾，不可用停格或無證據停留補滿。"
+                            "素材不足時應回傳自然且較短的版本。"
+                        )
                     )
                     + "素材裡有動作起訖的，動作做完需要多久就是那顆的下限。\n\n"
                     if target_seconds > 0
@@ -850,6 +881,7 @@ def decide_rhythm(
                 grid,
                 target_seconds=target_seconds,
                 duration_mode=duration_mode,
+                maximum_seconds=maximum_seconds,
             )
         from montagewright.coverage import edl_coverage_audit
         from montagewright.grounding import apply_to_edl, ground_timeline
@@ -870,6 +902,8 @@ def decide_rhythm(
             target_seconds,
             hard_target=duration_mode == "exact",
             duration_tolerance_seconds=preferred_tolerance,
+            minimum_seconds=minimum_seconds,
+            maximum_seconds=maximum_seconds,
         )
         coverage_faults = coverage.faults
         release_faults = rhythm_motion_faults(edl, candidate, grid)
@@ -944,6 +978,8 @@ def _rhythm_artifact_key(
     shots: "list[MaterialItem] | None",
     target_seconds: float,
     duration_mode: str,
+    minimum_seconds: float | None,
+    maximum_seconds: float | None,
     prompt: str,
     clip_ids: list[str],
 ) -> str:
@@ -993,6 +1029,8 @@ def _rhythm_artifact_key(
         "shots": plain(shots or []),
         "target_seconds": target_seconds,
         "duration_mode": duration_mode,
+        "minimum_seconds": minimum_seconds,
+        "maximum_seconds": maximum_seconds,
     }
     return asked(json.dumps(contract, ensure_ascii=False, sort_keys=True))
 
@@ -1003,6 +1041,7 @@ def _fit_preferred_rhythm_to_target(
     *,
     target_seconds: float,
     duration_mode: str,
+    maximum_seconds: float | None = None,
 ) -> EDL:
     """Sacrifice optional beat snaps before exceeding a preferred ceiling.
 
@@ -1020,8 +1059,12 @@ def _fit_preferred_rhythm_to_target(
     from montagewright.grounding import ground_timeline
 
     chosen = edl
-    ceiling = target_seconds + _preferred_rhythm_tolerance(
-        grid, duration_mode=duration_mode
+    ceiling = (
+        float(maximum_seconds)
+        if duration_mode == "range" and maximum_seconds is not None
+        else target_seconds + _preferred_rhythm_tolerance(
+            grid, duration_mode=duration_mode
+        )
     )
     duration = ground_timeline(chosen, grid).duration_seconds
     while duration > ceiling + 1e-6:
@@ -1375,6 +1418,7 @@ def locate_subject(
     *,
     client: Any | None = None,
     ledger: Any | None = None,
+    cache_dir: Path | None = None,
 ) -> tuple[list[dict[str, Any]], Usage]:
     """Ask where a named subject sits in each sampled frame.
 
@@ -1387,6 +1431,25 @@ def locate_subject(
 
     if client is None:
         client = _default_client()
+
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        digest = hashlib.sha256()
+        digest.update(b"montagewright-subject-location-v1\0")
+        digest.update(subject_description.encode("utf-8"))
+        for frame in frames:
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(frame.read_bytes()).digest())
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{digest.hexdigest()}.json"
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                boxes = cached.get("frames")
+                if isinstance(boxes, list):
+                    return boxes, Usage(0, 0, 0)
+            except (OSError, ValueError, TypeError):
+                pass
 
     request_input: list[dict[str, Any]] = [
         {
@@ -1416,7 +1479,12 @@ def locate_subject(
         model=MODEL_ID,
         store=False,
         input=request_input,
-        generation_config={"thinking_level": "low", "max_output_tokens": MAX_OUTPUT_TOKENS},
+        # One small bbox record per sampled JPEG. The global planning ceiling
+        # made the ledger reserve roughly $0.25 for a response that is usually
+        # a few hundred tokens, preventing safe low-budget resumes. 4096 is
+        # ample for the subject schema while keeping the pre-call reservation
+        # proportional to this operation.
+        generation_config={"thinking_level": "low", "max_output_tokens": 4096},
         response_format=structured_json(_subject_schema(len(frames))),
         ledger=ledger,
         budget_stage="subject",
@@ -1427,6 +1495,10 @@ def locate_subject(
     if disambiguation:
         for entry in frames_out:
             entry.setdefault("disambiguation", disambiguation)
+    if cache_path is not None:
+        from montagewright.measure.storage import write_json
+
+        write_json(cache_path, {"frames": frames_out})
     return frames_out, Usage.from_interaction(interaction)
 
 
@@ -1520,6 +1592,9 @@ class MaterialItem:
     # What selection is allowed to say, rather than a hint about what it
     # should say: a rejected stretch has no id, so there is nothing to name.
     spans: tuple[Any, ...] = ()
+    # Logging may narrow one long proxy to source-clock ranges for the final
+    # planning reel while retaining the original source_id and clocks.
+    planning_ranges: tuple[tuple[float, float], ...] = ()
     # How far this particular source can be pushed into before the delivered
     # frame is being enlarged past what the direction will accept. 1.0 means
     # no room at all. Measured from this file's own dimensions against the
@@ -1558,6 +1633,9 @@ class MaterialItem:
     # for a human/model prompt and rounded to tenths; arithmetic must never
     # parse that presentation string back into a timeline.
     audio_spans: tuple[tuple[str, float, float], ...] = ()
+    sync_group: str | None = None
+    sync_offset_seconds: float = 0.0
+    sync_role: str = ""
 
 
 def _direction_schema(
@@ -1686,6 +1764,518 @@ def _describe_one(item: MaterialItem) -> str:
     return _describe_material([item])
 
 
+def _describe_editorial_catalog(material: list[MaterialItem]) -> str:
+    """A semantic index, not a second low-resolution interpretation layer.
+
+    The editor watches the stringout.  This catalogue supplies stable names,
+    dialogue and hard exclusions that pixels cannot name; exact crop geometry,
+    detector clocks and motion budgets stay local until a shot is chosen.
+    """
+
+    lines: list[str] = []
+    for item in material:
+        facts = [f"{item.duration_seconds:.1f}s"]
+        if item.composition:
+            facts.append(f"構圖={item.composition}")
+        if item.shot_size:
+            facts.append(f"景別={item.shot_size}")
+        if item.facing and item.facing != "flat":
+            facts.append(f"朝向={item.facing}")
+        if item.camera_motion:
+            facts.append(f"原生運鏡={item.camera_motion}")
+        if item.sync_group:
+            facts.append(
+                f"同步組={item.sync_group}；角色={item.sync_role}；"
+                f"group clock=source+{item.sync_offset_seconds:+.3f}s"
+            )
+        if not item.carries_identity:
+            facts.append("指定主體已確認不在此來源；只可作環境／氣氛")
+        if item.identity_absent_targets:
+            facts.append("已確認不在=" + "、".join(item.identity_absent_targets))
+        for target_id, windows in (
+            getattr(item, "identity_windows_by_target", ()) or ()
+        ):
+            if windows:
+                facts.append(
+                    f"{target_id}可見區間="
+                    + "、".join(
+                        f"{float(start):.1f}–{float(end):.1f}s"
+                        for start, end in windows
+                    )
+                )
+        lines.append(
+            f"- {item.source_id}（{'；'.join(facts)}）：{item.summary or '以影片為準'}"
+        )
+        if item.spans:
+            lines.append(
+                "  可引用 span：" + "、".join(
+                    f"{span.span_id}({float(span.starts_seconds):.1f}–"
+                    f"{float(span.ends_seconds):.1f}s"
+                    + (
+                        f" {str(getattr(span, 'what', '') or getattr(span, 'why', ''))[:80]}"
+                        if getattr(span, "what", "") or getattr(span, "why", "")
+                        else ""
+                    )
+                    + ")"
+                    for span in item.spans
+                )
+            )
+        if item.action_ids:
+            lines.append("  可引用 action：" + "、".join(item.action_ids))
+        if item.speech:
+            lines.append("  Apple 時碼逐字稿：\n    " + "\n    ".join(item.speech))
+    return "\n".join(lines)
+
+
+def editorial_planning_route(material: list[MaterialItem]) -> str:
+    """Choose by watched duration, never by an arbitrary source-count quota."""
+
+    total = sum(max(0.0, float(one.duration_seconds)) for one in material)
+    if total <= DIRECT_STRINGOUT_MAX_SECONDS:
+        return "direct_stringout"
+    return "logged_selects"
+
+
+def _grounding_presence_policy(grounding_spec: Any | None) -> str:
+    if grounding_spec is None:
+        return "context_allowed"
+    framing = getattr(grounding_spec.identity_lock, "framing", None)
+    return str(getattr(
+        framing,
+        "editorial_presence_policy",
+        "context_allowed",
+    ))
+
+
+def _grounding_required_targets(grounding_spec: Any | None) -> tuple[str, ...]:
+    if grounding_spec is None:
+        return ()
+    framing = getattr(grounding_spec.identity_lock, "framing", None)
+    required = tuple(getattr(framing, "required_target_ids", ()) or ())
+    return tuple(dict.fromkeys(
+        str(target_id)
+        for target_id in (
+            required
+            or tuple(
+                target.target_id
+                for target in grounding_spec.identity_lock.identity.targets
+            )
+        )
+        if str(target_id)
+    ))
+
+
+def _grounding_policy_prompt(grounding_spec: Any | None) -> str:
+    required = _grounding_required_targets(grounding_spec)
+    if not required:
+        return ""
+    policy = _grounding_presence_policy(grounding_spec)
+    if policy == "target_only":
+        rule = (
+            "每一顆入選 picture shot 都必須實際含有至少一個指定主體；"
+            "不可使用只拍會場、人物或其他產品的 context-only 鏡頭。"
+        )
+    elif policy == "target_led":
+        rule = (
+            "指定主體必須是全片視覺骨幹；context 只可用來交代必要的場合、"
+            "人物或因果，不可讓其他產品或泛用裝飾鏡頭取代主體。"
+        )
+    else:
+        rule = (
+            "可使用不含指定主體的環境、人物或氣氛鏡頭，但只能作 context；"
+            "任何指定產品身分的畫面承諾仍必須來自已通過 identity screen 的來源。"
+        )
+    return f"指定主體：{'、'.join(required)}。出鏡政策：{rule}"
+
+
+def _material_log_schema(
+    required_target_ids: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Semantic bins plus a broad rank; no shot order or timing commitment."""
+
+    return {
+        "type": "object", "additionalProperties": False,
+        "required": ["assessment", "bins", "selects", "target_coverage"],
+        "properties": {
+            "assessment": {"type": "string"},
+            "bins": {
+                "type": "array", "minItems": 1,
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["name", "purpose", "source_ids", "span_ids"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "purpose": {"type": "string"},
+                        "source_ids": {
+                            "type": "array", "minItems": 1,
+                            "items": {"type": "string"},
+                        },
+                        "span_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "The source-clock spans belonging in this bin. "
+                                "A long single file must be classified by spans, "
+                                "not repeated as one undifferentiated source."
+                            ),
+                        },
+                    },
+                },
+            },
+            "selects": {
+                "type": "array", "minItems": 1,
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["source_id", "span_ids", "why", "roles"],
+                    "properties": {
+                        "source_id": {"type": "string"},
+                        "span_ids": {
+                            "type": "array", "items": {"type": "string"},
+                        },
+                        "why": {"type": "string"},
+                        "roles": {
+                            "type": "array", "items": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "target_coverage": {
+                "type": "array",
+                "minItems": len(required_target_ids),
+                "maxItems": len(required_target_ids),
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "required": [
+                        "target_id", "primary_source_ids",
+                        "alternate_source_ids", "why",
+                    ],
+                    "properties": {
+                        "target_id": {
+                            "type": "string",
+                            **(
+                                {"enum": list(required_target_ids)}
+                                if required_target_ids else {}
+                            ),
+                        },
+                        "primary_source_ids": {
+                            "type": "array", "minItems": 1,
+                            "items": {"type": "string"},
+                        },
+                        "alternate_source_ids": {
+                            "type": "array", "items": {"type": "string"},
+                        },
+                        "why": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+
+
+def prepare_material_log(
+    payload: dict[str, Any], material: list[MaterialItem], *,
+    grounding_spec: Any | None = None,
+) -> dict[str, Any]:
+    """Audit model-made bins and rank before they can hide any rushes."""
+
+    known = {one.source_id for one in material}
+    binned = {
+        str(source_id)
+        for one in payload.get("bins") or []
+        for source_id in one.get("source_ids") or []
+    }
+    unknown = sorted(binned - known)
+    missing = sorted(known - binned)
+    known_spans = {
+        str(span.span_id)
+        for item in material for span in item.spans
+    }
+    binned_spans = {
+        str(span_id)
+        for one in payload.get("bins") or []
+        for span_id in one.get("span_ids") or []
+    }
+    ranked = [
+        str(one.get("source_id") or "") for one in payload.get("selects") or []
+    ]
+    unknown_ranked = sorted(set(ranked) - known - {""})
+    faults: list[str] = []
+    if unknown:
+        faults.append(f"unknown_bins={unknown}")
+    if missing:
+        faults.append(f"unbinned={missing}")
+    unknown_binned_spans = sorted(binned_spans - known_spans)
+    if unknown_binned_spans:
+        faults.append(f"unknown bin spans={unknown_binned_spans}")
+    if (
+        sum(max(0.0, float(one.duration_seconds)) for one in material)
+        > DIRECT_STRINGOUT_MAX_SECONDS
+    ):
+        missing_spans = sorted(known_spans - binned_spans)
+        if missing_spans:
+            faults.append(f"unbinned spans={missing_spans}")
+    if unknown_ranked:
+        faults.append(f"unknown_selects={unknown_ranked}")
+    duplicate_selects = sorted({
+        source_id for source_id in ranked
+        if source_id and ranked.count(source_id) > 1
+    })
+    if duplicate_selects:
+        faults.append(f"duplicate selects={duplicate_selects}")
+    if not any(one in known for one in ranked):
+        faults.append("no executable selects")
+    spans_by_source = {
+        item.source_id: {str(span.span_id) for span in item.spans}
+        for item in material
+    }
+    by_id = {one.source_id: one for one in material}
+    span_owner = {
+        str(span.span_id): item.source_id
+        for item in material for span in item.spans
+    }
+    spans_by_id = {
+        str(span.span_id): span
+        for item in material for span in item.spans
+    }
+    select_rows_by_source = {
+        str(row.get("source_id") or ""): row
+        for row in payload.get("selects") or []
+    }
+    for row in payload.get("bins") or []:
+        source_ids = {str(one) for one in row.get("source_ids") or []}
+        misplaced = sorted(
+            str(span_id) for span_id in row.get("span_ids") or []
+            if span_owner.get(str(span_id)) not in source_ids
+        )
+        if misplaced:
+            faults.append(f"bin spans do not belong to sources={misplaced}")
+    for row in payload.get("selects") or []:
+        source_id = str(row.get("source_id") or "")
+        selected_spans = {str(one) for one in row.get("span_ids") or []}
+        wrong = sorted(selected_spans - spans_by_source.get(source_id, set()))
+        if wrong:
+            faults.append(f"{source_id} selects foreign spans={wrong}")
+        if (
+            by_id.get(source_id) is not None
+            and float(by_id[source_id].duration_seconds) > DIRECT_STRINGOUT_MAX_SECONDS
+            and spans_by_source.get(source_id)
+            and not selected_spans
+        ):
+            faults.append(f"{source_id} long source has no span selects")
+
+    required = _grounding_required_targets(grounding_spec)
+    coverage_rows = payload.get("target_coverage") or []
+    rows_by_target: dict[str, dict[str, Any]] = {}
+    for row in coverage_rows:
+        target_id = str(row.get("target_id") or "")
+        if target_id in rows_by_target:
+            faults.append(f"duplicate target coverage={target_id}")
+        rows_by_target[target_id] = row
+    unknown_targets = sorted(set(rows_by_target) - set(required))
+    if unknown_targets:
+        faults.append(f"unknown target coverage={unknown_targets}")
+    ranked_set = set(ranked)
+    for target_id in required:
+        eligible = {
+            item.source_id for item in material
+            if _material_can_claim_target(item, target_id, None)
+        }
+        row = rows_by_target.get(target_id)
+        if row is None:
+            faults.append(f"missing target coverage={target_id}")
+            continue
+        primary = tuple(dict.fromkeys(
+            str(one) for one in row.get("primary_source_ids") or []
+        ))
+        alternates = tuple(dict.fromkeys(
+            str(one) for one in row.get("alternate_source_ids") or []
+        ))
+        if not primary:
+            faults.append(f"{target_id} has no primary source")
+        bad = sorted((set(primary) | set(alternates)) - eligible)
+        if bad:
+            faults.append(f"{target_id} coverage cannot claim target={bad}")
+        # Logging narrows a long source to named ranges.  A source-level
+        # identity hit is not enough: the actual ranges admitted to the
+        # planning reel must retain the target.  Otherwise Gemini may truthfully
+        # report that Fold appears somewhere in a one-hour file while selecting
+        # only a later section where it is absent.
+        selected_without_target: list[str] = []
+        for source_id in (*primary, *alternates):
+            item = by_id.get(source_id)
+            row_for_source = select_rows_by_source.get(source_id)
+            if item is None or row_for_source is None:
+                continue
+            selected_span_ids = tuple(
+                str(one) for one in row_for_source.get("span_ids") or []
+            )
+            if selected_span_ids:
+                carries_selected = any(
+                    span is not None
+                    and _material_can_claim_target(item, target_id, span)
+                    for span in (
+                        spans_by_id.get(span_id)
+                        for span_id in selected_span_ids
+                    )
+                )
+            else:
+                # An un-ranged select places the whole source in the reel.
+                carries_selected = _material_can_claim_target(
+                    item, target_id, None
+                )
+            if not carries_selected:
+                selected_without_target.append(source_id)
+        if selected_without_target:
+            faults.append(
+                f"{target_id} selected spans cannot claim target="
+                f"{sorted(set(selected_without_target))}"
+            )
+        if set(primary) & set(alternates):
+            faults.append(f"{target_id} primary and alternate overlap")
+        if len(eligible) >= 2 and not alternates:
+            faults.append(f"{target_id} has no alternate source")
+        omitted = sorted((set(primary) | set(alternates)) - ranked_set)
+        if omitted:
+            faults.append(f"{target_id} coverage omitted from selects={omitted}")
+
+    if required and _grounding_presence_policy(grounding_spec) == "target_only":
+        context_selects = sorted(
+            source_id for source_id in ranked_set
+            if source_id in by_id and not any(
+                _material_can_claim_target(by_id[source_id], target_id, None)
+                for target_id in required
+            )
+        )
+        if context_selects:
+            faults.append(
+                "target_only selects include context-only sources="
+                + repr(context_selects)
+            )
+
+    if faults:
+        raise PlannerError(
+            "material logging audit failed: " + "; ".join(faults)
+        )
+    return payload
+
+
+def material_log_selects(
+    payload: Mapping[str, Any], material: list[MaterialItem], *,
+    max_seconds: float = DIRECT_STRINGOUT_MAX_SECONDS,
+    grounding_spec: Any | None = None,
+) -> list[MaterialItem]:
+    """Take Gemini's ranked broad selects until one direct reel is full."""
+
+    prepare_material_log(
+        dict(payload), material, grounding_spec=grounding_spec
+    )
+    by_id = {one.source_id: one for one in material}
+    selected: list[MaterialItem] = []
+    elapsed = 0.0
+    seen: set[str] = set()
+    mandatory = list(dict.fromkeys(
+        str(source_id)
+        for row in payload.get("target_coverage") or []
+        for field in ("primary_source_ids", "alternate_source_ids")
+        for source_id in row.get(field) or []
+    ))
+    select_rows = {
+        str(entry.get("source_id") or ""): entry
+        for entry in payload.get("selects") or []
+    }
+    ranked = list(select_rows)
+    mandatory_set = set(mandatory)
+    for source_id in [*mandatory, *ranked]:
+        item = by_id.get(source_id)
+        if item is None or source_id in seen:
+            continue
+        selected_span_ids = {
+            str(one) for one in (select_rows.get(source_id) or {}).get("span_ids") or []
+        }
+        selected_spans = tuple(
+            span for span in item.spans
+            if str(span.span_id) in selected_span_ids
+        )
+        planning_ranges = tuple(
+            (float(span.starts_seconds), float(span.ends_seconds))
+            for span in selected_spans
+        )
+        duration = (
+            sum(end - start for start, end in planning_ranges)
+            if planning_ranges else max(0.0, float(item.duration_seconds))
+        )
+        reel_cost = duration + PLANNING_SLATE_SECONDS * max(
+            1, len(planning_ranges)
+        )
+        if elapsed + reel_cost > max_seconds and source_id in mandatory_set:
+            raise PlannerError(
+                "required target primary/alternate sources exceed the "
+                f"{max_seconds:g}s selects reel budget at {source_id}"
+            )
+        if elapsed + reel_cost > max_seconds:
+            continue
+        selected.append(replace(
+            item,
+            spans=selected_spans or item.spans,
+            planning_ranges=planning_ranges,
+        ))
+        seen.add(source_id)
+        elapsed += reel_cost
+    if not selected:
+        raise PlannerError("material logging produced no executable selects")
+    # Reel order follows the rushes, not the model's preference order. Rank
+    # decides inclusion only; preserving source order avoids manufacturing a
+    # sequence before the editorial-plan call.
+    by_selected = {one.source_id: one for one in selected}
+    return [by_selected[one.source_id] for one in material if one.source_id in seen]
+
+
+def decide_material_log(
+    material: list[MaterialItem], *, brief: str, aspect: str,
+    grounding_spec: Any | None = None,
+    client: Any | None = None, ledger: Any | None = None,
+) -> tuple[dict[str, Any], Usage]:
+    """Gemini bins its existing visual ClipCard logs for an oversized project."""
+
+    if client is None:
+        client = _default_client()
+    required = _grounding_required_targets(grounding_spec)
+    prompt = (
+        "你是同一位剪輯師的 logging 階段。以下每張素材卡都來自 Gemini 已逐支"
+        "看過影片的視覺紀錄；現在只建立可重疊的語義 bins，並排一份寬鬆 selects"
+        "優先序，不能決定鏡頭順序、秒數或成片方向。每個 source_id 至少放進一個"
+        " bin；每個列出的 span_id 也至少放進一個 bin。單一長檔必須按 span 分類，"
+        "不可只把整支 source 重複填進幾個籠統分類。同一來源可屬於多個 bin。"
+        f"selects 的 span 總長加上每段 {PLANNING_SLATE_SECONDS:g} 秒 slate "
+        f"不得超過 {DIRECT_STRINGOUT_MAX_SECONDS:g} 秒；長檔必須收斂，不能全選。"
+        "selects 要保留 brief 覆蓋、建立鏡頭、"
+        "細節、反應、continuity partner 與 fallback，不只挑漂亮 hero shot。"
+        "不要自創 source_id。對每個 required target 另填 target_coverage："
+        "至少一個 primary；素材若有兩個以上可證明來源，必須另留不同來源的"
+        " alternate。這些來源也都必須出現在 selects，而且實際"
+        "選入的 span 必須落在該 target 的可見區間；不可只因同一支長檔"
+        "的其他時段曾出現過產品就宣稱已保留。\n\n"
+        + (_grounding_policy_prompt(grounding_spec) + "\n\n" if required else "")
+        + f"交付比例：{aspect}\n\n剪輯 brief：\n{brief}\n\n素材卡：\n"
+        + _describe_editorial_catalog(material)
+    )
+    interaction = ask(
+        client, model=MODEL_ID, store=False,
+        input=[{"type": "text", "text": prompt}],
+        generation_config={
+            "thinking_level": THINKING_HIGH,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        },
+        response_format=structured_json(_material_log_schema(required)),
+        ledger=ledger, budget_stage="material_logging",
+    )
+    payload = prepare_material_log(
+        _parse(interaction, what="material logging"), material,
+        grounding_spec=grounding_spec,
+    )
+    return payload, Usage.from_interaction(interaction)
+
+
 def _travel_seconds(room: float) -> str:
     """How long the frame takes to cross that much of this clip, per energy.
 
@@ -1806,6 +2396,12 @@ def _action_ids_for_material(material: list[MaterialItem]) -> list[str]:
     ))
 
 
+def _audio_span_ids_for_material(material: list[MaterialItem]) -> list[str]:
+    return list(dict.fromkeys(
+        span_id for item in material for span_id, _starts, _ends in item.audio_spans
+    ))
+
+
 def _describe_material(material: list[MaterialItem]) -> str:
     """The card's measurements alongside the description.
 
@@ -1823,6 +2419,11 @@ def _describe_material(material: list[MaterialItem]) -> str:
             facts.append(f"景別{item.shot_size}")
         if item.facing and item.facing != "flat":
             facts.append(f"朝向{item.facing}")
+        if item.sync_group:
+            facts.append(
+                f"同步組{item.sync_group}（{item.sync_role}，"
+                f"group=source{item.sync_offset_seconds:+.3f}s）"
+            )
         # Only movement that does something for the viewer counts as the
         # source doing the work. The selection prompt reads this label as a
         # reason to hold -- the camera will bring the subject in, so a second
@@ -2122,6 +2723,12 @@ def decide_direction(
                 f"## 交付比例\n\n這支片輸出 {aspect}，這是需求規格，不是你的選擇。"
                 f"所有調性與節奏的判斷都要建立在這個比例上。\n\n"
                 f"## 剪輯 brief\n\n{brief}\n\n"
+                + (
+                    "## 指定主體出鏡政策\n\n"
+                    + _grounding_policy_prompt(grounding_spec)
+                    + "\n\n"
+                    if grounding_spec is not None else ""
+                )
                 + (
                     "## 音樂結構（本機量測）\n\n"
                     + _describe_music(music_grid)
@@ -2606,7 +3213,7 @@ def _selection_schema(
                                 # was a wordmark, and its silence lowered the
                                 # bar it had to clear from whole to 85%.
                                 "required": [
-                                    "entity_id", "at", "seconds", "framing",
+                                    "entity_id", "co_visible_entity_ids", "at", "seconds", "framing",
                                     "must_be_whole", "presentation_intent"
                                 ],
                                 "properties": {
@@ -2620,6 +3227,19 @@ def _selection_schema(
                                             "stable reference identity: copy "
                                             "its entity_id exactly. Otherwise "
                                             "write none; never invent an id."
+                                        ),
+                                    },
+                                    "co_visible_entity_ids": {
+                                        "type": "array", "uniqueItems": True,
+                                        "items": {
+                                            "type": "string",
+                                            "enum": grounding_target_ids or [],
+                                        },
+                                        "description": (
+                                            "Only identities visible at the same instant and "
+                                            "inside the intended frame at this landing. A pan "
+                                            "which sees products one after another must leave "
+                                            "this empty."
                                         ),
                                     },
                                     "at": {
@@ -2861,7 +3481,10 @@ def _selection_schema(
                         "type": "string",
                         "description": (
                             "Offset from that shot's start, MM:SS. Usually 0:00; "
-                            "a positive value delays the voice for a J-cut setup."
+                            "a positive value delays the voice after its anchor. "
+                            "To author a J-cut, anchor the incoming voice on the "
+                            "preceding picture shot at the exact late offset where "
+                            "it should begin."
                         ),
                     },
                     "completion": {
@@ -2884,6 +3507,7 @@ def _editorial_plan_schema(
     grounding_target_ids: list[str] | None = None,
     commitment_ids: list[str] | None = None,
     action_ids: list[str] | None = None,
+    event_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     """One flat editorial plan: story, timing and shots decided in one call.
 
@@ -2897,9 +3521,9 @@ def _editorial_plan_schema(
 
     Coverage is adjacent shots proving one point; the shot count is
     len(shots), not a quota. target_seconds is optional -- omit it for a
-    free-length cut. This milestone only defines the schema; wiring it into
-    the pipeline and retiring the commitment machinery is a later step, so the
-    reused shot object still carries commitment_id for now.
+    free-length cut. The merged route deliberately omits commitment ids: each
+    shot is the editorial decision, and local execution validates that decision
+    against the named span and measured events directly.
     """
     import copy as _copy
 
@@ -2908,22 +3532,80 @@ def _editorial_plan_schema(
         graphic_candidate_ids=graphic_candidate_ids,
         audio_span_ids=audio_span_ids,
         grounding_target_ids=grounding_target_ids,
-        commitment_ids=commitment_ids, action_ids=action_ids,
+        # Kept in the function signature only so older callers do not break;
+        # the merged contract never exposes or requires commitment_id.
+        commitment_ids=None, action_ids=action_ids,
     )
     direction = _direction_schema()
     rhythm = _rhythm_schema(["k00"])
 
     shot = _copy.deepcopy(base["properties"]["shots"])
+    # Per-run ids are application data, not grammar. Hundreds of span/action
+    # enum members made the otherwise-flat schema cross the provider's
+    # complexity ceiling. Keep fixed editorial enums in the schema and audit
+    # all material ids locally on receipt.
+    shot["items"]["properties"]["span_id"].pop("enum", None)
+    shot["items"]["properties"]["action_id"].pop("enum", None)
+    shot["items"]["properties"]["action_id"]["description"] += (
+        "只能引用素材表列出的 id 或 none；本機 fail-closed 驗證。"
+    )
     # A fallback substitution (used only if the primary cannot ground or
     # deliver -- never a second shot) and the per-shot music sync folded in
     # from the rhythm decision, all as optional shot fields.
-    shot["items"]["properties"]["fallback_source"] = {
+    shot["items"]["properties"]["fallback_span_id"] = {
         "type": "string",
         "description": (
-            "選填。這顆的主來源若過不了身份確認或交付，才用它取代——它是備胎，"
-            "不是第二顆鏡頭。要覆蓋一個點就多開一顆觀眾看得出不同的鏡頭，別靠這個湊。"
+            "選填。這顆的主 span 若過不了身份確認或交付，才用它取代——它是備胎，"
+            "不是第二顆鏡頭。只能引用素材表列出的完整 span id；回傳後由本機"
+            "fail-closed 驗證，不把整份動態 id 清單複製進 schema。"
         ),
     }
+    # These describe the relationship at the incoming edge of each shot.
+    # They are editorial facts, not another timing pass: the model says why
+    # the cut exists and which measured event it means; local code resolves
+    # the event to a source frame and performs a handle-safe slip.
+    shot["items"]["properties"].update({
+        "story_point": {
+            "type": "string",
+            "description": "這顆在故事中推進或證明的同一個具名節點。",
+        },
+        "continuity_mode": {
+            "type": "string",
+            "enum": [
+                "none", "continuity_scene", "associative_montage", "reset",
+            ],
+        },
+        "cut_motivation": {
+            "type": "string",
+            "enum": [
+                "content", "cut_on_action", "reaction", "match_motion",
+                "match_shape", "eyeline", "screen_direction_reset",
+                "music_phrase", "music_accent", "intentional_jump", "end",
+            ],
+            "description": "這顆和前一顆之間為何在此刻切。第一顆填 content。",
+        },
+        "source_event_ref": {
+            "type": "string",
+            "description": (
+                "選填本機列出的具名 source event；本機解析到影格。"
+                "沒有完全相符的事件填 none，不可自創。回傳後會按本次"
+                "event catalog fail-closed 驗證；不用把數百個事件再複製進"
+                "provider grammar。"
+            ),
+        },
+        "source_event_relation": {
+            "type": "string",
+            "enum": ["none", "before", "at", "after"],
+        },
+        "event_tolerance_frames": {
+            "type": "integer", "minimum": 0, "maximum": 30,
+            "description": "允許本機把粗略進點 slip 到具名事件的最大格數。",
+        },
+    })
+    shot["items"]["required"].extend([
+        "story_point", "continuity_mode", "cut_motivation",
+        "source_event_ref", "source_event_relation", "event_tolerance_frames",
+    ])
     for name in ("sync_to", "beats", "cut_on_beat"):
         shot["items"]["properties"][name] = _copy.deepcopy(
             rhythm["properties"]["decisions"]["items"]["properties"][name]
@@ -2947,6 +3629,9 @@ def _editorial_plan_schema(
         properties["audio_assignments"] = _copy.deepcopy(
             base["properties"]["audio_assignments"]
         )
+        properties["audio_assignments"]["items"]["properties"][
+            "audio_span_id"
+        ].pop("enum", None)
     # Gemini video understanding samples at ~1 frame/second and only supports
     # whole-second MM:SS timestamps; a decimal like 0:02.5 is precision it
     # cannot perceive at that rate, so allowing `(?:\.\d+)?` in the pattern only
@@ -2974,6 +3659,8 @@ def _editorial_plan_schema(
         "reasoning", "material_assessment", "direction",
         "music_under_speech", "shots",
     ]
+    if "audio_assignments" in properties:
+        required.append("audio_assignments")
     return {
         "type": "object",
         "additionalProperties": False,
@@ -2983,37 +3670,248 @@ def _editorial_plan_schema(
 
 
 def _editorial_plan_prompt() -> str:
-    """The three planning briefs composed into one editor's brief.
+    """One authored editor brief, not three sequential roles concatenated."""
 
-    A builder rather than a new file, so it carries the direction, selection
-    and rhythm rules already written and lint-checked on disk -- including the
-    coverage rules (one point may take several DISTINCT shots, the alternate
-    is a fallback not a second shot, distinct means what the viewer sees, the
-    shot count is a soft target, target_seconds may be omitted for free
-    length) -- with no second copy to drift out of sync. The wiring milestone
-    can distil this into a single authored file; here it keeps one source of
-    truth.
+    return (PROMPTS / "editorial_plan_zh-TW.txt").read_text(
+        encoding="utf-8"
+    ).strip()
+
+
+def editorial_event_catalog(
+    material: list[MaterialItem],
+) -> tuple[list[str], str]:
+    """Expose locally measured source moments Gemini can name, never invent.
+
+    Span and action boundaries already exist on every MaterialItem before the
+    paid planning call.  Publishing their stable ids costs no new detector and
+    lets the answer point at meaning (action complete / usable span begins)
+    instead of guessing a more precise-looking second.
     """
 
-    preamble = (
-        "你現在一次做完整支片的編輯決定：故事定調、每一顆鏡頭、以及它們的粗略節奏，"
-        "在同一個回答裡決定，不再分成互不通氣的幾關。輸出一份扁平的 editorial plan——"
-        "故事層的欄位，加上一條有序的 shots。覆蓋＝相鄰幾顆證同一個點；鏡頭數就是 "
-        "shots 的長度，不是配額。目標秒數可留空＝自由長度。下面三段是同一位剪輯師的"
-        "三個面向，一起讀、一起決定。\n\n"
-        "所有時間欄位一律寫成整秒的 MM:SS（例如 `0:02`，不是 `0:02.5`）：你每秒約只"
-        "看到一格畫面，看不出更細的時間，別自己補出小數精度——本機程式會用逐格解碼把"
-        "時間校準到影格。\n\n"
-    )
-    parts = [
-        header + "\n\n" + (PROMPTS / name).read_text(encoding="utf-8").strip()
-        for header, name in (
-            ("## 一、定調與覆蓋", "direction_zh-TW.txt"),
-            ("## 二、選鏡與剪輯", "selection_zh-TW.txt"),
-            ("## 三、節奏與音樂", "rhythm_zh-TW.txt"),
+    refs: list[str] = []
+    lines: list[str] = []
+    for item in material:
+        local: list[str] = []
+        for span in item.spans:
+            local.extend([
+                f"span_start:{span.span_id}",
+                f"span_end:{span.span_id}",
+            ])
+        for action_id, starts, ends in item.action_windows:
+            del starts, ends
+            local.extend([
+                f"action_start:{item.source_id}:{action_id}",
+                f"action_complete:{item.source_id}:{action_id}",
+            ])
+        if not local:
+            continue
+        lines.append(f"- {item.source_id}")
+        for ref in local:
+            refs.append(ref)
+            lines.append(f"  - `{ref}`")
+    return list(dict.fromkeys(refs)), "\n".join(lines)
+
+
+def _validate_json_contract(
+    value: Any, schema: dict[str, Any], *, path: str = "$",
+) -> list[str]:
+    """Small dependency-free validator for replaying provider JSON offline."""
+
+    faults: list[str] = []
+    expected = schema.get("type")
+    matches = {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool),
+    }
+    if expected in matches and not matches[expected]:
+        return [f"{path} must be {expected}, got {type(value).__name__}"]
+    if "enum" in schema and value not in schema["enum"]:
+        faults.append(f"{path} is not one of the offered values: {value!r}")
+    if isinstance(value, dict):
+        properties = schema.get("properties") or {}
+        for name in schema.get("required") or []:
+            if name not in value:
+                faults.append(f"{path}.{name} is required")
+        if schema.get("additionalProperties") is False:
+            for name in value:
+                if name not in properties:
+                    faults.append(f"{path}.{name} is not allowed")
+        for name, child in value.items():
+            if name in properties:
+                faults.extend(_validate_json_contract(
+                    child, properties[name], path=f"{path}.{name}"
+                ))
+    elif isinstance(value, list):
+        minimum = schema.get("minItems")
+        maximum = schema.get("maxItems")
+        if minimum is not None and len(value) < int(minimum):
+            faults.append(f"{path} needs at least {minimum} items")
+        if maximum is not None and len(value) > int(maximum):
+            faults.append(f"{path} allows at most {maximum} items")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, child in enumerate(value):
+                faults.extend(_validate_json_contract(
+                    child, item_schema, path=f"{path}[{index}]"
+                ))
+    elif isinstance(value, str) and schema.get("pattern"):
+        if re.fullmatch(str(schema["pattern"]), value) is None:
+            faults.append(f"{path} does not match {schema['pattern']!r}")
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if schema.get("minimum") is not None and value < schema["minimum"]:
+            faults.append(f"{path} is below {schema['minimum']}")
+        if schema.get("maximum") is not None and value > schema["maximum"]:
+            faults.append(f"{path} is above {schema['maximum']}")
+    return faults
+
+
+def prepare_editorial_plan(
+    plan: dict[str, Any], material: list[MaterialItem], *,
+    aspect: str, seconds: float = 0.0, validate_provider_shape: bool = False,
+    grounding_spec: Any | None = None,
+) -> dict[str, Any]:
+    """Apply the exact local boundary used by paid and replayed plans."""
+
+    event_refs, _ = editorial_event_catalog(material)
+    if validate_provider_shape:
+        grounding_target_ids = (
+            [
+                target.target_id
+                for target in grounding_spec.identity_lock.identity.targets
+            ]
+            if grounding_spec is not None else []
         )
-    ]
-    return preamble + "\n\n".join(parts)
+        schema = _editorial_plan_schema(
+            [span.span_id for item in material for span in item.spans],
+            audio_span_ids=_audio_span_ids_for_material(material),
+            grounding_target_ids=grounding_target_ids,
+            action_ids=_action_ids_for_material(material),
+            event_refs=event_refs,
+        )
+        faults = _validate_json_contract(plan, schema)
+        if faults:
+            raise PlannerError(
+                "editorial plan replay violates the paid response contract: "
+                + "; ".join(faults[:20])
+            )
+    allowed_events = set(event_refs)
+    allowed_spans = {
+        span.span_id for item in material for span in item.spans
+    }
+    allowed_actions = {"none", *_action_ids_for_material(material)}
+    allowed_audio = set(_audio_span_ids_for_material(material))
+    for index, shot in enumerate(plan.get("shots") or []):
+        span_id = str(shot.get("span_id") or "")
+        if span_id not in allowed_spans:
+            raise PlannerError(
+                f"editorial plan shot {index} invented span {span_id!r}"
+            )
+        fallback = str(shot.get("fallback_span_id") or "")
+        if fallback and fallback not in allowed_spans:
+            raise PlannerError(
+                f"editorial plan shot {index} invented fallback span {fallback!r}"
+            )
+        action_id = str(shot.get("action_id") or "none")
+        if action_id not in allowed_actions:
+            raise PlannerError(
+                f"editorial plan shot {index} invented action {action_id!r}"
+            )
+        event_ref = str(shot.get("source_event_ref") or "none")
+        if event_ref != "none" and event_ref not in allowed_events:
+            plan.setdefault("event_disagreements", []).append(
+                f"shot {index} invented event {event_ref!r}; kept its semantic window"
+            )
+            shot["source_event_ref"] = "none"
+            shot["source_event_relation"] = "none"
+            shot["event_tolerance_frames"] = 0
+    for index, assignment in enumerate(plan.get("audio_assignments") or []):
+        audio_span_id = str(assignment.get("audio_span_id") or "")
+        if audio_span_id not in allowed_audio:
+            raise PlannerError(
+                f"editorial plan audio assignment {index} invented span "
+                f"{audio_span_id!r}"
+            )
+    from montagewright.spans import seconds_of
+
+    plan["aspect"] = aspect
+    plan["target_seconds"] = seconds_of(plan.get("target_seconds")) or (
+        seconds if seconds > 0 else 0.0
+    )
+    if seconds > 0:
+        plan["target_seconds"] = seconds
+    return plan
+
+
+def load_editorial_plan_replay(
+    path: Path, material: list[MaterialItem], *, aspect: str,
+    seconds: float = 0.0, grounding_spec: Any | None = None,
+    editorial_contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load a recorded Gemini answer without uploading or making an API call."""
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise PlannerError(f"cannot read editorial plan replay {path}: {error}") from error
+    if not isinstance(raw, dict):
+        raise PlannerError("editorial plan replay root must be an object")
+    # Accept either the raw provider object or Montagewright's durable
+    # planning-artifact envelope. The cached value has already had two local
+    # fields normalised; reconstruct their provider representation only for
+    # schema validation, then execute the preserved value.
+    if isinstance(raw.get("value"), dict) and "key" in raw:
+        raw = raw["value"]
+    replay = copy.deepcopy(raw)
+    provider_shape = copy.deepcopy(replay)
+    # Older recorded provider answers predate explicit simultaneous identity
+    # evidence. Empty is the only safe migration: sequential looks must never
+    # be promoted into a group shot merely because they share one clip.
+    for shot in provider_shape.get("shots") or []:
+        for look in shot.get("looks") or []:
+            look.setdefault("co_visible_entity_ids", [])
+    provider_shape.pop("aspect", None)
+    provider_shape.pop("event_disagreements", None)
+    target = provider_shape.get("target_seconds")
+    if isinstance(target, (int, float)) and not isinstance(target, bool):
+        total = max(0, int(round(float(target))))
+        provider_shape["target_seconds"] = f"{total // 60}:{total % 60:02d}"
+    prepare_editorial_plan(
+        provider_shape, material, aspect=aspect, seconds=seconds,
+        validate_provider_shape=True, grounding_spec=grounding_spec,
+    )
+    prepared = prepare_editorial_plan(
+        replay, material, aspect=aspect, seconds=seconds,
+        grounding_spec=grounding_spec,
+    )
+    if editorial_contract:
+        from montagewright.delivery_contract import (
+            editorial_obligation_faults, music_policy_faults,
+        )
+        from montagewright.job import MusicPolicy, TimelineObligation
+
+        obligations = tuple(
+            TimelineObligation.model_validate(one)
+            for one in editorial_contract.get("obligations") or []
+        )
+        faults = editorial_obligation_faults(
+            prepared.get("shots") or [], obligations,
+        )
+        faults.extend(music_policy_faults(
+            prepared,
+            MusicPolicy.model_validate(
+                editorial_contract.get("music_policy") or {}
+            ),
+        ))
+        if faults:
+            raise PlannerError(
+                "editorial plan replay violates the production work order: "
+                + "; ".join(faults)
+            )
+    return prepared
 
 
 def decide_editorial_plan(
@@ -3029,6 +3927,11 @@ def decide_editorial_plan(
     client: Any | None = None,
     ledger: Any | None = None,
     grounding_spec: Any | None = None,
+    planning_video: Path | None = None,
+    stringout_manifest: Any | None = None,
+    editorial_contract: dict[str, Any] | None = None,
+    material_log: dict[str, Any] | None = None,
+    allow_paid_repair: bool = False,
 ) -> tuple[dict[str, Any], Usage]:
     """The merged brain: story, shots and rough timing in ONE call.
 
@@ -3038,9 +3941,14 @@ def decide_editorial_plan(
     because one answer decides tone, coverage and rough timing together, the
     seams where a later stage contradicted an earlier one do not exist.
 
-    This is opt-in (see command_render). It does not touch grounding or the
-    executor: `editorial_plan_to_legacy` bridges its flat output into the
-    structures those stages already read.
+    Grounding and execution consume this plan directly.  The explicit legacy
+    three-pass route still has its own direction/selection contracts, but the
+    merged route never synthesises candidate commitments from its shots.
+
+    ``planning_video`` is one logging/selects stringout.  More than one source
+    must never fall back to one provider video part per file: Gemini currently
+    caps a request at ten videos and recommends one for best video attention.
+    The stringout sidecar is checked locally before any upload or paid call.
     """
 
     if client is None:
@@ -3050,22 +3958,108 @@ def decide_editorial_plan(
         [target.target_id for target in grounding_spec.identity_lock.identity.targets]
         if grounding_spec is not None else []
     )
-    # target_seconds is a soft target here, and may be omitted for free length.
+    # Exact commercial deliverables are a hard editorial constraint here too;
+    # leaving that only to the local convergence loop makes it stretch a plan
+    # which never budgeted enough content.
+    duration_contract = (
+        editorial_contract.get("duration", {})
+        if isinstance(editorial_contract, dict) else {}
+    )
+    range_minimum = duration_contract.get("minimum_seconds")
+    range_maximum = duration_contract.get("maximum_seconds")
     fixed = (
-        f"## 片長\n\n目標長度約 {seconds:g} 秒（軟目標，不是配額）。填 "
-        f"`target_seconds={seconds:g}`。素材只夠較少的不同鏡頭時交較短，不可用"
-        f"重複或空停留補滿。\n\n"
+        (
+            f"## 片長\n\n這是精確 {seconds:g} 秒的商業交付規格，不是軟目標。"
+            f"在選鏡時就要為完整 {seconds:g} 秒分配足夠、不重複的內容，"
+            f"填 `target_seconds={seconds:g}`。不可用重複、空停留或砍斷句子補秒數；"
+            "若素材客觀不足，必須在計畫中明說缺口。\n\n"
+            if duration_mode == "exact" else
+            (
+                f"## 片長\n\n這支片必須落在 {float(range_minimum):g}–"
+                f"{float(range_maximum):g} 秒；{seconds:g} 秒是區間內的理想目標。"
+                "先以內容完整、節奏自然為準，但不得交出區間外的計畫；"
+                "不可切字、重複或空停留補秒數。\n\n"
+                if duration_mode == "range"
+                and range_minimum is not None and range_maximum is not None
+                else
+            f"## 片長\n\n目標長度約 {seconds:g} 秒（軟目標）。填 "
+            f"`target_seconds={seconds:g}`。素材自然長度較短時可交較短，"
+            "不可用重複或空停留補滿。\n\n"
+            )
+        )
         if seconds > 0
         else "## 片長\n\n沒有指定長度：交素材自然能覆蓋的長度，"
         "`target_seconds` 可留空。\n\n"
     )
-    request_input: list[dict[str, Any]] = [
+    visible = [
+        item for item in material
+        if item.proxy is not None and item.proxy.exists()
+    ]
+    if planning_video is None:
+        if len(visible) != 1:
+            raise PlannerError(
+                "editorial planning requires one validated stringout when "
+                f"material has {len(visible)} video sources; no paid request was sent"
+            )
+        planning_video = visible[0].proxy
+    if planning_video is None or not planning_video.exists():
+        raise PlannerError("editorial planning stringout is missing; no paid request was sent")
+    if stringout_manifest is not None:
+        from montagewright.stringout import require_stringout_matches
+
+        require_stringout_matches(stringout_manifest, visible)
+
+    if cache is None:
+        planning_uri = upload_now(planning_video, client).uri
+    else:
+        planning_uri, _ = cache.uri_for(
+            planning_video, client, mime_type="video/mp4"
+        )
+
+    event_refs, event_catalog = editorial_event_catalog(material)
+    # Media first and the actual editorial question last. This follows the
+    # provider's video guidance and prevents a long table from anchoring what
+    # the editor thinks it sees before it has watched the reel.
+    request_input: list[dict[str, Any]] = [{
+        "type": "video", "mime_type": "video/mp4",
+        "uri": planning_uri, "resolution": "low",
+    }]
+    if grounding_spec is not None:
+        from montagewright.reference_grounding import reference_prompt_parts
+
+        request_input += reference_prompt_parts(
+            grounding_spec, client=client, cache=cache, resolution="high",
+        )
+    if music is not None:
+        request_input.append(_attach_music(music, cache, client))
+    request_input.append(
         {
             "type": "text",
             "text": (
                 f"{_editorial_plan_prompt()}\n\n{fixed}"
                 f"## 交付比例\n\n這支片輸出 {aspect}，是需求規格，不是你的選擇。\n\n"
                 f"## 剪輯 brief\n\n{brief}\n\n"
+                + (
+                    "## 助理剪輯 logging\n\n"
+                    + json.dumps(material_log, ensure_ascii=False, indent=2)
+                    + "\n\n這是你先前按來源時間段建立的 bins/selects；"
+                    "用它導航長素材，但仍以眼前影片作最後選鏡判斷。\n\n"
+                    if material_log else ""
+                )
+                + (
+                    "## 製作工作單硬約束\n\n"
+                    + json.dumps(
+                        editorial_contract, ensure_ascii=False, indent=2
+                    )
+                    + "\n\n這些不是創意建議。picture obligations 必須由 "
+                    "shots[].looks[].entity_id 與實際 seconds_needed 滿足；"
+                    "禁露窗口、共同出現與最短秒數不可只在 why 裡宣稱。"
+                    "continuous_soundbite 不得拼接或刪除句中內容；phrase_edit "
+                    "才可依逐詞 provenance 剪接。音樂只能取 allowed_ranges。\n\n"
+                    "rights.prohibited_visuals 是逐顆畫面的硬排除；不確定是否"
+                    "出現就不要選，不能留給裁切或 why 自動解決。\n\n"
+                    if editorial_contract else ""
+                )
                 + (
                     "## 音樂結構（本機量測）\n\n"
                     + _describe_music(music_grid)
@@ -3076,22 +4070,27 @@ def decide_editorial_plan(
                 )
                 + f"## 執行層做得到什麼\n\n{describe_for_prompt()}\n\n"
                 f"## 執行層做不到什麼\n\n{describe_limits_for_prompt()}\n\n"
-                f"## 素材\n\n以下 {len(material)} 支，每一支的說明就寫在它自己那段影片前面。\n"
+                + (
+                    "## 可具名引用的本機量測事件\n\n"
+                    + event_catalog
+                    + "\n\n這裡只公開事件名稱；真正秒數與影格由本機解析。\n\n"
+                    if event_catalog else ""
+                )
+                + "## 素材 Stringout\n\n"
+                + f"你剛看完的單支 stringout 收錄以下 {len(material)} 個來源；"
+                "畫面持續燒有 source_id。以影片為主要觀察，清單只提供可引用的"
+                "穩定名稱、Apple 逐字稿與硬性排除。\n\n"
+                + _describe_editorial_catalog(material)
+                + "\n\n看完所有內容後才產生一份完整 editorial plan。"
             ),
         }
-    ]
-    if grounding_spec is not None:
-        from montagewright.reference_grounding import reference_prompt_parts
+    )
 
-        # High-resolution here: unlike direction, this one call also binds an
-        # entity_id to a shot, so the reference pixels have to be able to
-        # affect that decision -- and they are sent once, not again at select.
-        request_input += reference_prompt_parts(
-            grounding_spec, client=client, cache=cache, resolution="high",
+    if sum(part.get("type") == "video" for part in request_input) != 1:
+        raise PlannerError(
+            "editorial planning payload must contain exactly one video; "
+            "no paid request was sent"
         )
-    request_input += _attach_material(material, cache, client)
-    if music is not None:
-        request_input.append(_attach_music(music, cache, client))
 
     interaction = ask(
         client,
@@ -3104,99 +4103,104 @@ def decide_editorial_plan(
         },
         response_format=structured_json(_editorial_plan_schema(
             [span.span_id for item in material for span in item.spans],
+            audio_span_ids=_audio_span_ids_for_material(material),
             grounding_target_ids=grounding_target_ids,
             action_ids=_action_ids_for_material(material),
+            event_refs=event_refs,
         )),
         ledger=ledger,
         budget_stage="editorial_plan",
         upload_cache=cache,
     )
     plan = _parse(interaction, what="editorial plan")
-    from montagewright.spans import seconds_of
+    interactions = [interaction]
+    try:
+        plan = prepare_editorial_plan(
+            plan, material, aspect=aspect, seconds=seconds,
+            grounding_spec=grounding_spec,
+        )
+    except PlannerError as error:
+        if not allow_paid_repair:
+            raise EditorialPlanUnrenderable(
+                str(error), draft=plan, fault=str(error)
+            ) from error
+        # This correction is deliberately text-only and preserves the edit.
+        # The model already watched the stringout; it only replaces invalid
+        # stable IDs in the complete JSON answer.  Re-uploading/re-watching
+        # the footage would pay again for a structural typo and could silently
+        # turn the correction into a different cut.
+        repair = ask(
+            client,
+            model=MODEL_ID,
+            store=False,
+            input=[{
+                "type": "text",
+                "text": (
+                    "你正在修正一份已完成的 editorial plan。保留原來的故事、"
+                    "shots、順序、長度、畫面選擇與理由；只修正下列本機合約錯誤。"
+                    "audio_assignments.audio_span_id 只能使用 Apple 逐字稿清單中的"
+                    " audio span ID，絕不可使用 picture span_id。回傳完整 JSON，"
+                    "不可只回 patch。\n\n本機錯誤：\n"
+                    f"{error}\n\n允許的 audio span IDs：\n"
+                    + "\n".join(_audio_span_ids_for_material(material))
+                    + "\n\n原始 plan：\n"
+                    + json.dumps(plan, ensure_ascii=False, indent=2)
+                ),
+            }],
+            generation_config={
+                "thinking_level": THINKING_HIGH,
+                "max_output_tokens": MAX_OUTPUT_TOKENS,
+            },
+            response_format=structured_json(_editorial_plan_schema(
+                [span.span_id for item in material for span in item.spans],
+                audio_span_ids=_audio_span_ids_for_material(material),
+                grounding_target_ids=grounding_target_ids,
+                action_ids=_action_ids_for_material(material),
+                event_refs=event_refs,
+            )),
+            ledger=ledger,
+            budget_stage="editorial_plan_repair",
+            upload_cache=cache,
+        )
+        interactions.append(repair)
+        corrected = _parse(repair, what="editorial plan repair")
+        try:
+            plan = prepare_editorial_plan(
+                corrected, material, aspect=aspect, seconds=seconds,
+                grounding_spec=grounding_spec,
+            )
+        except PlannerError as repair_error:
+            raise EditorialPlanUnrenderable(
+                str(repair_error), draft=corrected, fault=str(repair_error)
+            ) from repair_error
+    if editorial_contract:
+        from montagewright.delivery_contract import (
+            editorial_obligation_faults, music_policy_faults,
+        )
+        from montagewright.job import MusicPolicy, TimelineObligation
 
-    plan["aspect"] = aspect
-    plan["target_seconds"] = seconds_of(plan.get("target_seconds")) or (
-        seconds if seconds > 0 else 0.0
+        obligations = tuple(
+            TimelineObligation.model_validate(one)
+            for one in editorial_contract.get("obligations") or []
+        )
+        faults = editorial_obligation_faults(plan.get("shots") or [], obligations)
+        faults.extend(music_policy_faults(
+            plan,
+            MusicPolicy.model_validate(
+                editorial_contract.get("music_policy") or {}
+            ),
+        ))
+        if faults:
+            raise PlannerError(
+                "editorial plan violates the production work order: "
+                + "; ".join(faults)
+            )
+    usages = [Usage.from_interaction(one) for one in interactions]
+    return plan, Usage(
+        input_tokens=sum(one.input_tokens for one in usages),
+        output_tokens=sum(one.output_tokens for one in usages),
+        thought_tokens=sum(one.thought_tokens for one in usages),
     )
-    if seconds > 0:
-        plan["target_seconds"] = seconds
-    return plan, Usage.from_interaction(interaction)
-
-
-def editorial_plan_to_legacy(
-    plan: dict[str, Any], *, aspect: str = "9:16",
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Bridge the flat plan into the direction+selection dicts still consumed.
-
-    TEMPORARY. The merged call decides the shots directly, but the current
-    downstream (resolve_candidate_commitments, identity grounding, the EDL
-    build) still reads a direction dict with ``candidate_options`` and a
-    selection dict with ``shots``. This synthesises both from the plan -- one
-    commitment per shot, the shot's own source as primary and its
-    ``fallback_source`` as the alternate -- so nothing downstream has to change
-    yet. Milestone 3 has the downstream read the plan directly and deletes
-    this bridge along with the commitment machinery.
-    """
-
-    from montagewright.spans import seconds_of
-
-    shots = [dict(one) for one in (plan.get("shots") or [])]
-    candidate_options: list[dict[str, Any]] = []
-    for index, shot in enumerate(shots):
-        commitment_id = str(shot.get("commitment_id") or f"cmt_{index:02d}")
-        shot["commitment_id"] = commitment_id
-        looks = shot.get("looks") or []
-        need = seconds_of(shot.get("seconds_needed")) or 0.0
-        base_option = {
-            "commitment_id": commitment_id,
-            "purpose": str(shot.get("why") or "shot"),
-            "required": True,
-            "picture_role": str(shot.get("picture_role") or "primary_action"),
-            "tier": "primary",
-            "span_id": str(shot.get("span_id") or ""),
-            "min_supported_seconds": max(0.1, need or 0.1),
-            "presentation_intent": (
-                str((looks[0] or {}).get("presentation_intent"))
-                if looks and (looks[0] or {}).get("presentation_intent")
-                else "centered_hold"
-            ),
-            "target_id": str(
-                shot.get("target_id")
-                or ((looks[0] or {}).get("entity_id") if looks else None)
-                or "none"
-            ),
-            "why": str(shot.get("why") or "shot"),
-        }
-        candidate_options.append(base_option)
-        # The fallback_source is recorded on the shot, but it is NOT turned
-        # into a legacy alternate option: its real span in the material is not
-        # known here, so synthesising one (e.g. "C2:s00") names a span the
-        # resolver rejects. The legacy path never spent the alternate as a
-        # second shot anyway; milestone 3 reads fallback_source directly.
-
-    direction = {
-        "reasoning": str(plan.get("reasoning") or ""),
-        "material_assessment": str(plan.get("material_assessment") or ""),
-        "direction": str(plan.get("direction") or ""),
-        "aspect": aspect,
-        "target_seconds": plan.get("target_seconds") or 0.0,
-        "target_shot_count": max(1, len(shots)),
-        "typical_shot_seconds": 0.0,
-        "max_static_seconds": 0.0,
-        "music_under_speech": str(plan.get("music_under_speech") or "duck"),
-        "music_suggestion": plan.get("music_suggestion"),
-        "unusable": plan.get("unusable") or [],
-        "candidate_options": candidate_options,
-    }
-    selection = {
-        "shots": shots,
-        "covered": plan.get("covered") or [],
-        "uncovered": plan.get("uncovered") or [],
-        "audio_assignments": plan.get("audio_assignments") or [],
-        "music_from_seconds": plan.get("music_from_seconds"),
-        "music_spans": plan.get("music_spans"),
-    }
-    return direction, selection
 
 
 def _selection_patch_schema(
@@ -3524,16 +4528,20 @@ def material_look_boxes(
     }
     for look in reframe.looks:
         included = list(dict.fromkeys(getattr(look, "includes", ()) or ()))
+        primary = find_subject(card, look.at, entity_id=look.entity_id)
         included_boxes = [
             find_subject(
                 card, str(visual_labels.get(label) or label), entity_id=None
             )
             for label in included
         ]
-        if included and any(one is None for one in included_boxes):
+        if primary is None or (included and any(one is None for one in included_boxes)):
             return []
         if included_boxes:
-            boxes = [one for one in included_boxes if one is not None]
+            # `includes` means participants in addition to the thing at which
+            # the frame settles. Omitting `at` here centred a hand and could
+            # crop away the phone the hand was demonstrating.
+            boxes = [primary, *(one for one in included_boxes if one is not None)]
             left = min(one.centre_x - one.width / 2.0 for one in boxes)
             right = max(one.centre_x + one.width / 2.0 for one in boxes)
             top = min(one.centre_y - one.height / 2.0 for one in boxes)
@@ -3548,7 +4556,7 @@ def material_look_boxes(
                 moves=any(one.moves for one in boxes),
             )
         else:
-            box = find_subject(card, look.at, entity_id=look.entity_id)
+            box = primary
         if box is None:
             return []
         crop_width = (
@@ -3811,7 +4819,139 @@ def normalize_selection(
         bind_selection_content_contracts(
             chosen.get("shots") or [], commitments, list(material)
         )
+    narrative_repairs: list[str] = []
+    shots = chosen.get("shots") or []
+    speech_windows: dict[str, tuple[str, float, float]] = {}
+    speech_descriptions: dict[str, str] = {}
+    for item in material:
+        for line in item.speech:
+            found = re.match(
+                r"^`([^`]+)`\s+([0-9.]+)-([0-9.]+)s", str(line)
+            )
+            if found is not None:
+                speech_windows[found.group(1)] = (
+                    item.source_id, float(found.group(2)), float(found.group(3))
+                )
+                speech_descriptions[found.group(1)] = str(line)
+
+    # A camera file can end while somebody is still speaking. Apple keeps the
+    # measured syllables and the correction marks that cut-off with an
+    # ellipsis; that evidence can never satisfy complete_thought. When this is
+    # only the optional final reaction, lift it and finish on the preceding
+    # complete line. A truncated line in the middle still goes to replanning.
+    if shots:
+        last_index = len(shots) - 1
+        assignments = chosen.get("audio_assignments") or []
+        tail = [
+            assignment for assignment in assignments
+            if int(assignment.get("starts_at_shot_index", -1)) == last_index
+        ]
+        truncated_tail = [
+            assignment for assignment in tail
+            if str(assignment.get("completion") or "") == "complete_thought"
+            and re.search(
+                r"(?:…{1,}|\.{3,})\s*$",
+                speech_descriptions.get(
+                    str(assignment.get("audio_span_id") or ""), ""
+                ),
+            )
+        ]
+        if tail and len(truncated_tail) == len(tail):
+            shots.pop()
+            chosen["audio_assignments"] = [
+                assignment for assignment in assignments
+                if assignment not in truncated_tail
+            ]
+            for coverage in chosen.get("covered") or []:
+                coverage["shot_indexes"] = [
+                    index for index in coverage.get("shot_indexes") or []
+                    if int(index) != last_index
+                ]
+            narrative_repairs.append(
+                f"k{last_index:02d}: lifted truncated source-tail reaction "
+                "and finished on the preceding complete thought"
+            )
+    for assignment in chosen.get("audio_assignments") or []:
+        try:
+            shot_index = int(assignment.get("starts_at_shot_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= shot_index < len(shots):
+            continue
+        shot = shots[shot_index]
+        # A speaker shot anchored to an explicit narrative assignment already
+        # gets its production sound from that independent audio track. Keeping
+        # the picture's same source audio as sync_action/narrative would double
+        # it. With no named action there is no competing sync sound to protect,
+        # so this is mechanical track routing, not a new editorial decision.
+        if (
+            str(shot.get("picture_role") or "") == "speaker"
+            and str(shot.get("action_id") or "none") == "none"
+            and str(shot.get("audio_role") or "") in {"sync_action", "narrative"}
+        ):
+            shot["audio_role"] = "discard"
+            shot["audio_completion"] = "none"
+            shot["audio_reason"] = (
+                "Top-level narrative assignment owns this speaker audio; "
+                "picture source audio is discarded to prevent doubling."
+            )
+            narrative_repairs.append(
+                f"k{shot_index:02d}: routed speaker production sound through "
+                "its top-level narrative assignment"
+            )
+        # For an on-camera, same-source soundbite the Apple transcript is the
+        # source-clock authority. A card's representative sighting may be tens
+        # of seconds away in the same long interview take; do not let that
+        # thumbnail time replace the actual sentence. This is a local sync
+        # projection, not a semantic choice: Gemini chose the canonical span.
+        span_id = str(assignment.get("audio_span_id") or "")
+        window = speech_windows.get(span_id)
+        if (
+            window is not None
+            and str(shot.get("picture_role") or "") == "speaker"
+            and window[0] == str(shot.get("source_id") or "")
+            and abs(float(assignment.get("offset_seconds") or 0.0)) <= 1e-6
+        ):
+            named = resolve_named_span(shot, list(material))
+            if named is not None:
+                proposed = window[1]
+                current = float(shot.get("start_seconds") or 0.0)
+                if abs(proposed - current) > 1e-3:
+                    shot["start_seconds"] = round(proposed, 3)
+                    shot["start_offset_seconds"] = round(
+                        proposed - float(named.starts_seconds), 3
+                    )
+                    narrative_repairs.append(
+                        f"k{shot_index:02d}: aligned speaker picture to "
+                        f"Apple transcript span {span_id} at {proposed:.2f}s"
+                    )
+            # Gemini writes convenient tenths, while Apple supplies the
+            # measured word clock. Adjacent complete thoughts must meet at
+            # exactly one edit point; a 1.40s picture over a 1.44s utterance
+            # otherwise leaves two narrative clips active for 40ms. Absorb
+            # only normal rounding drift here, preserving deliberate J/L
+            # splits and materially different picture holds.
+            measured_duration = max(0.0, window[2] - window[1])
+            declared_duration = float(shot.get("seconds_needed") or 0.0)
+            if (
+                str(assignment.get("completion") or "") == "complete_thought"
+                and measured_duration > 0
+                and abs(measured_duration - declared_duration) <= 0.3
+                and abs(measured_duration - declared_duration) > 1e-3
+            ):
+                shot["seconds_needed"] = round(measured_duration, 3)
+                looks = shot.get("looks") or []
+                if len(looks) == 1 and abs(
+                    float(looks[0].get("seconds") or 0.0) - declared_duration
+                ) <= 1e-3:
+                    looks[0]["seconds"] = round(measured_duration, 3)
+                narrative_repairs.append(
+                    f"k{shot_index:02d}: fitted rounded speaker duration "
+                    f"{declared_duration:.2f}s to Apple span {span_id} "
+                    f"({measured_duration:.2f}s)"
+                )
     repairs = (
+        *narrative_repairs,
         *repair_single_look_hold_overflow(chosen),
         *repair_camera_rests_to_duration(chosen, material),
         *repair_selection_motion_contracts(chosen, list(material)),
@@ -4018,7 +5158,7 @@ def select_shots(
                 option.commitment_id, set()
             ).add(option.span_id)
 
-    if initial_selection is not None:
+    if initial_selection is not None and selection_commitments is not None:
         # A paid, normalized Selection already exists. Give the model the
         # complete editorial context, but make the provider grammar capable
         # of returning only the named failing shots. Local merge is the sole
@@ -4301,11 +5441,20 @@ def select_shots(
                             f"k{shot_index:02d} look {look_index + 1} names "
                             f"unknown grounding entity_id {entity_id!r}"
                         )
+                    for co_visible in look.get("co_visible_entity_ids") or []:
+                        if co_visible not in known_grounding_targets:
+                            faults.append(
+                                f"k{shot_index:02d} look {look_index + 1} names "
+                                f"unknown simultaneous entity_id {co_visible!r}"
+                            )
             identity_advisories.extend(grounding_target_disagreements(
                 chosen.get("shots") or [], grounding_required_target_ids
             ))
             identity_advisories.extend(context_only_disagreements(
                 chosen.get("shots") or [], usable, known_grounding_targets
+            ))
+            faults.extend(grounding_presence_disagreements(
+                chosen.get("shots") or [], usable, grounding_spec
             ))
         if not validating_previous:
             expand_audio_assignments(chosen, audio_span_ids)
@@ -4523,12 +5672,22 @@ def select_shots(
                 # a complete answer. Keep the full original span grammar;
                 # narrowing a full response to failing spans is contradictory.
                 attempt_schema = schema
+                speech_catalog = "\n".join(
+                    f"- source={item.source_id}: {line}"
+                    for item in usable
+                    for line in item.speech
+                ) or "- （沒有可引用的逐字稿 span）"
                 attempt_input = [{
                     "type": "text",
                     "text": (
                         "你只在修正上一版 Selection 的本機執行錯誤。"
                         "回傳完整 shots/audio_assignments 答案；不可只改理由，"
-                        "不可新增 span 或 commitment。\n\n"
+                        "不可新增 span 或 commitment。每個 audio_span_id 只代表"
+                        "目錄列出的單一講者與時間範圍；若內容包含提問與回答，"
+                        "必須引用各自的 span，不能用一個短 span 的理由宣稱兩者"
+                        "都有。speaker 畫面的長度必須由同來源 narrative audio "
+                        "實際覆蓋；偏好秒數無法自然成立時可以交較短的完整版本，"
+                        "不可用無證據的 speaker 尾段補秒。\n\n"
                         "## 已定方向\n"
                         + json.dumps(
                             direction, ensure_ascii=False, sort_keys=True
@@ -4540,6 +5699,8 @@ def select_shots(
                         )
                         + "\n\n## 本機仍無法執行的原因\n- "
                         + "\n- ".join(faults)
+                        + "\n\n## 可引用的 Apple 時碼逐字稿 span\n"
+                        + speech_catalog
                         + "\n\n## 上一版完整答案\n"
                         + json.dumps(
                             chosen, ensure_ascii=False, sort_keys=True
@@ -4679,6 +5840,18 @@ def audit_cached_selection(
                         f"k{shot_index:02d} look {look_index + 1} names "
                         f"unknown grounding entity_id {entity_id!r}"
                     )
+                for co_visible in look.get("co_visible_entity_ids") or []:
+                    if co_visible not in known:
+                        faults.append(
+                            f"k{shot_index:02d} look {look_index + 1} names "
+                            f"unknown simultaneous entity_id {co_visible!r}"
+                        )
+        check(
+            "grounding presence",
+            lambda: grounding_presence_disagreements(
+                shots, usable, grounding_spec
+            ),
+        )
 
     audio_span_sources = {
         line.split("`", 2)[1]: item.source_id
@@ -5213,6 +6386,94 @@ def grounding_target_disagreements(
     ]
 
 
+def grounding_presence_disagreements(
+    shots: list[dict[str, Any]], material: list[MaterialItem],
+    grounding_spec: Any | None,
+) -> list[str]:
+    """Enforce the brief-approved relationship between subject and context.
+
+    Identity screening is deliberately recall-oriented and keeps useful
+    context.  This gate decides whether the current brief permits that
+    context in the cut; it never infers the rule from prose after money has
+    been spent.
+    """
+
+    required = set(_grounding_required_targets(grounding_spec))
+    if not required:
+        return []
+    assert grounding_spec is not None
+    by_source = {item.source_id: item for item in material}
+    by_span = {span.span_id: span for item in material for span in item.spans}
+    seen: set[str] = set()
+    faults: list[str] = []
+    policy = _grounding_presence_policy(grounding_spec)
+    framing = getattr(grounding_spec.identity_lock, "framing", None)
+    total_seconds = 0.0
+    target_seconds = 0.0
+    context_run = 0
+    longest_context_run = 0
+    for index, shot in enumerate(shots):
+        claimed = {
+            str(look.get("entity_id") or "").strip()
+            for look in shot.get("looks") or []
+            if str(look.get("entity_id") or "").strip() in required
+        }
+        top_level = str(shot.get("target_id") or "").strip()
+        if top_level in required:
+            claimed.add(top_level)
+        source_id = str(
+            shot.get("source_id")
+            or str(shot.get("span_id") or "").split(":", 1)[0]
+        )
+        item = by_source.get(source_id)
+        span = by_span.get(str(shot.get("span_id") or ""))
+        executable = {
+            target_id for target_id in claimed
+            if item is not None
+            and _material_can_claim_target(item, target_id, span)
+        }
+        seen.update(executable)
+        try:
+            shot_seconds = max(0.0, float(shot.get("seconds_needed") or 0.0))
+        except (TypeError, ValueError):
+            shot_seconds = 0.0
+        total_seconds += shot_seconds
+        if executable:
+            target_seconds += shot_seconds
+            context_run = 0
+        else:
+            context_run += 1
+            longest_context_run = max(longest_context_run, context_run)
+        if policy == "target_only" and not executable:
+            faults.append(
+                f"k{index:02d} violates target_only: every picture shot must "
+                "contain and name at least one required grounding target"
+            )
+    if policy == "target_led" and total_seconds > 0:
+        minimum_share = float(getattr(
+            framing, "target_led_minimum_picture_share", 0.6
+        ))
+        actual_share = target_seconds / total_seconds
+        if actual_share + 1e-6 < minimum_share:
+            faults.append(
+                f"target_led carries {actual_share:.1%} of picture time; "
+                f"the approved minimum is {minimum_share:.1%}"
+            )
+        maximum_run = int(getattr(
+            framing, "target_led_max_consecutive_context_shots", 1
+        ))
+        if longest_context_run > maximum_run:
+            faults.append(
+                f"target_led has {longest_context_run} consecutive context "
+                f"shots; approved maximum is {maximum_run}"
+            )
+    faults.extend(
+        f"selection omits required grounding entity_id {target_id!r}"
+        for target_id in sorted(required - seen)
+    )
+    return faults
+
+
 def audio_assignment_disagreements(
     shots: list[dict[str, Any]], material: "list[MaterialItem]"
 ) -> list[str]:
@@ -5603,6 +6864,14 @@ def repair_selection_source_windows(
     """
 
     items = {item.source_id: item for item in material}
+    narrative_speaker_indices = {
+        int(assignment.get("starts_at_shot_index", -1))
+        for assignment in chosen.get("audio_assignments") or []
+        if str(assignment.get("audio_span_id") or "")
+        and str(assignment.get("completion") or "")
+        in {"complete_thought", "intentional_cut"}
+        and str(assignment.get("starts_at_shot_index", "")).lstrip("-").isdigit()
+    }
     repaired: list[str] = []
     for index, shot in enumerate(chosen.get("shots") or []):
         source = str(shot.get("source_id") or "")
@@ -5613,6 +6882,18 @@ def repair_selection_source_windows(
         duration = max(0.0, float(shot.get("seconds_needed") or 0.0))
         span_duration = float(span.ends_seconds - span.starts_seconds)
         if duration <= 0 or duration > span_duration:
+            continue
+        # A card sighting is one representative frame for a recurring person,
+        # not the time authority for every sentence they say in a long take.
+        # Moving an on-camera soundbite to that sighting silently destroys the
+        # Apple transcript clock (and collapses many different answers onto
+        # the same few seconds). Keep the editor's soundbite in-point here;
+        # the later speaker/audio clock alignment performs the frame-accurate
+        # adjustment from the selected narrative span.
+        if (
+            index in narrative_speaker_indices
+            and str(shot.get("picture_role") or "") == "speaker"
+        ):
             continue
         action_start_raw = shot.get("content_action_start_seconds")
         action_complete_raw = shot.get("content_action_complete_seconds")
@@ -6109,7 +7390,16 @@ def sequence_disagreements(shots: list[dict[str, Any]]) -> list[str]:
     for source, indices in by_source.items():
         if not source or len(indices) < 3:
             continue
-        undeclared = [k for k in indices if not _declared_repeat(shots[k])]
+        undeclared = [
+            k for k in indices
+            if not _declared_repeat(shots[k])
+            # A continuous interview answer is often cut at every speaker
+            # turn, with punch-ins/reframes on the same camera take. The
+            # overlapping-window check above still rejects duplicated frames;
+            # counting distinct, transcript-backed speaker turns as "leaning
+            # on one take" would reject ordinary dialogue editing.
+            and str(shots[k].get("picture_role") or "") != "speaker"
+        ]
         if len(undeclared) < 3:
             continue
         where = ", ".join(f"k{k:02d}" for k in indices)

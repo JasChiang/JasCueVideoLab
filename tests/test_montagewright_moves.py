@@ -761,7 +761,7 @@ def test_identity_degradation_has_a_separate_resumable_artifact() -> None:
 
     source = inspect.getsource(cli.command_render)
     assert (
-        '"resolved-selection-v2-camera-rest-fit-identity-needs-review-hold"'
+            '"resolved-selection-v3-truncated-tail-completion"'
         in source
     )
     assert '_decided(\n        work, "resolved-selection"' in source
@@ -1679,6 +1679,41 @@ def test_continuous_soundbites_split_at_long_pauses_and_duration_cap() -> None:
     assert "S02:t03-t04" in spans
 
 
+def test_phrase_edit_exposes_only_apple_clock_provenance_windows() -> None:
+    from montagewright.cli import _audio_spans_for_source
+    from montagewright.transcript import CARD_VERSION
+
+    card = {
+        "version": CARD_VERSION,
+        "words": [
+            {"text": "夏天", "starts_seconds": 1.0, "ends_seconds": 1.4},
+            {"text": "很熱", "starts_seconds": 1.7, "ends_seconds": 2.1},
+        ],
+        "lines": [{
+            "text": "夏天，很熱。", "speaker": "受訪者",
+            "starts_seconds": 1.0, "ends_seconds": 2.2,
+            "timed_text": [
+                {"text": "夏", "starts_seconds": 1.0, "ends_seconds": 1.2, "measured": True},
+                {"text": "天", "starts_seconds": 1.2, "ends_seconds": 1.4, "measured": True},
+                {"text": "，", "starts_seconds": 1.4, "ends_seconds": 1.5, "measured": True},
+                {"text": "很", "starts_seconds": 1.7, "ends_seconds": 1.9, "measured": True},
+                {"text": "熱", "starts_seconds": 1.9, "ends_seconds": 2.1, "measured": True},
+                {"text": "。", "starts_seconds": 2.1, "ends_seconds": 2.2, "measured": True},
+            ],
+        }],
+    }
+
+    continuous = _audio_spans_for_source("S03", card)
+    phrases = _audio_spans_for_source("S03", card, edit_mode="phrase_edit")
+
+    assert not any(key.startswith("S03:p") for key in continuous)
+    assert any(value["kind"] == "provenance_phrase" for value in phrases.values())
+    assert all(
+        value["in_seconds"] >= 1.0 and value["out_seconds"] <= 2.2
+        for key, value in phrases.items() if key.startswith("S03:p")
+    )
+
+
 def test_grouped_soundbite_resolves_to_one_source_window_in_the_edl(tmp_path) -> None:
     from montagewright.cli import _edl_from_selection
     from montagewright.transcript import CARD_VERSION
@@ -1878,7 +1913,7 @@ def test_an_already_cut_file_is_opened_along_its_own_boundaries() -> None:
     source = inspect.getsource(grounding.shots_in)
     assert "scene" in source
     # The split pieces keep the name they came from, so a report traces back.
-    assert '{path.stem}-{index:02d}' in inspect.getsource(cli.command_render)
+    assert 'f"{source_id}__shot{index:02d}"' in inspect.getsource(cli.command_render)
 
 
 def test_music_is_not_required_to_make_a_cut() -> None:
@@ -2005,7 +2040,7 @@ def test_music_is_measured_before_direction_and_reused_after_selection() -> None
     from montagewright import cli, planner
 
     command = inspect.getsource(cli.command_render)
-    measured = command.index("grid = analyse_track(args.music)")
+    measured = command.index("preflight_grid = analyse_track(music_path)")
     directed = command.index("direction, usage_direction = decide_direction(")
     selected = command.index("selection, usage_selection = select_shots(")
     assert measured < directed < selected
@@ -2313,8 +2348,8 @@ def test_a_new_run_clears_the_last_one_from_the_page() -> None:
     from montagewright.webapp import PAGE
 
     page = PAGE.read_text(encoding="utf-8")
-    start = page.index("runId = (await res.json()).run_id;")
-    assert "classList.add('hide')" in page[start:start + 600]
+    start = page.index("runId = started.run_id;")
+    assert "classList.add('hide')" in page[start:start + 800]
 
 
 def test_the_page_says_what_each_stage_is_doing() -> None:
@@ -2349,6 +2384,9 @@ def test_music_can_be_picked_the_same_way_as_the_rushes() -> None:
     assert "videos" in audio  # the listing switches what it looks for
     page = PAGE.read_text(encoding="utf-8")
     assert "browse-music" in page and "openPicker" in page
+    assert "values[values.length - 1]" in page
+    assert "require-target-cooccurrence" in page
+    assert "picture_obligations_json" in page
 
 
 def test_a_failed_run_says_so_where_it_can_be_seen() -> None:
@@ -4583,7 +4621,10 @@ def test_push_room_is_read_from_the_file_that_gets_cut(tmp_path) -> None:
         Path(__file__).resolve().parents[1]
         / "src" / "montagewright" / "cli.py"
     ).read_text(encoding="utf-8")
-    assert "originals = {path.stem: path for path in sources_paths}" in source
+    assert (
+        "originals = {source_id: path for source_id, path, _ in source_entries}"
+        in source
+    )
     assert "originals.get(source_id, proxy)" in source
 
 
@@ -5352,6 +5393,9 @@ def test_every_thing_the_report_records_reaches_the_report():
         "delivered_seconds": "duration_seconds",
         "usages": "tokens",
         "ledger": "spend",
+        # Runtime-only checkpoint location; subject_tracks is the durable
+        # measured result that belongs in the report.
+        "subject_cache_dir": "subject_tracks",
     }
     written = inspect.getsource(cli._write_report)
     missing = [
@@ -6719,6 +6763,30 @@ def test_resolved_sequence_flags_a_same_subject_punch_in_jump_cut():
     assert any("punch-in jump cut" in note for note in notes)
 
 
+def test_resolved_sequence_allows_a_continuous_take_to_switch_speakers():
+    from montagewright.pipeline import _resolved_sequence_disagreements
+    from montagewright.schema import Clip, EDL, Look, Reframe
+
+    clips = [
+        Clip(
+            clip_id="k00", source_id="INT", approx_in_seconds=0,
+            approx_out_seconds=2, reframe=Reframe(
+                looks=[Look(at="interviewer")], intent="hold",
+            ),
+        ),
+        Clip(
+            clip_id="k01", source_id="INT", approx_in_seconds=2.04,
+            approx_out_seconds=5, reframe=Reframe(
+                looks=[Look(at="interviewee")], intent="hold",
+            ),
+        ),
+    ]
+
+    notes = _resolved_sequence_disagreements(EDL(project_id="p", clips=clips))
+
+    assert not any("cut nearly continuously" in note for note in notes)
+
+
 def test_an_explicit_follow_does_not_reuse_one_card_box_as_a_trajectory():
     import inspect
 
@@ -7027,7 +7095,7 @@ def test_a_sample_is_the_same_clips_every_time_and_spread_across_the_shoot():
     sampling = sampling[: sampling.index("flush=True,") + 12]
 
     # Evenly spaced, so twelve clips are twelve different setups.
-    assert "len(sources_paths) / args.sample" in sampling
+    assert "len(source_entries) / args.sample" in sampling
     # Deterministic: no randomness anywhere near it.
     assert "random" not in sampling.lower()
 
@@ -7294,6 +7362,26 @@ def test_resolved_edl_coverage_uses_the_same_contract_as_selection():
     audit = edl_coverage_audit(edl, 5.0)
     assert audit.supported_seconds == pytest.approx(3.3)
     assert any("natural lead/tail" in fault for fault in audit.faults)
+
+
+def test_range_duration_is_enforced_before_render_without_forcing_midpoint():
+    from montagewright.coverage import edl_coverage_audit
+    from montagewright.schema import Clip, EDL
+
+    def audit(seconds):
+        return edl_coverage_audit(EDL(
+            project_id="range",
+            clips=[Clip(
+                clip_id="k00", source_id="ACTION",
+                approx_in_seconds=0.0, approx_out_seconds=seconds,
+                picture_role="primary_action", audio_role="sync_action",
+                coverage_claim_seconds=seconds,
+            )],
+        ), 30.0, minimum_seconds=27.0, maximum_seconds=33.0)
+
+    assert not audit(32.0).faults
+    assert any("below the allowed minimum" in one for one in audit(26.0).faults)
+    assert any("above the allowed maximum" in one for one in audit(34.0).faults)
 
 
 def test_only_the_last_shot_may_claim_an_end_hold():

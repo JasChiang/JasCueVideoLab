@@ -229,6 +229,7 @@ def visual_supported_max(
     motion_role: str = "",
     presentation_intent: str = "",
     target_id: str = "none",
+    speed: float = 1.0,
 ) -> float:
     """Return the locally supportable visual duration for one source window.
 
@@ -239,7 +240,11 @@ def visual_supported_max(
     when auditing the selected shot.
     """
 
+    # The caller asks how many programme seconds the picture can support.
+    # Measurements are on the source clock, so retiming changes how much
+    # measured action/motion those programme seconds read.
     available = max(0.0, float(available_seconds))
+    ratio = max(1e-6, float(speed or 1.0))
     base = VISUAL_ONLY_LIMITS.get(str(role), 3.0)
     if base is None:
         return available
@@ -253,7 +258,7 @@ def visual_supported_max(
         # proven later; this only permits a conservative three-second hold.
         base = max(float(base), 3.0)
 
-    source_end = float(source_start) + available
+    source_end = float(source_start) + available * ratio
     intervals: list[tuple[float, float, str]] = []
     # `illustrative_broll` is explicitly carried by another lane (usually
     # narrative). A source action can make the same picture independently
@@ -289,11 +294,13 @@ def visual_supported_max(
             and bool(getattr(item, "camera_moves", False))
         )
     ):
-        measured_seconds = available
+        measured_seconds = available * ratio
 
     # A small comprehension tail is already part of the existing coverage
     # contract.  It cannot extend beyond source evidence or invent more time.
-    evidenced = measured_seconds + 0.60 if measured_seconds > 0.0 else 0.0
+    evidenced = (
+        measured_seconds / ratio + 0.60 if measured_seconds > 0.0 else 0.0
+    )
     return min(available, max(float(base), evidenced))
 
 
@@ -421,11 +428,19 @@ def _target_faults(
     *,
     hard: bool = False,
     duration_tolerance_seconds: float | None = None,
+    minimum_seconds: float | None = None,
+    maximum_seconds: float | None = None,
 ) -> list[str]:
-    if target <= 0:
+    if target <= 0 and minimum_seconds is None and maximum_seconds is None:
         return []
+    tolerance_target = max(
+        target,
+        float(minimum_seconds or 0.0),
+        float(maximum_seconds or 0.0),
+    )
     evidence_tolerance = max(
-        TARGET_TOLERANCE_SECONDS, target * TARGET_TOLERANCE_FRACTION
+        TARGET_TOLERANCE_SECONDS,
+        tolerance_target * TARGET_TOLERANCE_FRACTION,
     )
     # A preferred music-led duration may legitimately finish on the end of
     # the current bar instead of cutting a protected action or camera move a
@@ -436,12 +451,25 @@ def _target_faults(
         evidence_tolerance, float(duration_tolerance_seconds or 0.0)
     )
     faults = []
-    if hard and duration < target - duration_tolerance:
+    if minimum_seconds is not None and duration < minimum_seconds - 1e-6:
+        faults.append(
+            f"timeline is {duration:.2f}s, below the allowed minimum "
+            f"{minimum_seconds:.2f}s by {minimum_seconds - duration:.2f}s"
+        )
+    elif hard and target > 0 and duration < target - duration_tolerance:
         faults.append(
             f"timeline is only {duration:.2f}s against the {target:.2f}s "
             f"target; structural selection is short by {target - duration:.2f}s"
         )
-    if duration > target + duration_tolerance:
+    if maximum_seconds is not None and duration > maximum_seconds + 1e-6:
+        faults.append(
+            f"timeline is {duration:.2f}s, above the allowed maximum "
+            f"{maximum_seconds:.2f}s by {duration - maximum_seconds:.2f}s"
+        )
+    elif (
+        maximum_seconds is None and target > 0
+        and duration > target + duration_tolerance
+    ):
         faults.append(
             f"timeline is {duration:.2f}s against the {target:.2f}s target; "
             f"it is over by {duration - target:.2f}s and must remove or "
@@ -498,6 +526,8 @@ def _visual_claim(item: Any, shot: dict[str, Any], role: str) -> float:
 def selection_coverage_audit(
     chosen: dict[str, Any], material: list[Any], target_seconds: float,
     *, hard_target: bool = False,
+    minimum_seconds: float | None = None,
+    maximum_seconds: float | None = None,
 ) -> CoverageAudit:
     """Audit the model's nominal selection using canonical audio durations."""
 
@@ -562,7 +592,8 @@ def selection_coverage_audit(
         faults.extend(found)
     supported = sum(one.supported_seconds for one in entries)
     faults.extend(_target_faults(
-        cursor, supported, float(target_seconds or 0), hard=hard_target
+        cursor, supported, float(target_seconds or 0), hard=hard_target,
+        minimum_seconds=minimum_seconds, maximum_seconds=maximum_seconds,
     ))
     return CoverageAudit(
         cursor, supported, float(target_seconds or 0), tuple(entries),
@@ -576,6 +607,8 @@ def edl_coverage_audit(
     *,
     hard_target: bool = False,
     duration_tolerance_seconds: float | None = None,
+    minimum_seconds: float | None = None,
+    maximum_seconds: float | None = None,
 ) -> CoverageAudit:
     """Audit the resolved picture/audio clock shared by CLI, Web and render."""
 
@@ -620,6 +653,8 @@ def edl_coverage_audit(
         float(target_seconds or 0),
         hard=hard_target,
         duration_tolerance_seconds=duration_tolerance_seconds,
+        minimum_seconds=minimum_seconds,
+        maximum_seconds=maximum_seconds,
     ))
     return CoverageAudit(
         cursor, supported, float(target_seconds or 0), tuple(entries),

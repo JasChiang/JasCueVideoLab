@@ -16,6 +16,7 @@ than on grain.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -319,8 +320,18 @@ def _render_segment(
     # as their own file, so a transition or a nudge has material without the
     # timeline paying for it -- the concat stays frame-exact because every
     # segment is already the length it is meant to be.
+    probed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "csv=p=0",
+            str(segment.source.path),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    source_has_audio = bool(probed.stdout.strip())
+    use_silence = segment.audio_role == "discard" or not source_has_audio
     audio = []
-    if segment.audio_role == "discard":
+    if segment.audio_role == "discard" and source_has_audio:
         # Keep a silent audio stream rather than dropping it. Every rendered
         # segment must have the same stream layout for frame-exact concat.
         audio = ["-af", "volume=0"]
@@ -348,12 +359,17 @@ def _render_segment(
         "-to", f"{segment.out_seconds:.6f}",
         "-i", str(segment.source.path),
     ]
+    if use_silence:
+        command += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
     if filters:
         command += ["-vf", ",".join(filters)]
     command += audio
     command += [
+        "-map", "0:v:0", "-map", ("1:a:0" if use_silence else "0:a:0"),
         "-c:v", video_encoder, "-b:v", "12M",
         "-c:a", "aac", "-b:a", "192k",
+        "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-colorspace", "bt709",
         "-pix_fmt", "yuv420p", "-r", str(output_fps), "-fps_mode", "cfr",
     ]
     if output_frames is not None:
@@ -361,27 +377,40 @@ def _render_segment(
             "-frames:v", str(output_frames),
             "-t", f"{output_frames / output_fps:.9f}",
         ]
+    if use_silence:
+        command.append("-shortest")
     command.append(str(destination))
     _run(command)
 
     if head > 0.0 or tail > 0.0:
         spare = destination.with_name(f"{destination.stem}.handles.mp4")
-        _run(
-            [
+        handle_command = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", f"{segment.in_seconds - head:.6f}",
                 "-to", f"{segment.out_seconds + tail:.6f}",
                 "-i", str(segment.source.path),
             ]
-            + (["-vf", ",".join(handle_filters)] if handle_filters else [])
+        if use_silence:
+            handle_command += [
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            ]
+        handle_command += (
+            (["-vf", ",".join(handle_filters)] if handle_filters else [])
             + audio
             + [
+                "-map", "0:v:0", "-map", ("1:a:0" if use_silence else "0:a:0"),
                 "-c:v", video_encoder, "-b:v", "12M",
                 "-c:a", "aac", "-b:a", "192k",
+                "-color_primaries", "bt709", "-color_trc", "bt709",
+                "-colorspace", "bt709",
                 "-pix_fmt", "yuv420p", "-r", str(output_fps),
-                "-fps_mode", "cfr", str(spare),
+                "-fps_mode", "cfr",
             ]
         )
+        if use_silence:
+            handle_command += ["-shortest"]
+        handle_command += [str(spare)]
+        _run(handle_command)
     return destination, Handles(head_seconds=head, tail_seconds=tail)
 
 
@@ -484,6 +513,7 @@ def _mux_music(
     music_from_seconds: float = 0.0,
     music_spans: "list[tuple[float, float]] | None" = None,
     fade_out_seconds: float = MUSIC_FADE_SECONDS,
+    target_lufs: float = TARGET_LUFS,
 ) -> Path:
     """Lay a music bed under the cut and normalise the result.
 
@@ -551,7 +581,7 @@ def _mux_music(
             f"{before}{tail}{fade},volume={bed_gain:.2f}dB[bed];"
             f"[0:a]{VOICE_LEVELLER}[voice];"
             "[voice][bed]amix=inputs=2:duration=first:normalize=0,"
-            f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
+            f"loudnorm=I={target_lufs}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
             f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled"
             "[out]"
         )
@@ -566,14 +596,14 @@ def _mux_music(
             f"threshold={DUCK_THRESHOLD}:ratio={DUCK_RATIO}:"
             f"attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}[ducked];"
             "[voice][ducked]amix=inputs=2:duration=first:normalize=0,"
-            f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
+            f"loudnorm=I={target_lufs}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
             f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled"
             "[out]"
         )
     else:
         chain = (
             f"{before}{tail}{fade},"
-            f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
+            f"loudnorm=I={target_lufs}:TP={TRUE_PEAK_CEILING_DB}:LRA=11,"
             # loudnorm in one pass predicts its true peak rather than
             # measuring it, and overshoots often enough to matter: this cut
             # came back at +0.017 dBFS against a -1.5 request. A limiter after
@@ -652,12 +682,14 @@ def _lay_audio_assignments(
                 f"timeline ({begins:.3f}–{ends:.3f}s of {duration:.3f}s)"
             )
         if assignment.role == "narrative" and begins < previous_end - 1e-6:
-            raise RenderError(
-                f"narrative audio {assignment.audio_id} overlaps another "
-                "narrative assignment"
-            )
+            overlap = previous_end - begins
+            if overlap > (1.0 / output_fps) + 1e-6:
+                raise RenderError(
+                    f"narrative audio {assignment.audio_id} overlaps another "
+                    "narrative assignment"
+                )
         if assignment.role == "narrative":
-            previous_end = ends
+            previous_end = max(previous_end, ends)
 
     inputs = ["-i", str(picture)]
     filters = [
@@ -670,11 +702,22 @@ def _lay_audio_assignments(
             0, round(assignment.timeline_start_frame * 48000 / output_fps)
         )
         label = f"a{index}"
+        input_label = (
+            f"[{index}:{assignment.audio_stream_index}]"
+            if assignment.audio_stream_index is not None
+            else f"[{index}:a]"
+        )
+        channel = (
+            f"pan=mono|c0=c{assignment.audio_channel},"
+            if assignment.audio_channel is not None else ""
+        )
         filters.append(
-            f"[{index}:a]atrim={assignment.in_seconds:.6f}:"
+            f"{input_label}atrim={assignment.in_seconds:.6f}:"
             f"{assignment.out_seconds:.6f},asetpts=PTS-STARTPTS,"
             f"atrim=duration={assignment.duration_seconds:.6f},"
-            "aresample=48000,aformat=channel_layouts=stereo,"
+            f"{channel}aresample=48000,aformat=channel_layouts=stereo,"
+            "afade=t=in:st=0:d=0.012,"
+            f"afade=t=out:st={max(0.0, assignment.duration_seconds - 0.012):.6f}:d=0.012,"
             f"volume={assignment.gain_db:.2f}dB,"
             f"adelay={delay_samples}S:all=1[{label}]"
         )
@@ -698,6 +741,74 @@ def _lay_audio_assignments(
         "-i", str(destination), "-vn", "-c:a", "aac", "-b:a", "192k",
         str(destination.parent / "voice-as-laid.m4a"),
     ])
+    return destination
+
+
+def _normalise_program_audio(
+    source: Path, destination: Path, *, target_lufs: float,
+) -> Path:
+    """Finish a music-free programme to the delivery loudness.
+
+    Music mixes already pass through the programme loudness chain in
+    ``_mux_music``.  A dialogue-only cut used to bypass that chain entirely,
+    which made interviews several LU quieter than their delivery sheet even
+    though the release audit correctly expected the requested value.
+
+    The H.264 metadata bitstream filter also makes the Rec.709 declaration
+    survive stream-copy muxes.  Some encoders write the matrix while omitting
+    primaries/transfer from the container; the VUI is the encoded picture's
+    durable authority in that case.
+    """
+
+    shaped = destination.with_name(f".{destination.stem}-mastering.wav")
+    try:
+        # Leave headroom in the shaped programme.  A one-pass loudnorm on a
+        # real interview can meet its peak ceiling only by landing 1–2 LU
+        # below target; measuring the shaped PCM lets the finishing gain use
+        # exactly the headroom that actually exists.
+        _run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(source), "-vn",
+            "-af",
+            f"loudnorm=I={target_lufs + 2.0}:TP=-2.5:LRA=11",
+            "-ar", "48000", "-c:a", "pcm_s24le", str(shaped),
+        ])
+        measured = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-nostats", "-i", str(shaped),
+                "-filter_complex", "ebur128=peak=true", "-f", "null", "-",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        loudness = re.findall(r"I:\s*(-?[0-9.]+) LUFS", measured.stderr)
+        peaks = re.findall(r"Peak:\s*(-?[0-9.]+) dBFS", measured.stderr)
+        # Pure digital silence has no gated LUFS/peak result. It is already a
+        # valid silent programme and needs no gain; still remux it through the
+        # same colour/sample-rate authority below.
+        integrated = float(loudness[-1]) if loudness else target_lufs
+        true_peak = float(peaks[-1]) if peaks else -99.0
+        # Keep 0.0 dB as a valid instruction: no guessed gain when the first
+        # pass already met both authorities.  The peak cap leaves AAC some
+        # inter-sample room while still allowing the LUFS target when the
+        # measured programme supports it.
+        gain_db = min(target_lufs - integrated, -1.5 - true_peak)
+
+        _run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(source), "-i", str(shaped),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy",
+            "-bsf:v",
+            "h264_metadata=colour_primaries=1:"
+            "transfer_characteristics=1:matrix_coefficients=1",
+            "-af",
+            f"volume={gain_db:.3f}dB,"
+            f"alimiter=limit={TRUE_PEAK_CEILING_LINEAR:.6f}:level=disabled",
+            "-ar", "48000", "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", str(destination),
+        ])
+    finally:
+        shaped.unlink(missing_ok=True)
     return destination
 
 
@@ -784,9 +895,23 @@ def render(
             under_speech=under_speech,
             music_from_seconds=plan.music_from_seconds,
             music_spans=plan.music_spans or None,
+            target_lufs=plan.loudness_lufs,
         )
     else:
-        shutil.copyfile(mix_picture, deliverable)
+        if kept_audio:
+            _normalise_program_audio(
+                mix_picture, deliverable, target_lufs=plan.loudness_lufs,
+            )
+            if plan.audio_assignments:
+                # The editable dialogue stem must be the track that was
+                # actually delivered, not the quieter pre-master mix.
+                _run([
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(deliverable), "-vn", "-c:a", "aac", "-b:a", "192k",
+                    str(output_dir / "voice-as-laid.m4a"),
+                ])
+        else:
+            shutil.copyfile(mix_picture, deliverable)
 
     preview = _preview(
         deliverable, output_dir / "preview.mp4", video_encoder=video_encoder

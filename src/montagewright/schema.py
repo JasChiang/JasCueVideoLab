@@ -19,7 +19,7 @@ answer degrades to a described value instead of a rejected response.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -254,6 +254,14 @@ class Look(ModelFacing):
             "Stable grounding identity when this look refers to a supplied "
             "reference entity; otherwise null. The label in `at` is display "
             "copy, not identity authority."
+        ),
+    )
+    co_visible_entity_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Other approved identities simultaneously visible with entity_id "
+            "at this exact landing. This is evidence for a group shot, not a "
+            "list of identities seen earlier or later during a pan."
         ),
     )
     seconds: float = Field(
@@ -638,6 +646,21 @@ class Clip(ModelFacing):
         default="primary_action",
         description="Why this source is visible during this editorial beat.",
     )
+    story_point: str = Field(
+        default="",
+        description="The story beat this picture advances; adjacent shots may share it.",
+    )
+    continuity_mode: Literal[
+        "none", "continuity_scene", "associative_montage", "reset"
+    ] = "none"
+    cut_motivation: Literal[
+        "content", "cut_on_action", "reaction", "match_motion",
+        "match_shape", "eyeline", "screen_direction_reset",
+        "music_phrase", "music_accent", "intentional_jump", "end",
+    ] = "content"
+    source_event_ref: str = "none"
+    source_event_relation: Literal["none", "before", "at", "after"] = "none"
+    event_tolerance_frames: int = Field(default=0, ge=0, le=30)
     coverage_claim_seconds: float | None = Field(
         default=None,
         ge=0.0,
@@ -660,9 +683,13 @@ class Clip(ModelFacing):
     sync_group: str | None = Field(
         default=None,
         description=(
-            "Reserved. Groups simultaneous angles of one moment once audio "
-            "fingerprint alignment exists; unused today."
+            "Groups simultaneous picture angles and double-system sound on "
+            "one verified source clock."
         ),
+    )
+    sync_offset_seconds: float = Field(
+        default=0.0,
+        description="group clock = this source clock + this verified offset",
     )
     # The stretch of this source that was judged worth cutting into, carried
     # with the clip rather than left on the card.
@@ -780,6 +807,11 @@ class AudioClip(ModelFacing):
     completion: AudioCompletion = "none"
     gain_db: float = 0.0
     why: str = ""
+    sync_group: str | None = None
+    sync_offset_seconds: float = 0.0
+    source_span_id: str = ""
+    audio_stream_index: int | None = Field(default=None, ge=0)
+    audio_channel: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def source_window_is_forward(self) -> "AudioClip":
@@ -948,12 +980,23 @@ def looks_of(shot: dict) -> "list[Look]":
                 if one.get("entity_id") not in {None, "", "none"}
                 else None
             ),
+            co_visible_entity_ids=[
+                str(value)
+                for value in (one.get("co_visible_entity_ids") or [])
+                if value not in {None, "", "none"}
+            ],
             seconds=float(one.get("seconds", 0.0) or 0.0),
             framing=str(one.get("framing", "thirds") or "thirds"),
             must_be_whole=bool(one.get("must_be_whole", False)),
-            presentation_intent=str(
-                one.get("presentation_intent", "centered_hold")
-                or "centered_hold"
+            presentation_intent=cast(
+                Literal[
+                    "complete_hold", "centered_hold", "reveal_endpoint",
+                    "sequential_read", "partial_reveal", "transition_pass",
+                ],
+                str(
+                    one.get("presentation_intent", "centered_hold")
+                    or "centered_hold"
+                ),
             ),
             geometry_query=(
                 str(one["geometry_query"])

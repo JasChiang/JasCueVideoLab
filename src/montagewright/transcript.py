@@ -593,6 +593,16 @@ def _portion_within(
     )
 
 
+def portion_within(
+    line: Line, *, from_seconds: float, to_seconds: float
+) -> tuple[str, float, float]:
+    """Public, measured corrected-text slice for provenance-safe dialogue edits."""
+
+    return _portion_within(
+        line, from_seconds=from_seconds, to_seconds=to_seconds
+    )
+
+
 @dataclass(frozen=True)
 class CutWindow:
     """One source window on the delivery timeline.

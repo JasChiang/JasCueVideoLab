@@ -360,6 +360,15 @@ class TargetIdentityScope(StrEnum):
     VISIBLE_REGION = "visible_region"
 
 
+class IdentitySemantics(StrEnum):
+    """What counts as the same editorial target across physical objects."""
+
+    PHYSICAL_INSTANCE = "physical_instance"
+    SKU = "sku"
+    VARIANT = "variant"
+    PRODUCT_FAMILY = "product_family"
+
+
 class PredicateRequiredAt(StrEnum):
     """The stage or interval at which an observable predicate must hold."""
 
@@ -387,13 +396,14 @@ class EvidenceAnchor(FrozenStrictModel):
 
 
 class EvidenceTargetIdentity(FrozenStrictModel):
-    """Persistent instance identity, separated from temporary event state."""
+    """Persistent editorial identity, separated from temporary event state."""
 
     target_id: str = Field(
         min_length=1, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
     )
     target_description: str = Field(min_length=1)
     scope: TargetIdentityScope = TargetIdentityScope.WHOLE_INSTANCE
+    identity_semantics: IdentitySemantics = IdentitySemantics.PHYSICAL_INSTANCE
     parent_target_id: str | None = Field(
         default=None, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$"
     )
@@ -579,6 +589,11 @@ class EvidenceAspectConstraint(FrozenStrictModel):
 class EvidenceFramingObligations(FrozenStrictModel):
     """Semantic framing priorities; contains no generated crop coordinates."""
 
+    editorial_presence_policy: Literal[
+        "context_allowed", "target_led", "target_only"
+    ] = "context_allowed"
+    target_led_minimum_picture_share: float = Field(default=0.6, ge=0.0, le=1.0)
+    target_led_max_consecutive_context_shots: int = Field(default=1, ge=0)
     required_target_ids: tuple[str, ...] = ()
     preferred_target_ids: tuple[str, ...] = ()
     sacrificable_target_ids: tuple[str, ...] = ()

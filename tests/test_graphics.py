@@ -1681,6 +1681,25 @@ def test_saving_graphics_invalidates_every_previous_graphics_delivery(
     assert all(not path.exists() for path in made)
 
 
+def test_missing_graphics_track_does_not_leave_output_locked(tmp_path: Path):
+    from fastapi.testclient import TestClient
+    import montagewright.webapp as web
+    from montagewright.release import acquire_output_lease
+
+    run = web.Run("missing-graphics", tmp_path / "run")
+    run.output.mkdir(parents=True)
+    web.RUNS[run.run_id] = run
+    try:
+        response = TestClient(web.create_app()).post(
+            f"/api/runs/{run.run_id}/burn-graphics"
+        )
+        assert response.status_code == 404
+        lease = acquire_output_lease(run.output)
+        lease.release()
+    finally:
+        web.RUNS.pop(run.run_id, None)
+
+
 @pytest.mark.parametrize(
     "family",
     [

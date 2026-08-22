@@ -1152,6 +1152,123 @@ def test_source_window_solver_places_reveal_sighting_near_the_shot_end() -> None
     assert shot["start_offset_seconds"] == shot["start_seconds"] - 1.0
 
 
+def test_source_window_solver_does_not_move_a_soundbite_to_a_card_sighting() -> None:
+    from montagewright.planner import MaterialItem, repair_selection_source_windows
+    from montagewright.spans import Span
+
+    item = MaterialItem(
+        source_id="INT", duration_seconds=60.0, summary="long interview",
+        sightings=(("speaker", 8.0),),
+        spans=(Span("INT:s00", "INT", 0.0, 60.0),),
+    )
+    shot = {
+        "source_id": "INT", "span_id": "INT:s00",
+        "start_seconds": 42.0, "start_offset_seconds": 42.0,
+        "seconds_needed": 4.0, "picture_role": "speaker",
+        "action_id": "none", "action_treatment": "none",
+        "looks": [{
+            "at": "speaker", "seconds": 4.0,
+            "presentation_intent": "complete_hold",
+        }],
+    }
+    chosen = {
+        "shots": [shot],
+        "audio_assignments": [{
+            "audio_span_id": "INT:t12", "starts_at_shot_index": 0,
+            "completion": "complete_thought",
+        }],
+    }
+
+    repairs = repair_selection_source_windows(chosen, [item])
+
+    assert repairs == ()
+    assert shot["start_seconds"] == 42.0
+    assert shot["start_offset_seconds"] == 42.0
+
+
+def test_normalization_aligns_speaker_picture_to_the_apple_span_clock() -> None:
+    from montagewright.planner import MaterialItem, normalize_selection
+    from montagewright.spans import Span
+
+    item = MaterialItem(
+        source_id="INT", duration_seconds=60.0, summary="long interview",
+        sightings=(("speaker", 8.0),),
+        speech=("`INT:t12` 42.0-46.04s（訪者）完整回答",),
+        spans=(Span("INT:s00", "INT", 0.0, 60.0),),
+    )
+    shot = {
+        "source_id": "INT", "span_id": "INT:s00",
+        "start_seconds": 8.0, "start_offset_seconds": 8.0,
+        "seconds_needed": 4.0, "picture_role": "speaker",
+        "audio_role": "discard", "action_id": "none",
+        "action_treatment": "none", "camera_intent": "hold",
+        "looks": [{
+            "at": "speaker", "seconds": 4.0,
+            "presentation_intent": "complete_hold",
+        }],
+    }
+    chosen = {
+        "shots": [shot],
+        "audio_assignments": [{
+            "audio_span_id": "INT:t12", "starts_at_shot_index": 0,
+            "offset_seconds": 0.0, "completion": "complete_thought",
+        }],
+    }
+
+    repairs = normalize_selection(chosen, [item])
+
+    assert any("aligned speaker picture" in note for note in repairs)
+    assert shot["start_seconds"] == 42.0
+    assert shot["start_offset_seconds"] == 42.0
+    assert shot["seconds_needed"] == 4.04
+    assert shot["looks"][0]["seconds"] == 4.04
+
+
+def test_normalization_lifts_a_truncated_optional_tail_reaction() -> None:
+    from montagewright.planner import MaterialItem, normalize_selection
+    from montagewright.spans import Span
+
+    item = MaterialItem(
+        source_id="INT", duration_seconds=52.5, summary="interview",
+        speech=(
+            "`INT:t15` 45.4-49.4s（訪者）女朋友永遠是對的。",
+            "`INT:t16` 49.8-50.9s（主持人）沒錯，這個答……",
+        ),
+        spans=(Span("INT:s00", "INT", 0.0, 52.5),),
+    )
+    def shot(at: float, seconds: float) -> dict:
+        return {
+            "source_id": "INT", "span_id": "INT:s00",
+            "start_seconds": at, "start_offset_seconds": at,
+            "seconds_needed": seconds, "picture_role": "speaker",
+            "audio_role": "discard", "audio_completion": "none",
+            "action_id": "none", "action_treatment": "none",
+            "camera_intent": "hold", "looks": [{
+                "at": "speaker", "seconds": seconds,
+                "presentation_intent": "complete_hold",
+            }],
+        }
+    chosen = {
+        "shots": [shot(45.4, 4.0), shot(49.8, 1.1)],
+        "audio_assignments": [
+            {"audio_span_id": "INT:t15", "starts_at_shot_index": 0,
+             "offset_seconds": 0.0, "completion": "complete_thought"},
+            {"audio_span_id": "INT:t16", "starts_at_shot_index": 1,
+             "offset_seconds": 0.0, "completion": "complete_thought"},
+        ],
+        "covered": [{"goal": "punchline", "shot_indexes": [0, 1]}],
+    }
+
+    repairs = normalize_selection(chosen, [item])
+
+    assert len(chosen["shots"]) == 1
+    assert [one["audio_span_id"] for one in chosen["audio_assignments"]] == [
+        "INT:t15"
+    ]
+    assert chosen["covered"][0]["shot_indexes"] == [0]
+    assert any("truncated source-tail" in one for one in repairs)
+
+
 def test_source_window_solver_contains_a_direction_bound_complete_action() -> None:
     from montagewright.planner import MaterialItem, repair_selection_source_windows
     from montagewright.spans import Span
@@ -1712,3 +1829,218 @@ def test_selection_speed_reaches_the_clip_and_out_of_range_is_clamped(tmp_path):
         {"shots": [shot]}, tmp_path, {}, material=[],
     )
     assert edl.clips[0].speed == 1.0
+
+
+def test_named_event_slips_source_without_changing_screen_duration(tmp_path):
+    from montagewright.cli import _edl_from_selection
+    from montagewright.planner import MaterialItem
+    from montagewright.spans import Span
+
+    shot = {
+        "source_id": "C1", "span_id": "C1:s00",
+        "start_seconds": 1.0, "seconds_needed": 2.0, "speed": 2.0,
+        "usable_from_seconds": 0.0, "usable_to_seconds": 10.0,
+        "action_id": "none", "action_treatment": "none",
+        "camera_intent": "hold", "energy": "medium", "why": "fold starts",
+        "audio_role": "discard", "audio_completion": "none",
+        "picture_role": "primary_action",
+        "looks": [{"at": "phone", "seconds": 0.0, "framing": "thirds"}],
+        "source_event_ref": "action_start:C1:a01",
+        "source_event_relation": "at", "event_tolerance_frames": 30,
+    }
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=10.0, summary="fold",
+        spans=(Span("C1:s00", "C1", 0.0, 10.0, "fold", "locked"),),
+        action_windows=(("a01", 2.0, 5.0),),
+    )]
+
+    edl, notes = _edl_from_selection(
+        {"shots": [shot]}, tmp_path, {}, material=material,
+    )
+    clip = edl.clips[0]
+    assert clip.approx_in_seconds == 2.0
+    assert clip.approx_out_seconds - clip.approx_in_seconds == 2.0
+    assert "screen duration unchanged" in notes["k00"]
+
+
+def test_event_slip_refuses_to_run_past_speed_aware_tail_handle(tmp_path):
+    from montagewright.cli import _edl_from_selection
+    from montagewright.planner import MaterialItem
+    from montagewright.spans import Span
+
+    shot = {
+        "source_id": "C1", "span_id": "C1:s00",
+        "start_seconds": 4.0, "seconds_needed": 2.0, "speed": 2.0,
+        "usable_from_seconds": 0.0, "usable_to_seconds": 8.0,
+        "action_id": "none", "action_treatment": "none",
+        "camera_intent": "hold", "energy": "medium", "why": "late event",
+        "audio_role": "discard", "audio_completion": "none",
+        "picture_role": "primary_action",
+        "looks": [{"at": "phone", "seconds": 0.0, "framing": "thirds"}],
+        "source_event_ref": "action_start:C1:a01",
+        "source_event_relation": "at", "event_tolerance_frames": 30,
+    }
+    material = [MaterialItem(
+        source_id="C1", duration_seconds=8.0, summary="fold",
+        spans=(Span("C1:s00", "C1", 0.0, 8.0, "fold", "locked"),),
+        action_windows=(("a01", 5.0, 7.0),),
+    )]
+
+    edl, notes = _edl_from_selection(
+        {"shots": [shot]}, tmp_path, {}, material=material,
+    )
+    assert edl.clips[0].approx_in_seconds == 4.0
+    assert "outside measured handles" in notes["k00"]
+
+
+def test_free_preflight_returns_before_a_gemini_client_can_exist():
+    import inspect
+    from montagewright import cli
+
+    source = inspect.getsource(cli.command_render)
+    gate = source.index('if bool(getattr(args, "preflight_only", False))')
+    paid = source.index("client = _client()")
+
+    assert gate < paid
+    assert "no Gemini client was created" in source[gate:paid]
+
+
+def test_new_paid_render_invalidates_caption_artifacts_from_an_older_timeline(tmp_path):
+    from montagewright import cli
+
+    old_srt = tmp_path / "subtitles.srt"
+    old_burn = tmp_path / "deliverable-subtitled.mp4"
+    old_combined = tmp_path / "deliverable-graphics-subtitled.mp4"
+    old_graphics = tmp_path / "deliverable-graphics.mp4"
+    old_overlay = tmp_path / "graphics-overlay.mov"
+    old_timeline = tmp_path / "timeline.xml"
+    old_authority = tmp_path / "work" / "subtitles.json"
+    old_graphics_authority = tmp_path / "work" / "graphics.json"
+    old_authority.parent.mkdir()
+    old_srt.write_text("old clock", encoding="utf-8")
+    old_burn.write_bytes(b"old picture")
+    old_combined.write_bytes(b"old combined picture")
+    old_graphics.write_bytes(b"old graphics picture")
+    old_overlay.write_bytes(b"old overlay")
+    old_timeline.write_text("old timeline", encoding="utf-8")
+    old_authority.write_text("[]", encoding="utf-8")
+    old_graphics_authority.write_text("{}", encoding="utf-8")
+
+    cli._invalidate_subtitle_derivatives(tmp_path)
+
+    assert not old_srt.exists()
+    assert not old_burn.exists()
+    assert not old_combined.exists()
+    assert not old_graphics.exists()
+    assert not old_overlay.exists()
+    assert not old_timeline.exists()
+    assert not old_authority.exists()
+    assert (tmp_path / "work" / "subtitles-before-rerun.json").exists()
+    assert not old_graphics_authority.exists()
+    assert (tmp_path / "work" / "graphics-before-rerun.json").exists()
+
+
+def test_rhythm_cannot_silently_change_an_authored_j_cut_lead():
+    from montagewright.planning_release import split_edit_timing_faults
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    authored = EDL(project_id="split", clips=[
+        Clip(
+            clip_id="broll", source_id="B",
+            approx_in_seconds=0, approx_out_seconds=3,
+        ),
+        Clip(
+            clip_id="speaker", source_id="A",
+            approx_in_seconds=0, approx_out_seconds=4,
+        ),
+    ], audio_clips=[AudioClip(
+        audio_id="voice", source_id="A",
+        in_seconds=0, out_seconds=5,
+        starts_at_clip_id="broll", offset_seconds=1.5,
+        role="narrative", completion="complete_thought",
+    )])
+    drifted = authored.model_copy(update={"clips": [
+        authored.clips[0].model_copy(update={"approx_out_seconds": 5}),
+        authored.clips[1],
+    ]})
+
+    assert split_edit_timing_faults(authored, authored) == ()
+    assert "J-cut timing drifted from 1.500s to 3.500s" in (
+        split_edit_timing_faults(authored, drifted)[0]
+    )
+
+
+def test_external_master_split_edit_timing_is_not_lost_between_camera_angles():
+    from montagewright.planning_release import split_edit_timing_faults
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    authored = EDL(project_id="double-system", clips=[
+        Clip(
+            clip_id="cam-a", source_id="CAM_A", sync_group="interview",
+            approx_in_seconds=0, approx_out_seconds=3,
+        ),
+        Clip(
+            clip_id="cam-b", source_id="CAM_B", sync_group="interview",
+            approx_in_seconds=3, approx_out_seconds=7,
+        ),
+    ], audio_clips=[AudioClip(
+        audio_id="boom", source_id="WAV", sync_group="interview",
+        in_seconds=1.5, out_seconds=6.5,
+        starts_at_clip_id="cam-a", offset_seconds=1.5,
+        role="narrative", completion="complete_thought",
+    )])
+    drifted = authored.model_copy(update={"clips": [
+        authored.clips[0].model_copy(update={"approx_out_seconds": 5}),
+        authored.clips[1],
+    ]})
+
+    faults = split_edit_timing_faults(authored, drifted)
+    assert faults
+    assert any("timing drifted" in fault for fault in faults)
+
+
+def test_same_take_rounding_is_not_mislabelled_as_a_j_cut() -> None:
+    from montagewright.planning_release import split_edit_timing_faults
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    authored = EDL(project_id="same-take", clips=[
+        Clip(clip_id="left", source_id="A", approx_in_seconds=0,
+             approx_out_seconds=1.4),
+        Clip(clip_id="right", source_id="A", approx_in_seconds=1.4,
+             approx_out_seconds=3.0),
+    ], audio_clips=[AudioClip(
+        audio_id="line", source_id="A", in_seconds=0, out_seconds=1.44,
+        starts_at_clip_id="left", offset_seconds=0,
+        role="narrative", completion="complete_thought",
+    )])
+    fitted = authored.model_copy(update={"clips": [
+        authored.clips[0].model_copy(update={"approx_out_seconds": 1.44}),
+        authored.clips[1],
+    ]})
+
+    assert split_edit_timing_faults(authored, fitted) == ()
+
+
+def test_range_bounds_are_enforced_even_without_a_centre_target():
+    from montagewright.coverage import _target_faults
+
+    assert _target_faults(
+        20.0, 20.0, 0.0, minimum_seconds=27.0, maximum_seconds=33.0,
+    ) == ["timeline is 20.00s, below the allowed minimum 27.00s by 7.00s"]
+    assert _target_faults(
+        32.0, 32.0, 0.0, minimum_seconds=27.0, maximum_seconds=33.0,
+    ) == []
+
+
+def test_brief_and_music_authority_snapshot_is_content_addressed(tmp_path):
+    from montagewright import cli
+
+    source = tmp_path / "brief.md"
+    source.write_text("locked brief", encoding="utf-8")
+
+    frozen, digest = cli._stable_authority_snapshot(
+        source, tmp_path / "work", "brief"
+    )
+
+    assert digest in frozen.name
+    assert frozen.read_text(encoding="utf-8") == "locked brief"

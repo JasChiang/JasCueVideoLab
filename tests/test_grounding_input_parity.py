@@ -216,8 +216,12 @@ def test_cli_command_records_only_the_canonical_grounding_artifact(
     monkeypatch.setattr(cli, "_tee_output", lambda _path: None)
     monkeypatch.setattr(cli, "_sam_checkpoint_for", lambda _args: None)
     monkeypatch.setattr(cli, "_make_findable", lambda _path: None)
+    # Ingest now deliberately precedes client construction. Stop at that
+    # boundary: this test only needs the command record written immediately
+    # before it and must not depend on a valid media fixture.
     monkeypatch.setattr(
-        cli, "_client", lambda: (_ for _ in ()).throw(StopAfterCommand)
+        "montagewright.ingest.build_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAfterCommand),
     )
 
     with pytest.raises(StopAfterCommand):
@@ -232,8 +236,11 @@ def test_cli_command_records_only_the_canonical_grounding_artifact(
     assert record["grounding_spec_sha256"] == hashlib.sha256(
         canonical.read_bytes()
     ).hexdigest()
-    at = record["command"].index("--grounding-spec")
-    assert record["command"][at + 1] == str(canonical)
+    at = record["original_command"].index("--grounding-spec")
+    assert record["original_command"][at + 1] == str(canonical)
+    assert record["command"][-2:] == [
+        "--job", str(output / "work" / "resolved-job.json"),
+    ]
     assert str(source) not in record["command"]
 
 
@@ -375,10 +382,13 @@ def test_web_path_and_upload_make_identical_cli_grounding_artifacts(
         (by_spec_upload, spec_upload_artifact),
         (by_reference_path, reference_path_artifact),
     ):
+        from montagewright.job import load_job
+
         run = web.RUNS[response.json()["run_id"]]
-        assert run.command.count("--grounding-spec") == 1
-        at = run.command.index("--grounding-spec")
-        assert run.command[at + 1] == str(artifact)
+        assert run.command[-2:] == ["--job", response.json()["job"]]
+        job = load_job(Path(response.json()["job"]))
+        assert job.subject is not None
+        assert job.subject.grounding_spec == str(artifact)
         payload = json.loads(artifact.read_text(encoding="utf-8"))
         stored = artifact.parent / payload["reference_images"][0]["path"]
         assert stored.read_bytes() == image_bytes
@@ -436,6 +446,7 @@ def test_web_simple_reference_fields_build_the_same_strict_contract(
             "source_path": str(rushes),
             "grounding_target_id": "device.fold",
             "grounding_target_description": "the exact foldable in the photo",
+            "grounding_presence_policy": "target_only",
             "grounding_identity_cues": "distinct hinge\nvertical cameras",
             "grounding_exclusions": "ordinary tablet",
             "review": "false",
@@ -451,6 +462,7 @@ def test_web_simple_reference_fields_build_the_same_strict_contract(
     target = spec.identity_lock.identity.target("device.fold")
     assert target.identity_cues == ("distinct hinge", "vertical cameras")
     assert target.stable_exclusions == ("ordinary tablet",)
+    assert spec.identity_lock.framing.editorial_presence_policy == "target_only"
     assert spec.resolve_reference_path(spec.reference_images[0]).read_bytes() == (
         b"reference bytes"
     )

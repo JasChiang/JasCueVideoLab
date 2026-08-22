@@ -861,10 +861,20 @@ def burn(
             f"lt(t,{overlay.ends_seconds:.3f})'[{nxt}]"
         )
         tag = nxt
+    # Overlaying re-encodes the picture.  Declare the delivery colour on the
+    # frames as well as the encoder/container so a subtitle pass cannot strip
+    # the Rec.709 authority established by the master render.
+    master = "master"
+    steps.append(
+        f"[{tag}]setparams=color_primaries=bt709:color_trc=bt709:"
+        f"colorspace=bt709[{master}]"
+    )
     command += [
         "-filter_complex", ";".join(steps),
-        "-map", f"[{tag}]", "-map", "0:a?",
+        "-map", f"[{master}]", "-map", "0:a?",
         "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+        "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-colorspace", "bt709", "-movflags", "+write_colr+faststart",
         "-pix_fmt", "yuv420p", "-r", output_fps,
         "-fps_mode", "cfr", "-c:a", "copy", str(destination),
     ]

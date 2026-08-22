@@ -561,25 +561,27 @@ def _floor_for(clip: Clip) -> float:
 def _action_floor_for(clip: Clip) -> float:
     """The hard content floor imposed by selected action contracts."""
 
-    return max(
+    source_seconds = max(
         (
             contract.minimum_duration_from(clip.approx_in_seconds)
             for contract in clip.action_contracts
         ),
         default=0.0,
     )
+    return source_seconds / max(1e-6, float(clip.speed or 1.0))
 
 
 def _source_motion_floor_for(clip: Clip) -> float:
     """The measured remainder of explicitly selected authored source motion."""
 
-    return max(
+    source_seconds = max(
         (
             contract.minimum_duration_from(clip.approx_in_seconds)
             for contract in clip.source_motion_contracts
         ),
         default=0.0,
     )
+    return source_seconds / max(1e-6, float(clip.speed or 1.0))
 
 
 def _content_floor_for(clip: Clip) -> float:

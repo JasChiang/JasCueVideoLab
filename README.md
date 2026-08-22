@@ -4,16 +4,64 @@ Montagewright 把一個毛片資料夾、可選的音樂與 Brief，整理成一
 
 它不只是「請模型列一份 EDL」：Gemini 負責理解素材、形成剪輯意圖與挑片；本機程式負責時間、節拍、逐幀追蹤、裁切可行性、字幕、字卡、渲染與驗收紀錄。最後除了影片，還會留下足以回答「為什麼這樣剪」的結構化報表。
 
-```bash
-montagewright render RUSHES/ \
-  --brief BRIEF.md \
-  --music MUSIC.mp3 \
-  --aspect 9:16 \
-  --seconds 90 \
-  --review \
-  --budget 5 \
-  --output CUT/
+一般使用者不必寫 YAML：打開 Web，選毛片資料夾、填 Brief、選音樂與成品規格即可。Web 會先產生並保存完整工作單；CLI 自動化或進階製作流程也可以直接使用同一份工作單。路徑以工作單所在資料夾為準：
+
+```yaml
+# edit-job.yaml
+version: montagewright-job-v1
+rushes: RUSHES
+output: CUT
+brief: BRIEF.md
+music: MUSIC.mp3
+delivery:
+  aspect: 9:16
+  seconds: 90
+  duration_mode: preferred
+  subtitles: none
+  frame_rate: 30
+  codec: h264
+  color: normalize_to_sdr
+  loudness_lufs: -14
+sound:
+  speech: never
+dialogue:
+  edit_mode: continuous_soundbite # 或 phrase_edit；仍只用 Apple 時鐘
+rights:
+  acknowledged: false
+release:
+  producer_approval_required: true
+run:
+  budget_usd: 5
+  review: false
 ```
+
+```bash
+montagewright render --job edit-job.yaml
+```
+
+還沒要付費時先跑完全相同的工作單：
+
+```bash
+montagewright render --job edit-job.yaml --preflight-only
+```
+
+它會做到素材盤點、hash、完整 decode、格式／色彩／格率／音軌、sync map、磁碟與交付契約檢查，然後在 `_client()` 之前返回；結果寫在 `work/preflight-report.json`。Web 也把「先做免費檢查」與「開始剪輯（會使用 Gemini）」分成兩個明確按鈕。
+
+少量的一次性需求仍可直接寫在命令列，且明確旗標會覆寫工作單：
+
+```bash
+montagewright render RUSHES/ --job edit-job.yaml --aspect 16:9 --output CUT/
+```
+
+每輪開始前都會在 `work/resolved-job.json` 保存套用預設值與覆寫後的完整工作單；`command.json` 以這份 resolved job 作為唯一可重跑 authority，另保留原始命令供稽核。系統先遞迴盤點並 hash 全部素材、檢查重名、格式、格率、色彩、音軌、完整解碼、磁碟空間與同步契約，通過後才建立 Gemini client。素材變更而沿用舊 output 時會拒絕續跑，不會讓舊 proxy 配上新 master。
+
+Renderer 完成只代表有可看的剪輯，不代表 producer 放行。未確認素材權利、尚有 review fault，或尚未由 producer 看過該版 draft 時，輸出會命名為 `draft-preview.mp4`。Web 的核准會綁定實際觀看檔案的 SHA-256；檔案之後若改變，舊核准立即失效。全數通過後才原子發布 `deliverable.mp4`，並寫下 `release-manifest.json`、來源 inventory hash、成片 SHA-256 與 `work/technical-qc.json`。
+
+多機位或外錄音必須在 `sync.map` 提供經 timecode、audio fingerprint、拍板或人工確認的共同時鐘；系統不會把同時拍攝的 angle 當成先後發生，也不會猜哪一軌是正式收音。工作單可用 `subject.identity_semantics` 明分 `physical_instance`、`sku`、`variant`、`product_family`，避免把參考圖中的一支展示機誤當唯一合法實機。
+
+同一 campaign 可在 `variants` 列出多個 delivery。每個比例／秒數會成為獨立 edit（會重新判斷選鏡、群像是否改為 sequential read、pan 或換鏡），但共享 content-addressed cards、逐字稿、identity evidence 與本機素材庫。`run.budget_usd` 是整個 campaign 的上限，平均分配到各 variant；`campaign-manifest.json` 記錄每版結果，避免三個版本各自悄悄花掉完整預算。
+
+`picture_composition.mode` 可把工作單明確標成 `split_screen`、`pip` 或 `screen_insert`，但目前沒有經驗證的多來源 compositor；這些要求會在付費前停下，不會讓 reframe 假裝已完成合成。HDR／VFR／interlace、23.976 與 ProRes 目前也採相同 fail-closed 原則，直到對應的色彩／time-map／encoder 路徑通過真素材驗證。
 
 也可以直接開啟本機 Web 編輯器：
 
@@ -164,7 +212,7 @@ montagewright render RUSHES/ \
 
 Gemini 先以參考圖和正／反向條件找出候選區間，再對候選的精確影片格確認身份與框；至少兩個不同時間點確認成功後，SAM 才能接手逐幀追蹤。SAM 負責延續遮罩與位置，不會自行判斷兩個相似物件是不是同一個。任何階段無法確認都會停止該身份追蹤，而不是換成外觀相似的替代品。
 
-Web 的「開始新一輪」提供相同的簡易欄位。需要多個目標、hard negative 或已核准的完整查詢契約時，可改用 CLI `--grounding-spec PATH` 或 Web 的進階 grounding JSON；兩條入口最後都會寫成同一份 `work/grounding-spec.json`，供續跑、報表與稽核使用。
+Web 的「開始新一輪」可直接新增多個產品，每個目標各自設定參考圖、`physical_instance`／`sku`／`variant`／`product_family` 語義與排除條件，不必手寫 JSON。需要 hard negative 或完整核准查詢契約時，仍可用 CLI `--grounding-spec PATH` 或 Web 載入既有 spec；所有入口最後都寫成同一份 `work/grounding-spec.json`，供續跑、報表與稽核使用。
 
 ### 本機逐字稿（macOS 26）
 
@@ -225,7 +273,8 @@ montagewright render ~/Movies/rushes \
 | `--music FILE` | 配樂；節奏階段會聽音樂並以本機 beat grid 落點 |
 | `--music-map FILE` | 使用已鎖定的音樂分析結果 |
 | `--aspect` | `16:9`、`1:1`、`4:5`、`9:16` |
-| `--seconds N` | 硬性的目標片長；不要只把秒數寫在 prose Brief 裡 |
+| `--seconds N` | 目標片長；搭配 `--duration-mode exact\|range\|preferred` 決定是硬規格、允許範圍或創意偏好 |
+| `--minimum-seconds N`／`--maximum-seconds N` | `range` 模式的合法片長範圍；系統在範圍內以剪輯節奏決定落點 |
 | `--sample N` | 只分析固定抽樣的 N 支素材 |
 | `--review` | 增加逐顆與整片 Gemini review；較慢、也較貴 |
 | `--budget USD` | 整輪成本上限，預設 US$5 |
@@ -341,6 +390,9 @@ montagewright-web
 
 Web 介面包含：
 
+- **開始一輪**：一般人只需選素材、Brief、音樂與交付規格；可先做零 API 費用的完整檢查，再明確開始 Gemini 剪輯。
+- **指定產品**：可加入多個 SKU／variant／產品系列、各自參考圖與身份範圍，並選擇 context allowed、target-led 或每顆都須含主角。
+- **商業出鏡規則**：可直接要求多個指定產品真正同時留在成品 crop 內，或設定某個已 grounding 主體的全片／限時禁露；不必手寫 YAML。載入進階工作單時，只更新 `web.*` 規則，其餘 CTA、graphic、audio 與法務 obligations 原樣保留。
 - **鏡頭**：逐顆查看選片理由、原計畫、實際運動、驗收與降級；可改進出點、音量、順序與刪除鏡頭。
 - **預覽工作區**：切換成片、原素材＋裁切框與並排模式，確認原生運鏡和數位裁切沒有混淆。
 - **字卡**：點時間軸或畫面字卡即可選取；雙擊畫面文字可直接編輯主文字。
@@ -348,6 +400,7 @@ Web 介面包含：
 - **沒用的**：查看未入選素材與原因。
 - **花費**：查看各 Gemini 階段與累計成本。
 - **匯出**：重新輸出目前成片、字幕版、字卡版或 NLE timeline。
+- **核准交付**：draft 看完後由 producer 確認權利與備註；核准只對該檔案 hash 有效，通過技術 QC 才會發布 final。
 
 Web 的 trim／reorder／字幕／字卡操作不會重新呼叫 Gemini。結構性 recut 會建立新的 current-timeline revision，重新對齊或失效與新版時間軸不一致的字卡、字幕與 preview 衍生檔，避免畫面已換但下載仍是舊版本。
 

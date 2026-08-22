@@ -23,7 +23,7 @@ import tempfile
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from types import SimpleNamespace
 from typing import Any
 
@@ -53,7 +53,7 @@ from montagewright.reframe import (
     observations_from_sam,
 )
 from montagewright.renderer import RenderResult, render
-from montagewright.schema import EDL, DegradationStep
+from montagewright.schema import Clip, EDL, DegradationStep
 
 # Enough samples to see a subject change direction, few enough that one shot
 # costs a fraction of a cent. Interpolation covers the gaps; SAM propagation
@@ -108,6 +108,48 @@ def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
     fail closed instead of pretending to be lip-synced.
     """
 
+    # Provider-facing transcript prose is rounded to tenths for readability;
+    # AudioClip retains the exact Apple source clock. Fit ordinary rounding
+    # drift before calculating film starts so two adjacent utterances meet at
+    # one cut instead of overlapping by a few frames. Materially different
+    # durations remain authored split edits and are left untouched.
+    exact_by_anchor: dict[str, list[Any]] = {}
+    for audio in edl.audio_clips:
+        if (
+            audio.role == "narrative"
+            and audio.completion == "complete_thought"
+            and abs(audio.offset_seconds) <= 1e-6
+        ):
+            exact_by_anchor.setdefault(audio.starts_at_clip_id, []).append(audio)
+    fitted_clips: list[Clip] = []
+    notes: list[str] = []
+    for clip in edl.clips:
+        matches = [
+            audio for audio in exact_by_anchor.get(clip.clip_id, [])
+            if audio.source_id == clip.source_id
+            or (
+                clip.sync_group is not None
+                and audio.sync_group == clip.sync_group
+            )
+        ]
+        picture_duration = clip.approx_out_seconds - clip.approx_in_seconds
+        if len(matches) == 1 and clip.picture_role == "speaker":
+            audio_duration = matches[0].out_seconds - matches[0].in_seconds
+            if (
+                abs(audio_duration - picture_duration) <= 0.3
+                and abs(audio_duration - picture_duration) > 1e-6
+            ):
+                clip = clip.model_copy(update={
+                    "approx_out_seconds": clip.approx_in_seconds + audio_duration,
+                })
+                notes.append(
+                    f"{clip.clip_id}: fitted rounded speaker duration "
+                    f"{picture_duration:.3f}s to Apple audio "
+                    f"{audio_duration:.3f}s"
+                )
+        fitted_clips.append(clip)
+    edl = edl.model_copy(update={"clips": fitted_clips})
+
     starts: dict[str, float] = {}
     cursor = 0.0
     for clip in edl.clips:
@@ -122,7 +164,7 @@ def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
         at = anchored + audio.offset_seconds
         narrative.append((audio, at, at + audio.out_seconds - audio.in_seconds))
 
-    aligned, notes = [], []
+    aligned = []
     for clip in edl.clips:
         if clip.picture_role != "speaker":
             aligned.append(clip)
@@ -131,10 +173,21 @@ def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
         candidates = [
             (audio, audio_at)
             for audio, audio_at, audio_end in narrative
-            if audio.source_id == clip.source_id
+            if (
+                audio.source_id == clip.source_id
+                or (
+                    clip.sync_group is not None
+                    and audio.sync_group == clip.sync_group
+                )
+            )
             and (
                 audio.starts_at_clip_id == clip.clip_id
-                or audio_at <= shot_at < audio_end
+                # Film/audio intervals are half-open. Floating addition can
+                # represent a shared 13.14s boundary as 13.140000000000002;
+                # keep that numerical dust from making both adjacent voices
+                # active at the same edit point. One microsecond is far below
+                # a delivered frame and does not hide a real overlap.
+                or audio_at - 1e-6 <= shot_at < audio_end - 1e-6
             )
         ]
         if len(candidates) != 1:
@@ -144,7 +197,10 @@ def align_speaker_pictures_to_audio(edl: EDL) -> tuple[EDL, list[str]]:
                 f"{len(candidates)}"
             )
         audio, audio_at = candidates[0]
-        source_in = audio.in_seconds + shot_at - audio_at
+        source_in = (
+            audio.in_seconds + shot_at - audio_at
+            + audio.sync_offset_seconds - clip.sync_offset_seconds
+        )
         if source_in < 0:
             raise ValueError(
                 f"speaker picture {clip.clip_id} cannot begin "
@@ -231,6 +287,13 @@ class Report:
     # asked.
     delivered_intent: dict[str, str] = field(default_factory=dict)
     degradations: list[DegradationStep] = field(default_factory=list)
+    # Paid subject boxes are checkpointed per run so a later local SAM or
+    # render failure can resume without buying the same semantic answer.
+    subject_cache_dir: Path | None = None
+    # Successful frame-clock projections are part of the audit trail, not
+    # release faults. Keep them separate from plan_disagreements so exact
+    # Apple-time alignment does not block the result it repaired.
+    execution_notes: list[str] = field(default_factory=list)
 
     def note_release_faults(self, category: str, faults: "Iterable[str]") -> None:
         """Record a release-gate fault as a reviewable disagreement.
@@ -439,18 +502,27 @@ def _resolved_sequence_disagreements(edl: EDL) -> list[str]:
             )
         if left.source_id != right.source_id:
             continue
+        left_reframe, right_reframe = left.reframe, right.reframe
+        left_labels = (
+            [look.at for look in left_reframe.looks]
+            if left_reframe is not None else []
+        )
+        right_labels = (
+            [look.at for look in right_reframe.looks]
+            if right_reframe is not None else []
+        )
+        coverage_switch = bool(
+            left_labels and right_labels and left_labels[-1] != right_labels[0]
+        )
         gap = right.approx_in_seconds - left.approx_out_seconds
-        if -0.25 <= gap <= 0.25:
+        if -0.25 <= gap <= 0.25 and not coverage_switch:
             notes.append(
                 f"{left.clip_id} and {right.clip_id} cut nearly continuously "
                 f"inside {left.source_id}; the {gap:+.2f}s source-clock jump "
                 "may read as an accidental cut"
             )
-        left_reframe, right_reframe = left.reframe, right.reframe
         if left_reframe is None or right_reframe is None:
             continue
-        left_labels = [look.at for look in left_reframe.looks]
-        right_labels = [look.at for look in right_reframe.looks]
         if not left_labels or not right_labels or left_labels[-1] != right_labels[0]:
             continue
         if not left_reframe.look_boxes or not right_reframe.look_boxes:
@@ -554,10 +626,16 @@ def _source_motion_measurement(
 def _locate_subject(frames, description, *, client, report):
     """Keep test/offline callers free of a keyword only live runs need."""
 
+    cache_dir = getattr(report, "subject_cache_dir", None)
+    cache_arg = {"cache_dir": cache_dir} if cache_dir is not None else {}
     if report.ledger is None:
-        return locate_subject(frames, description, client=client)
+        return locate_subject(
+            frames, description, client=client,
+            **cache_arg,
+        )
     return locate_subject(
-        frames, description, client=client, ledger=report.ledger
+        frames, description, client=client, ledger=report.ledger,
+        **cache_arg,
     )
 
 
@@ -945,6 +1023,105 @@ def _card_widths(card: dict[str, Any] | None) -> dict[str, float]:
     }
 
 
+def _co_visible_group_boxes(
+    primary: list[dict[str, Any]],
+    primary_times: list[float],
+    entity_ids: list[str],
+    references: Mapping[
+        str,
+        tuple[
+            list[dict[str, Any]],
+            list[float],
+            tuple[tuple[float, tuple[float, float, float, float]], ...],
+        ],
+    ],
+    *,
+    crop_width: float,
+    crop_height: float,
+    min_visible: float,
+) -> list[dict[str, Any]]:
+    """Union identities proven visible in the same delivered crop samples."""
+
+    indexed: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+    for entity_id in entity_ids:
+        reference = references.get(entity_id)
+        if reference is None:
+            return []
+        boxes, times, _anchors = reference
+        indexed[entity_id] = [
+            (times[index], box)
+            for box in boxes
+            for index in [int(box.get("frame_index", -1))]
+            if box.get("present") and 0 <= index < len(times)
+        ]
+        if not indexed[entity_id]:
+            return []
+
+    simultaneous: list[dict[str, Any]] = []
+    tolerance = 0.55 / TRACK_FPS
+    for primary_box in primary:
+        frame_index = int(primary_box.get("frame_index", -1))
+        if not 0 <= frame_index < len(primary_times):
+            continue
+        at = primary_times[frame_index]
+        group = [primary_box]
+        for entity_id in entity_ids:
+            nearest_at, nearest = min(
+                indexed[entity_id], key=lambda item: abs(item[0] - at)
+            )
+            if abs(nearest_at - at) > tolerance:
+                group = []
+                break
+            group.append(nearest)
+        if not group:
+            continue
+        rectangles = []
+        for box in group:
+            cx, cy = float(box["centre_x"]), float(box["centre_y"])
+            width, height = float(box.get("width") or 0.0), float(
+                box.get("height") or 0.0
+            )
+            rectangles.append((
+                cx - width / 2.0, cy - height / 2.0,
+                cx + width / 2.0, cy + height / 2.0,
+            ))
+        left = min(one[0] for one in rectangles)
+        top = min(one[1] for one in rectangles)
+        right = max(one[2] for one in rectangles)
+        bottom = max(one[3] for one in rectangles)
+        centre_x, centre_y = (left + right) / 2.0, (top + bottom) / 2.0
+        crop_left = min(
+            max(centre_x - crop_width / 2.0, 0.0),
+            max(0.0, 1.0 - crop_width),
+        )
+        crop_top = min(
+            max(centre_y - crop_height / 2.0, 0.0),
+            max(0.0, 1.0 - crop_height),
+        )
+        visible = []
+        for x0, y0, x1, y1 in rectangles:
+            intersection = max(
+                0.0, min(x1, crop_left + crop_width) - max(x0, crop_left)
+            ) * max(
+                0.0, min(y1, crop_top + crop_height) - max(y0, crop_top)
+            )
+            visible.append(intersection / max((x1 - x0) * (y1 - y0), 1e-9))
+        if min(visible) + 1e-6 < min_visible:
+            continue
+        simultaneous.append({
+            "frame_index": frame_index,
+            "present": True,
+            "centre_x": centre_x,
+            "centre_y": centre_y,
+            "width": right - left,
+            "height": bottom - top,
+            "geometry_source": "sam2.1_group_union",
+            "visible_fraction": min(visible),
+        })
+    needed = max(1, round(len(primary) * TRACK_QUORUM))
+    return simultaneous if len(simultaneous) >= needed else []
+
+
 def _measure_looks(
     looks, source, clip, work: Path, report, client, target_aspect: float,
     checkpoint: Path | None = None,
@@ -1095,6 +1272,22 @@ def _measure_looks(
                     ):
                         contained.append(one)
                 found = contained
+            if found and look.co_visible_entity_ids:
+                found = _co_visible_group_boxes(
+                    found,
+                    look_times,
+                    list(look.co_visible_entity_ids),
+                    reference_samples or {},
+                    crop_width=base,
+                    crop_height=base_height,
+                    min_visible=1.0 if look.must_be_whole else 0.85,
+                )
+                if not found:
+                    missing.append(
+                        f"{look.at} + {', '.join(look.co_visible_entity_ids)} "
+                        "(not simultaneously proven inside the delivery crop)"
+                    )
+                    continue
             if not found:
                 missing.append(look.at)
                 continue
@@ -2237,6 +2430,13 @@ def _reference_subject_samples(
         "grounding_spec_sha256": batch.grounding_spec_sha256,
         "matched_anchors": len(anchors),
         "source_pts": [item.lineage.frame_pts for item in matched],
+        "visible_states": [
+            {
+                "at_seconds": round(item.lineage.frame_time_ms / 1000.0, 3),
+                    "state": getattr(item.decision, "visible_state", "unjudged"),
+            }
+            for item in matched
+        ],
         "sam_seed_pts": seed.lineage.frame_pts,
         "sam_seed_sha256": seed.lineage.frame_sha256,
         "sam_seed_width": seed.lineage.width,
@@ -2281,6 +2481,36 @@ def _reference_subject_samples(
     return boxes, times, tuple(anchors)
 
 
+def _reference_absence_blocks(
+    entity_id: str, planned_entity_ids: Collection[str],
+) -> bool:
+    """A selected identity must exist; a forbidden identity may be absent."""
+
+    return entity_id in planned_entity_ids
+
+
+def _forbidden_obligation_applies(
+    obligation: Any,
+    entity_id: str,
+    at_seconds: float,
+    programme_duration: float,
+) -> bool:
+    """Resolve one picture prohibition on the delivered film clock."""
+
+    if entity_id not in (getattr(obligation, "refs", ()) or ()):
+        return False
+    window = getattr(obligation, "window", None)
+    final = getattr(window, "final_seconds", None)
+    if final is not None:
+        start = max(0.0, programme_duration - float(final))
+        end = programme_duration
+    else:
+        start = float(getattr(window, "start_seconds", None) or 0.0)
+        raw_end = getattr(window, "end_seconds", None)
+        end = programme_duration if raw_end is None else float(raw_end)
+    return start - 1e-6 <= at_seconds < end - 1e-6
+
+
 def follow_subjects(
     edl: EDL,
     sources: dict[str, Source],
@@ -2297,6 +2527,7 @@ def follow_subjects(
     confirmed_identities: "dict[str, Any] | None" = None,
     upload_cache: Any | None = None,
     source_motion_measurements: "Mapping[str, Any] | None" = None,
+    forbidden_obligations: tuple[Any, ...] = (),
 ) -> dict[str, CropPath]:
     """Build a crop path per shot that names a subject.
 
@@ -2313,7 +2544,21 @@ def follow_subjects(
     output_size = output_size or delivery_size(target_aspect)
 
     paths: dict[str, CropPath] = {}
+    if grounding_output is not None:
+        # Persist each paid semantic bbox immediately. A later SAM/render
+        # failure must not make resume buy the first N subject calls again.
+        report.subject_cache_dir = grounding_output.parent / "subject-locations"
     discoveries: dict[str, Any] = {}
+    reference_evidence: dict[
+        str,
+        dict[
+            str,
+            tuple[
+                list[dict[str, Any]], list[float],
+                tuple[tuple[float, tuple[float, float, float, float]], ...],
+            ],
+        ],
+    ] = {}
     unusable_shots: list[ReferenceShotUnusable] = []
     with tempfile.TemporaryDirectory() as raw_work:
         work = Path(raw_work)
@@ -2346,10 +2591,22 @@ def follow_subjects(
                 ] = {}
                 if grounding_spec is not None:
                     entity_faults: list[ReferenceShotUnusable] = []
-                    for entity_id in dict.fromkeys(
-                        look.entity_id
+                    planned_entity_ids = list(dict.fromkeys(
+                        identity
                         for look in reframe.looks
-                        if look.entity_id
+                        for identity in (
+                            look.entity_id,
+                            *tuple(look.co_visible_entity_ids),
+                        )
+                        if identity
+                    ))
+                    forbidden_entity_ids = tuple(dict.fromkeys(
+                        str(ref)
+                        for obligation in forbidden_obligations
+                        for ref in (getattr(obligation, "refs", ()) or ())
+                    ))
+                    for entity_id in dict.fromkeys(
+                        (*tuple(planned_entity_ids), *forbidden_entity_ids)
                     ):
                         try:
                             samples = _reference_subject_samples(
@@ -2372,11 +2629,17 @@ def follow_subjects(
                                 ),
                             )
                         except ReferenceShotUnusable as unusable:
-                            entity_faults.append(unusable)
+                            if entity_id in planned_entity_ids:
+                                entity_faults.append(unusable)
                             continue
                         if samples[0]:
                             reference_samples[entity_id] = samples
-                        else:
+                            reference_evidence.setdefault(
+                                clip.clip_id, {}
+                            )[entity_id] = samples
+                        elif _reference_absence_blocks(
+                            entity_id, planned_entity_ids
+                        ):
                             report.degradations.append(
                                 DegradationStep(
                                     clip_id=clip.clip_id,
@@ -2606,8 +2869,9 @@ def follow_subjects(
                 # nothing recorded.
                 route_policy = camera_route_policy(reframe)
                 if (
-                    (
+                (
                         len(reframe.looks) >= 2
+                        or any(look.co_visible_entity_ids for look in reframe.looks)
                         or (
                             route_policy.expand_sequential_read
                             and reframe.editorial_intent != "use_source_motion"
@@ -2625,7 +2889,18 @@ def follow_subjects(
                         report.subject_notes[clip.clip_id] = (
                             f"could not find {missing} in any sampled frame"[:160]
                         )
-                    if len(stops) >= 2:
+                        if any(
+                            look.co_visible_entity_ids for look in reframe.looks
+                        ):
+                            unusable_shots.append(ReferenceShotUnusable(
+                                clip.clip_id,
+                                "co-visible group",
+                                f"{clip.clip_id}: required identities were not "
+                                "simultaneously proven inside the delivered crop; "
+                                "reselect or use an explicit sequential read",
+                            ))
+                            continue
+                    if len(stops) >= 1:
                         out_w, out_h = output_size
                         _native = _native_motion_for(
                             clip, reframe, source_motion_measurements,
@@ -3225,6 +3500,94 @@ def follow_subjects(
                     attempt_id=fault.attempt_id,
                 )
             )
+    forbidden_entity_ids = tuple(dict.fromkeys(
+        str(ref)
+        for obligation in forbidden_obligations
+        for ref in (getattr(obligation, "refs", ()) or ())
+    ))
+    if forbidden_entity_ids:
+        from montagewright.executor import CropBox
+        from montagewright.reframe import (
+            interpolate_crop_keyframes, visible_fraction,
+        )
+
+        forbidden_faults: list[str] = []
+        programme_starts: dict[str, float] = {}
+        programme_duration = 0.0
+        for item in edl.clips:
+            programme_starts[item.clip_id] = programme_duration
+            programme_duration += (
+                item.approx_out_seconds - item.approx_in_seconds
+            ) / max(float(item.speed), 1e-9)
+
+        def forbidden_at(entity_id: str, at_seconds: float) -> bool:
+            return any(
+                _forbidden_obligation_applies(
+                    obligation, entity_id, at_seconds, programme_duration
+                ) for obligation in forbidden_obligations
+            )
+
+        for clip in edl.clips:
+            source = sources[clip.source_id]
+            path = paths.get(clip.clip_id)
+            if path is not None and path.keyframes:
+                keys = [
+                    {
+                        "at": key.seconds, "x": key.crop.x, "y": key.crop.y,
+                        "w": key.crop.width, "h": key.crop.height,
+                    }
+                    for key in path.keyframes
+                ]
+            else:
+                width = min(1.0, target_aspect / source.aspect_ratio)
+                height = min(1.0, width * source.aspect_ratio / target_aspect)
+                keys = [{
+                    "at": 0.0, "x": (1.0 - width) / 2.0,
+                    "y": (1.0 - height) / 2.0, "w": width, "h": height,
+                }]
+            for entity_id in forbidden_entity_ids:
+                evidence = reference_evidence.get(clip.clip_id, {}).get(entity_id)
+                if evidence is None:
+                    continue
+                boxes, times, _anchors = evidence
+                visible_hits = 0
+                for box in boxes:
+                    frame_index = int(box.get("frame_index", -1))
+                    if not 0 <= frame_index < len(times):
+                        continue
+                    shot_seconds = times[frame_index] - clip.approx_in_seconds
+                    programme_seconds = (
+                        programme_starts[clip.clip_id]
+                        + shot_seconds / max(float(clip.speed), 1e-9)
+                    )
+                    if not forbidden_at(entity_id, programme_seconds):
+                        continue
+                    crop_data = interpolate_crop_keyframes(keys, shot_seconds)
+                    if crop_data is None:
+                        continue
+                    fraction = visible_fraction(
+                        CropBox(
+                            crop_data["x"], crop_data["y"],
+                            crop_data["w"], crop_data["h"],
+                        ),
+                        Observation(
+                            shot_seconds,
+                            float(box["centre_x"]), float(box["centre_y"]),
+                            float(box.get("width") or 0.0),
+                            float(box.get("height") or 0.0),
+                        ),
+                    )
+                    visible_hits += fraction >= 0.05
+                if visible_hits:
+                    forbidden_faults.append(
+                        f"{clip.clip_id}: forbidden identity {entity_id} is "
+                        f"visible inside the delivered crop on {visible_hits} "
+                        "measured frame(s)"
+                    )
+        if forbidden_faults:
+            report.note_release_faults(
+                "forbidden delivered visual", forbidden_faults
+            )
     _remember_tracked_geometry(edl, report, cards)
     if unusable_shots:
         raise ReferenceShotsUnusable(unusable_shots)
@@ -3321,6 +3684,8 @@ def run(
     decide_rhythm_first: bool = True,
     target_seconds: float = 0.0,
     duration_mode: str = "exact",
+    minimum_seconds: float | None = None,
+    maximum_seconds: float | None = None,
     max_static_seconds: float = 0.0,
     keep_voice: bool = False,
     under_speech: str = "duck",
@@ -3332,6 +3697,11 @@ def run(
     rhythm_shots: "list[Any] | None" = None,
     upload_cache: Any | None = None,
     source_motion_measurements: Mapping[str, Any] | None = None,
+    output_size: tuple[int, int] | None = None,
+    output_fps: int = 30,
+    loudness_lufs: float = -14.0,
+    obligations: tuple[Any, ...] = (),
+    music_policy: Any | None = None,
 ) -> tuple[RenderResult, RenderPlan, Report, EDL]:
     """Take an EDL to a finished file.
 
@@ -3363,6 +3733,7 @@ def run(
     # Without it every length was whatever selection guessed for that shot
     # alone, and nothing ever asked whether eight of them in a row had any
     # shape. Speech-led cuts, which need shaping most, got none of it.
+    authored_split_edl = edl
     if decide_rhythm_first:
         if ledger is not None:
             ledger.check()
@@ -3377,6 +3748,8 @@ def run(
             cache=upload_cache,
             target_seconds=target_seconds,
             duration_mode=duration_mode,
+            minimum_seconds=minimum_seconds,
+            maximum_seconds=maximum_seconds,
             client=client,
             ledger=ledger,
             artifact_dir=output_dir / "work",
@@ -3387,18 +3760,17 @@ def run(
             if note not in report.plan_disagreements
         )
 
-    # Music grounding and dialogue boundaries both move cuts.  Neither may
-    # silently invalidate the other, so converge them before rendering and
-    # report only the final timeline. Speech has the final say inside each
-    # round; a following grounding round proves the musical request still
-    # lands. A cycle is a real planning conflict, not something to hide.
-    dialogue_history: list[str] = []
-    seen_windows: set[tuple[tuple[float, float], ...]] = set()
+    # Resolve once in editorial priority order.  The former four-round loop
+    # let music and dialogue alternately rewrite the same source window until
+    # they happened to converge (or cycled).  That is not a split edit; it is
+    # two policies fighting over one control.  Music proposes the sequence,
+    # measured dialogue then owns any edge it must move, and those protected
+    # edges are removed from the beat grid before the remaining picture cuts
+    # are laid out one final time.
     timeline = ground_timeline(edl, grid)
-    for attempt in range(4):
-        edl = apply_to_edl(edl, timeline)
-        if not transcripts:
-            break
+    edl = apply_to_edl(edl, timeline)
+    dialogue_history: list[str] = []
+    if transcripts:
         from montagewright.transcript import snap_edl_to_dialogue
 
         snapped, dialogue_notes, dialogue_faults = snap_edl_to_dialogue(
@@ -3406,31 +3778,35 @@ def run(
         )
         dialogue_history.extend(dialogue_notes)
         if dialogue_faults:
-            # A cut that crosses unfinished dialogue is a shot to swap, not a
-            # reason to deliver nothing. Take the dialogue-safe snap as the
-            # best available cut, flag the faults, and stop iterating.
             report.note_release_faults("dialogue", dialogue_faults)
-            edl = snapped
-            break
-        if not dialogue_notes:
-            break
-        signature = tuple(
-            (round(clip.approx_in_seconds, 4), round(clip.approx_out_seconds, 4))
-            for clip in snapped.clips
-        )
-        if signature in seen_windows or attempt == 3:
-            # Music grounding and dialogue snapping keep trading places. Rather
-            # than raise on the cycle, keep the dialogue-safe cut and record
-            # that the two could not be reconciled for review.
-            report.plan_disagreements.append(
-                "dialogue: music grounding and dialogue-safe boundaries did "
-                "not converge; the named speech shots may need replanning"
+
+        before = {clip.clip_id: clip for clip in edl.clips}
+        protected = []
+        for clip in snapped.clips:
+            old = before[clip.clip_id]
+            moved = (
+                abs(clip.approx_in_seconds - old.approx_in_seconds) > 1e-6
+                or abs(clip.approx_out_seconds - old.approx_out_seconds) > 1e-6
             )
-            edl = snapped
-            break
-        seen_windows.add(signature)
-        edl = snapped
+            if moved:
+                sync = clip.music_sync.model_copy(update={
+                    "cut_on_beat": False,
+                    "sync_to": None,
+                    "beats": None,
+                    "anchor": None,
+                })
+                clip = clip.model_copy(update={"music_sync": sync})
+                report.plan_disagreements.append(
+                    f"{clip.clip_id}: measured dialogue boundary overrides "
+                    "the requested music snap"
+                )
+            protected.append(clip)
+        edl = snapped.model_copy(update={"clips": protected})
+        # Recompute the programme clock once. Protected dialogue clips retain
+        # their exact source windows; other picture cuts may still land on the
+        # measured music grid around them.
         timeline = ground_timeline(edl, grid)
+        edl = apply_to_edl(edl, timeline)
     report.plan_disagreements.extend(dict.fromkeys(dialogue_history))
     report.aligned_cuts = timeline.aligned_count
     report.total_cuts = len(timeline.clips)
@@ -3466,7 +3842,9 @@ def run(
     from montagewright.coverage import edl_coverage_audit
 
     coverage = edl_coverage_audit(
-        edl, target_seconds, hard_target=duration_mode == "exact"
+        edl, target_seconds, hard_target=duration_mode == "exact",
+        minimum_seconds=minimum_seconds,
+        maximum_seconds=maximum_seconds,
     )
     report.coverage_seconds = round(coverage.supported_seconds, 3)
     report.unsupported_seconds = round(coverage.unsupported_seconds, 3)
@@ -3499,24 +3877,45 @@ def run(
     # a return to the speaker after B-roll can be mapped to the exact progress
     # of the continuing audio assignment.  It must precede SAM/reframing.
     edl, speaker_notes = align_speaker_pictures_to_audio(edl)
-    report.plan_disagreements.extend(speaker_notes)
+    report.execution_notes.extend(speaker_notes)
     # Lip-sync owns the final source in-point for speaker pictures.  It runs
     # after musical/dialogue grounding, so it must not be allowed to move a
     # clip through an action, source-motion or usable-window boundary that was
     # proved on the earlier window.
     from montagewright.planning_release import (
         audio_timeline_faults, resolved_source_contract_faults,
+        split_edit_timing_faults,
     )
 
     resolved_faults = tuple(dict.fromkeys((
         *resolved_source_contract_faults(edl),
         *audio_timeline_faults(edl),
+        *split_edit_timing_faults(authored_split_edl, edl),
     )))
     if resolved_faults:
         # Same principle as the pre-rhythm gate: a residual contract fault is
         # a shot whose window is slightly off, not an unrenderable film. Flag
         # it and render the draft.
         report.note_release_faults("resolved contract", resolved_faults)
+
+    # Publish the explicit v2 clocks beside the legacy EDL.  The proven
+    # executor still consumes v1 during migration, but every delivered edit is
+    # now inspectable as independent source, picture-timeline and audio ranges
+    # with sync links.  A malformed projection is a release fault, never a
+    # reason to withhold an otherwise renderable draft.
+    try:
+        from montagewright.edit_timeline import from_edl as explicit_timeline
+        from montagewright.measure.storage import write_json
+
+        edit_timeline = explicit_timeline(edl)
+        write_json(
+            output_dir / "work" / "editorial-timeline-v2.json",
+            edit_timeline,
+        )
+    except ValueError as error:
+        report.note_release_faults(
+            "explicit timeline", (f"could not project EDL v2: {error}",)
+        )
     for clip in edl.clips:
         if clip.clip_id in report.rhythm_decisions:
             report.rhythm_decisions[clip.clip_id]["seconds"] = round(
@@ -3537,6 +3936,11 @@ def run(
         confirmed_identities=confirmed_identities,
         upload_cache=upload_cache,
         source_motion_measurements=source_motion_measurements,
+        forbidden_obligations=tuple(
+            obligation for obligation in obligations
+            if getattr(obligation, "track", None) == "picture"
+            and getattr(obligation, "kind", None) == "forbidden_presence"
+        ),
     )
 
     for clip in edl.clips:
@@ -3572,9 +3976,46 @@ def run(
 
     plan = plan_render(
         edl, sources, target_aspect=target_aspect, crop_paths=paths,
-        output_size=delivery_size(target_aspect),
+        output_size=output_size or delivery_size(target_aspect),
+        output_fps=output_fps,
+        loudness_lufs=loudness_lufs,
     )
     report.degradations.extend(plan.degradations)
+
+    # Recheck producer obligations on the resolved timeline. The planning
+    # answer was audited before local roll/slip/dialogue grounding changed
+    # durations; release is judged against what will actually render.
+    if obligations or music_policy is not None:
+        from montagewright.delivery_contract import (
+            editorial_obligation_faults, music_policy_faults,
+        )
+
+        resolved_shots = []
+        for clip, segment in zip(edl.clips, plan.segments, strict=True):
+            looks = getattr(getattr(clip, "reframe", None), "looks", ()) or ()
+            resolved_shots.append({
+                "seconds_needed": segment.screen_duration_seconds,
+                "looks": [
+                    {
+                        "entity_id": look.entity_id,
+                        "co_visible_entity_ids": list(
+                            look.co_visible_entity_ids
+                        ),
+                    }
+                    for look in looks if getattr(look, "entity_id", None)
+                ],
+            })
+        contract_faults = editorial_obligation_faults(
+            resolved_shots, tuple(obligations),
+        )
+        if music_policy is not None:
+            contract_faults.extend(music_policy_faults({
+                "shots": resolved_shots,
+                "music_from_seconds": plan.music_from_seconds,
+                "music_spans": plan.music_spans,
+            }, music_policy))
+        if contract_faults:
+            report.note_release_faults("delivery contract", contract_faults)
 
     # Kept. A finished cut answers whether this is a film; it does not answer
     # whether any one shot came out the way it was planned -- six composition
@@ -3640,6 +4081,9 @@ def run(
                 "completion": audio.completion,
                 "gain_db": audio.gain_db,
                 "why": audio.why,
+                "source_span_id": audio.source_span_id,
+                "audio_stream_index": audio.audio_stream_index,
+                "audio_channel": audio.audio_channel,
             }
             for audio in plan.audio_assignments
         ],

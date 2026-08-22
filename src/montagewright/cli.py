@@ -18,8 +18,9 @@ import signal
 import sys
 import time
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Sequence, cast
 
 if TYPE_CHECKING:
     from montagewright.reference_grounding import ReferenceGroundingSpec
@@ -79,6 +80,7 @@ from montagewright.planner import (
     MODEL_ID,
     PROMPTS,
     THINKING_HIGH,
+    EditorialPlanUnrenderable,
     MaterialItem,
     SelectionUnrenderable,
     _describe_one,
@@ -89,7 +91,8 @@ from montagewright.planner import (
     correct_candidate_options,
     decide_direction,
     decide_editorial_plan,
-    editorial_plan_to_legacy,
+    expand_audio_assignments,
+    load_editorial_plan_replay,
     replan_shots,
     repair_selection_motion_contracts,
     repair_selection_source_windows,
@@ -100,9 +103,11 @@ from montagewright.planner import (
     select_shots,
 )
 from montagewright.schema import (
+    AudioCompletion,
     EDL,
     Clip,
     ContentContract,
+    ContentPolicy,
     delivered_camera_intent_of,
     looks_of,
     move_of_shot,
@@ -110,6 +115,7 @@ from montagewright.schema import (
     subject_of,
 )
 from montagewright.spans import spans_of
+from montagewright.ingest import VIDEO_SUFFIXES
 from montagewright.uploads import (
     UploadCache,
     content_hash,
@@ -123,7 +129,6 @@ SAM_CHECKPOINT_NAME = "sam2.1_hiera_tiny.pt"
 # Long enough that it is worth asking whether this is one take or many. Under
 # it, scene detection costs more than it can save.
 SPLIT_ABOVE_SECONDS = 90.0
-VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV"}
 
 
 def prepare_grounding_spec_artifact(
@@ -215,6 +220,7 @@ def _command_with_canonical_grounding(
         "--grounding-target-id", "--grounding-target-description",
         "--grounding-reference", "--grounding-negative",
         "--grounding-identity-cue", "--grounding-exclusion",
+        "--grounding-presence-policy",
     }
     rewritten: list[str] = []
     skip_value = False
@@ -626,6 +632,88 @@ def _identity_commitment_sources(commitments: Any) -> set[str]:
         for option in commitments.options
         if option.target_id != "none"
     }
+
+
+def _editorial_plan_identity_pairs(
+    plan: dict[str, Any], *, include_fallbacks: bool = True,
+) -> set[tuple[str, str]]:
+    """Identity claims made by actual shots, without a commitment layer."""
+
+    pairs: set[tuple[str, str]] = set()
+    for shot in plan.get("shots") or []:
+        span_ids = [str(shot.get("span_id") or "")]
+        if include_fallbacks and shot.get("fallback_span_id"):
+            span_ids.append(str(shot["fallback_span_id"]))
+        targets = {
+            str(look.get("entity_id") or "").strip()
+            for look in shot.get("looks") or []
+            if str(look.get("entity_id") or "").strip() not in {"", "none"}
+        }
+        target = str(shot.get("target_id") or "").strip()
+        if target not in {"", "none"}:
+            targets.add(target)
+        for span_id in span_ids:
+            source_id = span_id.split(":", 1)[0]
+            pairs.update((source_id, target_id) for target_id in targets)
+    return pairs
+
+
+def _spend_editorial_fallbacks(
+    plan: dict[str, Any],
+    outcomes: dict[tuple[str, str], dict[str, str]],
+    *,
+    require_confirmation: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset(),
+) -> list[str]:
+    """Replace a disproved primary with its explicitly named fallback span."""
+
+    notes: list[str] = []
+    for index, shot in enumerate(plan.get("shots") or []):
+        primary_source = str(shot.get("span_id") or "").split(":", 1)[0]
+        targets = {
+            str(look.get("entity_id") or "").strip()
+            for look in shot.get("looks") or []
+            if str(look.get("entity_id") or "").strip() not in {"", "none"}
+        }
+        explicit_target = str(shot.get("target_id") or "").strip()
+        if explicit_target not in {"", "none"}:
+            targets.add(explicit_target)
+        failed = [
+            target_id for target_id in targets
+            if outcomes.get((primary_source, target_id), {}).get("status") == "hard_negative"
+            or (
+                (primary_source, target_id) in require_confirmation
+                and outcomes.get((primary_source, target_id), {}).get("status")
+                != "confirmed"
+            )
+        ]
+        if not failed:
+            continue
+        fallback = str(shot.get("fallback_span_id") or "")
+        fallback_source_id = fallback.split(":", 1)[0]
+        fallback_ok = bool(fallback) and all(
+            outcomes.get((fallback_source_id, target_id), {}).get("status")
+            != "hard_negative"
+            for target_id in failed
+        )
+        if fallback_ok:
+            old = str(shot.get("span_id") or "")
+            shot["span_id"] = fallback
+            shot["fallback_used_for_span_id"] = old
+            shot["identity_status"] = "needs_review"
+            notes.append(
+                f"k{index:02d} replaced disproved {old} with fallback {fallback}"
+            )
+        else:
+            shot["identity_status"] = "needs_review"
+            shot["identity_issue"] = (
+                "primary identity was disproved and no exact-eligible fallback span exists"
+            )
+            notes.append(
+                f"k{index:02d} primary identity was disproved; no eligible fallback"
+            )
+    if notes:
+        plan.setdefault("plan_disagreements", []).extend(notes)
+    return notes
 
 
 def _rebuilt_material_geometry(
@@ -1172,7 +1260,8 @@ def _push_room(proxy: Path, target_aspect: float) -> float:
 
 
 def _make_proxy(
-    source: Path, destination: Path, *, library: Path | None = None
+    source: Path, destination: Path, *, library: Path | None = None,
+    source_sha256: str | None = None,
 ) -> Path:
     """A small copy for the model to watch.
 
@@ -1189,29 +1278,44 @@ def _make_proxy(
     now.
     """
 
+    source_digest = source_sha256 or content_hash(source)
+    lineage_path = destination.with_suffix(destination.suffix + ".source.json")
+    if destination.exists() and lineage_path.exists():
+        try:
+            lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            lineage = {}
+        if lineage.get("source_sha256") == source_digest:
+            return destination
     if destination.exists():
-        return destination
+        destination.unlink()
+    if lineage_path.exists():
+        lineage_path.unlink()
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     if library is not None:
-        from montagewright.uploads import content_hash
-
-        kept = library / "proxies" / f"{content_hash(source)[:20]}.mp4"
+        kept = library / "proxies" / f"{source_digest[:20]}.mp4"
         if kept.exists():
             try:
                 destination.hardlink_to(kept)
             except OSError:
                 shutil.copy2(kept, destination)
-            return destination
-        kept.parent.mkdir(parents=True, exist_ok=True)
-        _encode_proxy(source, kept)
-        try:
-            destination.hardlink_to(kept)
-        except OSError:
-            shutil.copy2(kept, destination)
-        return destination
-
-    _encode_proxy(source, destination)
+        else:
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            _encode_proxy(source, kept)
+            try:
+                destination.hardlink_to(kept)
+            except OSError:
+                shutil.copy2(kept, destination)
+    else:
+        _encode_proxy(source, destination)
+    temporary = lineage_path.with_name(f".{lineage_path.name}.tmp")
+    temporary.write_text(json.dumps({
+        "version": "montagewright-proxy-lineage-v1",
+        "source": str(source.resolve()),
+        "source_sha256": source_digest,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(lineage_path)
     return destination
 
 
@@ -1327,21 +1431,347 @@ def _make_findable(output: Path) -> None:
 
 
 def _editorial_plan_enabled(args: argparse.Namespace) -> bool:
-    """Opt-in switch for the merged one-call editorial plan.
+    """Use one editorial brain by default; retain an explicit legacy escape."""
 
-    Off unless asked, so the default render is the three-call path, byte for
-    byte as before. Enabled by `--editorial-plan` or MONTAGEWRIGHT_EDITORIAL_PLAN=1.
-    """
+    if bool(getattr(args, "legacy_three_pass", False)):
+        return False
+    configured = os.environ.get("MONTAGEWRIGHT_EDITORIAL_PLAN")
+    if configured is not None:
+        return configured.strip().lower() not in {"0", "false", "no", "off"}
+    return True
 
-    return bool(getattr(args, "editorial_plan", False)) or (
-        os.environ.get("MONTAGEWRIGHT_EDITORIAL_PLAN", "") not in ("", "0")
+
+def _expand_render_job_argv(
+    argv: list[str],
+) -> tuple[list[str], Path | None, Any | None]:
+    """Put work-order values before explicit flags so the CLI can override."""
+
+    if not argv or argv[0] != "render":
+        return argv, None, None
+    job_values: list[tuple[int, int, str]] = []
+    index = 1
+    while index < len(argv):
+        value = argv[index]
+        if value == "--job" and index + 1 < len(argv):
+            job_values.append((index, index + 2, argv[index + 1]))
+            index += 2
+            continue
+        if value.startswith("--job="):
+            job_values.append((index, index + 1, value.split("=", 1)[1]))
+        index += 1
+    if not job_values:
+        return argv, None, None
+    if len(job_values) != 1:
+        raise ValueError("give exactly one --job")
+    starts, ends, raw_path = job_values[0]
+    job_path = Path(raw_path).expanduser().resolve(strict=True)
+    from montagewright.job import EditJob, job_for_form, job_to_argv
+
+    job = EditJob.model_validate(job_for_form(job_path))
+    job_rushes, job_options = job_to_argv(job, job_path)
+    remaining = [*argv[:starts], *argv[ends:]]
+    # The ordinary syntax keeps rushes immediately after ``render``.  A work
+    # order may supply it instead; explicit positional rushes remain the
+    # authority when both exist.
+    explicit_rushes = (
+        len(remaining) > 1 and not remaining[1].startswith("-")
+    )
+    if explicit_rushes:
+        expanded = [remaining[0], remaining[1], *job_options, *remaining[2:]]
+    elif job_rushes:
+        expanded = [remaining[0], job_rushes, *job_options, *remaining[1:]]
+    else:
+        expanded = remaining
+    return expanded, job_path, job
+
+
+def _resolved_job(args: argparse.Namespace, rushes: Path, output: Path) -> Any:
+    """The actual delivery sheet after defaults, job and CLI overrides."""
+
+    from montagewright.job import Delivery, EditJob, RunPolicy, Sound, Subject
+
+    grounding = getattr(args, "reference_grounding_spec", None)
+    subject = None
+    if grounding is not None and getattr(args, "grounding_spec", None) is not None:
+        grounded_targets = tuple(grounding.identity_lock.identity.targets)
+        subject = Subject(
+            grounding_spec=str(args.grounding_spec),
+            identity_semantics=cast(
+                Literal[
+                    "physical_instance", "sku", "variant", "product_family"
+                ],
+                str(
+                    grounded_targets[0].identity_semantics
+                    if len(grounded_targets) == 1 else "physical_instance"
+                ),
+            ),
+            presence=cast(
+                Literal["context_allowed", "target_led", "target_only"],
+                str(getattr(
+                    grounding.identity_lock.framing,
+                    "editorial_presence_policy",
+                    "context_allowed",
+                )),
+            ),
+        )
+    seconds = float(getattr(args, "seconds", 0.0) or 0.0)
+    if (
+        args.duration_mode == "range" and seconds <= 0
+        and getattr(args, "minimum_seconds", None) is not None
+        and getattr(args, "maximum_seconds", None) is not None
+    ):
+        seconds = (
+            float(args.minimum_seconds) + float(args.maximum_seconds)
+        ) / 2.0
+    resolved = EditJob(
+        rushes=str(rushes),
+        output=str(output),
+        brief=str(args.brief) if args.brief else None,
+        music=str(args.music) if args.music else None,
+        delivery=Delivery(
+            aspect=args.aspect,
+            seconds=seconds,
+            duration_mode=(args.duration_mode if seconds > 0 else "preferred"),
+            minimum_seconds=getattr(args, "minimum_seconds", None),
+            maximum_seconds=getattr(args, "maximum_seconds", None),
+            subtitles=args.subtitles,
+            subtitle_look=args.subtitle_look,
+            subtitle_font=(str(args.subtitle_font) if args.subtitle_font else None),
+            timeline=args.timeline,
+        ),
+        sound=Sound(speech=args.speech, locale=args.locale),
+        subject=subject,
+        run=RunPolicy(budget_usd=args.budget, review=bool(args.review)),
+    )
+    original = getattr(args, "_job", None)
+    if original is not None:
+        merged_delivery = original.delivery.model_copy(update={
+            "aspect": resolved.delivery.aspect,
+            "seconds": resolved.delivery.seconds,
+            "duration_mode": resolved.delivery.duration_mode,
+            "minimum_seconds": resolved.delivery.minimum_seconds,
+            "maximum_seconds": resolved.delivery.maximum_seconds,
+            "subtitles": resolved.delivery.subtitles,
+            "subtitle_look": resolved.delivery.subtitle_look,
+            "subtitle_font": resolved.delivery.subtitle_font,
+            "timeline": resolved.delivery.timeline,
+        })
+        resolved = original.model_copy(update={
+            "rushes": resolved.rushes,
+            "output": resolved.output,
+            "brief": resolved.brief,
+            "music": resolved.music,
+            "delivery": merged_delivery,
+            "sound": resolved.sound,
+            "subject": resolved.subject,
+            "run": resolved.run,
+        })
+    return resolved
+
+
+def _run_campaign_variants(args: argparse.Namespace, job: Any) -> int:
+    """Render each explicit delivery as its own edit, sharing local evidence."""
+
+    import copy
+    from montagewright.job import job_to_argv
+
+    variants = tuple(job.variants)
+    if not variants:
+        return int(args.handler(args) or 0)
+    base_output = Path(job.output or args.output).expanduser().resolve()
+    total_budget = float(job.run.budget_usd)
+    per_variant_budget = total_budget / len(variants)
+    results: list[dict[str, Any]] = []
+    prepared: list[tuple[Any, argparse.Namespace, Path]] = []
+    for variant in variants:
+        output = (
+            Path(variant.output).expanduser().resolve()
+            if variant.output else base_output / variant.variant_id
+        )
+        brief_path = args.brief
+        if variant.brief_addendum.strip():
+            variant_brief = output / "work" / "variant-brief.md"
+            variant_brief.parent.mkdir(parents=True, exist_ok=True)
+            base_brief = (
+                Path(args.brief).read_text(encoding="utf-8")
+                if args.brief is not None else ""
+            )
+            variant_brief.write_text(
+                base_brief + "\n\n## Delivery variant\n\n"
+                + variant.brief_addendum.strip() + "\n",
+                encoding="utf-8",
+            )
+            brief_path = variant_brief
+        variant_job = job.model_copy(update={
+            "output": str(output),
+            "brief": str(brief_path) if brief_path is not None else None,
+            "delivery": variant.delivery,
+            "variants": (),
+            "run": job.run.model_copy(update={"budget_usd": per_variant_budget}),
+        })
+        child = copy.copy(args)
+        child.output = output
+        child.brief = brief_path
+        child.aspect = variant.delivery.aspect
+        child.seconds = variant.delivery.seconds
+        child.duration_mode = variant.delivery.duration_mode
+        child.minimum_seconds = variant.delivery.minimum_seconds
+        child.maximum_seconds = variant.delivery.maximum_seconds
+        child.subtitles = variant.delivery.subtitles
+        child.subtitle_look = variant.delivery.subtitle_look
+        child.subtitle_font = (
+            Path(variant.delivery.subtitle_font)
+            if variant.delivery.subtitle_font else None
+        )
+        child.timeline = variant.delivery.timeline
+        child.budget = per_variant_budget
+        child._job = variant_job
+        _, options = job_to_argv(variant_job, Path(args._job_path))
+        child._argv = ["render", str(args.rushes), *options]
+        prepared.append((variant, child, output))
+
+    # A campaign is one purchase decision. Prove that every aspect/codec/
+    # source contract can run locally before the first variant is allowed to
+    # create a provider client.
+    for _variant, child, _output in prepared:
+        probe = copy.copy(child)
+        probe.preflight_only = True
+        int(probe.handler(probe) or 0)
+
+    if bool(getattr(args, "preflight_only", False)):
+        base_output.mkdir(parents=True, exist_ok=True)
+        (base_output / "campaign-manifest.json").write_text(
+            json.dumps({
+                "version": "montagewright-campaign-v1",
+                "variants": [
+                    {
+                        "variant_id": variant.variant_id,
+                        "output": str(output),
+                        "status": "preflight_ready",
+                    }
+                    for variant, _child, output in prepared
+                ],
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return 0
+
+    for variant, child, output in prepared:
+        child.preflight_only = False
+        state = output / "run-state.json"
+        _write_run_state(state, "running")
+        try:
+            outcome = int(child.handler(child) or 0)
+        except Exception as error:
+            _write_run_state(state, "failed")
+            results.append({
+                "variant_id": variant.variant_id,
+                "output": str(output), "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+            })
+            base_output.mkdir(parents=True, exist_ok=True)
+            (base_output / "campaign-manifest.json").write_text(
+                json.dumps({
+                    "version": "montagewright-campaign-v1",
+                    "variants": results,
+                }, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            raise
+        _write_run_state(state, "done" if not outcome else "failed")
+        release_path = output / "release-manifest.json"
+        release_status = "rendered_draft"
+        if release_path.exists():
+            try:
+                release_payload = json.loads(release_path.read_text(encoding="utf-8"))
+                release_status = (
+                    "released"
+                    if release_payload.get("status") == "released"
+                    else "rendered_draft"
+                )
+            except (OSError, ValueError):
+                release_status = "rendered_draft"
+        results.append({
+            "variant_id": variant.variant_id,
+            "output": str(output),
+            "status": release_status if not outcome else "failed",
+        })
+    base_output.mkdir(parents=True, exist_ok=True)
+    (base_output / "campaign-manifest.json").write_text(
+        json.dumps({
+            "version": "montagewright-campaign-v1",
+            "shared_source": str(args.rushes),
+            "total_budget_usd": total_budget,
+            "per_variant_budget_usd": per_variant_budget,
+            "variants": results,
+        }, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return max(
+        (0 if one["status"] in {"released", "rendered_draft"} else 1
+         for one in results), default=0
     )
 
 
-def command_render(args: argparse.Namespace) -> int:
+def _invalidate_subtitle_derivatives(output: Path) -> None:
+    """Remove captions whose clocks belong to an earlier render revision."""
+
+    for stale in (
+        output / "subtitles.srt",
+        output / "deliverable-subtitled.mp4",
+        output / "deliverable-graphics.mp4",
+        output / "deliverable-graphics-subtitled.mp4",
+        output / "graphics-overlay.mov",
+        output / "timeline.xml",
+        output / "timeline.fcpxml",
+    ):
+        stale.unlink(missing_ok=True)
+    (output / "work" / "graphics-render" / "layout.json").unlink(
+        missing_ok=True
+    )
+    subtitle_authority = output / "work" / "subtitles.json"
+    if subtitle_authority.exists():
+        backup = output / "work" / "subtitles-before-rerun.json"
+        subtitle_authority.replace(backup)
+    graphics_authority = output / "work" / "graphics.json"
+    if graphics_authority.exists():
+        backup = output / "work" / "graphics-before-rerun.json"
+        graphics_authority.replace(backup)
+
+
+def _stable_authority_snapshot(source: Path, directory: Path, prefix: str) -> tuple[Path, str]:
+    """Freeze brief/music bytes only when stat and digest describe one revision."""
+
+    original = source.expanduser().resolve(strict=True)
+    before = original.stat()
+    digest = sha256_file(original)
+    after = original.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise OSError(f"{original} changed while it was being frozen")
+    directory.mkdir(parents=True, exist_ok=True)
+    frozen = directory / f"{prefix}-{digest}{original.suffix}"
+    if not frozen.exists():
+        temporary = frozen.with_name(f".{frozen.name}.tmp")
+        shutil.copyfile(original, temporary)
+        if sha256_file(temporary) != digest:
+            temporary.unlink(missing_ok=True)
+            raise OSError(f"{original} changed while its snapshot was copied")
+        temporary.replace(frozen)
+    return frozen, digest
+
+
+def command_render(args: argparse.Namespace) -> int:  # pyright: ignore[reportGeneralTypeIssues]
     rushes = args.rushes.expanduser().resolve()
     output = args.output.expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    if output == rushes or output.is_relative_to(rushes):
+        raise SystemExit(
+            "output must be outside the rushes folder; otherwise previews and "
+            "previous renders become input footage on the next run"
+        )
+    from montagewright.release import OutputBusy, acquire_output_lease
+
+    try:
+        output_lease = acquire_output_lease(output)
+    except OutputBusy as error:
+        raise SystemExit(str(error)) from error
 
     grounding_spec = getattr(args, "grounding_spec", None)
     simple_description = str(
@@ -1365,6 +1795,15 @@ def command_render(args: argparse.Namespace) -> int:
                     or "target.primary"
                 ),
                 target_description=simple_description,
+                identity_semantics=cast(
+                    Literal[
+                        "physical_instance", "sku", "variant", "product_family"
+                    ],
+                    str(
+                        getattr(args, "grounding_identity_semantics", None)
+                        or "physical_instance"
+                    ),
+                ),
                 positive_images=simple_references,
                 identity_cues=tuple(
                     getattr(args, "grounding_identity_cue", None) or ()
@@ -1375,6 +1814,13 @@ def command_render(args: argparse.Namespace) -> int:
                 negative_images=tuple(
                     Path(one)
                     for one in (getattr(args, "grounding_negative", None) or ())
+                ),
+                editorial_presence_policy=cast(
+                    Literal["context_allowed", "target_led", "target_only"],
+                    str(
+                        getattr(args, "grounding_presence_policy", None)
+                        or "context_allowed"
+                    ),
                 ),
                 created_by="cli_user",
             )
@@ -1436,6 +1882,47 @@ def command_render(args: argparse.Namespace) -> int:
         reference_grounding_spec.definition_sha256()
         if reference_grounding_spec is not None else None
     )
+    from montagewright.job import write_job
+
+    try:
+        resolved_job = _resolved_job(args, rushes, output)
+    except ValueError as error:
+        raise SystemExit(f"invalid edit work order: {error}") from error
+    # The work order may derive a planning centre for an explicit range.
+    # Every downstream planner/auditor must see that same resolved contract.
+    args.seconds = resolved_job.delivery.seconds
+    args.duration_mode = resolved_job.delivery.duration_mode
+    args.minimum_seconds = resolved_job.delivery.minimum_seconds
+    args.maximum_seconds = resolved_job.delivery.maximum_seconds
+    resolved_job_path = write_job(
+        output / "work" / "resolved-job.json", resolved_job
+    )
+    execution_faults = resolved_job.execution_contract_faults()
+    if reference_grounding_spec is not None:
+        framing = reference_grounding_spec.identity_lock.framing
+        grounding_execution_faults: list[str] = []
+        if reference_grounding_spec.identity_lock.predicate is not None:
+            grounding_execution_faults.append(
+                "grounding predicate/state contracts have no local delivered-frame auditor yet"
+            )
+        if framing.preferred_target_ids or framing.sacrificable_target_ids:
+            grounding_execution_faults.append(
+                "preferred/sacrificable grounding roles have no execution policy yet"
+            )
+        if framing.overlay_keepout_target_ids:
+            grounding_execution_faults.append(
+                "grounding overlay keepout has no graphics collision auditor yet"
+            )
+        if framing.aspect_constraints:
+            grounding_execution_faults.append(
+                "grounding aspect constraints have no verified crop auditor yet"
+            )
+        execution_faults = (*execution_faults, *grounding_execution_faults)
+    if execution_faults:
+        raise SystemExit(
+            "unsupported delivery contract before paid planning:\n  "
+            + "\n  ".join(execution_faults)
+        )
     (output / "command.json").write_text(
         json.dumps({
             "source": str(rushes),
@@ -1447,8 +1934,24 @@ def command_render(args: argparse.Namespace) -> int:
                 str(args.grounding_spec) if args.grounding_spec else None
             ),
             "grounding_spec_sha256": grounding_sha256,
-            "command": [sys.executable, "-u", "-m", "montagewright.cli"]
-            + recorded_argv,
+            "job_source": (
+                str(args._job_path) if getattr(args, "_job_path", None) else None
+            ),
+            "resolved_job": str(resolved_job_path),
+            # The resolved work order is the full replay authority. Expanded
+            # legacy flags cannot carry sync, obligations, rights or campaign
+            # fields and therefore are kept only as an audit of what arrived.
+            "original_command": [
+                sys.executable, "-u", "-m", "montagewright.cli",
+                *recorded_argv,
+            ],
+            "command": [
+                sys.executable, "-u", "-m", "montagewright.cli", "render",
+                "--job", str(resolved_job_path),
+                *(["--preflight-only"] if bool(
+                    getattr(args, "preflight_only", False)
+                ) else []),
+            ],
         }, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -1460,35 +1963,285 @@ def command_render(args: argparse.Namespace) -> int:
     # the output meant every new run over the same rushes paid for them again
     # -- forty-four cents of cards before anything was decided.
     library = (args.library or default_library()).expanduser()
+    from montagewright.ingest import (
+        IngestError, build_manifest, decode_preflight,
+        technical_contract_faults, write_manifest,
+    )
+
+    ingest_path = work / "ingest-manifest.json"
+    try:
+        ingest = build_manifest(
+            rushes, work_root=work,
+            previous=(ingest_path if ingest_path.exists() else None),
+        )
+    except IngestError as error:
+        raise SystemExit(f"ingest failed before paid planning: {error}") from error
+    write_manifest(ingest_path, ingest)
+    if ingest.rejected:
+        print(
+            f"ingest: {len(ingest.assets)} media accepted, "
+            f"{len(ingest.rejected)} unsupported files set aside",
+            flush=True,
+        )
+        camera_media = {
+            ".mts", ".m2ts", ".mxf", ".r3d", ".braw", ".crm", ".ari",
+            ".mpg", ".mpeg", ".wmv", ".webm",
+        }
+        omitted_media = [
+            one.relative_path for one in ingest.rejected
+            if Path(one.relative_path).suffix.casefold() in camera_media
+        ]
+        if omitted_media:
+            raise SystemExit(
+                "unsupported camera media was found; refusing to plan from an "
+                "incomplete card before paid planning:\n  "
+                + "\n  ".join(omitted_media)
+            )
+    resolved_sync = None
+    if resolved_job.sync.map:
+        from montagewright.sync import (
+            load_sync_map, resolve_sync, write_resolved_sync,
+        )
+
+        try:
+            supplied_sync = load_sync_map(Path(resolved_job.sync.map))
+            if supplied_sync.authority != resolved_job.sync.authority:
+                raise ValueError(
+                    "work order sync authority disagrees with sync map"
+                )
+            resolved_sync = resolve_sync(supplied_sync, ingest)
+        except (OSError, ValueError) as error:
+            raise SystemExit(
+                f"sync failed before paid planning: {error}"
+            ) from error
+        write_resolved_sync(work / "resolved-sync.json", resolved_sync)
+    if ingest.external_audio and resolved_sync is None:
+        names = ", ".join(one.relative_path for one in ingest.external_audio[:5])
+        raise SystemExit(
+            "ingest found external audio but this job has no sync authority yet: "
+            f"{names}. Supply a sync map before paid planning."
+        )
+    sync_members = resolved_sync.by_source() if resolved_sync is not None else {}
+    sync_audio_mezzanines: dict[str, Path] = {}
+    if resolved_sync is not None:
+        for member in resolved_sync.members:
+            if member.role != "master_audio":
+                continue
+            destination = work / "sync-audio" / f"{member.source_id}.wav"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source = Path(member.path)
+            input_label = (
+                f"0:{member.audio_stream_index}"
+                if member.audio_stream_index is not None else "0:a:0"
+            )
+            filters = (
+                ["-af", f"pan=mono|c0=c{member.channel}"]
+                if member.channel is not None else []
+            )
+            completed = subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source), "-map", input_label, *filters,
+                "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
+                str(destination),
+            ], capture_output=True, text=True, check=False)
+            if completed.returncode or not destination.exists():
+                raise SystemExit(
+                    f"sync audio extraction failed before paid planning for "
+                    f"{member.source_id}: {completed.stderr.strip()}"
+                )
+            sync_audio_mezzanines[member.source_id] = destination
+    selected_streams = {
+        source_id: member.audio_stream_index
+        for source_id, member in sync_members.items()
+        if member.audio_stream_index is not None
+    }
+    technical_faults = technical_contract_faults(
+        ingest,
+        delivery_color=resolved_job.delivery.color,
+        selected_audio_streams=selected_streams,
+    )
+    if technical_faults:
+        raise SystemExit(
+            "ingest is outside the verified delivery contract before paid "
+            "planning:\n  " + "\n  ".join(technical_faults)
+        )
+    try:
+        decode_preflight(ingest)
+    except IngestError as error:
+        raise SystemExit(f"ingest failed before paid planning: {error}") from error
+    # Validate every non-video authority before the provider client exists.
+    # Otherwise a bad brief, music file or font can be discovered only after
+    # the entire clip-card batch has already been paid for.
+    from montagewright.brief import load_brief
+
+    try:
+        authority_dir = work / "input-authorities"
+        authority_manifest: dict[str, Any] = {}
+        if args.brief:
+            original_brief = Path(args.brief).expanduser().resolve(strict=True)
+            frozen_brief, brief_hash = _stable_authority_snapshot(
+                original_brief, authority_dir, "brief"
+            )
+            args.brief = frozen_brief
+            authority_manifest["brief"] = {
+                "original": str(original_brief), "snapshot": str(frozen_brief),
+                "sha256": brief_hash,
+            }
+        if args.music:
+            original_music = Path(args.music).expanduser().resolve(strict=True)
+            frozen_music, music_hash = _stable_authority_snapshot(
+                original_music, authority_dir, "music"
+            )
+            args.music = frozen_music
+            authority_manifest["music"] = {
+                "original": str(original_music), "snapshot": str(frozen_music),
+                "sha256": music_hash,
+            }
+    except OSError as error:
+        raise SystemExit(
+            f"brief/music snapshot failed before paid planning: {error}"
+        ) from error
+
+    try:
+        brief_document = load_brief(args.brief)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise SystemExit(f"brief failed before paid planning: {error}") from error
+    grounding_refs = {
+        target.target_id
+        for target in (
+            reference_grounding_spec.identity_lock.identity.targets
+            if reference_grounding_spec is not None else ()
+        )
+    }
+    approved_copy_refs = {
+        fact.fact_id for fact in brief_document.approved_copy
+    }
+    authority_faults: list[str] = []
+    for obligation in resolved_job.obligations:
+        allowed = grounding_refs if obligation.track == "picture" else approved_copy_refs
+        unknown = set(obligation.refs) - allowed
+        if unknown and obligation.track in {"picture", "graphic"}:
+            authority_faults.append(
+                f"{obligation.obligation_id}: {obligation.track} refs have no "
+                f"approved authority: {', '.join(sorted(unknown))}"
+            )
+    if authority_faults:
+        raise SystemExit(
+            "work-order obligations cannot be audited before paid planning:\n  "
+            + "\n  ".join(authority_faults)
+        )
+    preflight_grid = None
+    try:
+        if args.music_map:
+            preflight_grid = load_beat_grid(args.music_map)
+        elif args.music:
+            music_path = Path(args.music).expanduser().resolve(strict=True)
+            preflight_grid = analyse_track(music_path)
+            args.music = music_path
+        if args.subtitle_font:
+            from PIL import ImageFont
+
+            font_path = Path(args.subtitle_font).expanduser().resolve(strict=True)
+            ImageFont.truetype(str(font_path), 24)
+            args.subtitle_font = font_path
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SystemExit(
+            f"music/font failed before paid planning: {error}"
+        ) from error
+    # Freeze the small mutable authorities into this revision. Provider
+    # decisions, approval and the renderer must all read the same brief/music
+    # bytes even when the original path is edited during a long run.
+    authority_dir.mkdir(parents=True, exist_ok=True)
+    (authority_dir / "manifest.json").write_text(
+        json.dumps(authority_manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    resolved_job = resolved_job.model_copy(update={
+        "brief": str(args.brief) if args.brief else None,
+        "music": str(args.music) if args.music else None,
+    })
+    write_job(resolved_job_path, resolved_job)
+    from montagewright.ingest import revalidate_manifest
+
+    try:
+        revalidate_manifest(ingest)
+    except IngestError as error:
+        raise SystemExit(f"ingest failed before paid planning: {error}") from error
+    command_path = output / "command.json"
+    command_record = json.loads(command_path.read_text(encoding="utf-8"))
+    command_record.update({
+        "ingest_manifest": str(ingest_path),
+        "ingest_inventory_sha256": ingest.inventory_sha256,
+        "sync_map": (
+            str(work / "resolved-sync.json") if resolved_sync is not None else None
+        ),
+    })
+    command_path.write_text(
+        json.dumps(command_record, ensure_ascii=False), encoding="utf-8",
+    )
+    if bool(getattr(args, "preflight_only", False)):
+        preflight_report = work / "preflight-report.json"
+        preflight_report.write_text(json.dumps({
+            "version": "montagewright-preflight-v1",
+            "status": "ready_for_paid_planning",
+            "ingest_inventory_sha256": ingest.inventory_sha256,
+            "accepted_assets": len(ingest.assets),
+            "video_assets": len(ingest.videos),
+            "external_audio_assets": len(ingest.external_audio),
+            "rejected": [one.model_dump(mode="json") for one in ingest.rejected],
+            "sync_map": (
+                str(work / "resolved-sync.json")
+                if resolved_sync is not None else None
+            ),
+            "delivery": resolved_job.delivery.model_dump(mode="json"),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("preflight   ready; no Gemini client was created", flush=True)
+        print(f"report      {preflight_report}", flush=True)
+        output_lease.release()
+        return 0
+
+    # Subtitles are derived from this run's resolved picture/audio clocks.
+    # A file left by an earlier run is never evidence that the current run
+    # produced captions, even when its duration happens to match.
+    _invalidate_subtitle_derivatives(output)
     client = _client()
     cache = UploadCache.load(args.upload_cache or default_cache_path())
     ledger = Ledger(
-        cap_usd=args.budget,
+        # Replay is a wiring test, not a disguised provider run. Cached cards,
+        # transcripts and grounding may be reused; any missing paid artifact
+        # fails at reservation instead of silently filling itself in.
+        cap_usd=(
+            0.0
+            if getattr(args, "editorial_plan_replay", None) is not None
+            else args.budget
+        ),
         model_id=MODEL_ID,
         journal_path=output / "spend-events.jsonl",
     )
 
-    sources_paths = sorted(
-        path for path in rushes.iterdir() if path.suffix in VIDEO_SUFFIXES
-    )
-    if not sources_paths:
-        raise SystemExit(f"no video files in {rushes}")
-    print(f"{len(sources_paths)} clips in {rushes.name}", flush=True)
+    source_entries = [
+        (one.source_id, Path(one.absolute_path), one.sha256)
+        for one in ingest.videos
+    ]
+    print(f"{len(source_entries)} clips in {rushes.name}", flush=True)
 
     # Something already cut is one file holding many takes. Handing it over
     # whole means one card for five minutes, one transcript, and a planner
     # choosing windows out of a single source as though the cuts inside it
     # were not there -- so a long file is opened along the boundaries it
     # already has. A continuous take comes back as itself.
-    rushes_paths: list[Path] = []
-    for path in sources_paths:
+    rushes_entries: list[tuple[str, Path, str | None]] = []
+    for source_id, path, source_digest in source_entries:
         spans = (
             shots_in(path)
-            if _duration(path) >= SPLIT_ABOVE_SECONDS
+            if (
+                source_id not in sync_members
+                and _duration(path) >= SPLIT_ABOVE_SECONDS
+            )
             else [(0.0, 0.0)]
         )
         if len(spans) < 2:
-            rushes_paths.append(path)
+            rushes_entries.append((source_id, path, source_digest))
             continue
         print(
             f"{path.name}: already cut, opening into {len(spans)} shots",
@@ -1497,45 +2250,52 @@ def command_render(args: argparse.Namespace) -> int:
         pieces = work / "shots"
         pieces.mkdir(parents=True, exist_ok=True)
         for index, (start, end) in enumerate(spans):
-            piece = pieces / f"{path.stem}-{index:02d}{path.suffix}"
+            piece_id = f"{source_id}__shot{index:02d}"
+            piece = pieces / f"{piece_id}{path.suffix}"
             if not piece.exists():
+                temporary_piece = piece.with_name(f".{piece.name}.tmp{path.suffix}")
                 subprocess.run(
                     [
                         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                         "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
                         "-i", str(path), "-c:v", "libx264", "-crf", "18",
-                        "-preset", "veryfast", "-c:a", "aac", str(piece),
+                        "-preset", "veryfast", "-c:a", "aac", str(temporary_piece),
                     ],
                     check=True,
                 )
-            rushes_paths.append(piece)
-    sources_paths = rushes_paths
+                temporary_piece.replace(piece)
+            rushes_entries.append((piece_id, piece, None))
+    source_entries = rushes_entries
 
     # A subset, chosen the same way every time. Random would mean a fresh set
     # of cards on every run, which is the cost this exists to avoid; evenly
     # spaced means the sample is not all of one setup, which taking the first
     # N would be -- rushes arrive in shooting order.
-    if args.sample and 0 < args.sample < len(sources_paths):
-        step = len(sources_paths) / args.sample
-        sources_paths = [
-            sources_paths[min(len(sources_paths) - 1, int(i * step))]
+    if args.sample and 0 < args.sample < len(source_entries):
+        step = len(source_entries) / args.sample
+        source_entries = [
+            source_entries[min(len(source_entries) - 1, int(i * step))]
             for i in range(args.sample)
         ]
         print(
-            f"sampling {len(sources_paths)} of {len(rushes_paths)} clips",
+            f"sampling {len(source_entries)} of {len(rushes_entries)} clips",
             flush=True,
         )
 
     proxies = {
-        path.stem: _make_proxy(
-            path, work / "proxies" / f"{path.stem}.mp4", library=library
+        source_id: _make_proxy(
+            path, work / "proxies" / f"{source_id}.mp4", library=library,
+            source_sha256=source_digest,
         )
-        for path in sources_paths
+        for source_id, path, source_digest in source_entries
     }
     # The originals, by source id. How far a shot can be pushed into is a
     # fact about the file that will be cut, and the proxy is 640 pixels wide
     # -- asking it says every clip has no room at all.
-    originals = {path.stem: path for path in sources_paths}
+    originals = {source_id: path for source_id, path, _ in source_entries}
+    originals.update({
+        one.source_id: Path(one.absolute_path) for one in ingest.external_audio
+    })
     def wrote(index: int, total: int, source_id: str) -> None:
         print(f"  card {index}/{total}  {source_id}", flush=True)
 
@@ -1584,10 +2344,20 @@ def command_render(args: argparse.Namespace) -> int:
     # so the card, which already watched the clip with its audio, says which
     # ones need one rather than a flag somebody has to remember.
     transcripts: dict[str, dict] = {}
+    master_audio_groups = {
+        member.group_id for member in (
+            resolved_sync.members if resolved_sync is not None else ()
+        )
+        if member.role == "master_audio"
+    }
     speaking = [
         source_id for source_id in proxies
         if (load_card(cards[source_id]) if source_id in cards else {})
         and (load_card(cards[source_id]) or {}).get("speech") == "content"
+        and not (
+            source_id in sync_members
+            and sync_members[source_id].group_id in master_audio_groups
+        )
     ]
     if speaking and args.speech != "never":
         from montagewright.transcript import describe as transcribe
@@ -1636,6 +2406,48 @@ def command_render(args: argparse.Namespace) -> int:
             transcripts[source_id] = card
         print(f"  transcribed, running total ${ledger.spent_usd:.4f}", flush=True)
 
+    # Double-system sound is transcribed on its own measured clock while a
+    # synced picture angle supplies visual/speaker context to Gemini. The
+    # sync map, not filename proximity, is the authority joining them.
+    sync_audio_hosts: dict[str, str] = {}
+    if resolved_sync is not None:
+        for member in resolved_sync.members:
+            if member.role == "picture_angle":
+                sync_audio_hosts.setdefault(member.group_id, member.source_id)
+        external_masters = [
+            member for member in resolved_sync.members
+            if member.role == "master_audio"
+            and member.source_id in {one.source_id for one in ingest.external_audio}
+        ]
+        if external_masters and args.speech != "never":
+            from montagewright.transcript import describe as transcribe
+            from montagewright.transcript import load as load_transcript
+            from montagewright.transcript import save as save_transcript
+
+            for member in external_masters:
+                picture_id = sync_audio_hosts.get(member.group_id)
+                if picture_id is None or picture_id not in proxies:
+                    raise SystemExit(
+                        f"sync group {member.group_id} has master audio but no "
+                        "picture angle for transcript correction"
+                    )
+                # Apple ASR and Gemini correction must hear the exact
+                # stream/channel the renderer will lay, not ffmpeg's default.
+                audio_path = sync_audio_mezzanines[member.source_id]
+                destination = (
+                    library / "transcripts"
+                    / f"{content_hash(audio_path)[:20]}.json"
+                )
+                card = load_transcript(destination)
+                if card is None:
+                    ledger.check()
+                    card, _ = transcribe(
+                        proxies[picture_id], client=client, locale=args.locale,
+                        cache=cache, audio=audio_path, ledger=ledger,
+                    )
+                    save_transcript(card, destination)
+                transcripts[member.source_id] = card
+
     # Measured once per source rather than twice per field, and off the
     # original: how far a crop can travel is a fact about resolution.
     _room = {
@@ -1667,6 +2479,18 @@ def command_render(args: argparse.Namespace) -> int:
         subject_boxes = tracked_geometry.applied(
             subjects_from_card(card or {}), cards.get(source_id),
         )
+        sync_member = sync_members.get(source_id)
+        related_audio_ids = [source_id]
+        if (
+            sync_member is not None
+            and sync_audio_hosts.get(sync_member.group_id) == source_id
+            and resolved_sync is not None
+        ):
+            related_audio_ids.extend(
+                member.source_id for member in resolved_sync.members
+                if member.group_id == sync_member.group_id
+                and member.role == "master_audio"
+            )
         material.append(
             MaterialItem(
                 source_id=source_id,
@@ -1736,20 +2560,39 @@ def command_render(args: argparse.Namespace) -> int:
                 ),
                 motion=tuple(motion_of(source_id) or ()),
                 crop_width=min(1.0, ASPECTS[args.aspect] / _aspect(proxy)),
-                speech=_speech_lines(source_id, transcripts.get(source_id)),
+                speech=tuple(
+                    line
+                    for audio_source_id in related_audio_ids
+                    for line in _speech_lines(
+                        audio_source_id, transcripts.get(audio_source_id),
+                        edit_mode=resolved_job.dialogue.edit_mode,
+                    )
+                ),
                 audio_spans=tuple(
                     (
                         span_id,
                         float(span["in_seconds"]),
                         float(span["out_seconds"]),
                     )
+                    for audio_source_id in related_audio_ids
                     for span_id, span in (
                         _audio_spans_for_source(
-                            source_id, transcripts[source_id]
-                        )
-                        if transcripts.get(source_id)
-                        else {}
+                            audio_source_id, transcripts[audio_source_id],
+                            edit_mode=resolved_job.dialogue.edit_mode,
+                        ) if transcripts.get(audio_source_id) else {}
                     ).items()
+                ),
+                sync_group=(
+                    sync_members[source_id].group_id
+                    if source_id in sync_members else None
+                ),
+                sync_offset_seconds=(
+                    sync_members[source_id].offset_seconds
+                    if source_id in sync_members else 0.0
+                ),
+                sync_role=(
+                    sync_members[source_id].role
+                    if source_id in sync_members else ""
                 ),
             )
         )
@@ -1788,9 +2631,7 @@ def command_render(args: argparse.Namespace) -> int:
         for source_id, why in list(set_aside.items())[:5]:
             print(f"  {source_id} — {why[:110]}", flush=True)
 
-    from montagewright.brief import load_brief
-
-    brief_document = load_brief(args.brief)
+    # ``brief_document`` was parsed before the paid boundary and is reused.
     # The copy manifest is data for the graphics track, not instructions to
     # the edit planner. The creative prose keeps the exact legacy behaviour
     # when no manifest exists.
@@ -1828,9 +2669,9 @@ def command_render(args: argparse.Namespace) -> int:
     # had already been paid for.  Measuring it here lets content selection
     # refer to the same stable cue IDs that local rhythm resolution executes.
     if args.music_map:
-        grid = load_beat_grid(args.music_map)
+        grid = preflight_grid
     elif args.music:
-        grid = None
+        grid = preflight_grid
         music_key = _asked(
             "runtime-music-analysis-v1",
             sha256_file(Path(args.music).expanduser().resolve(strict=True)),
@@ -1842,9 +2683,8 @@ def command_render(args: argparse.Namespace) -> int:
                 print("music analysis: reused from the last attempt", flush=True)
             except (KeyError, TypeError, ValueError):
                 remembered_music = None
-        if grid is None:
-            print("no music map given; measuring the track", flush=True)
-            grid = analyse_track(args.music)
+        if remembered_music is None:
+            print("music measured in free preflight", flush=True)
             _decide(work, "music-analysis", music_key, beat_grid_payload(grid))
     else:
         grid = None
@@ -1944,10 +2784,174 @@ def command_render(args: argparse.Namespace) -> int:
             if args.reference_grounding_spec is not None
             else "no-reference-grounding"
         ),
+        hashlib.sha256(json.dumps(
+            resolved_job.editorial_contract(), ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
     )
-    direction = _decided(work, "direction", asked)
+    direct_editorial_plan = _editorial_plan_enabled(args)
+    direction = None
+    plan_key = ""
     migrated_direction_key = False
-    if direction is None:
+    editorial_selection: dict[str, Any] | None = None
+    if direct_editorial_plan:
+        replay_path = getattr(args, "editorial_plan_replay", None)
+        planning_material = material
+        material_log_key = "direct"
+        material_log_context: dict[str, Any] | None = None
+        if replay_path is None:
+            from montagewright.planner import (
+                decide_material_log,
+                editorial_planning_route,
+                material_log_selects,
+            )
+
+            route = editorial_planning_route(material)
+            if route == "logged_selects":
+                material_log_key = _asked(
+                    asked, "material-log-v3-source-span-coverage"
+                )
+                material_log = _decided(work, "material_log", material_log_key)
+                if material_log is None:
+                    ledger.check()
+                    print(
+                        "material logging: project exceeds the direct reel "
+                        "attention budget; Gemini is binning its visual cards",
+                        flush=True,
+                    )
+                    material_log, _ = decide_material_log(
+                        material, brief=brief, aspect=args.aspect,
+                        grounding_spec=args.reference_grounding_spec,
+                        client=client, ledger=ledger,
+                    )
+                    _decide(work, "material_log", material_log_key, material_log)
+                else:
+                    print("material logging: reused semantic bins", flush=True)
+                planning_material = material_log_selects(
+                    material_log, material,
+                    grounding_spec=args.reference_grounding_spec,
+                )
+                material_log_context = material_log
+                print(
+                    f"material selects: {len(planning_material)}/{len(material)} "
+                    "sources, Gemini-ranked and restored to rushes order",
+                    flush=True,
+                )
+        replay_key = (
+            content_hash(replay_path)
+            if replay_path is not None and replay_path.exists()
+            else "provider"
+        )
+        plan_key = _asked(
+            asked, "editorial-plan-contract-v6-adaptive-stringout", replay_key,
+            material_log_key,
+            ",".join(one.source_id for one in planning_material),
+        )
+        if replay_path is not None:
+            plan = load_editorial_plan_replay(
+                replay_path,
+                material,
+                aspect=args.aspect,
+                seconds=args.seconds,
+                grounding_spec=args.reference_grounding_spec,
+                editorial_contract=resolved_job.editorial_contract(),
+                material_log=material_log_context,
+            )
+            _decide(work, "editorial_plan", plan_key, plan)
+            print(
+                f"editorial plan: offline replay from {replay_path}", flush=True
+            )
+        else:
+            plan = _decided(work, "editorial_plan", plan_key)
+            if plan is None:
+                blocked_plan = _decided(
+                    work, "invalid-editorial-plan-preflight", plan_key
+                )
+                if blocked_plan is not None:
+                    plan = copy.deepcopy(blocked_plan)
+                    for local_only in (
+                        "invalid_selection_faults", "delivery_status", "draft_only",
+                    ):
+                        plan.pop(local_only, None)
+                    print(
+                        "editorial plan: re-auditing the preserved paid draft "
+                        "against the current local execution contract",
+                        flush=True,
+                    )
+        if plan is None:
+            # Assistant-editor preparation, entirely local and free.  Every
+            # source remains present and in input order; the burned id and
+            # sidecar clock let one Gemini video part name the original take.
+            # Build and verify this before checking/reserving the paid call so
+            # a broken concat, missing proxy or stale map cannot spend money.
+            from montagewright.stringout import (
+                StringoutError,
+                build_stringout,
+                load_stringout_manifest,
+                require_stringout_matches,
+            )
+
+            planning_video = work / "editorial-stringout.mp4"
+            planning_manifest_path = work / "editorial-stringout.json"
+            planning_manifest = None
+            if planning_video.exists() and planning_manifest_path.exists():
+                try:
+                    planning_manifest = load_stringout_manifest(
+                        planning_manifest_path
+                    )
+                    require_stringout_matches(
+                        planning_manifest, planning_material
+                    )
+                except (OSError, ValueError, json.JSONDecodeError, StringoutError):
+                    planning_manifest = None
+            if planning_manifest is None:
+                print(
+                    f"editorial stringout: assembling {len(planning_material)} "
+                    "sources locally",
+                    flush=True,
+                )
+                planning_manifest = build_stringout(
+                    planning_material, planning_video,
+                    manifest_path=planning_manifest_path,
+                )
+            else:
+                print("editorial stringout: verified cached reel", flush=True)
+            ledger.check()
+            print("editorial plan: one merged call with one stringout", flush=True)
+            try:
+                plan, usage_direction = decide_editorial_plan(
+                    planning_material, brief=brief, aspect=args.aspect, music=args.music,
+                    music_grid=grid, seconds=args.seconds,
+                    duration_mode=args.duration_mode,
+                    cache=cache, client=client, ledger=ledger,
+                    grounding_spec=args.reference_grounding_spec,
+                    planning_video=planning_video,
+                    stringout_manifest=planning_manifest,
+                    editorial_contract=resolved_job.editorial_contract(),
+                    allow_paid_repair=bool(args.allow_paid_plan_repair),
+                )
+            except EditorialPlanUnrenderable as error:
+                blocked = copy.deepcopy(error.draft)
+                blocked["invalid_editorial_plan_fault"] = error.fault
+                blocked["delivery_status"] = "release_blocked"
+                blocked["draft_only"] = True
+                _decide(work, "invalid-editorial-plan-provider", plan_key, blocked)
+                raise SystemExit(
+                    "paid editorial plan failed the local ID contract; saved "
+                    "work/invalid-editorial-plan-provider.json. Resume with "
+                    "--allow-paid-plan-repair for one scoped text-only repair."
+                ) from error
+            _decide(work, "editorial_plan", plan_key, plan)
+        else:
+            print("editorial plan: reused from the last attempt", flush=True)
+        # The same authored object supplies story context to audits/replans and
+        # supplies shots to execution.  This is deliberately not converted to
+        # legacy Direction/Selection or candidate commitments.
+        direction = plan
+        editorial_selection = copy.deepcopy(plan)
+    else:
+        direction = _decided(work, "direction", asked)
+    if not direct_editorial_plan and direction is None:
         # v5 replaced natural-language subject labels with source-scoped
         # v01/v02 ids. A paid Direction written immediately before that
         # migration belongs to this same run/brief/material but naturally has
@@ -1980,38 +2984,7 @@ def command_render(args: argparse.Namespace) -> int:
                 )
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
-    editorial_selection: dict[str, Any] | None = None
-    if direction is None and _editorial_plan_enabled(args):
-        # Experimental one-call path: tone, shots and rough timing together.
-        # The plan is bridged into the same direction+selection shapes the rest
-        # of this function reads, so nothing downstream changes; select_shots is
-        # skipped below because the shots are already decided. Needs a paid run
-        # to validate editorial quality.
-        # Cache the raw merged plan the way direction/selection cache their
-        # answers -- same key inputs (material, brief, aspect, music, seconds,
-        # grounding) plus an editorial-plan contract tag so a change to the
-        # merged prompt/schema invalidates it -- so a re-run after a downstream
-        # fix does NOT re-pay the one heavy merged call.
-        plan_key = _asked(asked, "editorial-plan-contract-v1")
-        plan = _decided(work, "editorial_plan", plan_key)
-        if plan is None:
-            ledger.check()
-            print("editorial plan: one merged call (experimental)", flush=True)
-            plan, usage_direction = decide_editorial_plan(
-                material, brief=brief, aspect=args.aspect, music=args.music,
-                music_grid=grid, seconds=args.seconds,
-                duration_mode=args.duration_mode,
-                cache=cache, client=client, ledger=ledger,
-                grounding_spec=args.reference_grounding_spec,
-            )
-            _decide(work, "editorial_plan", plan_key, plan)
-        else:
-            print("editorial plan: reused from the last attempt", flush=True)
-        direction, editorial_selection = editorial_plan_to_legacy(
-            plan, aspect=args.aspect,
-        )
-        _decide(work, "direction", asked, direction)
-    elif direction is None:
+    if not direct_editorial_plan and direction is None:
         ledger.check()
         direction, usage_direction = decide_direction(
             material, brief=brief, aspect=args.aspect, music=args.music,
@@ -2021,8 +2994,10 @@ def command_render(args: argparse.Namespace) -> int:
             grounding_spec=args.reference_grounding_spec,
         )
         _decide(work, "direction", asked, direction)
-    else:
+    elif not direct_editorial_plan:
         print("direction: reused from the last attempt", flush=True)
+    if direction is None:  # Defensive invariant and type narrowing.
+        raise RuntimeError("planning produced neither an editorial plan nor direction")
     print(
         f"direction: {direction['target_seconds']:.0f}s {direction['aspect']}, "
         f"{len(direction.get('unusable', []))} ruled out",
@@ -2044,6 +3019,62 @@ def command_render(args: argparse.Namespace) -> int:
     from montagewright.planner import _beaten_and_broken
 
     beaten, broken = _beaten_and_broken(direction)
+    direct_plan_prepared = False
+    if direct_editorial_plan:
+        if editorial_selection is None:  # pragma: no cover - set with plan.
+            raise RuntimeError("direct editorial plan lost its shots")
+        # Reject deterministic execution faults before exact-frame identity
+        # confirmation can make another paid call. Identity-specific proof is
+        # audited later, after this cost-free span/clock/shot-contract gate.
+        from montagewright.planner import expand_spans
+
+        preflight_material = [
+            item for item in material if item.source_id not in broken
+        ]
+        expand_spans(
+            editorial_selection,
+            [span for item in preflight_material for span in item.spans],
+            source_motion={
+                item.source_id: item.camera_motion for item in preflight_material
+            },
+        )
+        expand_audio_assignments(
+            editorial_selection,
+            list(_audio_spans(
+                transcripts, edit_mode=resolved_job.dialogue.edit_mode,
+            )),
+        )
+        normalize_selection(editorial_selection, material, commitments=None)
+        pre_identity_faults = audit_cached_selection(
+            editorial_selection,
+            material,
+            editorial_selection,
+            commitments=None,
+            grounding_spec=None,
+            duration_mode=args.duration_mode,
+        )
+        if pre_identity_faults:
+            blocked = copy.deepcopy(editorial_selection)
+            blocked["invalid_selection_faults"] = list(pre_identity_faults)
+            blocked["delivery_status"] = "release_blocked"
+            blocked["draft_only"] = True
+            _decide(
+                work, "invalid-editorial-plan-preflight", plan_key, blocked
+            )
+            if not bool(getattr(args, "allow_paid_plan_repair", False)):
+                raise SystemExit(
+                    "editorial plan failed the cost-free execution preflight; "
+                    "saved work/invalid-editorial-plan-preflight.json and stopped "
+                    "before identity confirmation or another planning call."
+                )
+            print(
+                "editorial plan: cost-free preflight found executable faults; "
+                "the explicitly enabled scoped repair will receive this paid "
+                "draft without re-planning the whole project\n  - "
+                + "\n  - ".join(pre_identity_faults),
+                flush=True,
+            )
+        direct_plan_prepared = True
     # The screen is a filter, not a judge. It reads a 640-pixel proxy at a
     # frame a second, and when direction -- which watched the same clip --
     # promises the locked product from a source the screen called absent,
@@ -2054,14 +3085,18 @@ def command_render(args: argparse.Namespace) -> int:
     promoted: list[str] = []
     promoted_pairs: set[tuple[str, str]] = set()
     if args.reference_grounding_spec is not None and grounding_target_refs:
-        wanted_pairs = {
-            (
-                str(option.get("span_id") or "").split(":")[0],
-                str(option.get("target_id") or "none"),
-            )
-            for option in (direction.get("candidate_options") or [])
-            if str(option.get("target_id") or "none") in set(grounding_target_refs)
-        }
+        if direct_editorial_plan:
+            wanted_pairs = _editorial_plan_identity_pairs(direction)
+        else:
+            wanted_pairs = {
+                (
+                    str(option.get("span_id") or "").split(":")[0],
+                    str(option.get("target_id") or "none"),
+                )
+                for option in (direction.get("candidate_options") or [])
+                if str(option.get("target_id") or "none")
+                in set(grounding_target_refs)
+            }
         promoted_pairs = {
             (source_id, target_id)
             for source_id, target_id in wanted_pairs
@@ -2101,6 +3136,8 @@ def command_render(args: argparse.Namespace) -> int:
                 flush=True,
             )
     def bind_commitments(answer):
+        if direct_editorial_plan:
+            return None
         resolved_commitments = resolve_candidate_commitments(
             answer,
             material,
@@ -2159,7 +3196,7 @@ def command_render(args: argparse.Namespace) -> int:
     for correction in range(3):
         try:
             commitments = bind_commitments(direction)
-            if migrated_direction_key:
+            if migrated_direction_key and commitments is not None:
                 _decide(work, "direction", asked, direction)
             break
         except CommitmentError as error:
@@ -2207,7 +3244,11 @@ def command_render(args: argparse.Namespace) -> int:
     # box; a failed primary can still fall through to its already-confirmed
     # alternate without starting another planning call.
     if args.reference_grounding_spec is not None:
-        identity_sources = _identity_commitment_sources(commitments)
+        identity_sources = (
+            {source_id for source_id, _ in _editorial_plan_identity_pairs(direction)}
+            if direct_editorial_plan
+            else _identity_commitment_sources(commitments)
+        )
         normal = [
             item for item in material
             if item.source_id in identity_sources
@@ -2230,28 +3271,44 @@ def command_render(args: argparse.Namespace) -> int:
             work=work, spread=True,
             outcomes=identity_confirmation_outcomes,
         ))
-        commitments = _commitments_without_exact_hard_negatives(
-            commitments, identity_confirmation_outcomes,
-            require_confirmation=promoted_pairs,
-        )
+        if direct_editorial_plan:
+            if editorial_selection is None:  # pragma: no cover - set with plan.
+                raise RuntimeError("direct editorial plan lost its shots")
+            fallback_notes = _spend_editorial_fallbacks(
+                editorial_selection,
+                identity_confirmation_outcomes,
+                require_confirmation=promoted_pairs,
+            )
+            if fallback_notes:
+                # The source span changed after the cost-free preflight; bind
+                # its source clock and handles again before the final audit.
+                direct_plan_prepared = False
+            # Replans and audits should see the executed fallback choice too.
+            direction = editorial_selection
+        else:
+            commitments = _commitments_without_exact_hard_negatives(
+                commitments, identity_confirmation_outcomes,
+                require_confirmation=promoted_pairs,
+            )
     # Keep the paid full Direction immutable. Candidate corrections have
     # their own content-addressed artifacts above and are never allowed to
     # overwrite the decision that watched all rushes and heard the music.
-    publish_planning_state(
-        work,
-        planning_state,
-        stage=f"commitments-{commitments.sha256()[:16]}",
-        request={
-            "stage": "candidate_commitments",
-            "direction_key": asked,
-            "material_digest": planning_state.material_digest,
-        },
-        response=commitments.model_dump(mode="json"),
-        validation={
-            "valid": True,
-            "warnings": list(commitments.warnings),
-        },
-    )
+    if commitments is not None:
+        publish_planning_state(
+            work,
+            planning_state,
+            stage=f"commitments-{commitments.sha256()[:16]}",
+            request={
+                "stage": "candidate_commitments",
+                "direction_key": asked,
+                "material_digest": planning_state.material_digest,
+            },
+            response=commitments.model_dump(mode="json"),
+            validation={
+                "valid": True,
+                "warnings": list(commitments.warnings),
+            },
+        )
     for entry in direction.get("unusable", []) or []:
         source_id = str(entry.get("source_id", ""))
         if source_id in broken:
@@ -2278,7 +3335,9 @@ def command_render(args: argparse.Namespace) -> int:
                 one.candidate_id
                 for one in brief_document.graphics_candidates()
             ],
-            audio_span_ids=list(_audio_spans(transcripts)),
+            audio_span_ids=list(_audio_spans(
+                transcripts, edit_mode=resolved_job.dialogue.edit_mode,
+            )),
             grounding_target_ids=(
                 [
                     target.target_id
@@ -2286,9 +3345,11 @@ def command_render(args: argparse.Namespace) -> int:
                 ]
                 if args.reference_grounding_spec is not None else []
             ),
-            commitment_ids=list(dict.fromkeys(
-                option.commitment_id for option in commitments.options
-            )),
+            commitment_ids=(
+                list(dict.fromkeys(
+                    option.commitment_id for option in commitments.options
+                )) if commitments is not None else None
+            ),
             action_ids=list(dict.fromkeys(
                 action_id for item in material for action_id in item.action_ids
             )),
@@ -2297,14 +3358,14 @@ def command_render(args: argparse.Namespace) -> int:
     chose = _asked(
         asked,
         json.dumps(direction, sort_keys=True, ensure_ascii=False),
-        commitments.sha256(),
+        commitments.sha256() if commitments is not None else "direct-plan",
         selection_contract,
         # Local semantic validators are part of the executable answer's
         # meaning even though JSON Schema cannot encode their cross-field
         # rules. Bump this when those rules change so a paid answer accepted
         # by an older binary is audited again instead of bypassing the new
         # Selection repair loop on resume.
-        "selection-local-contract-v8-speed-and-declared-repeat",
+        "selection-local-contract-v10-truncated-tail-completion",
     )
     provider_selection = _decided(work, "selection", chose)
     selection_to_repair: dict[str, Any] | None = None
@@ -2316,9 +3377,9 @@ def command_render(args: argparse.Namespace) -> int:
         legacy_chose = _asked(
             asked,
             json.dumps(direction, sort_keys=True, ensure_ascii=False),
-            commitments.sha256(),
+            commitments.sha256() if commitments is not None else "direct-plan",
             selection_contract,
-            "selection-local-contract-v8-direction-bound-action",
+            "selection-local-contract-v9-interview-audio-repair",
         )
         provider_selection = _decided(work, "selection", legacy_chose)
     if provider_selection is not None:
@@ -2427,22 +3488,51 @@ def command_render(args: argparse.Namespace) -> int:
         # the merged selection reaches the same downstream in the same shape
         # and passes the same audit, so a bad merged plan surfaces faults
         # rather than shipping unchecked.
-        from montagewright.planner import expand_spans
-
         usable = [item for item in material if item.source_id not in broken]
         offered = [span for item in usable for span in item.spans]
-        expand_spans(
-            editorial_selection, offered,
-            source_motion={
-                item.source_id: item.camera_motion for item in usable
-            },
+        if not direct_plan_prepared:
+            from montagewright.planner import expand_spans
+
+            expand_spans(
+                editorial_selection, offered,
+                source_motion={
+                    item.source_id: item.camera_motion for item in usable
+                },
+            )
+            normalize_selection(
+                editorial_selection, material, commitments=commitments
+            )
+        direct_faults = audit_cached_selection(
+            editorial_selection,
+            material,
+            direction,
+            commitments=None,
+            grounding_spec=args.reference_grounding_spec,
+            duration_mode=args.duration_mode,
         )
-        normalize_selection(
-            editorial_selection, material, commitments=commitments
-        )
-        provider_selection = editorial_selection
-        _decide(work, "selection", chose, provider_selection)
-        print("selection: from the merged editorial plan (experimental)", flush=True)
+        if direct_faults:
+            selection_to_repair = editorial_selection
+            print(
+                "editorial plan: direct local audit needs a scoped repair\n  - "
+                + "\n  - ".join(direct_faults),
+                flush=True,
+            )
+            if not bool(getattr(args, "allow_paid_plan_repair", False)):
+                blocked = copy.deepcopy(editorial_selection)
+                blocked["invalid_selection_faults"] = list(direct_faults)
+                blocked["delivery_status"] = "release_blocked"
+                blocked["draft_only"] = True
+                _decide(work, "invalid-editorial-plan", chose, blocked)
+                raise SystemExit(
+                    "editorial plan failed the local execution audit; saved "
+                    "work/invalid-editorial-plan.json and stopped before a "
+                    "second paid planning call. Review/replay it offline, or "
+                    "explicitly pass --allow-paid-plan-repair."
+                )
+        else:
+            provider_selection = editorial_selection
+            _decide(work, "selection", chose, provider_selection)
+            print("selection: executing the merged editorial plan directly", flush=True)
     if provider_selection is None:
         ledger.check()
         def record_selection_attempt(
@@ -2474,7 +3564,8 @@ def command_render(args: argparse.Namespace) -> int:
             _annotate_selection_identity_evidence(
                 draft, confirmed_identities, identity_confirmation_outcomes
             )
-            _annotate_selection_direction_motion(draft, commitments)
+            if commitments is not None:
+                _annotate_selection_direction_motion(draft, commitments)
             draft["invalid_selection_faults"] = list(error.faults)
             draft["delivery_status"] = "release_blocked"
             draft["draft_only"] = True
@@ -2488,6 +3579,32 @@ def command_render(args: argparse.Namespace) -> int:
         print("selection: reused from the last attempt", flush=True)
         _annotate_selection_identity_evidence(
             provider_selection, confirmed_identities, identity_confirmation_outcomes
+        )
+    # A paid repair is not permission to continue spending on SAM/reference
+    # grounding when the answer still fails the same free execution audit.
+    # In particular, an interview plan whose speaker holds outrun its Apple
+    # transcript evidence cannot become acceptable merely by labelling the
+    # eventual render ``needs_review``. Preserve the provider draft and stop
+    # before the first visual-evidence call.
+    repaired_faults = audit_cached_selection(
+        provider_selection,
+        material,
+        direction,
+        commitments=commitments,
+        grounding_spec=args.reference_grounding_spec,
+        duration_mode=args.duration_mode,
+    )
+    if repaired_faults:
+        blocked = copy.deepcopy(provider_selection)
+        blocked["invalid_selection_faults"] = list(repaired_faults)
+        blocked["delivery_status"] = "release_blocked"
+        blocked["draft_only"] = True
+        _decide(work, "invalid-selection-draft", chose, blocked)
+        raise SystemExit(
+            "selection repair still failed the local execution audit; saved "
+            "work/invalid-selection-draft.json and stopped before subject "
+            "tracking, grounding, or rendering.\n  - "
+            + "\n  - ".join(repaired_faults)
         )
     # Selection has now named the subjects this film will actually look at,
     # which is far fewer than the pool and is the only set worth measuring.
@@ -2503,11 +3620,12 @@ def command_render(args: argparse.Namespace) -> int:
         say=lambda line: print(line, flush=True),
     )
     material = _rebuilt_material_geometry(material, cards)
-    _annotate_selection_direction_motion(provider_selection, commitments)
+    if commitments is not None:
+        _annotate_selection_direction_motion(provider_selection, commitments)
     resolved_selection_key = _asked(
         chose,
         json.dumps(provider_selection, sort_keys=True, ensure_ascii=False),
-        "resolved-selection-v2-camera-rest-fit-identity-needs-review-hold",
+        "resolved-selection-v3-truncated-tail-completion",
     )
     # Annotated because the invariant is not local: by here the provider
     # answer exists -- it was cached, recovered, or paid for above -- so the
@@ -2593,7 +3711,9 @@ def command_render(args: argparse.Namespace) -> int:
 
     edl, snaps = _edl_from_selection(
         selection, rushes, cards, transcripts=transcripts, library=library,
-        material=material,
+        material=material, masters=originals,
+        dialogue_mode=resolved_job.dialogue.edit_mode,
+        sync_members=sync_members,
     )
     camera_rest_repairs = _fit_camera_rests_to_shot(selection, edl)
     if camera_rest_repairs:
@@ -2603,7 +3723,9 @@ def command_render(args: argparse.Namespace) -> int:
         _decide(work, "resolved-selection", resolved_selection_key, selection)
         edl, snaps = _edl_from_selection(
             selection, rushes, cards, transcripts=transcripts, library=library,
-            material=material,
+            material=material, masters=originals,
+            dialogue_mode=resolved_job.dialogue.edit_mode,
+            sync_members=sync_members,
         )
     from montagewright.planning_release import resolve_preferred_camera_durations
 
@@ -2614,7 +3736,7 @@ def command_render(args: argparse.Namespace) -> int:
         print(f"  camera duration resolution: {note}", flush=True)
     if snaps:
         print(f"cut on action: {len(snaps)} in-points moved", flush=True)
-    found = {path.stem: path for path in sources_paths}
+    found = dict(originals)
     audio_source_ids = {audio.source_id for audio in edl.audio_clips}
     sources = {
         shot["source_id"]: probe(shot["source_id"], found[shot["source_id"]])
@@ -2638,6 +3760,15 @@ def command_render(args: argparse.Namespace) -> int:
         the speech thrown away and nothing but the bed left.
         """
 
+        if direction is None:  # Defensive closure narrowing for the renderer.
+            raise RuntimeError("render reached without editorial direction")
+        try:
+            revalidate_manifest(ingest)
+        except IngestError as error:
+            raise RuntimeError(
+                f"source changed before render: {error}"
+            ) from error
+
         return run(
             edl,
             sources,
@@ -2657,6 +3788,8 @@ def command_render(args: argparse.Namespace) -> int:
             rhythm_context=rhythm_context,
             target_seconds=float(direction["target_seconds"]),
             duration_mode=args.duration_mode,
+            minimum_seconds=getattr(args, "minimum_seconds", None),
+            maximum_seconds=getattr(args, "maximum_seconds", None),
             max_static_seconds=float(direction.get("max_static_seconds") or 0.0),
             music=args.music,
             cards=cards,
@@ -2681,6 +3814,21 @@ def command_render(args: argparse.Namespace) -> int:
                 item.source_id: item.motion for item in material
             },
             upload_cache=cache,
+            output_size=(
+                (resolved_job.delivery.width, resolved_job.delivery.height)
+                if resolved_job.delivery.width is not None
+                and resolved_job.delivery.height is not None
+                else None
+            ),
+            output_fps=int(resolved_job.delivery.frame_rate),
+            loudness_lufs=resolved_job.delivery.loudness_lufs,
+            obligations=resolved_job.obligations,
+            music_policy=resolved_job.music_policy,
+            # The merged brain has already heard the music and authored rough
+            # per-shot rhythm. Local grounding may move those choices to exact
+            # beats/dialogue frames; asking the retired Rhythm brain again
+            # would be a hidden second planning call and could overrule them.
+            decide_rhythm_first=not direct_editorial_plan,
         )
 
     # A shot whose identity cannot be proved is one review item, not a reason
@@ -2740,7 +3888,9 @@ def command_render(args: argparse.Namespace) -> int:
             )
             edl, snaps = _edl_from_selection(
                 selection, rushes, cards, transcripts=transcripts, library=library,
-                material=material,
+                material=material, masters=originals,
+                dialogue_mode=resolved_job.dialogue.edit_mode,
+                sync_members=sync_members,
             )
             sources = {
                 one["source_id"]: probe(one["source_id"], found[one["source_id"]])
@@ -2905,7 +4055,9 @@ def command_render(args: argparse.Namespace) -> int:
                       )
                       edl, snaps = _edl_from_selection(
                           selection, rushes, cards, transcripts=transcripts,
-                          library=library, material=material,
+                          library=library, material=material, masters=originals,
+                          dialogue_mode=resolved_job.dialogue.edit_mode,
+                          sync_members=sync_members,
                       )
                       sources = {
                           shot["source_id"]: probe(
@@ -3116,7 +4268,9 @@ def command_render(args: argparse.Namespace) -> int:
               # the same one.
               edl, snaps = _edl_from_selection(
                   selection, rushes, cards, transcripts=transcripts,
-                  library=library, material=material,
+                  library=library, material=material, masters=originals,
+                  dialogue_mode=resolved_job.dialogue.edit_mode,
+                  sync_members=sync_members,
               )
               sources = {
                   shot["source_id"]: probe(
@@ -3298,7 +4452,7 @@ def command_render(args: argparse.Namespace) -> int:
                     # rather than failing a render over a font.
                     print(f"not burned  {error}", flush=True)
 
-    print(f"deliverable {result.deliverable}", flush=True)
+    print(f"rendered     {result.deliverable}", flush=True)
     print(f"preview     {result.preview}", flush=True)
 
     # Off unless asked for. A rendered file is what most runs want; a
@@ -3333,6 +4487,69 @@ def command_render(args: argparse.Namespace) -> int:
                 )
                 print(f"timeline    {path}", flush=True)
 
+    # A renderer finishing is not producer approval. Publish a final name only
+    # when the immutable report, rights acknowledgement and named approval all
+    # agree; otherwise leave an equally watchable, unambiguous draft.
+    from montagewright.release import finalize_release, technical_qc_faults
+
+    release_artifact = (
+        output / "deliverable-subtitled.mp4"
+        if (
+            resolved_job.delivery.subtitles == "burn"
+            and (output / "deliverable-subtitled.mp4").exists()
+        )
+        else result.deliverable
+    )
+    qc_faults = list(technical_qc_faults(
+        release_artifact, resolved_job,
+        expected_duration=result.duration_seconds,
+    ))
+    if resolved_job.delivery.subtitles == "burn" and not (
+        output / "deliverable-subtitled.mp4"
+    ).exists():
+        qc_faults.append(
+            "delivery requires burned subtitles but no current subtitled artifact exists"
+        )
+    if resolved_job.delivery.subtitles == "sidecar":
+        sidecar = output / "subtitles.srt"
+        if not sidecar.exists() or not sidecar.read_text(encoding="utf-8").strip():
+            qc_faults.append(
+                "delivery requires a non-empty sidecar subtitle file"
+            )
+    (work / "technical-qc.json").write_text(
+        json.dumps({
+            "version": "montagewright-technical-qc-v1",
+            "passed": not qc_faults,
+            "faults": list(qc_faults),
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if qc_faults:
+        report_payload = json.loads(
+            (output / "report.json").read_text(encoding="utf-8")
+        )
+        report_payload["delivery_status"] = "needs_review"
+        disagreements = list(report_payload.get("plan_disagreements") or [])
+        disagreements.extend(
+            f"technical QC: {fault}" for fault in qc_faults
+            if f"technical QC: {fault}" not in disagreements
+        )
+        report_payload["plan_disagreements"] = disagreements
+        (output / "report.json").write_text(
+            json.dumps(report_payload, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+    release_manifest = finalize_release(
+        output, release_artifact, resolved_job,
+        ingest_inventory_sha256=ingest.inventory_sha256,
+        report_path=output / "report.json",
+    )
+    print(
+        f"release     {release_manifest.status}: {release_manifest.artifact}",
+        flush=True,
+    )
+    output_lease.release()
+
     # Everything that could still be delivered has been. The run failed all
     # the same, and says so to whoever asked.
     if crashed is not None:
@@ -3341,14 +4558,15 @@ def command_render(args: argparse.Namespace) -> int:
 
 
 def _suffix(rushes: Path, stem: str) -> str:
-    for suffix in VIDEO_SUFFIXES:
-        if (rushes / f"{stem}{suffix}").exists():
-            return suffix
+    for candidate in rushes.glob(f"{stem}.*"):
+        if candidate.suffix.casefold() in VIDEO_SUFFIXES:
+            return candidate.suffix
     return ".mp4"
 
 
 def _speech_lines(
-    source_id: str | dict, card: dict | None = None, limit: int = 40
+    source_id: str | dict, card: dict | None = None, limit: int = 40,
+    *, edit_mode: str = "continuous_soundbite",
 ) -> tuple[str, ...]:
     """The soundbites, as the planner needs to read them.
 
@@ -3371,7 +4589,7 @@ def _speech_lines(
         f"（{span['speaker'] or '未標'}）{span['text']}"
         + ("〔連續多行〕" if len(span["line_ids"]) > 1 else "")
         for span_id, span in _audio_spans_for_source(
-            str(source_id), card, limit=limit
+            str(source_id), card, limit=limit, edit_mode=edit_mode,
         ).items()
     )
 
@@ -3379,6 +4597,7 @@ def _speech_lines(
 def _audio_spans_for_source(
     source_id: str, card: dict, *, limit: int = 40,
     max_gap_seconds: float = 1.2, max_span_seconds: float = 14.0,
+    edit_mode: str = "continuous_soundbite",
 ) -> dict[str, dict]:
     """Canonical source-contiguous soundbites available to the planner.
 
@@ -3435,15 +4654,69 @@ def _audio_spans_for_source(
             add(run_start, run_end)
         run_start = run_end + 1
 
+    if edit_mode == "phrase_edit":
+        from montagewright.transcript import portion_within, words_in
+
+        measured_words = words_in(card)
+        for line_index, line in enumerate(lines):
+            boundaries = {line.starts_seconds, line.ends_seconds}
+            for piece in line.timed_text:
+                if piece.text in {"，", "。", "！", "？", "；", ",", ".", "!", "?", ";"}:
+                    boundaries.add(piece.starts_seconds)
+            local_words = [
+                word for word in measured_words
+                if word.ends_seconds > line.starts_seconds
+                and word.starts_seconds < line.ends_seconds
+            ]
+            for before, after in zip(local_words, local_words[1:]):
+                if after.starts_seconds - before.ends_seconds >= 0.12:
+                    boundaries.update((before.ends_seconds, after.starts_seconds))
+            edges = sorted(boundaries)
+            atomic: list[tuple[float, float, str]] = []
+            for start, end in zip(edges, edges[1:]):
+                text, audible_start, audible_end = portion_within(
+                    line, from_seconds=start, to_seconds=end,
+                )
+                if text and audible_end - audible_start >= 0.12:
+                    atomic.append((audible_start, audible_end, text))
+            for first in range(len(atomic)):
+                for last in range(first, len(atomic)):
+                    start, end = atomic[first][0], atomic[last][1]
+                    if end - start > max_span_seconds:
+                        break
+                    text, audible_start, audible_end = portion_within(
+                        line, from_seconds=start, to_seconds=end,
+                    )
+                    if not text:
+                        continue
+                    span_id = (
+                        f"{source_id}:p{line_index:02d}.{first:02d}"
+                        if first == last else
+                        f"{source_id}:p{line_index:02d}.{first:02d}-{last:02d}"
+                    )
+                    made[span_id] = {
+                        "source_id": source_id,
+                        "in_seconds": audible_start,
+                        "out_seconds": audible_end,
+                        "speaker": line.speaker,
+                        "text": text,
+                        "line_ids": [f"{source_id}:t{line_index:02d}"],
+                        "kind": "provenance_phrase",
+                    }
+
     return made
 
 
-def _audio_spans(cards: dict[str, dict]) -> dict[str, dict]:
+def _audio_spans(
+    cards: dict[str, dict], *, edit_mode: str = "continuous_soundbite",
+) -> dict[str, dict]:
     """Canonical transcript spans Gemini may place on the edit timeline."""
 
     made: dict[str, dict] = {}
     for source_id, card in cards.items():
-        made.update(_audio_spans_for_source(source_id, card))
+        made.update(_audio_spans_for_source(
+            source_id, card, edit_mode=edit_mode,
+        ))
     return made
 
 
@@ -3727,11 +5000,40 @@ def _fit_camera_rests_to_shot(
     return repairs
 
 
+def _material_event_seconds(item: Any, event_ref: str) -> float | None:
+    """Resolve a model-selected event against the chosen source only."""
+
+    if not event_ref or event_ref == "none" or item is None:
+        return None
+    kind, separator, local_id = event_ref.partition(":")
+    if not separator or not local_id:
+        return None
+    if kind in {"span_start", "span_end"}:
+        for span in item.spans:
+            if str(span.span_id) == local_id:
+                return float(
+                    span.starts_seconds if kind == "span_start"
+                    else span.ends_seconds
+                )
+        return None
+    if kind in {"action_start", "action_complete"}:
+        source_id, separator, action_ref = local_id.partition(":")
+        if not separator or source_id != str(item.source_id):
+            return None
+        for action_id, starts, ends in item.action_windows:
+            if str(action_id) == action_ref:
+                return float(starts if kind == "action_start" else ends)
+    return None
+
+
 def _edl_from_selection(
     selection: dict, rushes: Path, cards: dict[str, Path], *,
     transcripts: dict[str, dict] | None = None,
     library: Path | None = None,
     material: list[Any] | None = None,
+    masters: dict[str, Path] | None = None,
+    dialogue_mode: str = "continuous_soundbite",
+    sync_members: dict[str, Any] | None = None,
 ) -> tuple[EDL, dict[str, str]]:
     clips = []
     snaps: dict[str, str] = {}
@@ -3744,7 +5046,7 @@ def _edl_from_selection(
 
         if library is None:
             return []
-        original = rushes / f"{source_id}.MP4"
+        original = (masters or {}).get(source_id, rushes / f"{source_id}.MP4")
         if not original.exists():
             found = next(rushes.glob(f"{source_id}.*"), None)
             if found is None:
@@ -3786,6 +5088,13 @@ def _edl_from_selection(
                 f"{clip_id} has no positive resolved seconds_needed; invalid "
                 "MM:SS must be repaired at Selection, not changed into 4s"
             )
+        # Screen duration and source duration are different under retiming.
+        # Every handle check below is on the source clock, so price it in the
+        # same unit before clamping or slipping the in-point.
+        speed = float(shot.get("speed") or 1.0)
+        if speed < 0.25 or speed > 4.0:
+            speed = min(4.0, max(0.25, speed))
+        source_needed = wanted * speed
         item = material_by_source.get(str(shot["source_id"]))
         card = load_card(cards[shot["source_id"]]) if shot["source_id"] in cards else None
         action_contract = None
@@ -3835,8 +5144,52 @@ def _edl_from_selection(
             # swinging -- which is the case the field was added for.
             first, last = window
             room = max(0.0, last - first)
-            wanted = min(wanted, room) if room > 0 else wanted
-            start = min(max(start, first), max(first, last - wanted))
+            # Shortening source room changes screen duration by 1/speed.
+            if room > 0 and source_needed > room:
+                wanted = room / speed
+                source_needed = room
+            start = min(max(start, first), max(first, last - source_needed))
+
+        # Gemini names the semantic event; local code performs a handle-safe
+        # slip and keeps the screen duration/timeline position unchanged.
+        event_ref = str(shot.get("source_event_ref") or "none")
+        relation = str(shot.get("source_event_relation") or "none")
+        event_at = _material_event_seconds(item, event_ref)
+        if event_ref != "none":
+            if event_at is None or relation == "none":
+                snaps[clip_id] = (
+                    f"could not resolve source event {event_ref!r}; kept the "
+                    "semantic window"
+                )
+            else:
+                one_frame = 1.0 / 30.0
+                target = event_at + {
+                    "before": -one_frame, "at": 0.0, "after": one_frame,
+                }.get(relation, 0.0)
+                tolerance = int(shot.get("event_tolerance_frames") or 0) / 30.0
+                within_tolerance = abs(target - start) <= tolerance + 1e-6
+                within_handles = target >= 0.0
+                if window is not None:
+                    within_handles = (
+                        window[0] - 1e-6 <= target
+                        and target + source_needed <= window[1] + 1e-6
+                    )
+                if within_tolerance and within_handles:
+                    before = start
+                    start = target
+                    snaps[clip_id] = (
+                        f"slipped source in-point {before:.3f}s to {start:.3f}s "
+                        f"({relation} {event_ref}); screen duration unchanged"
+                    )
+                else:
+                    reason = (
+                        "outside measured handles" if not within_handles
+                        else f"more than {int(shot.get('event_tolerance_frames') or 0)} frames away"
+                    )
+                    snaps[clip_id] = (
+                        f"did not slip to {event_ref}: {reason}; kept the "
+                        "semantic window"
+                    )
         action_card = None
         if selected_action != "none" and resolved_action is not None:
             local_action = selected_action.rsplit(":", 1)[-1]
@@ -3868,7 +5221,8 @@ def _edl_from_selection(
             try:
                 if action_treatment == "complete_here":
                     start, action_contract, note = snap_to_action_contract(
-                        action_card, start, wanted, action_id=selected_action, within=window,
+                        action_card, start, source_needed,
+                        action_id=selected_action, within=window,
                         focus=focus_of(str(shot["source_id"])),
                     )
                     if selected_action == "none" or action_contract is None:
@@ -3876,11 +5230,13 @@ def _edl_from_selection(
                             f"{clip_id} selected action {selected_action!r}, but it "
                             "cannot be resolved and completed inside this source window"
                         )
-                    minimum = action_contract.minimum_duration_from(start)
-                    if wanted + 1e-3 < minimum:
+                    minimum_source = action_contract.minimum_duration_from(start)
+                    minimum_screen = minimum_source / speed
+                    if wanted + 1e-3 < minimum_screen:
                         raise ValueError(
                             f"{clip_id} gives {wanted:.2f}s to complete action "
-                            f"{selected_action!r}, which needs {minimum:.2f}s; "
+                            f"{selected_action!r}, which needs {minimum_screen:.2f}s "
+                            f"on screen at {speed:.2f}x; "
                             "Selection must repair this before Rhythm"
                         )
                 elif action_treatment == "after_completion":
@@ -3900,7 +5256,7 @@ def _edl_from_selection(
                     start = beat.ends_seconds
                     if window is not None:
                         first, last = window
-                        if start < first - 1e-3 or start + wanted > last + 1e-3:
+                        if start < first - 1e-3 or start + source_needed > last + 1e-3:
                             raise ValueError(
                                 f"{clip_id} cannot fit {wanted:.2f}s after action "
                                 f"{selected_action!r} inside this source window"
@@ -3923,12 +5279,15 @@ def _edl_from_selection(
                             f"{clip_id} cannot resolve intentional_cut for action "
                             f"{selected_action!r}"
                         )
-                    if start + wanted <= beat.starts_seconds + 1e-3:
+                    if start + source_needed <= beat.starts_seconds + 1e-3:
                         raise ValueError(
                             f"{clip_id} marks {selected_action!r} intentional_cut, "
                             "but its source window ends before that action begins"
                         )
-                    if start >= beat.ends_seconds - 1e-3 or start + wanted >= beat.ends_seconds - 1e-3:
+                    if (
+                        start >= beat.ends_seconds - 1e-3
+                        or start + source_needed >= beat.ends_seconds - 1e-3
+                    ):
                         raise ValueError(
                             f"{clip_id} marks {selected_action!r} intentional_cut, "
                             "but its source window does not actually cut before "
@@ -4001,12 +5360,13 @@ def _edl_from_selection(
                     for look in shot.get("looks") or []
                     if str(look.get("entity_id") or "none") != "none"
                 ), "none"),
+                speed=speed,
             )
             if delivered_camera_intent_of(shot) == "use_source_motion":
                 source_motion_contract = source_motion_contract_for(
                     item,
                     source_start=start,
-                    source_end=start + wanted,
+                    source_end=start + source_needed,
                     motion_role=str(shot.get("source_motion_role") or ""),
                 )
         content_contract = None
@@ -4023,20 +5383,27 @@ def _edl_from_selection(
             content_contract = ContentContract(
                 commitment_id=commitment_id,
                 purpose=content_purpose,
-                policy=content_policy,
+                policy=cast(ContentPolicy, content_policy),
                 minimum_seconds=content_minimum,
             )
         # The editor may play this shot off recorded speed to fit a piece of
         # action into the screen length it chose. Out of the supported range
         # is clamped, not refused: a shot's speed is not worth failing a film
         # over, and the clamp still honours the direction it asked for.
-        speed = float(shot.get("speed") or 1.0)
-        if speed < 0.25 or speed > 4.0:
-            speed = min(4.0, max(0.25, speed))
         clips.append(
             Clip(
                 clip_id=clip_id,
                 source_id=shot["source_id"],
+                sync_group=(
+                    sync_members[str(shot["source_id"])].group_id
+                    if sync_members and str(shot["source_id"]) in sync_members
+                    else None
+                ),
+                sync_offset_seconds=(
+                    sync_members[str(shot["source_id"])].offset_seconds
+                    if sync_members and str(shot["source_id"]) in sync_members
+                    else 0.0
+                ),
                 approx_in_seconds=start,
                 approx_out_seconds=start + wanted,
                 speed=speed,
@@ -4045,6 +5412,28 @@ def _edl_from_selection(
                 audio_role=shot.get("audio_role", "auto"),
                 audio_completion=shot.get("audio_completion", "none"),
                 picture_role=shot.get("picture_role", "primary_action"),
+                story_point=str(shot.get("story_point") or ""),
+                continuity_mode=cast(
+                    Literal[
+                        "none", "continuity_scene", "associative_montage", "reset"
+                    ],
+                    str(shot.get("continuity_mode") or "none"),
+                ),
+                cut_motivation=cast(
+                    Literal[
+                        "content", "cut_on_action", "reaction", "match_motion",
+                        "match_shape", "eyeline", "screen_direction_reset",
+                        "music_phrase", "music_accent", "intentional_jump", "end",
+                    ],
+                    str(shot.get("cut_motivation") or "content"),
+                ),
+                source_event_ref=event_ref,
+                source_event_relation=cast(
+                    Literal["none", "before", "at", "after"], relation
+                ),
+                event_tolerance_frames=int(
+                    shot.get("event_tolerance_frames") or 0
+                ),
                 coverage_claim_seconds=coverage_claim,
                 reframe=reframe,
                 # Carried on the clip so the layers after this one can see
@@ -4078,7 +5467,9 @@ def _edl_from_selection(
         )
     from montagewright.schema import AudioClip
 
-    available_audio = _audio_spans(transcripts or {})
+    available_audio = _audio_spans(
+        transcripts or {}, edit_mode=dialogue_mode,
+    )
     audio_clips = []
     audio_drops: list[str] = []
     speaker_sync: dict[int, tuple[float, str]] = {}
@@ -4097,7 +5488,19 @@ def _edl_from_selection(
             continue
         picture = clips[shot_index]
         if picture.picture_role == "speaker":
-            if picture.source_id != str(span["source_id"]):
+            audio_source_id = str(span["source_id"])
+            picture_member = (
+                sync_members.get(picture.source_id) if sync_members else None
+            )
+            audio_member = (
+                sync_members.get(audio_source_id) if sync_members else None
+            )
+            same_sync_group = bool(
+                picture_member is not None
+                and audio_member is not None
+                and picture_member.group_id == audio_member.group_id
+            )
+            if picture.source_id != audio_source_id and not same_sync_group:
                 audio_drops.append(
                     f"dropped {picture.clip_id} narrative {span_id!r}: picture "
                     f"source {picture.source_id} cannot lip-sync audio from "
@@ -4105,7 +5508,16 @@ def _edl_from_selection(
                 )
                 continue
             offset = float(assignment.get("offset_seconds") or 0.0)
+            # The sync-map convention is group_time = source_time + offset.
+            # Put the picture on the same group instant as the external master
+            # rather than copying the recorder's source time onto the camera.
             source_in = float(span["in_seconds"]) - offset
+            if same_sync_group:
+                assert audio_member is not None and picture_member is not None
+                source_in += (
+                    float(audio_member.offset_seconds)
+                    - float(picture_member.offset_seconds)
+                )
             if source_in < 0:
                 audio_drops.append(
                     f"dropped {picture.clip_id} narrative {span_id!r}: would "
@@ -4121,9 +5533,33 @@ def _edl_from_selection(
             starts_at_clip_id=clips[shot_index].clip_id,
             offset_seconds=float(assignment.get("offset_seconds") or 0.0),
             role="narrative",
-            completion=str(assignment.get("completion") or "complete_thought"),
+            completion=cast(
+                AudioCompletion,
+                str(assignment.get("completion") or "complete_thought"),
+            ),
             gain_db=float(assignment.get("gain_db") or 0.0),
             why=str(assignment.get("why") or ""),
+            sync_group=(
+                sync_members[str(span["source_id"])].group_id
+                if sync_members and str(span["source_id"]) in sync_members
+                else None
+            ),
+            sync_offset_seconds=(
+                sync_members[str(span["source_id"])].offset_seconds
+                if sync_members and str(span["source_id"]) in sync_members
+                else 0.0
+            ),
+            source_span_id=span_id,
+            audio_stream_index=(
+                sync_members[str(span["source_id"])].audio_stream_index
+                if sync_members and str(span["source_id"]) in sync_members
+                else None
+            ),
+            audio_channel=(
+                sync_members[str(span["source_id"])].channel
+                if sync_members and str(span["source_id"]) in sync_members
+                else None
+            ),
         ))
 
     for index, (source_in, span_id) in speaker_sync.items():
@@ -4306,6 +5742,7 @@ def _write_report(output: Path, **parts) -> None:
         "subject_tracks": report.subject_tracks,
         "reference_grounding": report.reference_grounding,
         "plan_disagreements": report.plan_disagreements,
+        "execution_notes": report.execution_notes,
         "degradations": [
             {
                 "clip_id": step.clip_id,
@@ -4395,7 +5832,10 @@ def command_transcribe(args: argparse.Namespace) -> int:
     ledger = Ledger(cap_usd=args.budget, model_id=MODEL_ID)
 
     sources = (
-        sorted(p for p in args.source.iterdir() if p.suffix in VIDEO_SUFFIXES)
+        sorted(
+            p for p in args.source.iterdir()
+            if p.suffix.casefold() in VIDEO_SUFFIXES
+        )
         if args.source.is_dir()
         else [args.source]
     )
@@ -4612,6 +6052,15 @@ def command_graphics(args: argparse.Namespace) -> int:
     from montagewright.renderer import probe_duration
 
     output = args.output.expanduser().resolve()
+    output_lease = None
+    if args.action in {"approve", "preview", "render"}:
+        from montagewright.release import OutputBusy, acquire_output_lease
+
+        try:
+            output_lease = acquire_output_lease(output)
+        except OutputBusy as error:
+            raise SystemExit(str(error)) from error
+        assert output_lease is not None
     plan_path = output / "work" / "graphics.json"
     if not plan_path.exists():
         raise SystemExit(f"no graphics track at {plan_path}")
@@ -4716,7 +6165,11 @@ def command_graphics(args: argparse.Namespace) -> int:
             raise SystemExit(f"unknown graphic id {args.graphic_id}") from None
         shape = probe_video(clean).video
         width, height = int(shape.display_width), int(shape.display_height)
-        rate = shape.average_frame_rate or shape.real_frame_rate or 30
+        measured_rate = shape.average_frame_rate or shape.real_frame_rate
+        rate = (
+            Fraction(measured_rate.numerator, measured_rate.denominator)
+            if measured_rate is not None else Fraction(30, 1)
+        )
         from montagewright.graphics import resolve_graphic_window
         start, _ = resolve_graphic_window(
             cue, beat_grid=beat_grid, output_fps=rate,
@@ -4752,6 +6205,41 @@ def command_graphics(args: argparse.Namespace) -> int:
         stale_timeline.unlink(missing_ok=True)
     print(f"graphics    {made}", flush=True)
     print(f"overlay     {overlay}", flush=True)
+    resolved_job_path = output / "work" / "resolved-job.json"
+    ingest_path = output / "work" / "ingest-manifest.json"
+    report_path = output / "report.json"
+    if resolved_job_path.exists() and ingest_path.exists() and report_path.exists():
+        from montagewright.ingest import IngestManifest
+        from montagewright.job import load_job
+        from montagewright.release import finalize_release, technical_qc_faults
+
+        job = load_job(resolved_job_path)
+        ingest = IngestManifest.model_validate_json(
+            ingest_path.read_text(encoding="utf-8")
+        )
+        report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+        qc_faults = technical_qc_faults(
+            made, job,
+            expected_duration=float(report_payload.get("duration_seconds") or 0.0),
+        )
+        if qc_faults:
+            report_payload["delivery_status"] = "needs_review"
+            disagreements = list(report_payload.get("plan_disagreements") or [])
+            disagreements.extend(
+                f"technical QC: {fault}" for fault in qc_faults
+                if f"technical QC: {fault}" not in disagreements
+            )
+            report_payload["plan_disagreements"] = disagreements
+            report_path.write_text(
+                json.dumps(report_payload, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        released = finalize_release(
+            output, made, job,
+            ingest_inventory_sha256=ingest.inventory_sha256,
+            report_path=report_path,
+        )
+        print(f"release     {released.status}: {released.artifact}", flush=True)
     return 0
 
 
@@ -4784,14 +6272,27 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     render = sub.add_parser("render", help="Cut a folder of rushes into a film")
-    render.add_argument("rushes", type=Path)
+    render.add_argument("rushes", type=Path, nargs="?")
+    render.add_argument(
+        "--job", type=Path,
+        help="JSON/YAML edit work order; explicit CLI options override it",
+    )
     render.add_argument("--brief", type=Path)
     render.add_argument(
         "--editorial-plan", action="store_true",
-        help="OPT-IN (experimental): decide tone, shots and rough timing in "
-             "one merged call instead of three sequential ones. Off by "
-             "default; also enabled by MONTAGEWRIGHT_EDITORIAL_PLAN=1. Needs a "
-             "paid run to validate editorial quality.",
+        help=argparse.SUPPRESS,
+    )
+    render.add_argument(
+        "--legacy-three-pass", action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    render.add_argument(
+        "--editorial-plan-replay", type=Path,
+        help=argparse.SUPPRESS,
+    )
+    render.add_argument(
+        "--allow-paid-plan-repair", action="store_true",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--grounding-spec",
@@ -4801,33 +6302,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     render.add_argument(
         "--grounding-target-id", default="target.primary",
-        help="stable ID for the simple reference-image mode",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--grounding-target-description", default="",
-        help="what exact identity the supplied reference images represent",
+        help=argparse.SUPPRESS,
+    )
+    render.add_argument(
+        "--grounding-identity-semantics",
+        choices=("physical_instance", "sku", "variant", "product_family"),
+        default="physical_instance",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--grounding-reference", type=Path, action="append", default=[],
-        help="positive reference image; repeat for more views",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--grounding-negative", type=Path, action="append", default=[],
-        help="image of a lookalike that must never be substituted; repeat "
-             "for more. The spec has carried these since it was written and "
-             "no entry point offered them, so telling the difference between "
-             "two similar things rested entirely on prose.",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--grounding-identity-cue", action="append", default=[],
-        help="stable visible identity cue; repeat as needed",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--grounding-exclusion", action="append", default=[],
-        help="lookalike or depiction that must not be substituted",
+        help=argparse.SUPPRESS,
+    )
+    render.add_argument(
+        "--grounding-presence-policy",
+        choices=("context_allowed", "target_led", "target_only"),
+        default="context_allowed",
+        help=argparse.SUPPRESS,
     )
     render.add_argument("--music", type=Path)
-    render.add_argument("--music-map", type=Path)
+    render.add_argument("--music-map", type=Path, help=argparse.SUPPRESS)
     render.add_argument("--aspect", choices=sorted(ASPECTS), default="9:16")
     render.add_argument(
         "--seconds", type=float, default=0.0,
@@ -4837,27 +6347,23 @@ def main(argv: list[str] | None = None) -> int:
              "'make it 15 seconds' in the brief is a request, not a number.",
     )
     render.add_argument(
-        "--duration-mode", choices=("exact", "preferred"), default="exact",
+        "--duration-mode", choices=("exact", "range", "preferred"), default="exact",
         help="whether --seconds is a hard delivery specification or a preferred "
              "maximum that may resolve shorter when verified content is insufficient",
     )
+    render.add_argument("--minimum-seconds", type=float, default=None)
+    render.add_argument("--maximum-seconds", type=float, default=None)
     render.add_argument(
         "--sample", type=int, default=0, metavar="N",
-        help="cut from N of the clips instead of all of them. For trying a "
-             "change without paying to describe a whole shoot: seventy-four "
-             "cards is about a dollar and twelve is fifteen cents. The same "
-             "N always picks the same clips, spread across the folder rather "
-             "than taken off the front, so the cards stay cached between "
-             "runs and the sample is not all one setup.",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--sam-checkpoint", type=Path,
-        help="SAM 2.1 checkpoint. By default Montagewright discovers "
-             "artifacts/models/sam2.1_hiera_tiny.pt and uses it.",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--no-sam-tracking", action="store_true",
-        help="Explicitly disable SAM and use sparse Gemini positions.",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--budget",
@@ -4869,16 +6375,25 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument(
         "--upload-cache",
         type=Path,
-        help="Where uploaded-media URIs are remembered. Defaults to a shared "
-        "location, because the key is the file's content and a per-run store "
-        "re-uploads material that has not changed.",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--review",
         action="store_true",
         help="Watch the finished cut and report what it would change.",
     )
-    render.add_argument("--output", type=Path, required=True)
+    render.add_argument(
+        "--preflight-only", action="store_true",
+        help="Inventory, hash, decode and validate the job without creating "
+             "a Gemini client or spending API budget.",
+    )
+    render.add_argument(
+        "--no-review",
+        action="store_false",
+        dest="review",
+        help=argparse.SUPPRESS,
+    )
+    render.add_argument("--output", type=Path)
     render.add_argument(
         "--timeline", choices=["none", "premiere", "finalcut", "both"],
         default="none",
@@ -4894,22 +6409,20 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument(
         "--subtitle-look", choices=["plain", "speakers", "spoken", "plate"],
         default="plain",
-        help="how burned subtitles look: plain, a colour per speaker, "
-             "filling as it is said, or on a plate",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--subtitle-font", type=Path,
-        help="a font file to set the subtitles in; the system is asked if "
-             "this is not given",
+        help=argparse.SUPPRESS,
     )
     render.add_argument(
         "--speech", choices=["auto", "never"], default="auto",
         help="transcribe clips whose card calls the speech content",
     )
-    render.add_argument("--locale", default="zh-TW")
+    render.add_argument("--locale", default="zh-TW", help=argparse.SUPPRESS)
     render.add_argument(
         "--library", type=Path,
-        help="where cards and transcripts live; shared across runs",
+        help=argparse.SUPPRESS,
     )
     render.set_defaults(handler=command_render)
 
@@ -4951,9 +6464,24 @@ def main(argv: list[str] | None = None) -> int:
     graphics.add_argument("--graphic-id")
     graphics.set_defaults(handler=command_graphics)
 
-    effective_argv = list(argv) if argv is not None else sys.argv[1:]
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    try:
+        effective_argv, job_path, job = _expand_render_job_argv(raw_argv)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     args = parser.parse_args(effective_argv)
     args._argv = effective_argv
+    args._job_path = job_path
+    args._job = job
+    if args.command == "render" and args.rushes is None:
+        parser.error("render needs rushes, either positionally or in --job")
+    if args.command == "render" and args.output is None:
+        parser.error("render needs --output, either explicitly or in --job")
+    if (
+        args.command == "render" and job is not None
+        and tuple(getattr(job, "variants", ()))
+    ):
+        return _run_campaign_variants(args, job)
     # A run started here is invisible to the interface: it reads a folder,
     # and a folder with no report in it is a run that died with the last
     # server. So a cut that was busy cutting showed as "interrupted", under

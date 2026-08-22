@@ -431,6 +431,9 @@ def draft_identity_from_references(
     ledger: Any | None = None,
     model_id: str = MODEL_ID,
     resolution: MediaResolution = "high",
+    identity_semantics: Literal[
+        "physical_instance", "sku", "variant", "product_family"
+    ] = "physical_instance",
 ) -> tuple[ReferenceIdentityDraft, Usage] | None:
     """Propose a description, cues and exclusions from the pictures.
 
@@ -466,6 +469,7 @@ def draft_identity_from_references(
         "text": (
             f"{DRAFT_PROMPT_PATH.read_text(encoding='utf-8')}\n\n"
             "TASK=reference_identity_draft\n"
+            f"IDENTITY_SEMANTICS={identity_semantics}\n"
             f"REFERENCE_COUNT={len(paths)}\n"
             "Return only the requested structured object."
         ),
@@ -504,6 +508,12 @@ def build_reference_grounding_spec(
     identity_cues: Sequence[str] = (),
     stable_exclusions: Sequence[str] = (),
     negative_images: Sequence[Path] = (),
+    editorial_presence_policy: Literal[
+        "context_allowed", "target_led", "target_only"
+    ] = "context_allowed",
+    identity_semantics: Literal[
+        "physical_instance", "sku", "variant", "product_family"
+    ] = "physical_instance",
     created_by: str = "local_user",
 ) -> ReferenceGroundingSpec:
     """Create the strict lock from ordinary user-facing reference inputs.
@@ -571,17 +581,27 @@ def build_reference_grounding_spec(
         references.append(reference)
 
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    identity_goals = {
+        "physical_instance": "the exact physical identity",
+        "sku": "any physical unit of the specified SKU",
+        "variant": "any unit of the specified SKU and visible variant",
+        "product_family": "any member of the specified product family",
+    }
+    if identity_semantics not in identity_goals:
+        raise ValueError(f"unsupported identity semantics: {identity_semantics}")
+    identity_goal = identity_goals[identity_semantics]
     payload = {
         "contract_version": "reference-grounding-spec-v1",
         "identity_lock": {
             "contract_version": "grounding-query-lock-v1",
             "query_id": f"grounding:{target_id}",
             "revision": 1,
-            "editorial_goal": f"Find and keep the exact identity: {target_description}",
+            "editorial_goal": f"Find and keep {identity_goal}: {target_description}",
             "identity": {"targets": [{
                 "target_id": target_id,
                 "target_description": target_description.strip(),
                 "scope": "whole_instance",
+                "identity_semantics": identity_semantics,
                 "parent_target_id": None,
                 "identity_cues": list(identity_cues),
                 "context_cues": [],
@@ -591,15 +611,18 @@ def build_reference_grounding_spec(
             }]},
             "predicate": None,
             "framing": {
+                "editorial_presence_policy": editorial_presence_policy,
+                "target_led_minimum_picture_share": 0.6,
+                "target_led_max_consecutive_context_shots": 1,
                 "required_target_ids": [target_id],
                 "preferred_target_ids": [],
                 "sacrificable_target_ids": [],
-                "overlay_keepout_target_ids": [target_id],
+                "overlay_keepout_target_ids": [],
                 "framing_intent": (
-                    "Keep the user-locked identity recognizable and do not "
-                    "replace it with a similar instance."
+                    f"Keep {identity_goal} recognizable; apply the approved "
+                    "SKU, variant or family boundary exactly as written."
                 ),
-                "editing_uses": ["selection", "reframe", "overlay_keepout"],
+                "editing_uses": ["selection", "reframe"],
                 "aspect_constraints": [],
             },
             "claim_source": "user_brief",
@@ -624,6 +647,88 @@ def build_reference_grounding_spec(
     temporary.write_text(_canonical_json(payload), encoding="utf-8")
     temporary.replace(output_path)
     return load_grounding_spec(output_path)
+
+
+def build_multi_reference_grounding_spec(
+    output_path: Path,
+    *,
+    targets: Sequence[dict[str, Any]],
+    editorial_presence_policy: Literal[
+        "context_allowed", "target_led", "target_only"
+    ] = "context_allowed",
+    created_by: str = "local_user",
+) -> ReferenceGroundingSpec:
+    """Build one approved lock from several ordinary product rows.
+
+    This is the non-spec-author entry point for a Samsung-style job. Each row
+    has its own references and identity boundary; the shared presence policy
+    describes how the group participates in the edit.
+    """
+
+    output_path = Path(output_path).expanduser().resolve()
+    if not targets:
+        raise ValueError("at least one grounding target is required")
+    built: list[ReferenceGroundingSpec] = []
+    temporary_paths: list[Path] = []
+    try:
+        for index, raw in enumerate(targets, start=1):
+            temporary = output_path.with_name(
+                f".{output_path.stem}.target-{index:03d}.json"
+            )
+            temporary_paths.append(temporary)
+            built.append(build_reference_grounding_spec(
+                temporary,
+                target_id=str(raw.get("target_id") or f"target.{index}"),
+                target_description=str(raw.get("description") or ""),
+                positive_images=tuple(Path(one) for one in raw.get("references") or ()),
+                negative_images=tuple(Path(one) for one in raw.get("negatives") or ()),
+                identity_cues=tuple(raw.get("identity_cues") or ()),
+                stable_exclusions=tuple(raw.get("exclusions") or ()),
+                identity_semantics=raw.get("identity_semantics", "physical_instance"),
+                editorial_presence_policy=editorial_presence_policy,
+                created_by=created_by,
+            ))
+        target_payloads: list[dict[str, Any]] = []
+        references: list[dict[str, Any]] = []
+        for spec in built:
+            target = spec.identity_lock.identity.targets[0].model_dump(mode="json")
+            target_id = str(target["target_id"])
+            prefix = re.sub(r"[^A-Za-z0-9_.:-]+", "-", target_id)
+            frame_map: dict[str, str] = {}
+            for field in ("positive_anchors", "negative_anchors"):
+                for anchor in target.get(field) or []:
+                    old = str(anchor["frame_id"])
+                    new = f"{prefix}.{old}"
+                    frame_map[old] = new
+                    anchor["frame_id"] = new
+            target_payloads.append(target)
+            for reference in spec.reference_images:
+                payload = reference.model_dump(mode="json")
+                payload["frame_id"] = frame_map.get(
+                    str(payload["frame_id"]), str(payload["frame_id"])
+                )
+                references.append(payload)
+        first = built[0].identity_lock.model_dump(mode="json")
+        first["query_id"] = "grounding:multi-target"
+        first["editorial_goal"] = "Find and keep every approved target identity"
+        first["identity"] = {"targets": target_payloads}
+        first["framing"]["editorial_presence_policy"] = editorial_presence_policy
+        target_ids = [str(one["target_id"]) for one in target_payloads]
+        first["framing"]["required_target_ids"] = target_ids
+        first["framing"]["overlay_keepout_target_ids"] = []
+        payload = {
+            "contract_version": "reference-grounding-spec-v1",
+            "identity_lock": first,
+            "reference_images": references,
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_output = output_path.with_name(f".{output_path.name}.tmp")
+        temporary_output.write_text(_canonical_json(payload), encoding="utf-8")
+        temporary_output.replace(output_path)
+        return load_grounding_spec(output_path)
+    finally:
+        for temporary in temporary_paths:
+            temporary.unlink(missing_ok=True)
 
 
 class VideoAssetLineage(FrozenStrictModel):
@@ -945,6 +1050,11 @@ class ExactFrameBBoxDecision(FrozenStrictModel):
     height: int = Field(gt=0)
     verdict: ExactFrameVerdict
     confidence: float = Field(ge=0.0, le=1.0)
+    visible_state: str = Field(
+        default="unjudged",
+        min_length=1,
+        description="Directly visible pose/configuration, separate from identity.",
+    )
     native_box_yxyx_1000: tuple[int, int, int, int] | None = None
     visibility_state: VisibilityState = "unknown"
     occlusion_state: OcclusionState = "unknown"
@@ -1248,6 +1358,7 @@ def _exact_frame_schema_for_candidates(
             "height",
             "verdict",
             "confidence",
+            "visible_state",
             "native_box_yxyx_1000",
             "visibility_state",
             "occlusion_state",
@@ -1284,6 +1395,7 @@ def _exact_frame_schema_for_candidates(
                 ],
             },
             "confidence": {"type": "number"},
+            "visible_state": {"type": "string"},
             "native_box_yxyx_1000": {
                 "anyOf": [
                     {
@@ -3153,6 +3265,7 @@ def _cross_asset_exact_frame_batch_schema(
             ],
         },
         "confidence": {"type": "number"},
+        "visible_state": {"type": "string"},
         "native_box_yxyx_1000": {
             "anyOf": [
                 {
@@ -3354,12 +3467,16 @@ def validate_cross_asset_exact_frame_payload(
             continue
         raw = offered[0]
         semantic_names = {
-            "verdict", "confidence", "native_box_yxyx_1000",
+            "verdict", "confidence", "visible_state", "native_box_yxyx_1000",
             "visibility_state", "occlusion_state", "touches_frame_edges",
             "identity_evidence", "exclusion_evidence", "excluded_instances",
             "reason",
         }
-        if set(raw) != {"item_id", *semantic_names}:
+        required_semantic_names = semantic_names - {"visible_state"}
+        if (
+            not {"item_id", *required_semantic_names} <= set(raw)
+            or not set(raw) <= {"item_id", *semantic_names}
+        ):
             outcomes.append(CrossAssetExactFrameOutcome(
                 item_id=item_id,
                 request_index=index,
@@ -3389,7 +3506,10 @@ def validate_cross_asset_exact_frame_payload(
             "frame_sha256": expected.frame_sha256,
             "width": expected.width,
             "height": expected.height,
-            **{name: raw[name] for name in semantic_names},
+            **{
+                name: raw.get(name, "unjudged")
+                for name in semantic_names
+            },
         }
         try:
             decision = validate_exact_frame_payload(

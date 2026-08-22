@@ -142,6 +142,7 @@ def audio_timeline_faults(edl: EDL) -> tuple[str, ...]:
         starts[clip.clip_id] = cursor
         cursor += clip.approx_out_seconds - clip.approx_in_seconds
     faults: list[str] = []
+    narrative_ranges: list[tuple[float, float, str]] = []
     for audio in edl.audio_clips:
         anchor = starts.get(audio.starts_at_clip_id)
         if anchor is None:
@@ -157,7 +158,88 @@ def audio_timeline_faults(edl: EDL) -> tuple[str, ...]:
                 f"audio {audio.audio_id} falls outside the {cursor:.3f}s "
                 f"picture timeline ({begins:.3f}-{ends:.3f}s)"
             )
+        if audio.role == "narrative":
+            for prior_start, prior_end, prior_id in narrative_ranges:
+                if begins < prior_end - 1e-6 and ends > prior_start + 1e-6:
+                    faults.append(
+                        f"narrative audio {audio.audio_id} overlaps {prior_id} "
+                        f"on the picture timeline"
+                    )
+            narrative_ranges.append((begins, ends, audio.audio_id))
     return tuple(dict.fromkeys(faults))
+
+
+def _split_edit_relations(edl: EDL) -> dict[tuple[str, str, str], float]:
+    """Measured J/L lead or tail against the picture cut it crosses."""
+
+    starts: dict[str, float] = {}
+    cursor = 0.0
+    for clip in edl.clips:
+        starts[clip.clip_id] = cursor
+        cursor += clip.approx_out_seconds - clip.approx_in_seconds
+    clips = {clip.clip_id: clip for clip in edl.clips}
+    next_clip = {
+        left.clip_id: right
+        for left, right in zip(edl.clips, edl.clips[1:])
+    }
+    relations: dict[tuple[str, str, str], float] = {}
+    for audio in edl.audio_clips:
+        anchor = clips.get(audio.starts_at_clip_id)
+        following = next_clip.get(audio.starts_at_clip_id)
+        if anchor is None or following is None:
+            continue
+        begins = starts[anchor.clip_id] + audio.offset_seconds
+        ends = begins + audio.out_seconds - audio.in_seconds
+        boundary = starts[following.clip_id]
+        if not begins < boundary - 1e-6 or not ends > boundary + 1e-6:
+            continue
+        # When both adjacent pictures and the audio are the same source, this
+        # is an ordinary continuous-take cut (often two speakers in one
+        # interview frame), not evidence of a J or L edit. A few hundredths
+        # of Apple-vs-provider rounding used to manufacture a J-cut here and
+        # then accuse the frame-accurate fit of destroying it.
+        if (
+            audio.source_id == following.source_id
+            and audio.source_id != anchor.source_id
+        ):
+            relations[(audio.audio_id, "J", following.clip_id)] = boundary - begins
+        elif (
+            audio.source_id == anchor.source_id
+            and audio.source_id != following.source_id
+        ):
+            relations[(audio.audio_id, "L", following.clip_id)] = ends - boundary
+        elif (
+            audio.sync_group
+            and audio.sync_group == anchor.sync_group == following.sync_group
+        ):
+            # A double-system master is not the source_id of either camera
+            # angle.  Without an explicit dialogue-side label it is unsafe to
+            # guess J versus L, so preserve both measured sides of the split.
+            relations[(audio.audio_id, "J", following.clip_id)] = boundary - begins
+            relations[(audio.audio_id, "L", following.clip_id)] = ends - boundary
+    return relations
+
+
+def split_edit_timing_faults(authored: EDL, executable: EDL) -> tuple[str, ...]:
+    """Keep an intentional J/L relationship stable while Rhythm changes holds."""
+
+    before = _split_edit_relations(authored)
+    after = _split_edit_relations(executable)
+    faults = []
+    for key, intended in before.items():
+        delivered = after.get(key)
+        audio_id, kind, next_clip = key
+        if delivered is None:
+            faults.append(
+                f"audio {audio_id}: authored {kind}-cut across {next_clip} no "
+                "longer crosses that picture cut"
+            )
+        elif abs(delivered - intended) > 0.08:
+            faults.append(
+                f"audio {audio_id}: {kind}-cut timing drifted from "
+                f"{intended:.3f}s to {delivered:.3f}s at {next_clip}"
+            )
+    return tuple(faults)
 
 
 def rhythm_motion_faults(
@@ -213,4 +295,5 @@ def rhythm_motion_faults(
     executable = apply_to_edl(candidate, timeline)
     faults.extend(resolved_source_contract_faults(executable))
     faults.extend(audio_timeline_faults(executable))
+    faults.extend(split_edit_timing_faults(authored, executable))
     return tuple(dict.fromkeys(faults))

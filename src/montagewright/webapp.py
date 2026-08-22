@@ -30,20 +30,22 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from montagewright.renderer import probe_duration
+from montagewright.ingest import AUDIO_SUFFIXES, VIDEO_SUFFIXES
 from montagewright.schema import looks_of, move_of_shot, subject_of
 from montagewright.uploads import default_library
 
-VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".MP4", ".MOV", ".avi", ".mkv"}
-AUDIO_SUFFIXES = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".aiff", ".MP3", ".M4A", ".WAV"}
 BRIEF_SUFFIXES = {".md", ".markdown", ".txt", ".MD", ".TXT"}
 SPEC_SUFFIXES = {".json", ".JSON"}
+JOB_SUFFIXES = {".json", ".JSON", ".yaml", ".YAML", ".yml", ".YML"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".JPG", ".JPEG", ".PNG", ".WEBP", ".HEIC"}
 # The names a request may ask for, and what each one is as a ratio. These
 # were two different shapes with one name -- a tuple to validate against and
 # a dict to look up -- and the lookup silently returned nothing.
@@ -816,6 +818,60 @@ def _invalidate_subtitle_delivery(run: Run) -> None:
     (run.output / "work" / "graphics-render" / "layout.json").unlink(
         missing_ok=True
     )
+
+
+def _leased_run_output_sync(operation):
+    """Hold the cross-process output lease before any authority is read."""
+
+    from functools import wraps
+
+    @wraps(operation)
+    def guarded(run_id: str, *args, **kwargs):
+        from montagewright.release import OutputBusy, acquire_output_lease
+
+        run = RUNS.get(run_id)
+        if run is None:
+            recall()
+            run = RUNS.get(run_id)
+        if run is None:
+            raise HTTPException(404, "no such run")
+        try:
+            lease = acquire_output_lease(run.output)
+        except OutputBusy as error:
+            raise HTTPException(409, str(error)) from error
+        try:
+            return operation(run_id, *args, **kwargs)
+        finally:
+            lease.release()
+
+    return guarded
+
+
+def _leased_run_output_async(operation):
+    """Async route equivalent of _leased_run_output_sync."""
+
+    from functools import wraps
+
+    @wraps(operation)
+    async def guarded(run_id: str, *args, **kwargs):
+        from montagewright.release import OutputBusy, acquire_output_lease
+
+        run = RUNS.get(run_id)
+        if run is None:
+            recall()
+            run = RUNS.get(run_id)
+        if run is None:
+            raise HTTPException(404, "no such run")
+        try:
+            lease = acquire_output_lease(run.output)
+        except OutputBusy as error:
+            raise HTTPException(409, str(error)) from error
+        try:
+            return await operation(run_id, *args, **kwargs)
+        finally:
+            lease.release()
+
+    return guarded
 
 
 def _keyed_graphics_lock(
@@ -1772,19 +1828,29 @@ def create_app() -> FastAPI:
         grounding_spec_path: str = Form(""),
         grounding_spec_json: str = Form(""),
         reference_image_paths: str = Form(""),
+        grounding_negative_paths: str = Form(""),
         grounding_target_id: str = Form(""),
         grounding_target_description: str = Form(""),
+        grounding_additional_targets_json: str = Form("[]"),
+        grounding_identity_semantics: str = Form("physical_instance"),
+        grounding_presence_policy: str = Form("context_allowed"),
         grounding_identity_cues: str = Form(""),
         grounding_exclusions: str = Form(""),
+        picture_obligations_json: str = Form("[]"),
         brief: str = Form(""),
         brief_path: str = Form(""),
+        loaded_job_path: str = Form(""),
         base_run_id: str = Form(""),
         inherit_brief: bool = Form(False),
         aspect: str = Form("9:16"),
         seconds: float = Form(0.0),
         duration_mode: str = Form("preferred"),
+        minimum_seconds: float | None = Form(None),
+        maximum_seconds: float | None = Form(None),
+        delivery_variants_json: str = Form("[]"),
         budget: float = Form(6.0),
         review: bool = Form(True),
+        preflight_only: bool = Form(False),
         timeline: str = Form("none"),
         speech: str = Form("auto"),
         subtitles: str = Form("sidecar"),
@@ -1796,8 +1862,26 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 400, f"aspect must be one of {sorted(ASPECTS)}"
             )
-        if duration_mode not in {"exact", "preferred"}:
-            raise HTTPException(400, "duration_mode must be exact or preferred")
+        if duration_mode not in {"exact", "range", "preferred"}:
+            raise HTTPException(400, "duration_mode must be exact, range or preferred")
+        if duration_mode == "exact" and seconds <= 0:
+            raise HTTPException(400, "exact duration requires seconds greater than zero")
+        if duration_mode == "range" and (
+            minimum_seconds is None
+            or maximum_seconds is None
+            or minimum_seconds <= 0
+            or maximum_seconds <= 0
+            or minimum_seconds > maximum_seconds
+        ):
+            raise HTTPException(
+                400,
+                "range duration requires positive minimum/maximum seconds in order",
+            )
+        if (
+            duration_mode == "range" and seconds <= 0
+        ):
+            assert minimum_seconds is not None and maximum_seconds is not None
+            seconds = (minimum_seconds + maximum_seconds) / 2.0
 
         run_id = uuid.uuid4().hex[:12]
         root = RUNS_ROOT / run_id
@@ -1833,8 +1917,8 @@ def create_app() -> FastAPI:
                         link.symlink_to(rush_dir)
                 rush_dir = holder
             kept = sum(
-                1 for path in rush_dir.iterdir()
-                if path.suffix in VIDEO_SUFFIXES
+                1 for path in rush_dir.rglob("*") if path.is_file()
+                if path.suffix.casefold() in VIDEO_SUFFIXES
             )
         else:
             rush_dir = keep() / "rushes"
@@ -1846,8 +1930,15 @@ def create_app() -> FastAPI:
                 # matters, and anything that is not footage is not ours to
                 # guess about.
                 name = Path(upload.filename or "").name
-                if not name or Path(name).suffix not in VIDEO_SUFFIXES:
+                if not name or Path(name).suffix.casefold() not in VIDEO_SUFFIXES:
                     continue
+                if (rush_dir / name).exists():
+                    shutil.rmtree(root, ignore_errors=True)
+                    raise HTTPException(
+                        400,
+                        f"two uploaded clips are both named {name}; give the "
+                        "source folder path so their card folders stay distinct",
+                    )
                 written = _save(upload, rush_dir / name)
                 budgeted -= written.stat().st_size
                 if budgeted < 0:
@@ -1868,7 +1959,17 @@ def create_app() -> FastAPI:
         # as it preserves the rushes and brief.  Do this on the server as
         # well as in the form: API callers and an older browser tab must not
         # silently start an ungrounded paid run because one input was absent.
-        explicit_simple_grounding = bool(grounding_target_description.strip())
+        try:
+            additional_targets = json.loads(grounding_additional_targets_json or "[]")
+            if not isinstance(additional_targets, list) or any(
+                not isinstance(one, dict) for one in additional_targets
+            ):
+                raise ValueError("additional targets must be a list")
+        except (json.JSONDecodeError, ValueError) as error:
+            raise HTTPException(400, f"invalid additional grounding targets: {error}")
+        explicit_simple_grounding = bool(
+            grounding_target_description.strip() or additional_targets
+        )
         explicit_spec = bool(
             grounding_spec_path.strip()
             or grounding_spec_json.strip()
@@ -1906,6 +2007,7 @@ def create_app() -> FastAPI:
 
         try:
             typed_references = _reference_path_lines(reference_image_paths)
+            typed_negatives = _reference_path_lines(grounding_negative_paths)
         except (json.JSONDecodeError, ValueError) as error:
             if made_root:
                 shutil.rmtree(root, ignore_errors=True)
@@ -1913,25 +2015,41 @@ def create_app() -> FastAPI:
         uploads = [
             upload for upload in reference_images or [] if upload.filename
         ]
-        simple_grounding = bool(grounding_target_description.strip())
+        simple_grounding = bool(
+            grounding_target_description.strip() or additional_targets
+        )
+        if grounding_presence_policy not in {
+            "context_allowed", "target_led", "target_only",
+        }:
+            if made_root:
+                shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(400, "invalid grounding presence policy")
         if simple_grounding and spec_sources:
             if made_root:
                 shutil.rmtree(root, ignore_errors=True)
             raise HTTPException(
                 400, "use either the simple reference fields or a grounding spec"
             )
-        if (typed_references or uploads) and not (spec_sources or simple_grounding):
+        if (typed_references or typed_negatives or uploads) and not (
+            spec_sources or simple_grounding
+        ):
             if made_root:
                 shutil.rmtree(root, ignore_errors=True)
             raise HTTPException(
                 400, "reference images require a target description or grounding spec"
             )
+        if simple_grounding and not grounding_target_description.strip():
+            if made_root:
+                shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(400, "the first grounding target needs a description")
         if simple_grounding and not (typed_references or uploads):
             if made_root:
                 shutil.rmtree(root, ignore_errors=True)
             raise HTTPException(400, "a grounding target needs a reference image")
 
         canonical_grounding: Path | None = None
+        canonical_grounding_contract: Any | None = None
+        grounded_targets: tuple[Any, ...] = ()
         if spec_sources or simple_grounding:
             staging = keep() / "grounding-input"
             staging.mkdir(parents=True, exist_ok=True)
@@ -1986,6 +2104,13 @@ def create_app() -> FastAPI:
                 # spec has carried negative anchors since it was written and
                 # neither entry point offered them.
                 refused: list[Path] = []
+                for raw_path in typed_negatives:
+                    image = _typed_path(raw_path)
+                    if image is None or not image.is_file():
+                        raise ValueError(
+                            f"negative reference image is not there: {raw_path}"
+                        )
+                    refused.append(image)
                 for upload in grounding_negatives or []:
                     if not upload.filename:
                         continue
@@ -2001,29 +2126,60 @@ def create_app() -> FastAPI:
                 portable_upload = spec_upload is not None or bool(spec_json)
                 if simple_grounding:
                     from montagewright.reference_grounding import (
+                        build_multi_reference_grounding_spec,
                         build_reference_grounding_spec,
                     )
 
-                    built = build_reference_grounding_spec(
-                        raw_spec,
-                        target_id=(
-                            grounding_target_id.strip() or "target.primary"
-                        ),
-                        target_description=grounding_target_description.strip(),
-                        identity_cues=tuple(
-                            line.strip()
-                            for line in grounding_identity_cues.splitlines()
+                    primary_target = {
+                        "target_id": grounding_target_id.strip() or "target.primary",
+                        "description": grounding_target_description.strip(),
+                        "identity_semantics": grounding_identity_semantics,
+                        "identity_cues": tuple(
+                            line.strip() for line in grounding_identity_cues.splitlines()
                             if line.strip()
                         ),
-                        stable_exclusions=tuple(
-                            line.strip()
-                            for line in grounding_exclusions.splitlines()
+                        "exclusions": tuple(
+                            line.strip() for line in grounding_exclusions.splitlines()
                             if line.strip()
                         ),
-                        positive_images=tuple(path for _, path in provided),
-                        negative_images=tuple(refused),
-                        created_by="web_user",
-                    )
+                        "references": tuple(path for _, path in provided),
+                        "negatives": tuple(refused),
+                    }
+                    if additional_targets:
+                        resolved_targets = [primary_target]
+                        for index, row in enumerate(additional_targets, start=2):
+                            refs = tuple(
+                                Path(str(one)).expanduser().resolve(strict=True)
+                                for one in row.get("references") or ()
+                            )
+                            resolved_targets.append({
+                                "target_id": str(row.get("target_id") or f"target.{index}"),
+                                "description": str(row.get("description") or ""),
+                                "identity_semantics": str(row.get("identity_semantics") or "sku"),
+                                "identity_cues": tuple(row.get("identity_cues") or ()),
+                                "exclusions": tuple(row.get("exclusions") or ()),
+                                "references": refs,
+                            })
+                        built = build_multi_reference_grounding_spec(
+                            raw_spec, targets=resolved_targets,
+                            editorial_presence_policy=cast(
+                                Literal["context_allowed", "target_led", "target_only"],
+                                grounding_presence_policy,
+                            ), created_by="web_user",
+                        )
+                    else:
+                        built = build_reference_grounding_spec(
+                            raw_spec,
+                            target_id=str(primary_target["target_id"]),
+                            target_description=str(primary_target["description"]),
+                            identity_semantics=cast(Any, grounding_identity_semantics),
+                            identity_cues=cast(Any, primary_target["identity_cues"]),
+                            stable_exclusions=cast(Any, primary_target["exclusions"]),
+                            positive_images=cast(Any, primary_target["references"]),
+                            negative_images=cast(Any, primary_target["negatives"]),
+                            editorial_presence_policy=cast(Any, grounding_presence_policy),
+                            created_by="web_user",
+                        )
                     staged_spec = Path(str(built.source_path))
                 elif provided or portable_upload:
                     staged_spec = _rewrite_uploaded_reference_paths(
@@ -2035,7 +2191,7 @@ def create_app() -> FastAPI:
 
                 from montagewright.cli import prepare_grounding_spec_artifact
 
-                canonical_grounding, _ = prepare_grounding_spec_artifact(
+                canonical_grounding, canonical_grounding_contract = prepare_grounding_spec_artifact(
                     staged_spec, keep() / "out" / "work" / "grounding-spec.json"
                 )
                 shutil.rmtree(staging, ignore_errors=True)
@@ -2053,6 +2209,13 @@ def create_app() -> FastAPI:
             "--output", str(keep() / "out"),
         ]
         if canonical_grounding is not None:
+            identity_lock = getattr(
+                canonical_grounding_contract, "identity_lock", None
+            )
+            grounded_targets = tuple(
+                getattr(getattr(identity_lock, "identity", None), "targets", ())
+                or ()
+            )
             command += ["--grounding-spec", str(canonical_grounding)]
         if seconds > 0:
             command += [
@@ -2095,6 +2258,7 @@ def create_app() -> FastAPI:
                 "\n\n## Web 補充需求\n\n" + brief.strip()
                 if brief.strip() else ""
             )
+        stored_brief: Path | None = None
         if brief.strip():
             stored_brief = keep() / "brief.md"
             stored_brief.write_text(brief, encoding="utf-8")
@@ -2113,10 +2277,170 @@ def create_app() -> FastAPI:
         if checkpoint.exists():
             command += ["--sam-checkpoint", str(checkpoint)]
 
+        # The form is an edit work order, not a command-line builder. Keep
+        # exactly that durable sheet and let the CLI compile it through the
+        # same validator used by terminal runs. The spawned command therefore
+        # stays short and cannot drift from the Web fields as flags are added.
+        from montagewright.job import (
+            Delivery, EditJob, RunPolicy, Sound, Subject,
+            TimelineObligation, write_job,
+        )
+
+        try:
+            raw_picture_obligations = json.loads(
+                picture_obligations_json or "[]"
+            )
+            if not isinstance(raw_picture_obligations, list):
+                raise ValueError("picture obligations must be a list")
+            picture_obligations = tuple(
+                TimelineObligation.model_validate(one)
+                for one in raw_picture_obligations
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(400, f"invalid picture obligations: {error}")
+
+        subject = None
+        if canonical_grounding is not None:
+            framing = getattr(
+                getattr(canonical_grounding_contract, "identity_lock", None),
+                "framing", None,
+            )
+            subject = Subject(
+                grounding_spec=str(canonical_grounding),
+                identity_semantics=cast(
+                    Literal[
+                        "physical_instance", "sku", "variant", "product_family"
+                    ],
+                    str(
+                        grounded_targets[0].identity_semantics
+                        if len(grounded_targets) == 1 else "physical_instance"
+                    ),
+                ),
+                presence=cast(
+                    Literal["context_allowed", "target_led", "target_only"],
+                    str(getattr(
+                        framing, "editorial_presence_policy", "context_allowed"
+                    )),
+                ),
+            )
+        try:
+            web_job = EditJob(
+                rushes=str(rush_dir),
+                output=str(keep() / "out"),
+                brief=str(stored_brief) if stored_brief is not None else None,
+                music=str(track) if track is not None else None,
+                delivery=Delivery(
+                    aspect=cast(
+                        Literal["9:16", "16:9", "1:1", "4:5"], aspect
+                    ),
+                    seconds=seconds,
+                    duration_mode=cast(
+                        Literal["exact", "range", "preferred"],
+                        duration_mode if seconds > 0 else "preferred",
+                    ),
+                    minimum_seconds=minimum_seconds,
+                    maximum_seconds=maximum_seconds,
+                    subtitles=cast(
+                        Literal["none", "sidecar", "burn"], subtitles
+                    ),
+                    subtitle_look=cast(
+                        Literal["plain", "speakers", "spoken", "plate"],
+                        subtitle_look,
+                    ),
+                    subtitle_font=subtitle_font or None,
+                    timeline=cast(
+                        Literal["none", "premiere", "finalcut", "both"],
+                        timeline,
+                    ),
+                ),
+                sound=Sound(
+                    speech=cast(Literal["auto", "never"], speech),
+                    locale=locale.strip() or "zh-TW",
+                ),
+                subject=subject,
+                obligations=picture_obligations,
+                run=RunPolicy(budget_usd=budget, review=review),
+            )
+            # Loading a work order and pressing Start must not rebuild a
+            # smaller one. Keep every advanced contract which has no simple
+            # form control, while treating the visible basic fields as the
+            # user's deliberate overrides.
+            loaded_path = _typed_path(loaded_job_path)
+            if loaded_path is not None:
+                from montagewright.job import job_for_form
+
+                loaded_job = EditJob.model_validate(job_for_form(loaded_path))
+                merged_delivery = loaded_job.delivery.model_copy(update={
+                    field: getattr(web_job.delivery, field)
+                    for field in (
+                        "aspect", "seconds", "duration_mode", "subtitles",
+                        "minimum_seconds", "maximum_seconds",
+                        "subtitle_look", "subtitle_font", "timeline",
+                    )
+                })
+                web_job = loaded_job.model_copy(update={
+                    "rushes": web_job.rushes,
+                    "output": web_job.output,
+                    "brief": web_job.brief,
+                    "music": web_job.music,
+                    "delivery": merged_delivery,
+                    "sound": web_job.sound,
+                    "subject": web_job.subject,
+                    "obligations": tuple(
+                        obligation for obligation in loaded_job.obligations
+                        if not obligation.obligation_id.startswith("web.")
+                    ) + web_job.obligations,
+                    "run": web_job.run,
+                })
+            try:
+                raw_variants = json.loads(delivery_variants_json or "[]")
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid delivery variants: {error}") from error
+            if not isinstance(raw_variants, list):
+                raise ValueError("delivery variants must be a list")
+            if raw_variants:
+                from montagewright.job import DeliveryVariant
+
+                variants = [DeliveryVariant(
+                    variant_id="primary",
+                    delivery=web_job.delivery,
+                )]
+                for raw_variant in raw_variants:
+                    if not isinstance(raw_variant, dict):
+                        raise ValueError("each delivery variant must be an object")
+                    raw_delivery = raw_variant.get("delivery") or {}
+                    if not isinstance(raw_delivery, dict):
+                        raise ValueError("variant delivery must be an object")
+                    variant_delivery = Delivery.model_validate({
+                        **web_job.delivery.model_dump(mode="json"),
+                        "aspect": raw_delivery.get("aspect", web_job.delivery.aspect),
+                        "seconds": float(raw_delivery.get("seconds") or 0.0),
+                        "duration_mode": raw_delivery.get("duration_mode", "preferred"),
+                        "minimum_seconds": None,
+                        "maximum_seconds": None,
+                    })
+                    variants.append(DeliveryVariant(
+                        variant_id=str(raw_variant.get("variant_id") or "").strip(),
+                        delivery=variant_delivery,
+                    ))
+                web_job = web_job.model_copy(update={"variants": tuple(variants)})
+        except ValueError as error:
+            shutil.rmtree(root, ignore_errors=True)
+            raise HTTPException(400, f"invalid edit work order: {error}") from error
+        job_path = write_job(keep() / "edit-job.json", web_job)
+        command = [
+            sys.executable, "-u", "-m", "montagewright.cli", "render",
+            str(rush_dir), "--job", str(job_path),
+        ]
+        if preflight_only:
+            command.append("--preflight-only")
+
         run = Run(
             run_id=run_id, root=keep(), source=str(rush_dir), command=command
         )
         run.lines.append(f"{kept} clips from {rush_dir}")
+        run.lines.append(f"edit job {job_path}")
         if canonical_grounding is not None:
             run.lines.append(f"grounding spec {canonical_grounding}")
         try:
@@ -2159,6 +2483,7 @@ def create_app() -> FastAPI:
         threading.Thread(target=_collect, args=(run,), daemon=True).start()
         return JSONResponse({
             "run_id": run_id,
+            "job": str(job_path),
             "grounding_spec": (
                 str(canonical_grounding) if canonical_grounding else None
             ),
@@ -2168,6 +2493,7 @@ def create_app() -> FastAPI:
     async def grounding_draft(
         reference_images: list[UploadFile] | None = None,
         reference_image_paths: str = Form(""),
+        grounding_identity_semantics: str = Form("physical_instance"),
     ) -> JSONResponse:
         """Read the reference pictures and propose what to say about them.
 
@@ -2238,6 +2564,13 @@ def create_app() -> FastAPI:
                 drafted = await run_in_threadpool(
                     draft_identity_from_references,
                     images, client=client, cache=cache, ledger=ledger,
+                    identity_semantics=cast(
+                        Literal[
+                            "physical_instance", "sku", "variant",
+                            "product_family",
+                        ],
+                        grounding_identity_semantics,
+                    ),
                 )
             except ReferenceGroundingError as error:
                 raise HTTPException(502, f"draft failed: {error}")
@@ -2280,7 +2613,9 @@ def create_app() -> FastAPI:
         looking = (
             AUDIO_SUFFIXES if kind == "audio"
             else BRIEF_SUFFIXES if kind == "file"
+            else IMAGE_SUFFIXES if kind == "image"
             else SPEC_SUFFIXES if kind == "spec"
+            else JOB_SUFFIXES if kind == "job"
             else VIDEO_SUFFIXES
         )
         folders = []
@@ -2290,7 +2625,7 @@ def create_app() -> FastAPI:
             try:
                 clips = sum(
                     1 for child in entry.iterdir()
-                    if child.suffix in looking
+                    if child.suffix.casefold() in looking
                 )
             except PermissionError:
                 continue
@@ -2298,7 +2633,7 @@ def create_app() -> FastAPI:
         loose = [
             {"name": entry.name, "path": str(entry)}
             for entry in sorted(here.iterdir())
-            if entry.is_file() and entry.suffix in looking
+            if entry.is_file() and entry.suffix.casefold() in looking
         ]
         return JSONResponse({
             "here": str(here),
@@ -2306,6 +2641,18 @@ def create_app() -> FastAPI:
             "folders": folders,
             "videos": loose,
         })
+
+    @app.get("/api/jobs/inspect")
+    def inspect_job(path: str) -> JSONResponse:
+        from montagewright.job import job_for_form
+
+        typed = _typed_path(path)
+        if typed is None:
+            raise HTTPException(400, "give a job path")
+        try:
+            return JSONResponse(job_for_form(typed))
+        except (OSError, ValueError) as error:
+            raise HTTPException(400, str(error)) from error
 
     @app.get("/api/runs")
     def history(limit: int = 30) -> JSONResponse:
@@ -2363,7 +2710,7 @@ def create_app() -> FastAPI:
             source = next(
                 (
                     run.output / name
-                    for name in ("picture.mp4", "deliverable.mp4")
+                    for name in ("picture.mp4", "deliverable.mp4", "draft-preview.mp4")
                     if (run.output / name).exists()
                 ),
                 run.output / "picture.mp4",
@@ -2397,7 +2744,7 @@ def create_app() -> FastAPI:
             # the lane pointing at the wrong moment, in the one view whose
             # job is showing where the sound sits.
             seconds = 0.0
-            for name in ("picture.mp4", "deliverable.mp4", "preview.mp4"):
+            for name in ("picture.mp4", "deliverable.mp4", "draft-preview.mp4", "preview.mp4"):
                 if (run.output / name).exists():
                     seconds = probe_duration(run.output / name) or 0.0
                     if seconds:
@@ -2853,8 +3200,17 @@ def create_app() -> FastAPI:
                 out_seconds=float(one["out_seconds"]),
                 starts_at_clip_id=f"k{clip_index:02d}",
                 offset_seconds=(starts - clip_start) / output_fps,
-                role=str(one.get("role", "narrative")),
-                completion=str(one.get("completion", "none")),
+                role=cast(
+                    Literal["narrative", "sync_action", "ambient_texture"],
+                    str(one.get("role", "narrative")),
+                ),
+                completion=cast(
+                    Literal[
+                        "none", "complete_thought", "complete_action_sound",
+                        "intentional_cut",
+                    ],
+                    str(one.get("completion", "none")),
+                ),
                 gain_db=float(one.get("gain_db", 0.0) or 0.0),
                 why=str(one.get("why", "")),
             ))
@@ -3181,7 +3537,7 @@ def create_app() -> FastAPI:
                 staging / "work" / "current-timeline.json", manifest
             )
 
-            for name in ("picture.mp4", "deliverable.mp4", "preview.mp4"):
+            for name in ("picture.mp4", "deliverable.mp4", "draft-preview.mp4", "preview.mp4"):
                 os.replace(staging / name, run.output / name)
             laid = staging / "bed-as-laid.m4a"
             if laid.exists():
@@ -3420,7 +3776,10 @@ def create_app() -> FastAPI:
         # maximum-looking word from every historical log line.  Completion
         # markers are otherwise durable artifacts, not these messages.
         phase = "proxy"
-        if report_ready or (run.output / "deliverable.mp4").exists():
+        if report_ready or any(
+            (run.output / name).exists()
+            for name in ("deliverable.mp4", "draft-preview.mp4")
+        ):
             phase = "done"
         elif selection_ready:
             phase = "subject" if rhythm_ready else "rhythm"
@@ -3590,6 +3949,81 @@ def create_app() -> FastAPI:
             run.state = "stopped"
         return JSONResponse({"state": run.state})
 
+    @app.post("/api/runs/{run_id}/release")
+    async def release_run(
+        run_id: str,
+        approver: str = Form(...),
+        approval_note: str = Form(""),
+        expected_artifact_sha256: str = Form(...),
+        acknowledge_rights: bool = Form(False),
+    ) -> JSONResponse:
+        """Approve the exact draft somebody watched, never a future file."""
+
+        import hashlib
+        from montagewright.job import load_job, write_job
+        from montagewright.release import (
+            OutputBusy, acquire_output_lease, finalize_release,
+            technical_qc_faults,
+        )
+
+        run = _run(run_id)
+        output = run.output
+        draft = output / "draft-preview.mp4"
+        if not draft.is_file():
+            raise HTTPException(409, "there is no draft artifact to approve")
+        digest = hashlib.sha256()
+        with draft.open("rb") as artifact:
+            for block in iter(lambda: artifact.read(1024 * 1024), b""):
+                digest.update(block)
+        actual_hash = digest.hexdigest()
+        if expected_artifact_sha256 != actual_hash:
+            raise HTTPException(
+                409, "the draft changed after it was reviewed; reload before approval"
+            )
+        if not approver.strip():
+            raise HTTPException(400, "approver is required")
+        if not acknowledge_rights:
+            raise HTTPException(400, "asset rights must be acknowledged explicitly")
+        job_path = output / "work" / "resolved-job.json"
+        report_path = output / "report.json"
+        ingest_path = output / "work" / "ingest-manifest.json"
+        if not all(path.is_file() for path in (job_path, report_path, ingest_path)):
+            raise HTTPException(409, "the run has no complete release authority")
+        try:
+            lease = acquire_output_lease(output)
+        except OutputBusy as error:
+            raise HTTPException(409, str(error)) from error
+        try:
+            job = load_job(job_path)
+            approved = job.model_copy(update={
+                "rights": job.rights.model_copy(update={"acknowledged": True}),
+                "release": job.release.model_copy(update={
+                    "approver": approver.strip(),
+                    "approval_note": approval_note.strip() or None,
+                    "approved_artifact_sha256": actual_hash,
+                }),
+            })
+            qc_faults = technical_qc_faults(draft, approved)
+            if qc_faults:
+                raise HTTPException(
+                    422, "technical QC failed: " + "; ".join(qc_faults)
+                )
+            ingest_payload = json.loads(ingest_path.read_text(encoding="utf-8"))
+            manifest = finalize_release(
+                output, draft, approved,
+                ingest_inventory_sha256=str(ingest_payload["inventory_sha256"]),
+                report_path=report_path,
+            )
+            if manifest.status != "released":
+                raise HTTPException(409, {
+                    "message": "release is still blocked",
+                    "blockers": list(manifest.blockers),
+                })
+            write_job(output / "work" / "approved-job.json", approved)
+            return JSONResponse(manifest.model_dump(mode="json"))
+        finally:
+            lease.release()
+
     @app.get("/api/runs/{run_id}/video")
     def video(run_id: str):
         path = _run(run_id).output / "preview.mp4"
@@ -3599,12 +4033,29 @@ def create_app() -> FastAPI:
 
     @app.get("/api/runs/{run_id}/deliverable")
     def deliverable(run_id: str):
-        path = _run(run_id).output / "deliverable.mp4"
-        if not path.exists():
-            raise HTTPException(404, "no deliverable yet")
-        return FileResponse(
-            path, media_type="video/mp4", filename=f"{run_id}.mp4"
+        output = _run(run_id).output
+        path = next(
+            (output / name for name in ("deliverable.mp4", "draft-preview.mp4")
+             if (output / name).exists()),
+            None,
         )
+        if path is None:
+            raise HTTPException(404, "no render yet")
+        return FileResponse(
+            path, media_type="video/mp4",
+            filename=(f"{run_id}.mp4" if path.name == "deliverable.mp4"
+                      else f"{run_id}-DRAFT.mp4"),
+        )
+
+    @app.get("/api/runs/{run_id}/release-status")
+    def release_status(run_id: str) -> JSONResponse:
+        path = _run(run_id).output / "release-manifest.json"
+        if not path.is_file():
+            raise HTTPException(404, "no release manifest yet")
+        try:
+            return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as error:
+            raise HTTPException(409, f"release manifest is unreadable: {error}")
 
     @app.get("/api/runs/{run_id}/timeline/{flavour}")
     def timeline(run_id: str, flavour: str):
@@ -3897,6 +4348,7 @@ def create_app() -> FastAPI:
         })
 
     @app.put("/api/runs/{run_id}/graphics-track")
+    @_leased_run_output_async
     async def edit_graphics_track(
         run_id: str, request: Request
     ) -> JSONResponse:
@@ -4018,7 +4470,7 @@ def create_app() -> FastAPI:
         source = next(
             (
                 run.output / name
-                for name in ("deliverable.mp4", "picture.mp4")
+                for name in ("deliverable.mp4", "draft-preview.mp4", "picture.mp4")
                 if (run.output / name).exists()
             ),
             None,
@@ -4067,6 +4519,7 @@ def create_app() -> FastAPI:
         })
 
     @app.post("/api/runs/{run_id}/approve-graphic/{graphic_id}")
+    @_leased_run_output_async
     async def approve_graphic(
         run_id: str, graphic_id: str, request: Request
     ) -> JSONResponse:
@@ -4166,6 +4619,7 @@ def create_app() -> FastAPI:
         return JSONResponse(plan.model_dump(mode="json"))
 
     @app.post("/api/runs/{run_id}/burn-graphics")
+    @_leased_run_output_sync
     def burn_graphics_track(run_id: str) -> JSONResponse:
         """Render approved cards over a copy, never over the clean master."""
 
@@ -4205,7 +4659,7 @@ def create_app() -> FastAPI:
         clean = next(
             (
                 run.output / name
-                for name in ("deliverable.mp4", "picture.mp4")
+                for name in ("deliverable.mp4", "draft-preview.mp4", "picture.mp4")
                 if (run.output / name).exists()
             ),
             None,
@@ -4304,7 +4758,7 @@ def create_app() -> FastAPI:
         picture = next(
             (
                 run.output / name
-                for name in ("deliverable.mp4", "picture.mp4")
+                for name in ("deliverable.mp4", "draft-preview.mp4", "picture.mp4")
                 if (run.output / name).exists()
             ),
             None,
@@ -4316,6 +4770,7 @@ def create_app() -> FastAPI:
             output_fps, picture_duration = await run_in_threadpool(
                 _video_timing, picture
             )
+            graphic_fps = Fraction(output_fps)
             picture_stat = picture.stat()
             subtitle_track = await run_in_threadpool(partial(
                 _prepare_run_subtitle_track, run, picture,
@@ -4411,7 +4866,7 @@ def create_app() -> FastAPI:
             ))
             cue_windows = {
                 item.graphic_id: resolve_graphic_window(
-                    item, beat_grid=beat_grid, output_fps=output_fps,
+                    item, beat_grid=beat_grid, output_fps=graphic_fps,
                     timeline_duration=picture_duration,
                 )
                 for item in preview_cues
@@ -4475,7 +4930,7 @@ def create_app() -> FastAPI:
                             evidence=evidence_map.get(current.graphic_id),
                             forbidden_positions=set(), keepout_rects=keepouts,
                             beat_grid=beat_grid,
-                            output_fps=output_fps,
+                            output_fps=graphic_fps,
                             timeline_duration=picture_duration,
                         )
                     )
@@ -4617,6 +5072,7 @@ def create_app() -> FastAPI:
         )
 
     @app.put("/api/runs/{run_id}/subtitle-track")
+    @_leased_run_output_async
     async def edit_subtitle_track(run_id: str, request: Request) -> JSONResponse:
         """Keep an edited set of lines beside the ones that were derived.
 
@@ -4681,6 +5137,7 @@ def create_app() -> FastAPI:
         })
 
     @app.post("/api/runs/{run_id}/burn-subtitles")
+    @_leased_run_output_sync
     def burn_subtitles(
         run_id: str, look: str = "plain", font: str = ""
     ) -> JSONResponse:
@@ -4703,7 +5160,7 @@ def create_app() -> FastAPI:
         source = next(
             (
                 run.output / name
-                for name in ("deliverable.mp4", "picture.mp4")
+                for name in ("deliverable.mp4", "draft-preview.mp4", "picture.mp4")
                 if (run.output / name).exists()
             ),
             None,
@@ -4762,7 +5219,7 @@ def create_app() -> FastAPI:
         picture = next(
             (
                 run.output / name
-                for name in ("picture.mp4", "deliverable.mp4")
+                for name in ("picture.mp4", "deliverable.mp4", "draft-preview.mp4")
                 if (run.output / name).exists()
             ),
             None,

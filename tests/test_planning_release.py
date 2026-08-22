@@ -214,6 +214,76 @@ def test_speaker_alignment_is_revalidated_against_protected_source_contracts():
     assert any("starts after protected action a01" in fault for fault in faults)
 
 
+def test_adjacent_speaker_turns_fit_to_exact_apple_audio_before_alignment():
+    from montagewright.pipeline import align_speaker_pictures_to_audio
+    from montagewright.schema import AudioClip
+
+    edl = EDL(project_id="dialogue", clips=[
+        Clip(
+            clip_id="k00", source_id="INT", approx_in_seconds=2.1,
+            approx_out_seconds=3.5, picture_role="speaker",
+        ),
+        Clip(
+            clip_id="k01", source_id="INT", approx_in_seconds=3.5,
+            approx_out_seconds=5.2, picture_role="speaker",
+        ),
+    ], audio_clips=[
+        AudioClip(
+            audio_id="a00", source_id="INT", in_seconds=2.1,
+            out_seconds=3.54, starts_at_clip_id="k00", role="narrative",
+            completion="complete_thought",
+        ),
+        AudioClip(
+            audio_id="a01", source_id="INT", in_seconds=3.54,
+            out_seconds=5.28, starts_at_clip_id="k01", role="narrative",
+            completion="complete_thought",
+        ),
+    ])
+
+    aligned, notes = align_speaker_pictures_to_audio(edl)
+
+    assert aligned.clips[0].approx_in_seconds == 2.1
+    assert aligned.clips[0].approx_out_seconds == 3.54
+    assert abs(aligned.clips[1].approx_in_seconds - 3.54) < 1e-9
+    assert abs(aligned.clips[1].approx_out_seconds - 5.28) < 1e-9
+    assert sum("fitted rounded speaker duration" in note for note in notes) == 2
+
+
+def test_shared_dialogue_boundary_is_not_a_two_voice_overlap():
+    from montagewright.pipeline import align_speaker_pictures_to_audio
+    from montagewright.schema import AudioClip
+
+    # Decimal addition deliberately creates an outgoing end infinitesimally
+    # above the incoming start (13.140000000000002 vs 13.14).
+    first_duration = 11.520000000000003
+    assert 1.62 + first_duration > 13.14
+    edl = EDL(project_id="boundary", clips=[
+        Clip(
+            clip_id="k00", source_id="INT", approx_in_seconds=1.62,
+            approx_out_seconds=1.62 + first_duration, picture_role="speaker",
+        ),
+        Clip(
+            clip_id="k01", source_id="INT", approx_in_seconds=13.5,
+            approx_out_seconds=15.3, picture_role="speaker",
+        ),
+    ], audio_clips=[
+        AudioClip(
+            audio_id="a00", source_id="INT", in_seconds=1.62,
+            out_seconds=13.14, starts_at_clip_id="k00", role="narrative",
+            completion="complete_thought",
+        ),
+        AudioClip(
+            audio_id="a01", source_id="INT", in_seconds=13.5,
+            out_seconds=15.3, starts_at_clip_id="k01", role="narrative",
+            completion="complete_thought",
+        ),
+    ])
+
+    aligned, _ = align_speaker_pictures_to_audio(edl)
+
+    assert aligned.clips[1].approx_in_seconds == 13.5
+
+
 def test_independent_audio_must_fit_inside_the_resolved_picture_timeline():
     from montagewright.planning_release import audio_timeline_faults
     from montagewright.schema import AudioClip

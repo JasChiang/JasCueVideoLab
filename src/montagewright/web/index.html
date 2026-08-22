@@ -1428,6 +1428,7 @@
       <button class="ghost" id="export">匯出 ▾</button>
       <div class="drop hide" id="export-drop">
         <a class="item" id="dl-film" href="#" download>成片（完整畫質）</a>
+        <button type="button" class="item hide" id="approve-release">看完後核准這個版本…</button>
         <button type="button" class="item" id="export-graphics">產生成片＋字卡</button>
         <a class="item hide" id="dl-burned" href="#" download>成片＋燒好的字幕</a>
         <a class="item hide" id="dl-srt" href="#" download>字幕檔 SRT</a>
@@ -1625,6 +1626,15 @@
       <h2>新的一輪</h2>
       <p class="sub">只有素材是一定要給的。其他留空，它會自己決定。</p>
 
+      <details class="setup-advanced"><summary>載入之前保存的剪輯工作單</summary>
+        <div class="row" style="gap:8px;flex-wrap:nowrap;margin-top:10px">
+          <input type="text" id="job-path" placeholder="edit-job.json／edit-job.yaml">
+          <button type="button" class="ghost" id="browse-job">瀏覽…</button>
+          <button type="button" id="load-job">載入</button>
+        </div>
+        <div class="why" id="job-note">載入後仍可在下面調整；Web 會把最後狀態另存成這一輪的新工作單。</div>
+      </details>
+
       <!-- The order somebody decides things in, not the order the command
            line takes them. What the film is about used to sit below two
            collapsed advanced panels, under the heading 創作 Brief. -->
@@ -1691,8 +1701,13 @@
                      style="flex:0 0 84px">
               <select id="duration-mode">
                 <option value="preferred">大約就好</option>
+                <option value="range">落在允許範圍</option>
                 <option value="exact">要剛剛好</option>
               </select>
+            </div>
+            <div class="row hide" id="duration-range-fields" style="gap:8px;margin-top:7px">
+              <label style="flex:1">最短秒數<input type="number" id="minimum-seconds" min="0" step="1" placeholder="例如 27"></label>
+              <label style="flex:1">最長秒數<input type="number" id="maximum-seconds" min="0" step="1" placeholder="例如 33"></label>
             </div>
             <div class="why">「大約」不會用空停留硬補滿。</div></div>
           <div class="field"><label>畫面比例</label>
@@ -1701,6 +1716,15 @@
           <div class="field"><label>現場說話</label>
             <select id="speech"><option value="auto">有人講話就聽寫</option><option value="never">不用聽寫</option></select>
             <div class="why">沒有旁白的活動片可以關掉，省時間。</div></div>
+          <div class="field wide">
+            <details class="deeper"><summary>同一批素材還要其他比例／秒數</summary>
+              <div class="fields">
+                <button type="button" class="ghost" id="add-delivery-variant">＋ 加一個成片版本</button>
+                <div id="delivery-variants"></div>
+                <div class="why">目前上方規格會成為第一版。所有版本會先一起做免費檢查，通過後才開始任何 Gemini 工作。</div>
+              </div>
+            </details>
+          </div>
         </div>
       </section>
 
@@ -1710,12 +1734,45 @@
         <div class="field wide"><label>這是什麼</label>
           <input type="text" id="grounding-target-description" placeholder="例如：參考圖中這一台摺疊手機">
           <div class="why">這一欄加參考圖就夠了，不需要自己寫 spec。留空＝不鎖身分。</div></div>
+        <div class="field wide"><label>主角名稱</label>
+          <input type="text" id="grounding-target-id" value="target.primary" placeholder="例如：sku.flip8">
+          <div class="why">多款產品時用簡短且不重複的名稱，例如 sku.flip8、sku.fold8。</div></div>
+        <div class="field wide"><label>哪些實物都算這個主角</label>
+          <select id="grounding-identity-semantics">
+            <option value="physical_instance">只限參考圖中的同一個實體</option>
+            <option value="sku">同一 SKU 的不同展示機都可以</option>
+            <option value="variant">同 SKU，且顏色／配置也要一致</option>
+            <option value="product_family">指定產品系列的成員都可以</option>
+          </select>
+          <div class="why">人物通常選第一項；新品活動多半選 SKU 或 variant。這會改變辨識邊界，不只是文案。</div></div>
+        <div class="field wide"><label>主角要出現到什麼程度</label>
+          <select id="grounding-presence-policy">
+            <option value="context_allowed">產品鏡頭要正確；可穿插會場、人物與氣氛</option>
+            <option value="target_led">以指定主角為視覺骨幹；context 只在必要時使用</option>
+            <option value="target_only">每一顆畫面都必須含指定主角</option>
+          </select>
+          <div class="why">這是 brief 的出鏡規則，不是辨識信心。選「每一顆」時，純會場或其他產品鏡頭不會進成片。</div></div>
         <div class="field wide"><label>參考圖</label>
           <input type="file" id="reference-images" accept="image/*" multiple>
           <div class="row" style="gap:8px;align-items:center;margin-top:7px">
             <button type="button" class="ghost" id="draft-identity" disabled>讀這幾張圖，幫我寫</button>
             <span class="why" id="draft-note">選好圖之後，讓它先寫一份草稿，你再改。</span>
           </div></div>
+        <div class="field wide">
+          <button type="button" class="ghost" id="add-grounding-target">＋ 再指定一款產品／人物</button>
+          <div id="additional-grounding-targets"></div>
+          <div class="why">每一款各自設定辨識邊界與參考圖；不需要手寫 JSON。</div>
+        </div>
+        <details class="deeper"><summary>商業出鏡硬規則（選填）</summary>
+        <div class="fields">
+          <label class="check field wide"><input type="checkbox" id="require-target-cooccurrence"> 指定的所有主角必須在同一時間、同一個成品 crop 內出現</label>
+          <div class="field wide"><label>禁止出現的主角 ID（一行一個）</label>
+            <textarea id="forbidden-target-ids" placeholder="例如：sku.ultra"></textarea>
+            <div class="why">必須是上面已定義、可被 reference grounding 驗證的 ID。</div></div>
+          <div class="field"><label>禁露開始（成片秒數）</label><input type="number" id="forbidden-start-seconds" min="0" step="0.1" placeholder="片頭"></div>
+          <div class="field"><label>禁露結束（成片秒數）</label><input type="number" id="forbidden-end-seconds" min="0" step="0.1" placeholder="片尾"></div>
+          <div class="why field wide">兩欄留空＝全片禁露；例如 0 到 3 代表 reveal 前三秒不得出現。Pan 依序看到不算同框。</div>
+        </div></details>
         <details class="deeper"><summary>再講細一點（選填）</summary>
         <div class="fields">
         <div class="field wide"><label>可辨識特徵（一行一項）</label>
@@ -1724,6 +1781,7 @@
           <textarea id="grounding-exclusions" placeholder="例如：展開後外形相似的平板、另一個型號、螢幕中的圖片"></textarea></div>
         <div class="field wide"><label>反例照片（會混淆的那個東西長什麼樣）</label>
           <input type="file" id="grounding-negatives" accept="image/*" multiple>
+          <textarea id="grounding-negative-paths" placeholder="或填本機路徑，一行一張"></textarea>
           <div class="why">文字說得出「另一個型號更寬」，說不出它實際長什麼樣。給一張，判定就能直接比對兩張圖，不必靠描述。</div></div>
         </div></details>
         <details class="deeper" id="grounding-spec-details"><summary id="grounding-spec-summary">我已經有 grounding spec</summary>
@@ -1773,8 +1831,11 @@
         </div></details>
       </div>
       <div class="actions">
-        <button id="go" disabled>開始剪</button>
+        <button class="ghost" id="preflight-go" disabled>先做免費檢查</button>
+        <button id="go" disabled>開始剪輯（會使用 Gemini）</button>
+        <input type="checkbox" class="hide" id="preflight-only">
         <label class="check"><input type="checkbox" id="review"> 剪完讓它自己審一遍再改（比較慢，也比較貴）</label>
+        <span class="why">兩個按鈕都會先做完整本機檢查；只有「開始剪輯」在檢查通過後才呼叫 Gemini。開始前會保存可重跑的工作單。</span>
         <span class="grow"></span>
         <button class="ghost" id="close-sheet">關閉</button>
       </div>
@@ -1791,6 +1852,26 @@
       <div class="fault hide" id="fault"></div>
       <ol class="steps" id="steps"></ol>
       <details id="raw"><summary class="why">原始輸出</summary><div id="log"></div></details>
+    </div>
+  </div>
+</div>
+
+<div class="veil hide" id="release-veil">
+  <div class="sheet" style="width:min(520px,100%)">
+    <h2>核准這個成片版本</h2>
+    <p class="sub">核准會綁定你剛剛觀看的檔案雜湊。成片若重新輸出，必須重新觀看與核准。</p>
+    <div class="fields">
+      <div class="field wide"><label for="release-approver">核准人</label>
+        <input id="release-approver" type="text" placeholder="姓名"></div>
+      <div class="field wide"><label for="release-note">檢查備註</label>
+        <textarea id="release-note" placeholder="例如：已確認三款產品、競品禁露、字幕與 CTA。"></textarea></div>
+      <label class="check field wide"><input type="checkbox" id="release-rights"> 我已確認素材、音樂與人物／產品畫面的使用權利</label>
+    </div>
+    <div class="fault hide" id="release-fault" style="margin-top:12px"></div>
+    <div class="actions" style="padding-left:0;padding-right:0">
+      <button class="ghost" id="release-cancel">取消</button>
+      <span class="grow"></span>
+      <button id="release-submit">核准這個檔案</button>
     </div>
   </div>
 </div>
@@ -1824,7 +1905,7 @@ function updateGroundingSpecSummary(inherited = false) {
 let baseRunId = '';
 let inheritOpenedBrief = false;
 
-let picking = '', pickTarget = 'path', pickKind = 'video';
+let picking = '', pickTarget = 'path', pickKind = 'video', pickAppend = false;
 
 async function browseTo(path) {
   const res = await fetch('/api/browse?path=' + encodeURIComponent(path || '')
@@ -1841,10 +1922,10 @@ async function browseTo(path) {
       <span class="ico">▸</span>${esc(f.name)}` +
       (f.clips ? `<span class="count">${f.clips} 支</span>` : '') + `</div>`);
   }
-  const picksAFile = pickKind === 'audio' || pickKind === 'file' || pickKind === 'spec';
+  const picksAFile = pickKind === 'audio' || pickKind === 'file' || pickKind === 'image' || pickKind === 'spec' || pickKind === 'job';
   for (const v of d.videos) {
     rows.push(picksAFile
-      ? `<div class="pick" data-file="${esc(v.path)}"><span class="ico">${pickKind === 'audio' ? '♪' : pickKind === 'spec' ? '{}' : '§'}</span>${esc(v.name)}</div>`
+      ? `<div class="pick" data-file="${esc(v.path)}"><span class="ico">${pickKind === 'audio' ? '♪' : (pickKind === 'spec' || pickKind === 'job') ? '{}' : '§'}</span>${esc(v.name)}</div>`
       : `<div class="pick file"><span class="ico">·</span>${esc(v.name)}</div>`);
   }
   $('listing').innerHTML = rows.join('') ||
@@ -1853,29 +1934,108 @@ async function browseTo(path) {
     ? (picksAFile ? `點一個檔案選它` : `這層有 ${d.videos.length} 支影片`)
     : (pickKind === 'audio' ? '這層沒有音檔，往下點'
       : pickKind === 'file' ? '這層沒有 Brief 檔，往下點'
-      : pickKind === 'spec' ? '這層沒有 JSON，往下點' : '這層沒有影片，往下點');
+      : pickKind === 'image' ? '這層沒有圖片，往下點'
+      : pickKind === 'spec' ? '這層沒有 JSON，往下點'
+      : pickKind === 'job' ? '這層沒有工作單，往下點' : '這層沒有影片，往下點');
   for (const el of $('listing').querySelectorAll('.pick[data-path]')) {
     el.onclick = () => browseTo(el.dataset.path);
   }
   for (const el of $('listing').querySelectorAll('.pick[data-file]')) {
     el.onclick = () => {
-      $(pickTarget).value = el.dataset.file;
+      const target = $(pickTarget);
+      target.value = pickAppend && target.value.trim()
+        ? `${target.value.trim()}\n${el.dataset.file}` : el.dataset.file;
       $('picker').classList.add('hide');
     };
   }
 }
 
-function openPicker(target, kind) {
-  pickTarget = target; pickKind = kind;
+function openPicker(target, kind, append = false) {
+  pickTarget = target; pickKind = kind; pickAppend = append;
   $('use-here').style.display =
-    kind === 'audio' || kind === 'file' || kind === 'spec' ? 'none' : '';
+    kind === 'audio' || kind === 'file' || kind === 'image' || kind === 'spec' || kind === 'job' ? 'none' : '';
   $('picker').classList.remove('hide');
-  browseTo($(target).value.trim());
+  const values = $(target).value.trim().split(/\r?\n/).filter(Boolean);
+  browseTo(values.length ? values[values.length - 1] : '');
 }
 $('browse').addEventListener('click', () => openPicker('path', 'video'));
 $('browse-music').addEventListener('click', () => openPicker('music-path', 'audio'));
 $('browse-brief').addEventListener('click', () => openPicker('brief-path', 'file'));
 $('browse-spec').addEventListener('click', () => openPicker('grounding-spec-path', 'spec'));
+$('browse-job').addEventListener('click', () => openPicker('job-path', 'job'));
+$('job-path').addEventListener('input', () => { delete $('job-path').dataset.loaded; });
+$('duration-mode').addEventListener('change', () => {
+  $('duration-range-fields').classList.toggle('hide', $('duration-mode').value !== 'range');
+});
+
+let groundingTargetSerial = 0;
+let deliveryVariantSerial = 0;
+function addDeliveryVariant(value = {}) {
+  deliveryVariantSerial += 1;
+  const row = document.createElement('div');
+  row.className = 'row delivery-variant';
+  row.style.cssText = 'gap:8px;align-items:end;flex-wrap:wrap;margin-top:8px';
+  row.innerHTML = `<label style="flex:1;min-width:120px">版本名稱<input class="variant-id" value="${esc(value.variant_id || `version-${deliveryVariantSerial}`)}"></label>
+    <label style="flex:0 0 100px">比例<select class="variant-aspect"><option>9:16</option><option>16:9</option><option>1:1</option><option>4:5</option></select></label>
+    <label style="flex:0 0 100px">秒數<input type="number" min="1" step="1" class="variant-seconds" value="${esc(value.delivery?.seconds || 15)}"></label>
+    <label style="flex:0 0 130px">長度規格<select class="variant-duration"><option value="preferred">大約</option><option value="exact">固定</option></select></label>
+    <button type="button" class="ghost variant-remove">移除</button>`;
+  row.querySelector('.variant-aspect').value = value.delivery?.aspect || '16:9';
+  row.querySelector('.variant-duration').value = value.delivery?.duration_mode === 'exact' ? 'exact' : 'preferred';
+  row.querySelector('.variant-remove').addEventListener('click', () => row.remove());
+  $('delivery-variants').appendChild(row);
+}
+$('add-delivery-variant').addEventListener('click', () => addDeliveryVariant());
+
+function deliveryVariants() {
+  return [...document.querySelectorAll('.delivery-variant')].map(row => ({
+    variant_id: row.querySelector('.variant-id').value.trim(),
+    delivery: {
+      aspect: row.querySelector('.variant-aspect').value,
+      seconds: Number(row.querySelector('.variant-seconds').value || 0),
+      duration_mode: row.querySelector('.variant-duration').value,
+    },
+  }));
+}
+
+function addGroundingTarget(value = {}) {
+  groundingTargetSerial += 1;
+  const key = `grounding-extra-${groundingTargetSerial}`;
+  const row = document.createElement('details');
+  row.className = 'deeper grounding-extra';
+  row.open = true;
+  row.innerHTML = `<summary>${esc(value.description || '另一個指定主角')}</summary>
+    <div class="fields">
+      <div class="field wide"><label>主角名稱</label><input class="extra-target-id" value="${esc(value.target_id || '')}" placeholder="sku.fold8"></div>
+      <div class="field wide"><label>這是什麼</label><input class="extra-description" value="${esc(value.description || '')}" placeholder="例如：Samsung Fold8"></div>
+      <div class="field wide"><label>哪些實物算同一主角</label><select class="extra-semantics">
+        <option value="physical_instance">只限同一個實體</option><option value="sku">同一 SKU</option>
+        <option value="variant">同 SKU 與同 variant</option><option value="product_family">同一產品系列</option>
+      </select></div>
+      <div class="field wide"><label>參考圖本機路徑（一行一張）</label>
+        <textarea id="${key}" class="extra-references" placeholder="/Users/…/fold8.jpg">${esc((value.references || []).join('\n'))}</textarea>
+        <button type="button" class="ghost extra-browse">選一張…</button></div>
+      <div class="field wide"><label>可辨識特徵（一行一項）</label><textarea class="extra-cues">${esc((value.identity_cues || []).join('\n'))}</textarea></div>
+      <div class="field wide"><label>不要混淆（一行一項）</label><textarea class="extra-exclusions">${esc((value.exclusions || []).join('\n'))}</textarea></div>
+      <button type="button" class="ghost extra-remove">移除這個主角</button>
+    </div>`;
+  row.querySelector('.extra-semantics').value = value.identity_semantics || 'sku';
+  row.querySelector('.extra-browse').addEventListener('click', () => openPicker(key, 'image', true));
+  row.querySelector('.extra-remove').addEventListener('click', () => row.remove());
+  $('additional-grounding-targets').appendChild(row);
+}
+$('add-grounding-target').addEventListener('click', () => addGroundingTarget());
+
+function additionalGroundingTargets() {
+  return [...document.querySelectorAll('.grounding-extra')].map(row => ({
+    target_id: row.querySelector('.extra-target-id').value.trim(),
+    description: row.querySelector('.extra-description').value.trim(),
+    identity_semantics: row.querySelector('.extra-semantics').value,
+    references: row.querySelector('.extra-references').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
+    identity_cues: row.querySelector('.extra-cues').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
+    exclusions: row.querySelector('.extra-exclusions').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
+  }));
+}
 $('grounding-spec-path').addEventListener('input', () => updateGroundingSpecSummary(false));
 $('grounding-spec-file').addEventListener('change', () => updateGroundingSpecSummary(false));
 $('close-picker').addEventListener('click', () => $('picker').classList.add('hide'));
@@ -1885,12 +2045,71 @@ $('use-here').addEventListener('click', () => {
   if (pickTarget === 'path') sourceChosen();
 });
 
+$('load-job').addEventListener('click', async () => {
+  const path = $('job-path').value.trim();
+  if (!path) { $('job-note').textContent = '還沒選工作單。'; return; }
+  const res = await fetch('/api/jobs/inspect?path=' + encodeURIComponent(path));
+  if (!res.ok) { $('job-note').textContent = await plainError(res); return; }
+  const job = await res.json();
+  $('job-path').dataset.loaded = path;
+  if (job.rushes) { $('path').value = job.rushes; sourceChosen(); }
+  $('brief-path').value = job.brief || '';
+  $('music-path').value = job.music || '';
+  const variants = job.variants || [];
+  const delivery = variants.length ? (variants[0].delivery || {}) : (job.delivery || {});
+  $('aspect').value = delivery.aspect || '9:16';
+  $('seconds').value = delivery.seconds || '';
+  $('duration-mode').value = delivery.duration_mode || 'preferred';
+  $('duration-range-fields').classList.toggle('hide', $('duration-mode').value !== 'range');
+  $('minimum-seconds').value = delivery.minimum_seconds || '';
+  $('maximum-seconds').value = delivery.maximum_seconds || '';
+  $('subtitles').value = delivery.subtitles || 'sidecar';
+  $('setup-look').value = delivery.subtitle_look || 'plain';
+  $('timeline').value = delivery.timeline || 'none';
+  const sound = job.sound || {};
+  $('speech').value = sound.speech || 'auto';
+  $('locale').value = sound.locale || 'zh-TW';
+  const subject = job.subject || {};
+  $('grounding-spec-path').value = subject.grounding_spec || '';
+  $('grounding-target-description').value = subject.description || '';
+  $('grounding-target-id').value = subject.target_id || 'target.primary';
+  $('grounding-identity-semantics').value = subject.identity_semantics || 'physical_instance';
+  $('grounding-presence-policy').value = subject.presence || 'context_allowed';
+  $('reference-image-paths').value = (subject.references || []).join('\n');
+  $('grounding-negative-paths').value = (subject.negatives || []).join('\n');
+  $('grounding-identity-cues').value = (subject.identity_cues || []).join('\n');
+  $('grounding-exclusions').value = (subject.exclusions || []).join('\n');
+  $('additional-grounding-targets').innerHTML = '';
+  (subject.targets || []).slice(1).forEach(addGroundingTarget);
+  $('delivery-variants').innerHTML = '';
+  variants.slice(1).forEach(addDeliveryVariant);
+  const pictureObligations = (job.obligations || []).filter(
+    o => o.track === 'picture' && String(o.obligation_id || '').startsWith('web.')
+  );
+  $('require-target-cooccurrence').checked = pictureObligations.some(
+    o => o.obligation_id === 'web.required-cooccurrence'
+  );
+  const forbidden = pictureObligations.filter(
+    o => String(o.obligation_id || '').startsWith('web.forbidden.')
+  );
+  $('forbidden-target-ids').value = forbidden.flatMap(o => o.refs || []).join('\n');
+  const forbiddenWindow = forbidden[0]?.window || {};
+  $('forbidden-start-seconds').value = forbiddenWindow.start_seconds ?? '';
+  $('forbidden-end-seconds').value = forbiddenWindow.end_seconds ?? '';
+  const run = job.run || {};
+  if (run.budget_usd != null) $('budget').value = run.budget_usd;
+  $('review').checked = Boolean(run.review);
+  updateGroundingSpecSummary(false);
+  $('job-note').textContent = '已載入；常用欄位顯示在下面，進階同步、權利與交付約束會原樣保留。';
+});
+
 // A path in a box is not an answer to "did I pick the right folder". Say
 // what is in it, and only let the run start once there is something to cut.
 let sayingAbout = '';
 async function sourceChosen() {
   const where = $('path').value.trim();
   $('go').disabled = !where && ![...($('rushes').files || [])].length;
+  $('preflight-go').disabled = $('go').disabled;
   if (!where || where === sayingAbout) return;
   sayingAbout = where;
   $('source-say').textContent = '看看裡面有什麼…';
@@ -1902,9 +2121,11 @@ async function sourceChosen() {
       ? `<b>${where.split('/').pop()}</b>　找到 ${clips} 支影片`
       : `<b>${where.split('/').pop()}</b>　這個資料夾裡沒有影片`;
     $('go').disabled = !clips;
+    $('preflight-go').disabled = $('go').disabled;
   } catch (error) {
     $('source-say').textContent = '找不到這個資料夾';
     $('go').disabled = true;
+    $('preflight-go').disabled = true;
   }
 }
 $('path').addEventListener('input', sourceChosen);
@@ -1947,6 +2168,8 @@ $('draft-identity').addEventListener('click', async () => {
   const body = new FormData();
   images.forEach(file => body.append('reference_images', file, file.name));
   body.append('reference_image_paths', $('reference-image-paths').value.trim());
+  body.append('grounding_identity_semantics', $('grounding-identity-semantics').value);
+  body.append('grounding_negative_paths', $('grounding-negative-paths').value.trim());
   try {
     const res = await fetch('/api/grounding/draft', { method: 'POST', body });
     const data = await res.json();
@@ -4972,16 +5195,33 @@ window.addEventListener('popstate', () => {
 
 $('rushes').addEventListener('change', () => {
   $('go').disabled = ![...$('rushes').files].length;
+  $('preflight-go').disabled = $('go').disabled;
   const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
   $('picked').textContent = files.length ? `${files.length} 支影片` : '沒有找到影片檔';
 });
 
-$('go').addEventListener('click', async () => {
+async function startRun(preflightOnly) {
   if ($('go').disabled) return;
   const files = [...$('rushes').files].filter(f => /\.(mp4|mov|m4v|avi|mkv)$/i.test(f.name));
   const path = $('path').value.trim();
   if (!path && !files.length) {
     sayFault('還沒指到素材', '選一個裝著毛片的資料夾，或改用上傳。');
+    return;
+  }
+  const durationMode = $('duration-mode').value;
+  const requestedSeconds = Number($('seconds').value || 0);
+  const minimumSeconds = Number($('minimum-seconds').value || 0);
+  const maximumSeconds = Number($('maximum-seconds').value || 0);
+  if (durationMode === 'exact' && requestedSeconds <= 0) {
+    sayFault('請填固定秒數', '固定長度需要一個大於 0 的秒數，例如 15 或 30。');
+    $('seconds').focus();
+    return;
+  }
+  if (durationMode === 'range' && (
+    minimumSeconds <= 0 || maximumSeconds <= 0 || minimumSeconds > maximumSeconds
+  )) {
+    sayFault('秒數範圍不完整', '最短與最長秒數都要大於 0，而且最短不能大於最長。');
+    $('minimum-seconds').focus();
     return;
   }
   const body = new FormData();
@@ -4990,11 +5230,34 @@ $('go').addEventListener('click', async () => {
   body.append('music_path', $('music-path').value.trim());
   body.append('grounding_spec_path', $('grounding-spec-path').value.trim());
   body.append('reference_image_paths', $('reference-image-paths').value.trim());
-  // The simple mode locks exactly one identity, so its internal name is a
-  // constant and asking for it only invited someone to type a display
-  // string into a field the planning state keys obligations on. The server
-  // still accepts grounding_target_id for spec authors and API callers.
+  body.append('grounding_negative_paths', $('grounding-negative-paths').value.trim());
+  body.append('grounding_target_id', $('grounding-target-id').value.trim());
   body.append('grounding_target_description', $('grounding-target-description').value.trim());
+  body.append('grounding_additional_targets_json', JSON.stringify(additionalGroundingTargets()));
+  body.append('grounding_identity_semantics', $('grounding-identity-semantics').value);
+  body.append('grounding_presence_policy', $('grounding-presence-policy').value);
+  const targetIds = [
+    $('grounding-target-id').value.trim(),
+    ...additionalGroundingTargets().map(one => one.target_id),
+  ].filter(Boolean);
+  const pictureObligations = [];
+  if ($('require-target-cooccurrence').checked && targetIds.length > 1) {
+    pictureObligations.push({
+      obligation_id: 'web.required-cooccurrence', kind: 'required_cooccurrence',
+      track: 'picture', refs: targetIds,
+    });
+  }
+  const forbiddenStart = $('forbidden-start-seconds').value;
+  const forbiddenEnd = $('forbidden-end-seconds').value;
+  $('forbidden-target-ids').value.split(/\r?\n/).map(v => v.trim()).filter(Boolean)
+    .forEach((targetId, index) => pictureObligations.push({
+      obligation_id: `web.forbidden.${index + 1}`, kind: 'forbidden_presence',
+      track: 'picture', refs: [targetId], window: {
+        start_seconds: forbiddenStart === '' ? null : Number(forbiddenStart),
+        end_seconds: forbiddenEnd === '' ? null : Number(forbiddenEnd),
+      },
+    }));
+  body.append('picture_obligations_json', JSON.stringify(pictureObligations));
   body.append('grounding_identity_cues', $('grounding-identity-cues').value.trim());
   body.append('grounding_exclusions', $('grounding-exclusions').value.trim());
   const groundingSpecFile = $('grounding-spec-file').files[0];
@@ -5011,19 +5274,25 @@ $('go').addEventListener('click', async () => {
   body.append('locale', $('locale').value.trim());
   body.append('brief', $('brief').value);
   body.append('brief_path', $('brief-path').value.trim());
+  body.append('loaded_job_path', $('job-path').dataset.loaded || '');
   body.append('base_run_id', baseRunId);
   body.append('inherit_brief', $('inherit-brief').checked ? 'true' : 'false');
   body.append('aspect', $('aspect').value);
   body.append('seconds', $('seconds').value || '0');
-  body.append('duration_mode', $('duration-mode').value);
+  body.append('duration_mode', durationMode);
+  body.append('delivery_variants_json', JSON.stringify(deliveryVariants()));
+  if ($('minimum-seconds').value) body.append('minimum_seconds', $('minimum-seconds').value);
+  if ($('maximum-seconds').value) body.append('maximum_seconds', $('maximum-seconds').value);
   body.append('budget', $('budget').value);
   body.append('review', $('review').checked ? 'true' : 'false');
+  body.append('preflight_only', preflightOnly ? 'true' : 'false');
   body.append('timeline', $('timeline').value);
   body.append('subtitles', $('subtitles').value);
   body.append('subtitle_look', $('setup-look').value);
   body.append('subtitle_font', $('setup-font').value);
 
   $('go').disabled = true;
+  $('preflight-go').disabled = true;
   clearInterval(timer); clearInterval(ticker);
   $('veil').classList.remove('hide');
   $('progress').classList.remove('hide');
@@ -5050,6 +5319,7 @@ $('go').addEventListener('click', async () => {
     $('fault').classList.remove('hide');
     $('log').textContent = `啟動失敗：${message}`;
     $('go').disabled = false;
+    $('preflight-go').disabled = false;
     return;
   }
   if (!res.ok) {
@@ -5067,9 +5337,12 @@ $('go').addEventListener('click', async () => {
     $('fault').classList.remove('hide');
     $('log').textContent = '啟動失敗：' + message;
     $('go').disabled = false;
+    $('preflight-go').disabled = false;
     return;
   }
-  runId = (await res.json()).run_id;
+  const started = await res.json();
+  runId = started.run_id;
+  if (started.job) $('job-note').textContent = '本輪工作單：' + started.job;
   // A run that is still cutting is the one worth being able to reload back
   // into, more than a finished one.
   markRunInUrl(runId, 'push');
@@ -5087,7 +5360,9 @@ $('go').addEventListener('click', async () => {
   timer = setInterval(poll, 1200);
   ticker = setInterval(() => { paintSteps(lastProgress, 'running'); }, 1000);
   poll();
-});
+}
+$('go').addEventListener('click', () => startRun(false));
+$('preflight-go').addEventListener('click', () => startRun(true));
 
 $('resume').addEventListener('click', async () => {
   const res = await fetch(`/api/runs/${runId}/resume`, { method: 'POST' });
@@ -5396,6 +5671,7 @@ async function poll() {
 
   if (data.state !== 'running') {
     clearInterval(timer); clearInterval(ticker); $('go').disabled = false;
+    $('preflight-go').disabled = false;
     if (data.has_video) {
       $('video').src = `/api/runs/${runId}/video`;
       $('download').href = `/api/runs/${runId}/deliverable`;
@@ -6063,7 +6339,49 @@ function wireExports(report) {
   $('dl-srt').href = `/api/runs/${runId}/subtitles`;
   $('dl-burned').classList.toggle('hide', !subsEdited && !spoken);
   $('dl-burned').href = `/api/runs/${runId}/burned`;
+  fetch(`/api/runs/${runId}/release-status`).then(async response => {
+    if (!response.ok) return;
+    const release = await response.json();
+    $('approve-release').classList.toggle('hide', release.status !== 'draft');
+    $('approve-release').dataset.sha256 = release.artifact_sha256 || '';
+    $('dl-film').textContent = release.status === 'released'
+      ? '成片（已核准）' : '草稿預覽（尚未核准）';
+  });
 }
+
+$('approve-release').addEventListener('click', () => {
+  $('release-fault').classList.add('hide');
+  $('release-veil').classList.remove('hide');
+  $('release-approver').focus();
+});
+$('release-cancel').addEventListener('click', () => $('release-veil').classList.add('hide'));
+$('release-submit').addEventListener('click', async () => {
+  const approver = $('release-approver').value.trim();
+  const note = $('release-note').value.trim();
+  if (!approver || !$('release-rights').checked) {
+    $('release-fault').textContent = '請填核准人，並明確確認素材權利。';
+    $('release-fault').classList.remove('hide');
+    return;
+  }
+  const body = new FormData();
+  body.append('approver', approver);
+  body.append('approval_note', note);
+  body.append('expected_artifact_sha256', $('approve-release').dataset.sha256 || '');
+  body.append('acknowledge_rights', 'true');
+  $('release-submit').disabled = true;
+  const response = await fetch(`/api/runs/${runId}/release`, {method: 'POST', body});
+  $('release-submit').disabled = false;
+  if (!response.ok) {
+    $('release-fault').textContent = await plainError(response);
+    $('release-fault').classList.remove('hide');
+    return;
+  }
+  $('release-veil').classList.add('hide');
+  $('approve-release').classList.add('hide');
+  $('dl-film').textContent = '成片（已核准）';
+  $('notice').textContent = '已核准並綁定這個成片檔案';
+  $('notice').classList.remove('hide');
+});
 
 // The four operations captioning actually needs. Everything else is
 // typing, which the list already does.

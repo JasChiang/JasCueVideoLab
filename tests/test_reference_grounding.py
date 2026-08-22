@@ -762,6 +762,7 @@ def test_simple_builder_creates_content_addressed_approved_lock(tmp_path):
         stable_exclusions=("ordinary tablet",),
         positive_images=(positive,),
         negative_images=(negative,),
+        editorial_presence_policy="target_only",
     )
 
     target = spec.identity_lock.identity.target("device.fold")
@@ -773,6 +774,40 @@ def test_simple_builder_creates_content_addressed_approved_lock(tmp_path):
         for reference in spec.reference_images
     )
     assert spec.identity_lock.contract_version == "grounding-query-lock-v1"
+    assert (
+        spec.identity_lock.framing.editorial_presence_policy == "target_only"
+    )
+
+
+def test_multi_builder_keeps_each_sku_and_its_reference_authority(tmp_path):
+    from montagewright.reference_grounding import build_multi_reference_grounding_spec
+
+    flip = tmp_path / "flip.jpg"
+    fold = tmp_path / "fold.jpg"
+    flip.write_bytes(b"flip identity bytes")
+    fold.write_bytes(b"fold identity bytes")
+    spec = build_multi_reference_grounding_spec(
+        tmp_path / "three-products.json",
+        targets=(
+            {
+                "target_id": "sku.flip8", "description": "Z Flip8",
+                "identity_semantics": "sku", "references": (flip,),
+            },
+            {
+                "target_id": "sku.fold8", "description": "Fold8",
+                "identity_semantics": "sku", "references": (fold,),
+            },
+        ),
+        editorial_presence_policy="target_led",
+    )
+
+    assert [one.target_id for one in spec.identity_lock.identity.targets] == [
+        "sku.flip8", "sku.fold8",
+    ]
+    assert len({one.frame_id for one in spec.reference_images}) == 2
+    assert spec.identity_lock.framing.required_target_ids == (
+        "sku.flip8", "sku.fold8",
+    )
 
 
 def test_reference_prompt_parts_without_client_is_text_only_and_never_reads_media(
@@ -1483,3 +1518,69 @@ def test_exact_frame_output_budget_scales_for_multi_frame_answers():
     assert exact_frame_output_budget(1) == 4096
     assert exact_frame_output_budget(5) == 7424
     assert exact_frame_output_budget(8) == 11264
+
+
+def test_co_visible_group_requires_same_moment_and_delivery_crop_visibility():
+    from montagewright.pipeline import _co_visible_group_boxes
+
+    primary = [{
+        "frame_index": 0, "present": True,
+        "centre_x": 0.2, "centre_y": 0.5, "width": 0.18, "height": 0.4,
+    }]
+    other = ({
+        "frame_index": 0, "present": True,
+        "centre_x": 0.8, "centre_y": 0.5, "width": 0.18, "height": 0.4,
+    },)
+    references = {"sku.ultra": (list(other), [1.0], ())}
+
+    vertical = _co_visible_group_boxes(
+        primary, [1.0], ["sku.ultra"], references,
+        crop_width=0.316, crop_height=1.0, min_visible=0.85,
+    )
+    wide = _co_visible_group_boxes(
+        primary, [1.0], ["sku.ultra"], references,
+        crop_width=1.0, crop_height=1.0, min_visible=0.85,
+    )
+    wrong_time = _co_visible_group_boxes(
+        primary, [1.0], ["sku.ultra"],
+        {"sku.ultra": (list(other), [1.5], ())},
+        crop_width=1.0, crop_height=1.0, min_visible=0.85,
+    )
+
+    assert vertical == []
+    assert wide and wide[0]["geometry_source"] == "sam2.1_group_union"
+    assert wrong_time == []
+
+
+def test_forbidden_absence_is_a_pass_and_window_uses_film_clock():
+    from montagewright.job import TimelineObligation, TimelineWindow
+    from montagewright.pipeline import (
+        _forbidden_obligation_applies, _reference_absence_blocks,
+    )
+
+    obligation = TimelineObligation(
+        obligation_id="ultra-before-reveal",
+        kind="forbidden_presence",
+        refs=("sku.ultra",),
+        window=TimelineWindow(start_seconds=0.0, end_seconds=3.0),
+    )
+    assert not _reference_absence_blocks("sku.ultra", ["sku.fold"])
+    assert _forbidden_obligation_applies(obligation, "sku.ultra", 2.0, 12.0)
+    assert not _forbidden_obligation_applies(obligation, "sku.ultra", 10.0, 12.0)
+    assert not _forbidden_obligation_applies(obligation, "sku.fold", 2.0, 12.0)
+
+
+def test_an_excluded_lookalike_is_not_itself_a_forbidden_rule():
+    """A Fold decision may exclude the approved Ultra beside it in a group shot."""
+
+    from montagewright.job import TimelineObligation
+    from montagewright.pipeline import _forbidden_obligation_applies
+
+    prohibit_competitor = TimelineObligation(
+        obligation_id="no-competitor",
+        kind="forbidden_presence",
+        refs=("brand.competitor",),
+    )
+    assert not _forbidden_obligation_applies(
+        prohibit_competitor, "sku.ultra", 1.0, 5.0
+    )

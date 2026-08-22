@@ -86,6 +86,84 @@ def test_one_audio_assignment_runs_continuously_across_three_picture_cuts(
     assert (tmp_path / "out" / "voice-as-laid.m4a").exists()
 
 
+def test_music_free_dialogue_is_mastered_and_tagged(tmp_path: Path, monkeypatch) -> None:
+    """An interview without music still honours its delivery master."""
+
+    import re
+    import montagewright.renderer as renderer
+
+    picture_path = tmp_path / "picture.mp4"
+    _silent_colour_clip(picture_path, seconds=3, colour="blue")
+    voice_path = tmp_path / "voice.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=black:s=160x90:d=3:r=30",
+        "-f", "lavfi", "-i",
+        "sine=frequency=440:duration=3:sample_rate=48000,volume=0.03",
+        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", str(voice_path),
+    ], check=True)
+    source = Source("picture", picture_path, 3, 160, 90)
+    voice = Source("voice", voice_path, 3, 160, 90)
+    plan = RenderPlan(
+        project_id="dialogue-master", output_size=(160, 90), output_fps=30,
+        segments=[Segment("k00", source, 0, 3)],
+        audio_assignments=[AudioAssignment(
+            audio_id="a00", source=voice, in_seconds=0, out_seconds=3,
+            timeline_in_seconds=0, timeline_start_frame=0, frame_count=90,
+            role="narrative", completion="complete_thought",
+        )],
+        audio_track_explicit=True, loudness_lufs=-14.0,
+    )
+    monkeypatch.setattr(renderer, "_encoder", lambda *_: "libx264")
+
+    made = render(plan, tmp_path / "out")
+    measured = subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostats", "-i", str(made.deliverable),
+        "-filter_complex", "ebur128=peak=true", "-f", "null", "-",
+    ], capture_output=True, text=True, check=True)
+    values = re.findall(r"I:\s*(-?[0-9.]+) LUFS", measured.stderr)
+    assert values and abs(float(values[-1]) - (-14.0)) <= 1.0
+    frame = json.loads(subprocess.check_output([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_frames", "-read_intervals", "%+#1", "-show_entries",
+        "frame=color_primaries,color_transfer", "-of", "json",
+        str(made.deliverable),
+    ]))["frames"][0]
+    assert frame["color_primaries"] == "bt709"
+    assert frame["color_transfer"] == "bt709"
+
+
+def test_video_only_first_segment_cannot_silently_drop_later_source_audio(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import montagewright.renderer as renderer
+
+    silent = tmp_path / "video-only.mp4"
+    _colour_clip(silent, fps=30, colour="black")
+    audible = tmp_path / "audible.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=white:s=320x180:d=0.6:r=30",
+        "-f", "lavfi", "-i", "sine=frequency=600:duration=0.6:sample_rate=48000",
+        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", str(audible),
+    ], check=True)
+    plan = RenderPlan(
+        project_id="mixed-layout", output_size=(320, 180), output_fps=30,
+        segments=[
+            Segment("k00", Source("silent", silent, .6, 320, 180), 0, .6),
+            Segment("k01", Source("audible", audible, .6, 320, 180), 0, .6),
+        ],
+    )
+    monkeypatch.setattr(renderer, "_encoder", lambda *_: "libx264")
+
+    made = render(plan, tmp_path / "mixed-out", keep_voice=True)
+
+    assert _pcm_peak(made.deliverable, .2) < 200
+    assert _pcm_peak(made.deliverable, .9) > 1000
+
+
 def test_subtitles_follow_the_audio_assignment_not_picture_boundaries() -> None:
     from types import SimpleNamespace
     from montagewright.transcript import against_audio_assignments
@@ -170,6 +248,74 @@ def test_audio_assignment_uses_the_same_master_frame_clock_as_picture() -> None:
     # .515s is cumulatively allocated to frame 15, then .1s adds 3 frames.
     assert plan.audio_assignments[0].timeline_start_frame == 18
     assert plan.audio_assignments[0].timeline_in_seconds == .6
+
+
+def test_one_frame_dialogue_overlap_preserves_the_last_phoneme() -> None:
+    from montagewright.executor import plan_render
+    from montagewright.schema import AudioClip, Clip, EDL
+
+    source = Source("A", Path("A.mp4"), 20, 160, 90)
+    edl = EDL(project_id="fractional-dialogue", clips=[
+        Clip(
+            clip_id="k00", source_id="A", approx_in_seconds=0,
+            approx_out_seconds=1.54, in_looks_like="first speaker",
+            energy_intent="medium",
+        ),
+        Clip(
+            clip_id="k01", source_id="A", approx_in_seconds=2,
+            approx_out_seconds=3, in_looks_like="second speaker",
+            energy_intent="medium",
+        ),
+    ], audio_clips=[
+        AudioClip(
+            audio_id="a00", source_id="A", in_seconds=4,
+            out_seconds=5.56, starts_at_clip_id="k00", role="narrative",
+            completion="complete_thought",
+        ),
+        AudioClip(
+            audio_id="a01", source_id="A", in_seconds=6,
+            out_seconds=7, starts_at_clip_id="k01", role="narrative",
+            completion="complete_thought",
+        ),
+    ])
+
+    plan = plan_render(edl, {"A": source}, output_fps=30)
+
+    assert plan.audio_assignments[0].frame_count == 47
+    assert plan.audio_assignments[1].timeline_start_frame == 46
+    assert any("share one delivery frame" in note for note in plan.notes)
+
+
+def test_renderer_accepts_the_same_one_frame_dialogue_overlap(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import montagewright.renderer as renderer
+
+    picture = tmp_path / "picture.mp4"
+    picture.touch()
+    source = Source("A", tmp_path / "voice.wav", 2, 160, 90)
+    assignments = [
+        AudioAssignment(
+            audio_id="a00", source=source, in_seconds=0,
+            out_seconds=47 / 30, timeline_in_seconds=0,
+            timeline_start_frame=0, frame_count=47, role="narrative",
+            completion="complete_thought",
+        ),
+        AudioAssignment(
+            audio_id="a01", source=source, in_seconds=0,
+            out_seconds=1, timeline_in_seconds=46 / 30,
+            timeline_start_frame=46, frame_count=30, role="narrative",
+            completion="complete_thought",
+        ),
+    ]
+    monkeypatch.setattr(renderer, "probe_duration", lambda _: 3.0)
+    monkeypatch.setattr(renderer, "_run", lambda _: None)
+
+    made = renderer._lay_audio_assignments(
+        picture, assignments, tmp_path / "voice-as-laid.m4a", output_fps=30,
+    )
+
+    assert made.name == "voice-as-laid.m4a"
 
 
 def test_web_current_timeline_v2_round_trips_independent_audio(

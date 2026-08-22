@@ -46,6 +46,7 @@ def test_merged_schema_drops_the_commitment_machinery():
         assert gone not in props, gone
     shot = plan["properties"]["shots"]["items"]["properties"]
     assert "tier" not in shot
+    assert "commitment_id" not in shot
 
 
 def test_merged_schema_adds_fallback_music_and_optional_length():
@@ -53,8 +54,14 @@ def test_merged_schema_adds_fallback_music_and_optional_length():
     props = plan["properties"]
     shot = props["shots"]["items"]["properties"]
     # Fallback is a substitution field, and the music sync is folded in.
-    assert "fallback_source" in shot
+    assert "fallback_span_id" in shot
+    assert "enum" not in shot["fallback_span_id"]
     for name in ("sync_to", "beats", "cut_on_beat"):
+        assert name in shot, name
+    for name in (
+        "story_point", "continuity_mode", "cut_motivation",
+        "source_event_ref", "source_event_relation", "event_tolerance_frames",
+    ):
         assert name in shot, name
     # target_seconds exists but is optional -- omit it for free length.
     assert "target_seconds" in props
@@ -66,6 +73,18 @@ def test_merged_schema_adds_fallback_music_and_optional_length():
         "music_from_seconds", "music_spans", "shots",
     ):
         assert sibling in props, sibling
+
+
+def test_merged_audio_track_uses_local_id_audit_not_a_large_schema_enum():
+    plan = planner._editorial_plan_schema(
+        ["C1:s00"], audio_span_ids=["C1:t00-t02"], action_ids=["a1"],
+    )
+    audio = plan["properties"]["audio_assignments"]
+    assert "audio_assignments" in plan["required"]
+    assert "enum" not in audio["items"]["properties"]["audio_span_id"]
+    shot = plan["properties"]["shots"]["items"]["properties"]
+    assert "enum" not in shot["span_id"]
+    assert "enum" not in shot["action_id"]
 
 
 def test_merged_schema_forbids_sub_second_timestamps():
@@ -101,3 +120,35 @@ def test_merged_prompt_carries_the_coverage_and_fallback_rules():
     assert "定調" in text and "選鏡" in text and "節奏" in text
     # And the whole-second timestamp rule (1 fps -> no invented sub-second).
     assert "0:02.5" in text and "整秒" in text
+    # It is one authored decision, not the old rhythm role claiming that
+    # picture and order were already locked inside the same supposedly merged call.
+    assert "畫面與順序已選好" not in text
+    assert "continuity_mode" in text and "J-cut" in text
+
+
+def test_event_catalog_publishes_measured_span_and_action_boundaries():
+    from montagewright.planner import MaterialItem, editorial_event_catalog
+    from montagewright.spans import Span
+
+    item = MaterialItem(
+        source_id="C1", duration_seconds=10.0, summary="phone folds",
+        spans=(Span("C1:s00", "C1", 1.0, 8.0, "usable", "locked"),),
+        action_windows=(("a01", 2.0, 5.0),),
+    )
+    refs, text = editorial_event_catalog([item])
+    assert "span_start:C1:s00" in refs
+    assert "action_complete:C1:a01" in refs
+    assert "5.000s" not in text
+    assert "action_complete:C1:a01" in text
+def test_look_projection_preserves_simultaneous_grounded_identities():
+    from montagewright.schema import looks_of
+
+    looks = looks_of({"looks": [{
+        "at": "Fold8",
+        "entity_id": "sku.fold8",
+        "co_visible_entity_ids": ["sku.flip8", "sku.ultra"],
+        "seconds": 2.0,
+        "framing": "thirds",
+    }]})
+
+    assert looks[0].co_visible_entity_ids == ["sku.flip8", "sku.ultra"]

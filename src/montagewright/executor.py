@@ -206,6 +206,9 @@ class AudioAssignment:
     completion: str = "none"
     gain_db: float = 0.0
     why: str = ""
+    audio_stream_index: int | None = None
+    audio_channel: int | None = None
+    source_span_id: str = ""
 
     @property
     def duration_seconds(self) -> float:
@@ -245,6 +248,7 @@ class RenderPlan:
     # One CFR timeline for every source. Source FPS is observation, not a
     # property that may leak across cuts into a concatenated deliverable.
     output_fps: int = 30
+    loudness_lufs: float = -14.0
     # Where in the track the bed starts, carried from the EDL so the renderer
     # does not have to know about planning to lay music that is not the intro.
     music_from_seconds: float = 0.0
@@ -320,6 +324,7 @@ def plan_render(
     crop_paths: "dict[str, CropPath] | None" = None,
     output_size: "tuple[int, int] | None" = None,
     output_fps: int = 30,
+    loudness_lufs: float = -14.0,
 ) -> RenderPlan:
     """Compile an EDL into segments. Never returns fewer than it was given.
 
@@ -331,6 +336,8 @@ def plan_render(
 
     if output_fps not in {24, 25, 30, 50, 60}:
         raise ValueError("output_fps must be one of 24, 25, 30, 50 or 60")
+    if not -24.0 <= loudness_lufs <= -9.0:
+        raise ValueError("loudness_lufs must be between -24 and -9")
     segments: list[Segment] = []
     degradations: list[DegradationStep] = []
     notes: list[str] = []
@@ -423,6 +430,9 @@ def plan_render(
             completion=audio.completion,
             gain_db=audio.gain_db,
             why=audio.why,
+            audio_stream_index=audio.audio_stream_index,
+            audio_channel=audio.audio_channel,
+            source_span_id=audio.source_span_id,
         ))
     # Once a project uses the explicit sound contract, every retained piece
     # of sync/ambient/narrative source audio joins that track. Otherwise the
@@ -484,6 +494,19 @@ def plan_render(
     narrative.sort()
     for previous, here in zip(narrative, narrative[1:]):
         if here[0] < previous[1]:
+            overlap_frames = previous[1] - here[0]
+            if overlap_frames <= 1:
+                # A measured utterance can end at a fractional delivery
+                # frame (1.56s == 46.8 frames at 30fps). Preserve the final
+                # phoneme and let the laid dialogue track crossfade/mix for
+                # at most one frame; cutting the word to satisfy CFR would be
+                # the less faithful edit. Anything larger is a real timeline
+                # contradiction and remains blocked.
+                notes.append(
+                    f"narrative audio {previous[2]} and {here[2]} share "
+                    "one delivery frame due to source-clock quantization"
+                )
+                continue
             raise ValueError(
                 f"narrative audio {previous[2]} overlaps {here[2]}"
             )
@@ -494,6 +517,7 @@ def plan_render(
         notes=notes,
         output_size=output_size or delivery_size(target_aspect or 9 / 16),
         output_fps=output_fps,
+        loudness_lufs=loudness_lufs,
         music_from_seconds=getattr(edl, "music_from_seconds", 0.0),
         music_spans=list(getattr(edl, "music_spans", []) or []),
         audio_assignments=audio_assignments,

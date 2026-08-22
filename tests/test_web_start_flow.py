@@ -1,4 +1,6 @@
 import io
+import hashlib
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -66,6 +68,47 @@ def test_web_children_preserve_an_explicit_cache_home(tmp_path, monkeypatch):
         configured / "montagewright" / "library"
     )
     assert environment["PYTHONUNBUFFERED"] == "1"
+
+
+def test_web_image_picker_lists_product_reference_images(tmp_path):
+    (tmp_path / "fold8.jpg").write_bytes(b"jpg")
+    (tmp_path / "brief.md").write_text("brief", encoding="utf-8")
+
+    response = TestClient(web.create_app()).get(
+        "/api/browse", params={"path": str(tmp_path), "kind": "image"},
+    )
+
+    assert response.status_code == 200
+    assert [one["name"] for one in response.json()["videos"]] == ["fold8.jpg"]
+
+
+def test_web_can_load_a_saved_job_and_resolve_its_relative_paths(tmp_path):
+    from montagewright.job import EditJob, Subject, write_job
+
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    reference = tmp_path / "flip.png"
+    reference.touch()
+    job_path = write_job(tmp_path / "edit-job.json", EditJob(
+        rushes="rushes",
+        output="out",
+        subject=Subject(
+            description="the specified foldable phone",
+            references=("flip.png",),
+            presence="target_only",
+        ),
+    ))
+
+    response = TestClient(web.create_app()).get(
+        "/api/jobs/inspect", params={"path": str(job_path)},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["rushes"] == str(rushes)
+    assert payload["output"] == str(tmp_path / "out")
+    assert payload["subject"]["references"] == [str(reference)]
+    assert payload["subject"]["presence"] == "target_only"
 
 
 def test_default_material_library_follows_xdg_cache_home(tmp_path, monkeypatch):
@@ -193,15 +236,220 @@ def test_web_duration_contract_is_explicit_and_reaches_the_cli(
 
     assert response.status_code == 200
     run = web.RUNS[response.json()["run_id"]]
-    at = run.command.index("--duration-mode")
-    assert run.command[at + 1] == "preferred"
+    from montagewright.job import load_job
+
+    job = load_job(Path(response.json()["job"]))
+    assert job.delivery.seconds == 30
+    assert job.delivery.duration_mode == "preferred"
+    assert run.command[-2:] == ["--job", response.json()["job"]]
     page = (Path(__file__).parents[1] / "src/montagewright/web/index.html").read_text()
     assert 'id="duration-mode"' in page
     # The wording is the interface's to choose; what this test defends is that
     # both modes are offered and named for what they do, so the difference is
     # a decision somebody makes rather than a flag they inherit.
     assert 'value="preferred"' in page and 'value="exact"' in page
+    assert 'value="range"' in page
     assert "不會用空停留硬補滿" in page
+
+
+def test_web_builds_campaign_variants_without_handwritten_job(tmp_path, monkeypatch):
+    from montagewright.job import load_job
+
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(web.subprocess, "Popen", _FinishedProcess)
+    web.RUNS.clear()
+
+    response = TestClient(web.create_app()).post("/api/runs", data={
+        "source_path": str(rushes), "review": "false",
+        "aspect": "9:16", "seconds": "15", "duration_mode": "exact",
+        "delivery_variants_json": json.dumps([{
+            "variant_id": "wide-30",
+            "delivery": {"aspect": "16:9", "seconds": 30, "duration_mode": "exact"},
+        }]),
+    })
+
+    assert response.status_code == 200
+    job = load_job(Path(response.json()["job"]))
+    assert [(one.variant_id, one.delivery.aspect, one.delivery.seconds) for one in job.variants] == [
+        ("primary", "9:16", 15), ("wide-30", "16:9", 30),
+    ]
+
+
+def test_starting_a_loaded_job_preserves_advanced_contracts(tmp_path, monkeypatch):
+    from montagewright.job import EditJob, TimelineObligation, write_job, load_job
+
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    saved = write_job(tmp_path / "advanced.json", EditJob.model_validate({
+        "rushes": str(rushes),
+        "dialogue": {"edit_mode": "phrase_edit", "remove_fillers": True},
+        "music_policy": {"allowed_ranges": [
+            {"start_seconds": 4, "end_seconds": 20},
+        ]},
+        "obligations": [{
+            "obligation_id": "cta", "kind": "minimum_read",
+            "track": "graphic", "refs": ["cta.copy"], "minimum_seconds": 2,
+        }, {
+            "obligation_id": "web.forbidden.old", "kind": "forbidden_presence",
+            "track": "picture", "refs": ["device.old"],
+        }],
+        "rights": {"allowed_platforms": ["YouTube"]},
+        "picture_composition": {"mode": "none"},
+        "variants": [{
+            "variant_id": "vertical", "delivery": {"aspect": "9:16"},
+        }],
+    }))
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(web.subprocess, "Popen", _FinishedProcess)
+    web.RUNS.clear()
+
+    response = TestClient(web.create_app()).post("/api/runs", data={
+        "source_path": str(rushes), "loaded_job_path": str(saved),
+        "review": "false",
+        "picture_obligations_json": json.dumps([{
+            "obligation_id": "web.forbidden.1",
+            "kind": "forbidden_presence", "track": "picture",
+            "refs": ["device.fold"],
+        }]),
+    })
+
+    assert response.status_code == 200
+    actual = load_job(Path(response.json()["job"]))
+    assert actual.dialogue.edit_mode == "phrase_edit"
+    assert actual.dialogue.remove_fillers is True
+    assert actual.music_policy.allowed_ranges[0].start_seconds == 4
+    assert [one.obligation_id for one in actual.obligations] == [
+        "cta", "web.forbidden.1",
+    ]
+    assert actual.rights.allowed_platforms == ("YouTube",)
+    assert actual.variants[0].variant_id == "vertical"
+
+    cleared = TestClient(web.create_app()).post("/api/runs", data={
+        "source_path": str(rushes), "loaded_job_path": str(saved),
+        "review": "false", "picture_obligations_json": "[]",
+    })
+    assert cleared.status_code == 200
+    cleared_job = load_job(Path(cleared.json()["job"]))
+    assert [one.obligation_id for one in cleared_job.obligations] == ["cta"]
+
+
+def test_web_builds_multi_sku_grounding_without_handwritten_json(
+    tmp_path, monkeypatch,
+):
+    from montagewright.job import load_job
+    from montagewright.reference_grounding import load_grounding_spec
+
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    flip = tmp_path / "flip.jpg"
+    fold = tmp_path / "fold.jpg"
+    flip.write_bytes(b"flip")
+    fold.write_bytes(b"fold")
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(web.subprocess, "Popen", _FinishedProcess)
+    web.RUNS.clear()
+
+    response = TestClient(web.create_app()).post("/api/runs", data={
+        "source_path": str(rushes), "review": "false",
+        "grounding_target_id": "sku.flip8",
+        "grounding_target_description": "Z Flip8",
+        "grounding_identity_semantics": "sku",
+        "reference_image_paths": str(flip),
+        "grounding_additional_targets_json": json.dumps([{
+            "target_id": "sku.fold8", "description": "Fold8",
+            "identity_semantics": "sku", "references": [str(fold)],
+        }]),
+    })
+
+    assert response.status_code == 200
+    job = load_job(Path(response.json()["job"]))
+    assert job.subject is not None and job.subject.grounding_spec
+    spec = load_grounding_spec(Path(job.subject.grounding_spec))
+    assert [one.target_id for one in spec.identity_lock.identity.targets] == [
+        "sku.flip8", "sku.fold8",
+    ]
+
+
+def test_web_can_author_group_and_timed_forbidden_picture_rules(
+    tmp_path, monkeypatch,
+):
+    from montagewright.job import load_job
+
+    rushes = tmp_path / "rushes"
+    rushes.mkdir()
+    (rushes / "take.mp4").touch()
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(web.subprocess, "Popen", _FinishedProcess)
+    web.RUNS.clear()
+
+    rules = [{
+        "obligation_id": "web.required-cooccurrence",
+        "kind": "required_cooccurrence", "track": "picture",
+        "refs": ["sku.flip8", "sku.fold8"],
+    }, {
+        "obligation_id": "web.forbidden.1",
+        "kind": "forbidden_presence", "track": "picture",
+        "refs": ["sku.fold8"],
+        "window": {"start_seconds": 0, "end_seconds": 3},
+    }]
+    response = TestClient(web.create_app()).post("/api/runs", data={
+        "source_path": str(rushes), "review": "false",
+        "picture_obligations_json": json.dumps(rules),
+    })
+
+    assert response.status_code == 200
+    job = load_job(Path(response.json()["job"]))
+    assert [one.kind for one in job.obligations] == [
+        "required_cooccurrence", "forbidden_presence",
+    ]
+    assert job.obligations[1].window.end_seconds == 3
+
+
+def test_web_release_approval_is_bound_to_the_watched_draft_hash(
+    tmp_path, monkeypatch,
+):
+    from montagewright.job import EditJob, load_job, write_job
+    import montagewright.release as release
+
+    root = tmp_path / "run"
+    output = root / "out"
+    (output / "work").mkdir(parents=True)
+    draft = output / "draft-preview.mp4"
+    draft.write_bytes(b"the watched draft")
+    digest = hashlib.sha256(draft.read_bytes()).hexdigest()
+    write_job(output / "work" / "resolved-job.json", EditJob())
+    (output / "report.json").write_text(json.dumps({
+        "delivery_status": "ready", "plan_disagreements": [],
+    }), encoding="utf-8")
+    (output / "work" / "ingest-manifest.json").write_text(json.dumps({
+        "inventory_sha256": "a" * 64,
+    }), encoding="utf-8")
+    monkeypatch.setattr(release, "technical_qc_faults", lambda *_a, **_k: ())
+    monkeypatch.setattr(web, "RUNS_ROOT", tmp_path)
+    web.RUNS.clear()
+    web.RUNS["approved"] = web.Run(
+        "approved", root, source="", command=[], state="done",
+    )
+
+    response = TestClient(web.create_app()).post(
+        "/api/runs/approved/release",
+        data={
+            "approver": "Jas", "approval_note": "checked final crop",
+            "expected_artifact_sha256": digest,
+            "acknowledge_rights": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "released"
+    approved = load_job(output / "work" / "approved-job.json")
+    assert approved.release.approved_artifact_sha256 == digest
+    assert (output / "deliverable.mp4").read_bytes() == b"the watched draft"
 
 
 def test_new_round_inherits_parent_brief_on_the_server(
@@ -232,8 +480,10 @@ def test_new_round_inherits_parent_brief_on_the_server(
 
     assert response.status_code == 200
     child = web.RUNS[response.json()["run_id"]]
-    at = child.command.index("--brief")
-    child_brief = Path(child.command[at + 1])
+    from montagewright.job import load_job
+
+    job = load_job(Path(response.json()["job"]))
+    child_brief = Path(str(job.brief))
     assert child_brief.parent == child.root
     assert child_brief.read_text() == parent_brief.read_text()
 
@@ -278,8 +528,11 @@ def test_new_round_inherits_parent_grounding_on_the_server(
 
     assert response.status_code == 200
     child = web.RUNS[response.json()["run_id"]]
-    at = child.command.index("--grounding-spec")
-    inherited = Path(child.command[at + 1])
+    from montagewright.job import load_job
+
+    job = load_job(Path(response.json()["job"]))
+    assert job.subject is not None
+    inherited = Path(str(job.subject.grounding_spec))
     assert inherited.parent == child.root / "out" / "work"
     assert inherited.read_text(encoding="utf-8") == grounding.read_text(
         encoding="utf-8"
@@ -309,9 +562,10 @@ def test_web_can_start_from_a_brief_file_path(tmp_path, monkeypatch):
     )
 
     assert response.status_code == 200
-    run = web.RUNS[response.json()["run_id"]]
-    at = run.command.index("--brief")
-    saved = Path(run.command[at + 1]).read_text()
+    from montagewright.job import load_job
+
+    job = load_job(Path(response.json()["job"]))
+    saved = Path(str(job.brief)).read_text()
     assert "Z Fold8 only" in saved
     assert "experience event context" in saved
 
@@ -473,3 +727,29 @@ def test_a_live_pid_survives_the_line_that_distrusts_running(tmp_path, monkeypat
     webapp.recall()
 
     assert webapp.RUNS["from-the-command-line"].state == "running"
+
+
+def test_web_subtitle_writers_respect_the_output_lease(tmp_path):
+    from montagewright.release import acquire_output_lease
+
+    run = web.Run("subtitle-locked", tmp_path / "run")
+    work = run.output / "work"
+    work.mkdir(parents=True)
+    (run.output / "deliverable.mp4").write_bytes(b"picture")
+    (work / "subtitles.json").write_text(json.dumps([{
+        "at": 0.0, "until": 1.0, "text": "hello",
+    }]), encoding="utf-8")
+    web.RUNS[run.run_id] = run
+    lease = acquire_output_lease(run.output)
+    client = TestClient(web.create_app())
+    try:
+        edited = client.put(
+            f"/api/runs/{run.run_id}/subtitle-track",
+            json={"lines": []},
+        )
+        burned = client.post(f"/api/runs/{run.run_id}/burn-subtitles")
+        assert edited.status_code == 409
+        assert burned.status_code == 409
+    finally:
+        lease.release()
+        web.RUNS.pop(run.run_id, None)
